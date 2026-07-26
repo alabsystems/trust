@@ -1,0 +1,33 @@
+trust
+Copyright 2026 Andrew Yates
+
+trust is licensed under the ALab Academic Use License 1.0; the terms are in LICENSE.
+
+trust's binaries include third-party components. Each remains under its own
+license, and nothing in the ALab Academic Use License limits the rights that license
+gives you.
+
+Trust is built on rust-lang/rust (https://github.com/rust-lang/rust), which is
+Copyright (c) The Rust Project Contributors and is licensed under the Apache
+License, Version 2.0 (licenses/Apache-2.0.txt) or the MIT license
+(licenses/MIT.txt), at your option. The files Trust inherits from it, with
+Trust's changes to them, remain under those terms; the files Trust wrote, and
+Trust as a whole, are licensed under the ALab Academic Use License.
+
+Trust's toolchain includes LLVM (https://llvm.org), licensed under the Apache
+License, Version 2.0 with LLVM Exceptions (licenses/Apache-2.0.txt and
+licenses/LLVM-exception.txt).
+
+The toolchain includes ALab's ay, clean and ty binaries. Their third-party
+components keep their own licenses and notices, which those repositories'
+NOTICE files reproduce:
+  https://github.com/alabsystems/ay/blob/main/NOTICE
+  https://github.com/alabsystems/clean/blob/main/NOTICE
+  https://github.com/alabsystems/ty/blob/main/NOTICE
+Among them, ay statically links the malachite crates (GNU Lesser General
+Public License 3.0), and clean statically links GNU MP 6.3.0 with the rug and
+gmp-mpfr-sys crates (GNU Lesser General Public License 3.0 or later); the
+license text is licenses/LGPL-3.0.txt, which incorporates licenses/GPL-3.0.txt.
+Some crates are under the Mozilla Public License 2.0 (licenses/MPL-2.0.txt).
+Section 5 of the ALab Academic Use License keeps every right those licenses
+give you.
