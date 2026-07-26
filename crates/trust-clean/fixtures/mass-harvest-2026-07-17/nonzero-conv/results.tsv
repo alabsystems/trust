@@ -1,0 +1,27 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+as_i32_i64	FULLY_FAITHFUL	true	true	true	true	true	false	true
+as_i8_i64	FULLY_FAITHFUL	true	true	true	true	true	false	true
+as_u16_usize	FULLY_FAITHFUL	true	true	true	true	true	false	true
+as_u32_u64	FULLY_FAITHFUL	true	true	true	true	true	false	true
+as_u8_u32	FULLY_FAITHFUL	true	true	true	true	true	false	true
+from_i16_i32	SHAPE_GAP	false	false	false	false	false	false	false
+from_i8_i64	SHAPE_GAP	false	false	false	false	false	false	false
+from_u16_u64	SHAPE_GAP	false	false	false	false	false	false	false
+from_u16_usize	SHAPE_GAP	false	false	false	false	false	false	false
+from_u8_i32	SHAPE_GAP	false	false	false	false	false	false	false
+from_u8_u32	SHAPE_GAP	false	false	false	false	false	false	false
+std::num::NonZero::<i64>::get	SHAPE_GAP	false	false	false	false	false	false	false
+nz_i64_get	SHAPE_GAP	false	false	false	false	false	false	false
+std::num::NonZero::<u32>::get	SHAPE_GAP	false	false	false	false	false	false	false
+nz_u32_get	SHAPE_GAP	false	false	false	false	false	false	false
+std::num::NonZero::<u32>::new	SHAPE_GAP	false	false	false	false	false	false	false
+nz_u32_new	SHAPE_GAP	false	false	false	false	false	false	false
+std::option::Option::<std::num::NonZero<u32>>::is_some	FULLY_FAITHFUL	false	false	true	true	true	false	true
+opt_nz_is_some	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::convert::num::<impl std::convert::From<i16> for i32>::from	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::convert::num::<impl std::convert::From<i8> for i64>::from	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::convert::num::<impl std::convert::From<u16> for u64>::from	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::convert::num::<impl std::convert::From<u16> for usize>::from	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::convert::num::<impl std::convert::From<u8> for i32>::from	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::convert::num::<impl std::convert::From<u8> for u32>::from	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::num::NonZero::<i64>::new	SHAPE_GAP	false	false	false	false	false	false	false

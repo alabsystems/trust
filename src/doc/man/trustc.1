@@ -1,0 +1,14 @@
+.TH TRUSTC "1" "April 2026" "trustc <INSERT VERSION HERE>" "User Commands"
+.SH NAME
+trustc \- The Trust compiler
+.SH SYNOPSIS
+.B trustc
+[\fIOPTIONS\fR] \fIINPUT\fR
+.SH DESCRIPTION
+\fBtrustc\fR is the canonical compiler binary for the Trust toolchain. It
+preserves inherited Rust language compatibility while exposing Trust-owned
+strict batteries-on native verification. Use \fB-Z trust-verify=off\fR only for
+an explicit vanilla-compatibility compilation; use \fBtargo trust\fR for the
+normal Cargo-aware verification workflow.
+.SH SEE ALSO
+.BR trustdoc (1)

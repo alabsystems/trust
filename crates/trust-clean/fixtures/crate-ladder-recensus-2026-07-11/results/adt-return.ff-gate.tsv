@@ -1,0 +1,11 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+_64::<impl From<i16> for u16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+_64::<impl From<i32> for u32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+_64::<impl From<i64> for u64>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+_64::<impl From<i8> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+_64::<impl From<u16> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+_64::<impl From<u32> for i8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+_64::<impl From<u64> for i32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+_x128::<impl From<i128> for u128>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+_x128::<impl From<u128> for i32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+_x128::<impl From<u128> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true

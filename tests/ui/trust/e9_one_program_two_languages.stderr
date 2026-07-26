@@ -1,0 +1,121 @@
+note: Clean island kernel-checked: 3 declaration(s) registered (u64_ge_refl, min2_case, min2_le_left)
+  --> $DIR/e9_one_program_two_languages.rs:19:5
+   |
+LL | /     theorem u64_ge_refl : forall (x : UInt64),
+LL | |         Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
+LL | |         fun x => Nat.le.refl (UInt64.toNat x)
+LL | |     theorem min2_case : forall (x y : UInt64) (d : Bool),
+...  |
+LL | |         fun x y => min2_case x y (Nat.ble (UInt64.toNat y) (UInt64.toNat x))
+LL | |             (Eq.refl Bool (Nat.ble (UInt64.toNat y) (UInt64.toNat x)))
+   | |______________________________________________________________________^
+
+
+=== Trust Verification Report (e9_one_program_two_languages) ===
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_one_program_two_languages.rs:43:1
+   |
+LL | pub fn s1(x: u64) -> u64 ensures x >= x by u64_ge_refl { x }
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_one_program_two_languages.rs:45:1
+   |
+LL | pub fn s4(x: u64) -> u64 ensures result >= x by u64_ge_refl { x }
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_one_program_two_languages.rs:47:1
+   |
+LL | pub fn s2(x: u64) -> u64 ensures ident(x) >= ident(x) by u64_ge_refl { x }
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: Trust verification: 4 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 4 obligation(s)
+  --> $DIR/e9_one_program_two_languages.rs:49:1
+   |
+LL | pub fn s3(x: u64) -> u64 ensures x >= x by u64_ge_refl ensures x <= x by u64_ge_refl { x }
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: of which 4 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_one_program_two_languages.rs:51:1
+   |
+LL | pub fn s5(x: u64, y: u64) -> u64 ensures min2(x, y) <= x by min2_le_left { x }
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_one_program_two_languages.rs:53:1
+   |
+LL | / pub fn s6(x: u64) -> u64 ensures ident(x) >= ident(x) by u64_ge_refl {
+LL | |     let a = x ^ 3; let b = a ^ 3; b
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `s1`, with a clean certification audit
+  --> $DIR/e9_one_program_two_languages.rs:43:44
+   |
+LL | pub fn s1(x: u64) -> u64 ensures x >= x by u64_ge_refl { x }
+   |                                            ^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+
+note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `s4`, with a clean certification audit
+  --> $DIR/e9_one_program_two_languages.rs:45:49
+   |
+LL | pub fn s4(x: u64) -> u64 ensures result >= x by u64_ge_refl { x }
+   |                                                 ^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+
+note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `s2`, with a clean certification audit
+  --> $DIR/e9_one_program_two_languages.rs:47:58
+   |
+LL | pub fn s2(x: u64) -> u64 ensures ident(x) >= ident(x) by u64_ge_refl { x }
+   |                                                          ^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+
+note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `s3`, with a clean certification audit
+  --> $DIR/e9_one_program_two_languages.rs:49:44
+   |
+LL | pub fn s3(x: u64) -> u64 ensures x >= x by u64_ge_refl ensures x <= x by u64_ge_refl { x }
+   |                                            ^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+
+note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `s3`, with a clean certification audit
+  --> $DIR/e9_one_program_two_languages.rs:49:74
+   |
+LL | pub fn s3(x: u64) -> u64 ensures x >= x by u64_ge_refl ensures x <= x by u64_ge_refl { x }
+   |                                                                          ^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+
+note: citation `min2_le_left` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `s5`, with a clean certification audit
+  --> $DIR/e9_one_program_two_languages.rs:51:61
+   |
+LL | pub fn s5(x: u64, y: u64) -> u64 ensures min2(x, y) <= x by min2_le_left { x }
+   |                                                             ^^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+
+note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `s6`, with a clean certification audit
+  --> $DIR/e9_one_program_two_languages.rs:53:58
+   |
+LL | pub fn s6(x: u64) -> u64 ensures ident(x) >= ident(x) by u64_ge_refl {
+   |                                                          ^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+

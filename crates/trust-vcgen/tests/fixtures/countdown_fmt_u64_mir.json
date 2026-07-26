@@ -1,0 +1,3865 @@
+{
+  "name": "fmt_u64",
+  "def_path": "fmt_u64",
+  "span": {
+    "file": "<dump-root>/cd/traps/traps.rs",
+    "line_start": 126,
+    "col_start": 0,
+    "line_end": 149,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "n"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 20
+              }
+            }
+          }
+        },
+        "name": "buf"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "offset"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Array": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                },
+                "len": 20
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "remain"
+      },
+      {
+        "index": 7,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "quad"
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 23,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 24,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 25,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 26,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 27,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 28,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 29,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 30,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 31,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 32,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 33,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 34,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 35,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 36,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 37,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 38,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 39,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 40,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 41,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 42,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 43,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 44,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 45,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 46,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 47,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 48,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 49,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 50,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 51,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 52,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 53,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 54,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 55,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 56,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 57,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 58,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 59,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 60,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 61,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 62,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 63,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 64,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 2,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 127,
+                "col_start": 21,
+                "line_end": 127,
+                "col_end": 24
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Ref": {
+                      "mutable": false,
+                      "inner": {
+                        "Slice": {
+                          "elem": {
+                            "Int": {
+                              "width": 8,
+                              "signed": false
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 127,
+                "col_start": 21,
+                "line_end": 127,
+                "col_end": 24
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Move": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 127,
+                "col_start": 21,
+                "line_end": 127,
+                "col_end": 30
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 128,
+                "col_start": 21,
+                "line_end": 128,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 1
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 6,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 129,
+                "col_start": 10,
+                "line_end": 129,
+                "col_end": 16
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Move": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        999,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 129,
+                "col_start": 10,
+                "line_end": 129,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 7,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                19
+              ]
+            ],
+            "otherwise": 2,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 129,
+              "col_start": 10,
+              "line_end": 129,
+              "col_end": 22
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Sub",
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        4,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 130,
+                "col_start": 8,
+                "line_end": 130,
+                "col_end": 19
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 9,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Sub"
+            },
+            "target": 3,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 130,
+              "col_start": 8,
+              "line_end": 130,
+              "col_end": 19
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 9,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 130,
+                "col_start": 8,
+                "line_end": 130,
+                "col_end": 19
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 6,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 131,
+                "col_start": 19,
+                "line_end": 131,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        10000,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 131,
+                "col_start": 19,
+                "line_end": 131,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 12,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "RemainderByZero",
+            "target": 4,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 131,
+              "col_start": 19,
+              "line_end": 131,
+              "col_end": 34
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Rem",
+                  {
+                    "Move": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        10000,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 131,
+                "col_start": 19,
+                "line_end": 131,
+                "col_end": 34
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        10000,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 132,
+                "col_start": 8,
+                "line_end": 132,
+                "col_end": 24
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 13,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "DivisionByZero",
+            "target": 5,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 132,
+              "col_start": 8,
+              "line_end": 132,
+              "col_end": 24
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Copy": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        10000,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 132,
+                "col_start": 8,
+                "line_end": 132,
+                "col_end": 24
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1000,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 133,
+                "col_start": 22,
+                "line_end": 133,
+                "col_end": 35
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 15,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "DivisionByZero",
+            "target": 6,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 133,
+              "col_start": 22,
+              "line_end": 133,
+              "col_end": 35
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Copy": {
+                      "local": 10,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1000,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 133,
+                "col_start": 22,
+                "line_end": 133,
+                "col_end": 35
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 133,
+                "col_start": 12,
+                "line_end": 133,
+                "col_end": 18
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 16,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        20,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 133,
+                "col_start": 8,
+                "line_end": 133,
+                "col_end": 19
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 17,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 7,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 133,
+              "col_start": 8,
+              "line_end": 133,
+              "col_end": 19
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": [
+                  "Deref",
+                  {
+                    "Index": 16
+                  }
+                ]
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 14,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 8,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 133,
+                "col_start": 8,
+                "line_end": 133,
+                "col_end": 41
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 20,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        100,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 134,
+                "col_start": 27,
+                "line_end": 134,
+                "col_end": 39
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 20,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "DivisionByZero",
+            "target": 8,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 134,
+              "col_start": 27,
+              "line_end": 134,
+              "col_end": 39
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Copy": {
+                      "local": 10,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        100,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 134,
+                "col_start": 27,
+                "line_end": 134,
+                "col_end": 39
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        10,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 134,
+                "col_start": 26,
+                "line_end": 134,
+                "col_end": 45
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 21,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "RemainderByZero",
+            "target": 9,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 134,
+              "col_start": 26,
+              "line_end": 134,
+              "col_end": 45
+            }
+          }
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Rem",
+                  {
+                    "Move": {
+                      "local": 19,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        10,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 134,
+                "col_start": 26,
+                "line_end": 134,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 23,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 134,
+                "col_start": 12,
+                "line_end": 134,
+                "col_end": 18
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 23,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 134,
+                "col_start": 12,
+                "line_end": 134,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 24,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 10,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 134,
+              "col_start": 12,
+              "line_end": 134,
+              "col_end": 22
+            }
+          }
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 24,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 134,
+                "col_start": 12,
+                "line_end": 134,
+                "col_end": 22
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 25,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 22,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        20,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 134,
+                "col_start": 8,
+                "line_end": 134,
+                "col_end": 23
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 25,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 11,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 134,
+              "col_start": 8,
+              "line_end": 134,
+              "col_end": 23
+            }
+          }
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": [
+                  "Deref",
+                  {
+                    "Index": 22
+                  }
+                ]
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 18,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 8,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 134,
+                "col_start": 8,
+                "line_end": 134,
+                "col_end": 51
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 28,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        10,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 135,
+                "col_start": 27,
+                "line_end": 135,
+                "col_end": 38
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 28,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "DivisionByZero",
+            "target": 12,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 135,
+              "col_start": 27,
+              "line_end": 135,
+              "col_end": 38
+            }
+          }
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 27,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Copy": {
+                      "local": 10,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        10,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 135,
+                "col_start": 27,
+                "line_end": 135,
+                "col_end": 38
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 29,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        10,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 135,
+                "col_start": 26,
+                "line_end": 135,
+                "col_end": 44
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 29,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "RemainderByZero",
+            "target": 13,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 135,
+              "col_start": 26,
+              "line_end": 135,
+              "col_end": 44
+            }
+          }
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 26,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Rem",
+                  {
+                    "Move": {
+                      "local": 27,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        10,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 135,
+                "col_start": 26,
+                "line_end": 135,
+                "col_end": 44
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 31,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 135,
+                "col_start": 12,
+                "line_end": 135,
+                "col_end": 18
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 32,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 31,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        2,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 135,
+                "col_start": 12,
+                "line_end": 135,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 32,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 14,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 135,
+              "col_start": 12,
+              "line_end": 135,
+              "col_end": 22
+            }
+          }
+        }
+      },
+      {
+        "id": 14,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 30,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 32,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 135,
+                "col_start": 12,
+                "line_end": 135,
+                "col_end": 22
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 33,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 30,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        20,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 135,
+                "col_start": 8,
+                "line_end": 135,
+                "col_end": 23
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 33,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 15,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 135,
+              "col_start": 8,
+              "line_end": 135,
+              "col_end": 23
+            }
+          }
+        }
+      },
+      {
+        "id": 15,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": [
+                  "Deref",
+                  {
+                    "Index": 30
+                  }
+                ]
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 26,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 8,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 135,
+                "col_start": 8,
+                "line_end": 135,
+                "col_end": 50
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 35,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        10,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 136,
+                "col_start": 26,
+                "line_end": 136,
+                "col_end": 37
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 35,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "RemainderByZero",
+            "target": 16,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 136,
+              "col_start": 26,
+              "line_end": 136,
+              "col_end": 37
+            }
+          }
+        }
+      },
+      {
+        "id": 16,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 34,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Rem",
+                  {
+                    "Copy": {
+                      "local": 10,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        10,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 136,
+                "col_start": 26,
+                "line_end": 136,
+                "col_end": 37
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 37,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 136,
+                "col_start": 12,
+                "line_end": 136,
+                "col_end": 18
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 38,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 37,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        3,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 136,
+                "col_start": 12,
+                "line_end": 136,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 38,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 17,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 136,
+              "col_start": 12,
+              "line_end": 136,
+              "col_end": 22
+            }
+          }
+        }
+      },
+      {
+        "id": 17,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 36,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 38,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 136,
+                "col_start": 12,
+                "line_end": 136,
+                "col_end": 22
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 39,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 36,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        20,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 136,
+                "col_start": 8,
+                "line_end": 136,
+                "col_end": 23
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 39,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 18,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 136,
+              "col_start": 8,
+              "line_end": 136,
+              "col_end": 23
+            }
+          }
+        }
+      },
+      {
+        "id": 18,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": [
+                  "Deref",
+                  {
+                    "Index": 36
+                  }
+                ]
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 34,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 8,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 136,
+                "col_start": 8,
+                "line_end": 136,
+                "col_end": 43
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 1
+        }
+      },
+      {
+        "id": 19,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 41,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 6,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 138,
+                "col_start": 7,
+                "line_end": 138,
+                "col_end": 13
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 40,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Move": {
+                      "local": 41,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        9,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 138,
+                "col_start": 7,
+                "line_end": 138,
+                "col_end": 17
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 40,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                29
+              ]
+            ],
+            "otherwise": 20,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 138,
+              "col_start": 7,
+              "line_end": 138,
+              "col_end": 17
+            }
+          }
+        }
+      },
+      {
+        "id": 20,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 42,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Sub",
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        2,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 139,
+                "col_start": 8,
+                "line_end": 139,
+                "col_end": 19
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 42,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Sub"
+            },
+            "target": 21,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 139,
+              "col_start": 8,
+              "line_end": 139,
+              "col_end": 19
+            }
+          }
+        }
+      },
+      {
+        "id": 21,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 42,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 139,
+                "col_start": 8,
+                "line_end": 139,
+                "col_end": 19
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 45,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 6,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 140,
+                "col_start": 24,
+                "line_end": 140,
+                "col_end": 30
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 46,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        10,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 140,
+                "col_start": 23,
+                "line_end": 140,
+                "col_end": 36
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 46,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "DivisionByZero",
+            "target": 22,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 140,
+              "col_start": 23,
+              "line_end": 140,
+              "col_end": 36
+            }
+          }
+        }
+      },
+      {
+        "id": 22,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 44,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Move": {
+                      "local": 45,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        10,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 140,
+                "col_start": 23,
+                "line_end": 140,
+                "col_end": 36
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 47,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        10,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 140,
+                "col_start": 22,
+                "line_end": 140,
+                "col_end": 42
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 47,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "RemainderByZero",
+            "target": 23,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 140,
+              "col_start": 22,
+              "line_end": 140,
+              "col_end": 42
+            }
+          }
+        }
+      },
+      {
+        "id": 23,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 43,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Rem",
+                  {
+                    "Move": {
+                      "local": 44,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        10,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 140,
+                "col_start": 22,
+                "line_end": 140,
+                "col_end": 42
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 48,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 140,
+                "col_start": 12,
+                "line_end": 140,
+                "col_end": 18
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 49,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 48,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        20,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 140,
+                "col_start": 8,
+                "line_end": 140,
+                "col_end": 19
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 49,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 24,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 140,
+              "col_start": 8,
+              "line_end": 140,
+              "col_end": 19
+            }
+          }
+        }
+      },
+      {
+        "id": 24,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": [
+                  "Deref",
+                  {
+                    "Index": 48
+                  }
+                ]
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 43,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 8,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 140,
+                "col_start": 8,
+                "line_end": 140,
+                "col_end": 48
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 51,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 6,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 141,
+                "col_start": 27,
+                "line_end": 141,
+                "col_end": 33
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 52,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        10,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 141,
+                "col_start": 26,
+                "line_end": 141,
+                "col_end": 39
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 52,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "RemainderByZero",
+            "target": 25,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 141,
+              "col_start": 26,
+              "line_end": 141,
+              "col_end": 39
+            }
+          }
+        }
+      },
+      {
+        "id": 25,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 50,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Rem",
+                  {
+                    "Move": {
+                      "local": 51,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        10,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 141,
+                "col_start": 26,
+                "line_end": 141,
+                "col_end": 39
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 54,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 141,
+                "col_start": 12,
+                "line_end": 141,
+                "col_end": 18
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 55,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 54,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 141,
+                "col_start": 12,
+                "line_end": 141,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 55,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 26,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 141,
+              "col_start": 12,
+              "line_end": 141,
+              "col_end": 22
+            }
+          }
+        }
+      },
+      {
+        "id": 26,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 53,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 55,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 141,
+                "col_start": 12,
+                "line_end": 141,
+                "col_end": 22
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 56,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 53,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        20,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 141,
+                "col_start": 8,
+                "line_end": 141,
+                "col_end": 23
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 56,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 27,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 141,
+              "col_start": 8,
+              "line_end": 141,
+              "col_end": 23
+            }
+          }
+        }
+      },
+      {
+        "id": 27,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": [
+                  "Deref",
+                  {
+                    "Index": 53
+                  }
+                ]
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 50,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 8,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 141,
+                "col_start": 8,
+                "line_end": 141,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 57,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        100,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 142,
+                "col_start": 8,
+                "line_end": 142,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 57,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "DivisionByZero",
+            "target": 28,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 142,
+              "col_start": 8,
+              "line_end": 142,
+              "col_end": 21
+            }
+          }
+        }
+      },
+      {
+        "id": 28,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Copy": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        100,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 142,
+                "col_start": 8,
+                "line_end": 142,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 29
+        }
+      },
+      {
+        "id": 29,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 59,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 6,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 144,
+                "col_start": 7,
+                "line_end": 144,
+                "col_end": 13
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 58,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ne",
+                  {
+                    "Move": {
+                      "local": 59,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 144,
+                "col_start": 7,
+                "line_end": 144,
+                "col_end": 18
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 58,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                30
+              ]
+            ],
+            "otherwise": 31,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 144,
+              "col_start": 7,
+              "line_end": 144,
+              "col_end": 18
+            }
+          }
+        }
+      },
+      {
+        "id": 30,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 60,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 144,
+                "col_start": 22,
+                "line_end": 144,
+                "col_end": 28
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 60,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                34
+              ]
+            ],
+            "otherwise": 31,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 144,
+              "col_start": 22,
+              "line_end": 144,
+              "col_end": 28
+            }
+          }
+        }
+      },
+      {
+        "id": 31,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 61,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Sub",
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 145,
+                "col_start": 8,
+                "line_end": 145,
+                "col_end": 19
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 61,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Sub"
+            },
+            "target": 32,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 145,
+              "col_start": 8,
+              "line_end": 145,
+              "col_end": 19
+            }
+          }
+        }
+      },
+      {
+        "id": 32,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 61,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 145,
+                "col_start": 8,
+                "line_end": 145,
+                "col_end": 19
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 62,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 6,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 146,
+                "col_start": 22,
+                "line_end": 146,
+                "col_end": 28
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 63,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 146,
+                "col_start": 12,
+                "line_end": 146,
+                "col_end": 18
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 64,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 63,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        20,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 146,
+                "col_start": 8,
+                "line_end": 146,
+                "col_end": 19
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 64,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": "BoundsCheck",
+            "target": 33,
+            "span": {
+              "file": "<dump-root>/cd/traps/traps.rs",
+              "line_start": 146,
+              "col_start": 8,
+              "line_end": 146,
+              "col_end": 19
+            }
+          }
+        }
+      },
+      {
+        "id": 33,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": [
+                  "Deref",
+                  {
+                    "Index": 63
+                  }
+                ]
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 62,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 8,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 146,
+                "col_start": 8,
+                "line_end": 146,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 34
+        }
+      },
+      {
+        "id": 34,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/cd/traps/traps.rs",
+                "line_start": 148,
+                "col_start": 4,
+                "line_end": 148,
+                "col_end": 10
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "n",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

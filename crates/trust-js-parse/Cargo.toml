@@ -1,0 +1,25 @@
+# trust-js-parse: the TrustJS ECMAScript parser — M1 D1
+#
+# Full ES2025 script-grammar parser (lexer, AST, cover grammars, ASI, early
+# errors, strict reparse), built to the spec and never translated from an
+# engine. Independent of trust-js-sem's internal parser BY DESIGN: sem is the
+# reference semantics, and sharing a parser would collapse the differential.
+# Measured from day one by the parse-verdict lane of trust-js-differential
+# (docs/design/2026-07-21-trustjs-m1-scope.md D1): every incompleteness is a
+# sound Unsupported refusal, never a guessed verdict.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-js-parse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }

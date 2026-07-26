@@ -1,0 +1,145 @@
+{
+  "name": "res_is_err_usize",
+  "def_path": "res_is_err_usize",
+  "span": {
+    "file": "src/main.rs",
+    "line_start": 107,
+    "col_start": 0,
+    "line_end": 107,
+    "col_end": 76
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "std::result::Result",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ],
+                  [
+                    "__v0_0",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "__v1_0",
+                    {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "Ok",
+                    "discriminant": 0,
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ]
+                  },
+                  {
+                    "name": "Err",
+                    "discriminant": 1,
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ]
+                  }
+                ],
+                "disc_index_safe": true
+              }
+            }
+          }
+        },
+        "name": "r"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "std::result::Result::<usize, u8>::is_err",
+            "args": [
+              {
+                "Move": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "src/main.rs",
+              "line_start": 107,
+              "col_start": 0,
+              "line_end": 107,
+              "col_end": 54
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Bool"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

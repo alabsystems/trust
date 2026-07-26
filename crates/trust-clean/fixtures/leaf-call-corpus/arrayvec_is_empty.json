@@ -1,0 +1,147 @@
+{
+  "name": "is_empty",
+  "def_path": "arrayvec::ArrayVec::<T, CAP>::is_empty",
+  "span": {
+    "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/arrayvec-0.7.7/src/arrayvec.rs",
+    "line_start": 126,
+    "col_start": 4,
+    "line_end": 126,
+    "col_end": 60
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "arrayvec::ArrayVec",
+                "fields": [
+                  [
+                    "len",
+                    {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "xs",
+                    {
+                      "Unsupported": {
+                        "kind": "TyKind::Array",
+                        "detail": "array length CAP/#1 is not a concrete target usize"
+                      }
+                    }
+                  ]
+                ]
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "arrayvec::ArrayVec::<T, CAP>::len",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/arrayvec-0.7.7/src/arrayvec.rs",
+              "line_start": 126,
+              "col_start": 43,
+              "line_end": 126,
+              "col_end": 53
+            },
+            "atomic": null,
+            "is_foreign": false
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Move": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/arrayvec-0.7.7/src/arrayvec.rs",
+                "line_start": 126,
+                "col_start": 43,
+                "line_end": 126,
+                "col_end": 58
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Bool"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

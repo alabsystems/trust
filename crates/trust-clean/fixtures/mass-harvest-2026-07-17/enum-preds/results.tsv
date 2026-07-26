@@ -1,0 +1,28 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+std::cmp::Ordering::is_eq	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::cmp::Ordering::is_ge	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::cmp::Ordering::is_gt	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::cmp::Ordering::is_le	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::cmp::Ordering::is_lt	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::cmp::Ordering::is_ne	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::ops::ControlFlow::<i32, i32>::is_break	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::ops::ControlFlow::<i32, i32>::is_continue	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::task::Poll::<i32>::is_pending	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::task::Poll::<i32>::is_ready	FULLY_FAITHFUL	false	false	true	true	true	false	true
+w_bound_is_excluded	SHAPE_GAP	false	false	false	false	false	false	false
+w_bound_is_included	FULLY_FAITHFUL	false	false	true	true	true	false	true
+w_bound_is_unbounded	SHAPE_GAP	false	false	false	false	false	false	false
+w_cf_is_break	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_cf_is_continue	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_e1_is_a	FULLY_FAITHFUL	false	false	true	true	true	false	true
+w_e2_is_a	FULLY_FAITHFUL	false	false	true	true	true	false	true
+w_e3_is_a	FULLY_FAITHFUL	false	false	true	true	true	false	true
+w_ord_is_eq	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_ord_is_ge	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_ord_is_gt	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_ord_is_le	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_ord_is_lt	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_ord_is_ne	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_poll_is_pending	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_poll_is_ready	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_result_is_ok	FULLY_FAITHFUL	false	false	true	true	true	false	true

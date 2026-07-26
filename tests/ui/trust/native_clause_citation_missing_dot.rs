@@ -1,0 +1,12 @@
+// Split from native_clause_citation_grammar_errors.rs (one parse-error case per
+// file; parse aborts at the first citation error).
+//@ compile-flags: -Z trust-verify=off
+
+fn missing_dot(x: u32) -> u32
+    ensures result == x by Lemma part
+    //~^ ERROR expected `.` or the end of the contract clause citation
+{
+    x
+}
+
+fn main() {}

@@ -1,0 +1,25 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+<u32 as std::cmp::Ord>::min	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<u8 as std::cmp::Ord>::max	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<u8 as std::cmp::Ord>::min	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<usize as std::cmp::Ord>::max	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<usize as std::cmp::Ord>::min	FULLY_FAITHFUL	true	true	false	false	false	false	true
+std::cmp::max::<usize>	FULLY_FAITHFUL	true	true	true	true	true	false	true
+Buf::grow_target	FULLY_FAITHFUL	true	true	true	true	true	false	true
+Buf::larger_dim	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::cmp::min::<usize>	FULLY_FAITHFUL	true	true	true	true	true	false	true
+Buf::used	FULLY_FAITHFUL	true	true	true	true	true	false	true
+Config::capped_count	SHAPE_GAP	false	false	false	false	false	false	false
+std::option::Option::<i32>::is_some	FULLY_FAITHFUL	false	false	true	true	true	false	true
+Config::has_name	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::option::Option::<i32>::unwrap_or	FULLY_FAITHFUL	true	true	false	false	false	false	true
+Config::name_or_zero	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::option::Option::<u8>::is_some	FULLY_FAITHFUL	false	false	true	true	true	false	true
+State::has_mode	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::option::Option::<u8>::unwrap_or	FULLY_FAITHFUL	true	true	false	false	false	false	true
+State::mode_or_default	FULLY_FAITHFUL	true	true	true	true	true	false	true
+State::retries_at_least_one	FULLY_FAITHFUL	true	true	true	true	true	false	true
+State::retries_capped	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::cmp::impls::<impl std::cmp::PartialOrd for u32>::lt	SHAPE_GAP	false	false	false	false	false	false	false
+std::cmp::impls::<impl std::cmp::PartialOrd for u8>::lt	SHAPE_GAP	false	false	false	false	false	false	false
+std::cmp::impls::<impl std::cmp::PartialOrd for usize>::lt	SHAPE_GAP	false	false	false	false	false	false	false

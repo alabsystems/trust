@@ -1,0 +1,218 @@
+{
+  "convert": {
+    "checked_certificate_readback": {
+      "production_checked_certificates": 1,
+      "production_positive_golden_inventory": {
+        "missing_artifacts": [
+          {
+            "artifact": "decompile --to trust-cg --json",
+            "detail": "missing production-positive targo trust decompile <binary> --to trust-cg --json golden with artifact_gate.accepted=true and production_proof_grade_evidence present",
+            "evidence_required": [
+              "artifact_gate.accepted=true",
+              "production_proof_grade_evidence",
+              "trust_decompile_binary_release_gate"
+            ],
+            "stage": "targo-trust::decompile",
+            "status": "missing"
+          },
+          {
+            "artifact": "decompile -> convert --to trust-cg --json",
+            "detail": "missing production-positive chained targo trust decompile <binary> --to trust-cg --json -> targo trust convert <binary> --to trust-cg --json golden with conversion_gate.accepted=true",
+            "evidence_required": [
+              "conversion_gate.accepted=true",
+              "artifact_gate.accepted=true",
+              "production_cli_golden"
+            ],
+            "stage": "targo-trust::convert",
+            "status": "missing"
+          },
+          {
+            "artifact": "checked cert manifest",
+            "detail": "missing loadable --checked-cert-manifest with production checked certificate rows bound to the proof-grade CLI golden",
+            "evidence_required": [
+              "--checked-cert-manifest",
+              "loadable_checked_certificate_manifest",
+              "production_checked_certificate"
+            ],
+            "stage": "targo-trust::convert-loader",
+            "status": "missing"
+          },
+          {
+            "artifact": "replay identity",
+            "detail": "missing exact replay identity tying machine replay transcript and binary artifact digest identity to the selected binary image",
+            "evidence_required": [
+              "exact_replay_identity",
+              "machine_replay_transcript",
+              "selected_image_digest_identity",
+              "binary_artifact_digest_identity"
+            ],
+            "stage": "targo-trust::binary-replay",
+            "status": "missing"
+          },
+          {
+            "artifact": "unsupported-ledger elimination",
+            "detail": "missing production golden proving empty unsupported ledger for the decompile/convert trust-cg chain",
+            "evidence_required": [
+              "empty_unsupported_ledger",
+              "unsupported_ledger_empty"
+            ],
+            "stage": "targo-trust::unsupported-ledger",
+            "status": "missing"
+          }
+        ],
+        "required": true,
+        "status": "blocked",
+        "target": "trust-cg"
+      },
+      "proof_grade_release_accepted": false,
+      "proof_grade_release_blockers": [
+        {
+          "code": "production-proof-grade-cli-evidence-missing",
+          "detail": "production-proof-grade-cli-evidence-missing: binary-derived trust-cg proof-grade conversion is not backed by a real targo trust decompile/convert proof-grade CLI artifact; missing trust_decompile_binary_release_gate, proof_grade_binary_verification, checked_certificate_identity, exact_replay_identity, binary_artifact_digest_identity, nonzero_required_vcs, empty_unsupported_ledger; missing production-positive artifacts decompile --to trust-cg --json, decompile -> convert --to trust-cg --json, checked cert manifest, replay identity, unsupported-ledger elimination",
+          "evidence_required": [
+            "trust_decompile_binary_release_gate",
+            "proof_grade_binary_verification",
+            "checked_certificate_identity",
+            "exact_replay_identity",
+            "binary_artifact_digest_identity",
+            "nonzero_required_vcs",
+            "empty_unsupported_ledger",
+            "decompile_trust_cg_json_production_positive_golden",
+            "decompile_convert_trust_cg_json_production_positive_golden",
+            "checked_certificate_manifest",
+            "replay_identity",
+            "unsupported_ledger_elimination",
+            "production_cli_golden"
+          ],
+          "feature": "production-proof-grade-cli-evidence",
+          "stage": "targo-trust::convert-release-gate"
+        }
+      ],
+      "status": "blocked"
+    },
+    "conversion_gate": {
+      "accepted": false,
+      "blockers": [
+        "production-proof-grade-cli-evidence-missing: binary-derived trust-cg proof-grade conversion is not backed by a real targo trust decompile/convert proof-grade CLI artifact; missing trust_decompile_binary_release_gate, proof_grade_binary_verification, checked_certificate_identity, exact_replay_identity, binary_artifact_digest_identity, nonzero_required_vcs, empty_unsupported_ledger; missing production-positive artifacts decompile --to trust-cg --json, decompile -> convert --to trust-cg --json, checked cert manifest, replay identity, unsupported-ledger elimination"
+      ],
+      "status": "rejected",
+      "validation_blockers": [
+        "production-proof-grade-cli-evidence-missing: binary-derived trust-cg proof-grade conversion is not backed by a real targo trust decompile/convert proof-grade CLI artifact; missing trust_decompile_binary_release_gate, proof_grade_binary_verification, checked_certificate_identity, exact_replay_identity, binary_artifact_digest_identity, nonzero_required_vcs, empty_unsupported_ledger; missing production-positive artifacts decompile --to trust-cg --json, decompile -> convert --to trust-cg --json, checked cert manifest, replay identity, unsupported-ledger elimination"
+      ]
+    },
+    "production_proof_grade_evidence": null,
+    "target_proof_consumer_evidence": {
+      "binding_sha256": "615f88923f832e9d2b4ed734ffe1789d167593116309b9be488355d121c1b4e6",
+      "status": "accepted",
+      "target_semantics_consumed": true
+    }
+  },
+  "decompile": {
+    "artifact_gate": {
+      "accepted": false,
+      "blockers": [
+        "production-proof-grade-cli-evidence-missing: binary-derived trust-cg proof-grade conversion is not backed by a real targo trust decompile/convert proof-grade CLI artifact; missing trust_decompile_binary_release_gate, proof_grade_binary_verification, checked_certificate_identity, exact_replay_identity, binary_artifact_digest_identity, nonzero_required_vcs, empty_unsupported_ledger; missing production-positive artifacts decompile --to trust-cg --json, decompile -> convert --to trust-cg --json, checked cert manifest, replay identity, unsupported-ledger elimination"
+      ],
+      "status": "rejected",
+      "validation_blockers": [
+        "production-proof-grade-cli-evidence-missing: binary-derived trust-cg proof-grade conversion is not backed by a real targo trust decompile/convert proof-grade CLI artifact; missing trust_decompile_binary_release_gate, proof_grade_binary_verification, checked_certificate_identity, exact_replay_identity, binary_artifact_digest_identity, nonzero_required_vcs, empty_unsupported_ledger; missing production-positive artifacts decompile --to trust-cg --json, decompile -> convert --to trust-cg --json, checked cert manifest, replay identity, unsupported-ledger elimination"
+      ]
+    },
+    "checked_certificate_readback": {
+      "production_checked_certificates": 1,
+      "production_positive_golden_inventory": {
+        "missing_artifacts": [
+          {
+            "artifact": "decompile --to trust-cg --json",
+            "detail": "missing production-positive targo trust decompile <binary> --to trust-cg --json golden with artifact_gate.accepted=true and production_proof_grade_evidence present",
+            "evidence_required": [
+              "artifact_gate.accepted=true",
+              "production_proof_grade_evidence",
+              "trust_decompile_binary_release_gate"
+            ],
+            "stage": "targo-trust::decompile",
+            "status": "missing"
+          },
+          {
+            "artifact": "decompile -> convert --to trust-cg --json",
+            "detail": "missing production-positive chained targo trust decompile <binary> --to trust-cg --json -> targo trust convert <binary> --to trust-cg --json golden with conversion_gate.accepted=true",
+            "evidence_required": [
+              "conversion_gate.accepted=true",
+              "artifact_gate.accepted=true",
+              "production_cli_golden"
+            ],
+            "stage": "targo-trust::convert",
+            "status": "missing"
+          },
+          {
+            "artifact": "checked cert manifest",
+            "detail": "missing loadable --checked-cert-manifest with production checked certificate rows bound to the proof-grade CLI golden",
+            "evidence_required": [
+              "--checked-cert-manifest",
+              "loadable_checked_certificate_manifest",
+              "production_checked_certificate"
+            ],
+            "stage": "targo-trust::convert-loader",
+            "status": "missing"
+          },
+          {
+            "artifact": "replay identity",
+            "detail": "missing exact replay identity tying machine replay transcript and binary artifact digest identity to the selected binary image",
+            "evidence_required": [
+              "exact_replay_identity",
+              "machine_replay_transcript",
+              "selected_image_digest_identity",
+              "binary_artifact_digest_identity"
+            ],
+            "stage": "targo-trust::binary-replay",
+            "status": "missing"
+          },
+          {
+            "artifact": "unsupported-ledger elimination",
+            "detail": "missing production golden proving empty unsupported ledger for the decompile/convert trust-cg chain",
+            "evidence_required": [
+              "empty_unsupported_ledger",
+              "unsupported_ledger_empty"
+            ],
+            "stage": "targo-trust::unsupported-ledger",
+            "status": "missing"
+          }
+        ],
+        "required": true,
+        "status": "blocked",
+        "target": "trust-cg"
+      },
+      "proof_grade_release_accepted": false,
+      "proof_grade_release_blockers": [
+        {
+          "code": "production-proof-grade-cli-evidence-missing",
+          "detail": "production-proof-grade-cli-evidence-missing: binary-derived trust-cg proof-grade conversion is not backed by a real targo trust decompile/convert proof-grade CLI artifact; missing trust_decompile_binary_release_gate, proof_grade_binary_verification, checked_certificate_identity, exact_replay_identity, binary_artifact_digest_identity, nonzero_required_vcs, empty_unsupported_ledger; missing production-positive artifacts decompile --to trust-cg --json, decompile -> convert --to trust-cg --json, checked cert manifest, replay identity, unsupported-ledger elimination",
+          "evidence_required": [
+            "trust_decompile_binary_release_gate",
+            "proof_grade_binary_verification",
+            "checked_certificate_identity",
+            "exact_replay_identity",
+            "binary_artifact_digest_identity",
+            "nonzero_required_vcs",
+            "empty_unsupported_ledger",
+            "decompile_trust_cg_json_production_positive_golden",
+            "decompile_convert_trust_cg_json_production_positive_golden",
+            "checked_certificate_manifest",
+            "replay_identity",
+            "unsupported_ledger_elimination",
+            "production_cli_golden"
+          ],
+          "feature": "production-proof-grade-cli-evidence",
+          "stage": "targo-trust::convert-release-gate"
+        }
+      ],
+      "status": "blocked"
+    },
+    "production_proof_grade_evidence": null,
+    "target_proof_consumer_evidence": {
+      "binding_sha256": "615f88923f832e9d2b4ed734ffe1789d167593116309b9be488355d121c1b4e6",
+      "status": "accepted",
+      "target_semantics_consumed": true
+    }
+  }
+}

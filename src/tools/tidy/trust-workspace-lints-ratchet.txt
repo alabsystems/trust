@@ -1,0 +1,4 @@
+# Trust workspace-lint ratchet: how many Trust-owned member manifests
+# still lack `[lints] workspace = true`. See src/tools/tidy/src/workspace_lints.rs.
+# Only ever goes down. `x.py test tidy --bless` writes the current lower count.
+0

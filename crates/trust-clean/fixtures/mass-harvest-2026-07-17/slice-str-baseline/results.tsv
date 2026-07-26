@@ -1,0 +1,19 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+<usize as std::cmp::Ord>::min	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<usize as std::slice::SliceIndex<[i32]>>::get	SHAPE_GAP	false	false	false	false	false	false	false
+core::slice::<impl [i32]>::first	SHAPE_GAP	false	false	false	false	false	false	false
+core::slice::<impl [i32]>::get::<usize>	SHAPE_GAP	false	false	false	false	false	false	false
+core::slice::<impl [i32]>::is_empty	SHAPE_GAP	false	false	false	false	false	false	false
+core::slice::<impl [i32]>::last	SHAPE_GAP	false	false	false	false	false	false	false
+core::str::<impl str>::is_empty	SHAPE_GAP	false	false	false	false	false	false	false
+core::str::<impl str>::len	SHAPE_GAP	false	false	false	false	false	false	false
+std::option::Option::<&i32>::is_some	FULLY_FAITHFUL	false	false	true	true	true	false	true
+w_array_len	SHAPE_GAP	false	false	false	false	false	false	false
+w_get_is_some	SHAPE_GAP	false	false	false	false	false	false	false
+w_len_min_cap	SHAPE_GAP	false	false	false	false	false	false	false
+w_slice_first	SHAPE_GAP	false	false	false	false	false	false	false
+w_slice_is_empty	SHAPE_GAP	false	false	false	false	false	false	false
+w_slice_last	SHAPE_GAP	false	false	false	false	false	false	false
+w_slice_len	SHAPE_GAP	false	false	false	false	false	false	false
+w_str_is_empty	SHAPE_GAP	false	false	false	false	false	false	false
+w_str_len	SHAPE_GAP	false	false	false	false	false	false	false

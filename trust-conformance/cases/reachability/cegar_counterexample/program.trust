@@ -1,0 +1,8 @@
+state start;
+state branch;
+state bug;
+
+start -> branch when input == 7;
+branch -> bug when guard == true;
+
+target bug;

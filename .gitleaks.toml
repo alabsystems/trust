@@ -1,0 +1,23 @@
+# .gitleaks.toml
+# Gitleaks secret scanning configuration
+# See: https://github.com/gitleaks/gitleaks
+#
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Licensed under the Apache License, Version 2.0
+#
+# NO ALLOWLIST, deliberately. The publication engine rejects every
+# repository-controlled suppression surface (`[allowlist]`/`[allowlists]`,
+# per-rule allowlists, `disabledRules`, external `[extend] path`/`url`,
+# `regexTarget = "line"`), and it scans with `--ignore-gitleaks-allow` and an
+# empty ignore path, so `gitleaks:allow` comments and `.gitleaksignore` are
+# neutralized too. The allowlist this file used to carry was 100% vendored
+# upstream false positives; every one of them is now gone at the source —
+# `src/llvm-project` is no longer exported (publish/DECISIONS.md, option C)
+# and the Cargo Book's example registry token was replaced with a placeholder.
+# If gitleaks flags something, fix it where it lives. Do not re-add
+# suppression here.
+
+[extend]
+# Use default gitleaks rules
+useDefault = true

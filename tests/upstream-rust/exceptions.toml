@@ -1,0 +1,5 @@
+# Production-shaped seed exception ledger for upstream Rust compatibility accounting.
+# Empty until observed tRust-specific compatibility failures have reviewed waivers.
+
+schema_version = "0.1.0"
+exceptions = []

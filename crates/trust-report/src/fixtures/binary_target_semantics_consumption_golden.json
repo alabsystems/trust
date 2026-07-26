@@ -1,0 +1,66 @@
+{
+  "proof_grade_gate": {
+    "accepted": false,
+    "reconstruction_validated": true,
+    "target_semantics_consumed": false,
+    "validated_target_outputs": 1,
+    "target_validation_blockers": 1,
+    "blocker_group_counts": {
+      "reconstruction": 2
+    },
+    "rejection_kinds": [
+      "TargetSemanticsNotConsumed",
+      "TargetValidationBlockersPresent"
+    ]
+  },
+  "unresolved_blockers": {
+    "total_blockers": 4,
+    "reconstruction": 3,
+    "entries": [
+      {
+        "family": "reconstruction",
+        "stage": "proof_grade_gate",
+        "feature": "target_semantics_not_consumed",
+        "location": null,
+        "reason": "target semantics not proof-grade: target=TrustIr, validated_outputs=1, target_validation_blockers=1"
+      },
+      {
+        "family": "reconstruction",
+        "stage": "proof_grade_gate",
+        "feature": "target_validation_blockers_present",
+        "location": null,
+        "reason": "target validation blockers present: target=TrustIr, count=1"
+      },
+      {
+        "family": "source_backpropagation_gate",
+        "stage": "source_backpropagation_gate",
+        "feature": "target_validation",
+        "location": null,
+        "reason": "target validation is not accepted: target_semantics_consumed=false, target_validation_blockers=1, preserved_symbolic_formulas=0"
+      },
+      {
+        "family": "reconstruction",
+        "stage": "trust-wasm-bridge::target-validation",
+        "feature": "binary-provenance-not-consumed-by-target-semantics",
+        "location": "0x401010",
+        "reason": "canonical input claimed target_semantics_consumed=true, but target semantics have not consumed binary provenance"
+      }
+    ]
+  },
+  "reconstruction": {
+    "validation": "Validated",
+    "target_validation_blocker_count": 1,
+    "target_validation_blockers_by_feature": {
+      "binary-provenance-not-consumed-by-target-semantics": 1
+    }
+  },
+  "text_markers": [
+    "target_semantics_consumed=false",
+    "target semantics not proof-grade: target=TrustIr, validated_outputs=1, target_validation_blockers=1",
+    "target validation blockers present: target=TrustIr, count=1",
+    "TrustIr/trust-wasm-bridge::target-validation/binary-provenance-not-consumed-by-target-semantics function=main @0x401010",
+    "reconstruction/target_validation_blockers_present stage=proof_grade_gate",
+    "source_backpropagation_gate/target_validation stage=source_backpropagation_gate",
+    "reconstruction/binary-provenance-not-consumed-by-target-semantics stage=trust-wasm-bridge::target-validation @0x401010"
+  ]
+}

@@ -1,0 +1,80 @@
+# rustc_codegen_trust_cg: trust-codegen codegen backend adapter for rustc
+#
+# Thin adapter that implements the real rustc CodegenBackend trait by delegating
+# to trust-cg-bridge. This crate lives in compiler/ because it needs
+# #![feature(rustc_private)] to access rustc internals.
+#
+# Part of #829 (CodegenBackend for trust-codegen).
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "rustc_codegen_trust_cg"
+version = "0.0.0"
+edition = "2024"
+
+[lib]
+# trust-cg is a builtin rustc_interface backend.  Building it as a standalone
+# dylib gives the plugin its own statically linked rustc_span/SESSION_GLOBALS
+# and is therefore ABI- and TLS-incompatible with the loading compiler.
+crate-type = ["rlib"]
+
+[features]
+# Trust (Step 1): OFF-BY-DEFAULT emission adapter. When disabled (the default),
+# `src/trust_ir_emission.rs` is not compiled and the optional `trust-ir` /
+# `serde_json` dependencies are not linked, so the default codegen path is
+# byte-for-byte unchanged. When enabled, the backend additionally composes the
+# already-proven MIR->VerifiableFunction and VerifiableFunction->trust_ir::Module
+# passes to produce a `trust_ir::Module` per codegen unit (log-only; no codegen
+# output change).
+default = []
+trust-ir-emission = ["dep:trust-ir-bridge", "dep:trust-ir", "dep:serde_json"]
+# Trust (Step 2): OFF-BY-DEFAULT observational codegen probe. Implies
+# `trust-ir-emission` (so the per-CGU `trust_ir::Module` is built and in hand at
+# the hook). Adds NO new dependency: the `trust_ir::Module` -> LIR converter
+# (`trust_cg_bridge::lower_module_to_lir`) lives in the already-linked
+# `trust-cg-bridge` crate. When enabled, the backend additionally runs that
+# converter over every compiled function and logs handled-vs-fail-closed
+# coverage; it does NOT change codegen output. With the feature off,
+# `src/trust_ir_codegen.rs` is not compiled and the codegen path is unchanged.
+trust-ir-codegen = ["trust-ir-emission"]
+
+[dependencies]
+# tidy-alphabetical-start
+rustc_abi = { path = "../rustc_abi" }
+rustc_ast = { path = "../rustc_ast" }
+rustc_codegen_ssa = { path = "../rustc_codegen_ssa" }
+rustc_data_structures = { path = "../rustc_data_structures" }
+rustc_hir = { path = "../rustc_hir" }
+rustc_metadata = { path = "../rustc_metadata" }
+rustc_middle = { path = "../rustc_middle" }
+rustc_session = { path = "../rustc_session" }
+rustc_span = { path = "../rustc_span" }
+rustc_symbol_mangling = { path = "../rustc_symbol_mangling" }
+rustc_target = { path = "../rustc_target" }
+tracing = "0.1"
+# Trust (M-POS): enable `ay-proofs` so the proven-output gate (verify_output:
+# emit_objects_verified / EmitPolicy) and its ay / trust-disasm /
+# trust-machine-sem dependencies are compiled into the builtin backend. Without
+# this feature the gate code is `#[cfg(feature = "ay-proofs")]`-ed out and the
+# in-compiler refusal of Refuted functions would not exist.
+# Trust (RUNG 1, anti-Thompson): also enable `kernel-recheck` so the SHIPPED
+# backend routes the [PROVED] grade through the clean CIC kernel re-check
+# (verify_output.rs `try_kernel_recheckable_proof`). Without it every Proven
+# verdict is graded AyValidated, which `-Ztrust-cg-output-gate=strict`
+# (EmitPolicy::StrictProvenOnly) refuses — i.e. strict mode would fatal on 100%
+# of functions. Grade-only change: verdicts and emitted bytes are unaffected.
+trust-cg-bridge = { path = "../../crates/trust-cg-bridge", features = ["ay-proofs", "kernel-recheck"] }
+trust-mir-extract = { path = "../../crates/trust-mir-extract" }
+trust-types = { path = "../../crates/trust-types" }
+# tidy-alphabetical-end
+
+# Trust (Step 1, trust-ir-emission): OPTIONAL deps, pulled in ONLY by the
+# off-by-default `trust-ir-emission` feature. With the feature off these are not
+# part of the builtin backend's link closure, so the default codegen path is
+# unchanged. `trust-ir` is enabled with `serde` so the emitted Module can be
+# serde-roundtripped by the fidelity oracle.
+serde_json = { workspace = true, optional = true }
+trust-ir = { path = "../../first-party/trust-ir/crates/trust-ir", features = ["serde"], optional = true }
+trust-ir-bridge = { path = "../../crates/trust-ir-bridge", optional = true }

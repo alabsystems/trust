@@ -1,0 +1,81 @@
+{
+  "name": "clean_id",
+  "def_path": "clean_id",
+  "span": {
+    "file": "crates/trust-clean/fixtures/reassign-corpus/SOURCE.rs",
+    "line_start": 6,
+    "col_start": 0,
+    "line_end": 6,
+    "col_end": 36
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "x"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-clean/fixtures/reassign-corpus/SOURCE.rs",
+                "line_start": 6,
+                "col_start": 33,
+                "line_end": 6,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

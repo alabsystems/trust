@@ -1,0 +1,199 @@
+{
+  "accepted": false,
+  "invalid_engine_count": 0,
+  "admission_preflight": {
+    "accepted": false,
+    "fail_closed": true,
+    "mutates_lock_file": false,
+    "input_schema": "dpub.public-engine-package.v1",
+    "input_directory": "reports/release/public-engine-packages",
+    "derived_engine_count": 0,
+    "package_admissions_ready": false,
+    "package_admissions_blocked_reason": "lock/dscan admission is blocked until every required signed dpub.public-engine-package.v1 input is present, valid, and bound to the current trust-engines.lock pins.",
+    "admission_derivation_rule": "For each engine in required_engines order, validate the signed dpub.public-engine-package.v1 JSON input, derive admission fields with scripts/derive_public_engine_package_admission.py, write those fields to the matching trust-engines.lock engine public_package table, and emit the dscan package_admissions entry as {'name': <engine>, **derived_fields}.",
+    "lock_admission_target": "trust-engines.lock [[engine]].public_package",
+    "dscan_admission_target": "dscan.trust-engines.v1 package_admissions",
+    "field_order": [
+      "package_name",
+      "package_version",
+      "package_coordinate",
+      "source_repo",
+      "source_ref_kind",
+      "source_rev",
+      "verifier_api",
+      "capability_set",
+      "package_hash",
+      "admission_hash",
+      "admission_signature_algorithm",
+      "admission_signature_keyid",
+      "admission_signature",
+      "native_evidence"
+    ],
+    "lock_preflight_command": "python3 scripts/validate_trust_engines_lock.py --production --require-public-package-admissions --lock-file trust-engines.lock",
+    "dscan_preflight_command": "python3 scripts/validate_dscan_trust_engines_report.py <dscan.trust-engines.v1.json> --lock-file trust-engines.lock --require-public-package-admissions"
+  },
+  "package_admissions": [],
+  "lock_file": "trust-engines.lock",
+  "missing_engine_count": 5,
+  "mode": "production",
+  "next_action": "Provide signed dpub.public-engine-package.v1 JSON inputs for sunder, zani, certus, tla2, and ay; validate this contract; then derive trust-engines.lock public_package tables from those inputs.",
+  "package_dir": "reports/release/public-engine-packages",
+  "packages": [
+    {
+      "expected": {
+        "capability_set": [
+          "deductive-proof",
+          "vc-discharge"
+        ],
+        "name": "sunder",
+        "native_evidence_required": false,
+        "package_coordinate": "dpub://trust-engines/sunder@0.1.1",
+        "package_name": "sunder",
+        "package_version": "0.1.1",
+        "role": "deductive-engine",
+        "schema": "dpub.public-engine-package.v1",
+        "source_ref_kind": "commit",
+        "source_repo": "https://github.com/alabsystems/sunder",
+        "source_rev": "2143f98df63a06150c2f7e54025d51893ece5f9d",
+        "verifier_api": "trust-verifier-api@0.1.0"
+      },
+      "missing_reason": "signed package input is missing",
+      "name": "sunder",
+      "package_input_path": "reports/release/public-engine-packages/sunder.dpub.public-engine-package.v1.json",
+      "package_input_present": false,
+      "package_input_valid": false,
+      "role": "deductive-engine",
+      "validation_errors": [
+        "signed dpub.public-engine-package.v1 input is missing: reports/release/public-engine-packages/sunder.dpub.public-engine-package.v1.json"
+      ]
+    },
+    {
+      "expected": {
+        "capability_set": [
+          "chc-pdr",
+          "reachability"
+        ],
+        "name": "zani",
+        "native_evidence_required": false,
+        "package_coordinate": "dpub://trust-engines/zani@0.67.0",
+        "package_name": "zani",
+        "package_version": "0.67.0",
+        "role": "reachability-engine",
+        "schema": "dpub.public-engine-package.v1",
+        "source_ref_kind": "commit",
+        "source_repo": "https://github.com/alabsystems/zani",
+        "source_rev": "e6dd5d0620615a4604f2ad72b2c14243b64067f5",
+        "verifier_api": "trust-verifier-api@0.1.0"
+      },
+      "missing_reason": "signed package input is missing",
+      "name": "zani",
+      "package_input_path": "reports/release/public-engine-packages/zani.dpub.public-engine-package.v1.json",
+      "package_input_present": false,
+      "package_input_valid": false,
+      "role": "reachability-engine",
+      "validation_errors": [
+        "signed dpub.public-engine-package.v1 input is missing: reports/release/public-engine-packages/zani.dpub.public-engine-package.v1.json"
+      ]
+    },
+    {
+      "expected": {
+        "capability_set": [
+          "proof-calculus",
+          "proof-certificate"
+        ],
+        "name": "certus",
+        "native_evidence_required": false,
+        "package_coordinate": "dpub://trust-engines/certus@1.0.0",
+        "package_name": "certus",
+        "package_version": "1.0.0",
+        "role": "proof-calculus-engine",
+        "schema": "dpub.public-engine-package.v1",
+        "source_ref_kind": "commit",
+        "source_repo": "https://github.com/alabsystems/certus",
+        "source_rev": "2fd467c38f5cb0aac8966d7b553df7084e423e51",
+        "verifier_api": "trust-verifier-api@0.1.0"
+      },
+      "missing_reason": "signed package input is missing",
+      "name": "certus",
+      "package_input_path": "reports/release/public-engine-packages/certus.dpub.public-engine-package.v1.json",
+      "package_input_present": false,
+      "package_input_valid": false,
+      "role": "proof-calculus-engine",
+      "validation_errors": [
+        "signed dpub.public-engine-package.v1 input is missing: reports/release/public-engine-packages/certus.dpub.public-engine-package.v1.json"
+      ]
+    },
+    {
+      "expected": {
+        "capability_set": [
+          "spec-invariant",
+          "temporal-model-checking"
+        ],
+        "name": "tla2",
+        "native_evidence_required": true,
+        "package_coordinate": "dpub://trust-engines/tla2@0.9.0",
+        "package_name": "tla2",
+        "package_version": "0.9.0",
+        "role": "temporal-spec-engine",
+        "schema": "dpub.public-engine-package.v1",
+        "source_ref_kind": "commit",
+        "source_repo": "https://github.com/alabsystems/ty",
+        "source_rev": "460acbc1d4335bbb1470b6ad1c8eeeebed3ce4c5",
+        "verifier_api": "trust-verifier-api@0.1.0"
+      },
+      "missing_reason": "signed package input is missing",
+      "name": "tla2",
+      "package_input_path": "reports/release/public-engine-packages/tla2.dpub.public-engine-package.v1.json",
+      "package_input_present": false,
+      "package_input_valid": false,
+      "role": "temporal-spec-engine",
+      "validation_errors": [
+        "signed dpub.public-engine-package.v1 input is missing: reports/release/public-engine-packages/tla2.dpub.public-engine-package.v1.json"
+      ]
+    },
+    {
+      "expected": {
+        "capability_set": [
+          "smt-solving",
+          "solver-proof-kernel"
+        ],
+        "name": "ay",
+        "native_evidence_required": false,
+        "package_coordinate": "dpub://trust-engines/ay@0.10.0",
+        "package_name": "ay",
+        "package_version": "0.10.0",
+        "role": "solver-proof-kernel",
+        "schema": "dpub.public-engine-package.v1",
+        "source_ref_kind": "commit",
+        "source_repo": "https://github.com/alabsystems/ay",
+        "source_rev": "e652bc37deefa6bf26e7546d18e7c3f7836c0c43",
+        "verifier_api": "trust-verifier-api@0.1.0"
+      },
+      "missing_reason": "signed package input is missing",
+      "name": "ay",
+      "package_input_path": "reports/release/public-engine-packages/ay.dpub.public-engine-package.v1.json",
+      "package_input_present": false,
+      "package_input_valid": false,
+      "role": "solver-proof-kernel",
+      "validation_errors": [
+        "signed dpub.public-engine-package.v1 input is missing: reports/release/public-engine-packages/ay.dpub.public-engine-package.v1.json"
+      ]
+    }
+  ],
+  "policy_version": "dpub-public-engine-package-input-contract@v1",
+  "required_engines": [
+    "sunder",
+    "zani",
+    "certus",
+    "tla2",
+    "ay"
+  ],
+  "required_signed_fields": [
+    "package_hash",
+    "admission_hash",
+    "admission_signature_algorithm",
+    "admission_signature_keyid",
+    "admission_signature"
+  ],
+  "schema": "dpub.public-engine-package-inputs.v1"
+}

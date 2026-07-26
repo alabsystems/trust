@@ -1,0 +1,92 @@
+# S-async — the frozen "async core" Test262 slice for TrustJS calibration.
+# It is S0's selection contract with rule 4 FLIPPED: the async flag is REQUIRED
+# (selected) instead of excluded, so S-async and S0 partition the corpus's
+# language/built-ins tests along exactly the async-test-harness boundary. Every
+# other rule (prefixes, suffix, $262., features, proposal features, poisoned
+# includes) is byte-identical to S0.
+#
+# Like S0.toml, this slice is payload-external: the full path list is NOT
+# embedded. It is re-derived from the pinned corpus (tests/js262/corpus-pin.json)
+# by applying the [rules] below exactly, then checked against [derived]: the
+# sorted list must have exactly `count` entries and hash to `list_sha256`
+# (sha256 over the UTF-8 concatenation of each relative path + "\n", paths sorted
+# bytewise ascending). Any mismatch is drift — fail closed. The canonical
+# selection-rules text hashes to
+# rules_sha256 = 3fc395ed79f1618cc6bed836568527297aa1e2689bc78c35d6e030e38c37e200
+# (SliceKind::SAsync in crates/trust-js-differential/src/slice.rs).
+#
+# Selection contract (a file is IN iff ALL hold):
+#   1. path (relative to corpus root, forward slashes) starts with one of
+#      [rules].include_prefixes;
+#   2. path does NOT start with any of [rules].exclude_prefixes;
+#   3. filename ends ".js" and does NOT end with any of
+#      [rules].exclude_suffixes;
+#   4. frontmatter flags contain EVERY flag in [rules].require_flags (i.e.
+#      "async") AND NONE of [rules].exclude_flags ("module" and "CanBlock*"
+#      stay excluded: module/top-level-await tests are the future S-module
+#      slice's territory; CanBlock* gate SharedArrayBuffer blocking);
+#   5. the raw file content does NOT contain any of
+#      [rules].exclude_content_substrings;
+#   6. frontmatter features contain NONE of [rules].exclude_features and NO
+#      feature containing any of [rules].exclude_feature_substrings;
+#   7. frontmatter features contain NO proposal-stage feature, where the
+#      proposal set is read from the pinned corpus's own features.txt
+#      "## Proposed language features" section ([rules].
+#      exclude_proposal_features_from) — pin-derived, so the rule can never
+#      be tuned to observed engine agreement;
+#   8. frontmatter includes name NO harness file whose content contains any
+#      of [rules].exclude_include_content_substrings.
+#
+# The async-test-harness protocol: a flags:[async] case signals completion by
+# calling $DONE() (from harness/doneprintHandle.js, auto-added by the harness),
+# which prints "Test262:AsyncTestComplete" or "Test262:AsyncTestFailure:<err>".
+# The trace driver drains the microtask + virtual-timer queues, so such a case's
+# ObservableTrace is its ordered console output (incl. that sentinel) plus its
+# sync completion. See docs/design/2026-07-22-trustjs-m2-scope.md (D5).
+#
+# NOTE FOR THE COORDINATOR: S-async is NOT yet on the coverage.toml ratchet;
+# it gets its own future per-slice ledger entries (M2 D5 / exit gate item 4).
+#
+# Author: Andrew Yates
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+schema_version = "0.1.0"
+id = "js262.s-async.2026-07-22-v1"
+
+[corpus]
+revision = "tc39/test262:9e61c12835c5e4a3bdba93850427e6742c4f64c4"
+
+[rules]
+include_prefixes = ["test/language/", "test/built-ins/"]
+exclude_prefixes = [
+    "test/intl402/",
+    "test/staging/",
+    "test/annexB/",
+    "test/built-ins/Temporal/",
+]
+exclude_suffixes = ["_FIXTURE.js"]
+require_flags = ["async"]
+exclude_flags = ["module", "CanBlockIsTrue", "CanBlockIsFalse"]
+exclude_content_substrings = ["$262."]
+exclude_features = [
+    "Atomics",
+    "SharedArrayBuffer",
+    "Temporal",
+    "tail-call-optimization",
+    "IsHTMLDDA",
+    "cross-realm",
+    "host-gc-required",
+]
+exclude_feature_substrings = ["Intl"]
+exclude_proposal_features_from = "features.txt#Proposed language features"
+exclude_include_content_substrings = ["$262."]
+
+[derived]
+# 2026-07-23: count 5401 -> 5279, list_sha256 refreshed after the same
+# proposal-feature reader fix that re-baselined S0 (see S0.toml [derived] and
+# slice.rs load_slice_context): 10 proposals listed after two typo'd `## ` rows
+# in features.txt were being silently admitted; rule 7 always meant to exclude
+# the whole proposal section (-122 async files, incl. the source-phase-imports
+# import.source cases).
+count = 5279
+list_sha256 = "4b6f31207c4688a7a463d45f07013b116ae53255ae67087660dffc3259d0f12e"

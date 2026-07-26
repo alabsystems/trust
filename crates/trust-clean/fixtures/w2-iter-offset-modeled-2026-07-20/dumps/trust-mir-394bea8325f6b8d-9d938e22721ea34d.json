@@ -1,0 +1,1087 @@
+{
+  "name": "count",
+  "def_path": "<core::slice::iter::Iter<'_, i32> as core::iter::traits::iterator::Iterator>::count",
+  "span": {
+    "file": "core/src/slice/iter/macros.rs",
+    "line_start": 224,
+    "col_start": 12,
+    "line_end": 226,
+    "col_end": 13
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "len"
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "core::slice::iter::Iter",
+            "fields": [
+              [
+                "ptr",
+                {
+                  "Adt": {
+                    "name": "core::ptr::non_null::NonNull",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Int": {
+                                "width": 32,
+                                "signed": true
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null
+                  }
+                }
+              ],
+              [
+                "end_or_len",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Int": {
+                        "width": 32,
+                        "signed": true
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "_marker",
+                {
+                  "Adt": {
+                    "name": "core::marker::PhantomData",
+                    "fields": [],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "core::ptr::non_null::NonNull",
+            "fields": [
+              [
+                "pointer",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Int": {
+                        "width": 32,
+                        "signed": true
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Adt": {
+            "name": "core::ptr::non_null::NonNull",
+            "fields": [
+              [
+                "pointer",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Int": {
+                        "width": 32,
+                        "signed": true
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 6,
+        "ty": {
+          "RawPtr": {
+            "mutable": true,
+            "pointee": {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 7,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            }
+          }
+        },
+        "name": "origin"
+      },
+      {
+        "index": 8,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 9,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": "Never",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Constant": {
+                "Bool": false
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "core/src/slice/iter/macros.rs",
+              "line_start": 28,
+              "col_start": 11,
+              "line_end": 28,
+              "col_end": 20
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageLive": 2
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "core/src/slice/iter/macros.rs",
+                "line_start": 29,
+                "col_start": 23,
+                "line_end": 29,
+                "col_end": 39
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/ptr/const_ptr.rs",
+                "line_start": 159,
+                "col_start": 17,
+                "line_end": 159,
+                "col_end": 50
+              }
+            }
+          },
+          {
+            "StorageDead": 2
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "StorageLive": 3
+          },
+          {
+            "StorageLive": 4
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "core/src/slice/iter/macros.rs",
+                "line_start": 33,
+                "col_start": 71,
+                "line_end": 33,
+                "col_end": 87
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Adt": {
+                      "name": "core::ptr::non_null::NonNull",
+                      "fields": [
+                        [
+                          "pointer",
+                          {
+                            "RawPtr": {
+                              "mutable": false,
+                              "pointee": {
+                                "Int": {
+                                  "width": 32,
+                                  "signed": true
+                                }
+                              }
+                            }
+                          }
+                        ]
+                      ],
+                      "variants": [],
+                      "disc_index_safe": false,
+                      "faithful_enum_repr": null,
+                      "layout": null
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/slice/iter/macros.rs",
+                "line_start": 33,
+                "col_start": 32,
+                "line_end": 33,
+                "col_end": 88
+              }
+            }
+          },
+          {
+            "StorageDead": 4
+          },
+          {
+            "StorageLive": 5
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "core/src/slice/iter/macros.rs",
+                "line_start": 57,
+                "col_start": 50,
+                "line_end": 57,
+                "col_end": 59
+              }
+            }
+          },
+          {
+            "StorageLive": 6
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": true,
+                      "pointee": {
+                        "Int": {
+                          "width": 32,
+                          "signed": true
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/ptr/non_null.rs",
+                "line_start": 404,
+                "col_start": 17,
+                "line_end": 404,
+                "col_end": 53
+              }
+            }
+          },
+          {
+            "StorageLive": 7
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": {
+                        "Int": {
+                          "width": 32,
+                          "signed": true
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/ptr/non_null.rs",
+                "line_start": 886,
+                "col_start": 52,
+                "line_end": 886,
+                "col_end": 71
+              }
+            }
+          },
+          {
+            "StorageLive": 8
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": {
+                        "Int": {
+                          "width": 32,
+                          "signed": true
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/ptr/mut_ptr.rs",
+                "line_start": 892,
+                "col_start": 17,
+                "line_end": 892,
+                "col_end": 35
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Constant": {
+                "Bool": true
+              }
+            },
+            "targets": [
+              [
+                0,
+                7
+              ]
+            ],
+            "otherwise": 5,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "core/src/ub_checks.rs",
+              "line_start": 77,
+              "col_start": 34,
+              "line_end": 77,
+              "col_end": 41
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": "Return"
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "StorageDead": 8
+          },
+          {
+            "StorageDead": 7
+          },
+          {
+            "StorageDead": 6
+          },
+          {
+            "StorageDead": 5
+          },
+          {
+            "StorageDead": 3
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "StorageLive": 10
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/ptr/const_ptr.rs",
+                "line_start": 726,
+                "col_start": 34,
+                "line_end": 726,
+                "col_end": 51
+              }
+            }
+          },
+          {
+            "StorageLive": 11
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/ptr/const_ptr.rs",
+                "line_start": 727,
+                "col_start": 36,
+                "line_end": 727,
+                "col_end": 55
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::ptr::const_ptr::<impl *const T>::offset_from_unsigned::precondition_check",
+            "args": [
+              {
+                "Move": {
+                  "local": 10,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 11,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 9,
+              "projections": []
+            },
+            "target": 6,
+            "span": {
+              "file": "core/src/ub_checks.rs",
+              "line_start": 78,
+              "col_start": 16,
+              "line_end": 78,
+              "col_end": 45
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "StorageDead": 11
+          },
+          {
+            "StorageDead": 10
+          }
+        ],
+        "terminator": {
+          "Goto": 7
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "StorageLive": 12
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        4,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/ptr/const_ptr.rs",
+                "line_start": 732,
+                "col_start": 16,
+                "line_end": 732,
+                "col_end": 32
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 12,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                10
+              ]
+            ],
+            "otherwise": 8,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "core/src/ptr/const_ptr.rs",
+              "line_start": 732,
+              "col_start": 16,
+              "line_end": 732,
+              "col_end": 32
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "StorageLive": 13
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Le",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        4,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        9223372036854775807,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/ptr/const_ptr.rs",
+                "line_start": 732,
+                "col_start": 36,
+                "line_end": 732,
+                "col_end": 71
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 13,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                10
+              ]
+            ],
+            "otherwise": 9,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "core/src/ptr/const_ptr.rs",
+              "line_start": 732,
+              "col_start": 36,
+              "line_end": 732,
+              "col_end": 71
+            }
+          }
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "StorageDead": 13
+          },
+          {
+            "StorageDead": 12
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::intrinsics::ptr_offset_from_unsigned::<i32>",
+            "args": [
+              {
+                "Move": {
+                  "local": 8,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 7,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "core/src/ptr/const_ptr.rs",
+              "line_start": 734,
+              "col_start": 17,
+              "line_end": 734,
+              "col_end": 67
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": true
+          }
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::panicking::panic",
+            "args": [
+              {
+                "Constant": {
+                  "Str": {
+                    "bytes": [
+                      97,
+                      115,
+                      115,
+                      101,
+                      114,
+                      116,
+                      105,
+                      111,
+                      110,
+                      32,
+                      102,
+                      97,
+                      105,
+                      108,
+                      101,
+                      100,
+                      58,
+                      32,
+                      48,
+                      32,
+                      60,
+                      32,
+                      112,
+                      111,
+                      105,
+                      110,
+                      116,
+                      101,
+                      101,
+                      95,
+                      115,
+                      105,
+                      122,
+                      101,
+                      32,
+                      38,
+                      38,
+                      32,
+                      112,
+                      111,
+                      105,
+                      110,
+                      116,
+                      101,
+                      101,
+                      95,
+                      115,
+                      105,
+                      122,
+                      101,
+                      32,
+                      60,
+                      61,
+                      32,
+                      105,
+                      115,
+                      105,
+                      122,
+                      101,
+                      58,
+                      58,
+                      77,
+                      65,
+                      88,
+                      32,
+                      97,
+                      115,
+                      32,
+                      117,
+                      115,
+                      105,
+                      122,
+                      101
+                    ]
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 14,
+              "projections": []
+            },
+            "target": null,
+            "span": {
+              "file": "core/src/ptr/const_ptr.rs",
+              "line_start": 732,
+              "col_start": 8,
+              "line_end": 732,
+              "col_end": 72
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

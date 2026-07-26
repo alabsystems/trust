@@ -1,0 +1,105 @@
+{
+  "name": "min",
+  "def_path": "cmp::min",
+  "span": {
+    "file": "library/core/src/cmp.rs",
+    "line_start": 1574,
+    "col_start": 0,
+    "line_end": 1576,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Unsupported": {
+            "kind": "TyKind::Param",
+            "detail": "generic parameter T/#0 needs monomorphization"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Unsupported": {
+            "kind": "TyKind::Param",
+            "detail": "generic parameter T/#0 needs monomorphization"
+          }
+        },
+        "name": "v1"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Unsupported": {
+            "kind": "TyKind::Param",
+            "detail": "generic parameter T/#0 needs monomorphization"
+          }
+        },
+        "name": "v2"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<T as cmp::Ord>::min",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "library/core/src/cmp.rs",
+              "line_start": 1575,
+              "col_start": 4,
+              "line_end": 1575,
+              "col_end": 14
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Unsupported": {
+        "kind": "TyKind::Param",
+        "detail": "generic parameter T/#0 needs monomorphization"
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

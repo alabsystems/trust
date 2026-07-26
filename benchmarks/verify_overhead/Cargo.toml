@@ -1,0 +1,26 @@
+# trust-benchmarks: Criterion benchmarks for verification pipeline overhead
+#
+# Measures time per function for VC generation, MIR classification, and
+# full verification dispatch using real compiler-extracted MIR fixtures.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-benchmarks"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+publish = false
+
+[[bench]]
+name = "verify_overhead"
+harness = false
+
+[dependencies]
+trust-types = { path = "../../crates/trust-types" }
+trust-vcgen = { path = "../../crates/trust-vcgen" }
+trust-router = { path = "../../crates/trust-router" }
+serde_json = "1"
+criterion = { version = "0.5", features = ["html_reports"] }

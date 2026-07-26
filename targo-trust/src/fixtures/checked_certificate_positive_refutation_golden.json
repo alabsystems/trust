@@ -1,0 +1,36 @@
+{
+  "exploit_find": {
+    "evidence_gate": {
+      "accepted": false,
+      "independent_refutation": "not_run",
+      "proof_grade_complete": false,
+      "unsupported_evidence_blocks_completion": false
+    },
+    "independent_refutation_note": "checked UNSAT certificate evidence proves verification VCs, but no exploit claim was captured for independent refutation",
+    "independent_refutation_status": "not_run",
+    "typed_scaffold_refutation": {
+      "independently_refuted": false,
+      "status": "not_run"
+    }
+  },
+  "verify_binary": {
+    "checked_certificate_coverage": {
+      "checked_certificates": 1,
+      "checked_certificates_satisfy_coverage": true,
+      "missing_checked_certificates": 0
+    },
+    "checked_certificate_import": {
+      "diagnostics": [],
+      "dispatches_missing_canonical_binding": 0,
+      "imported": 1,
+      "loaded_artifacts": 1,
+      "rejected_artifacts": 0,
+      "unmatched_artifacts": 0
+    },
+    "proof_grade_gate": {
+      "certificate_only_replay_semantics_vcs": 1,
+      "checked_certificates": 1,
+      "replay_semantics_satisfied": true
+    }
+  }
+}

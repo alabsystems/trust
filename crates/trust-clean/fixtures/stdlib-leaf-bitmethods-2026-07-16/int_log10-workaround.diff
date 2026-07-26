@@ -1,0 +1,20 @@
+--- src/num/imp/int_log10.rs
++++ src/num/imp/int_log10.rs
+@@ -102,3 +102,4 @@
+-            // SAFETY: Integer logarithm is monotonic non-decreasing, so the computed `result` cannot
+-            // exceed the value produced for the maximum input.
+-            unsafe { crate::hint::assert_unchecked(result <= const { $impl_fn($ty::MAX) }) };
++            // Trust extraction workaround (scratchpad copy only): the
++            // `const { $impl_fn($ty::MAX) }` promotion cycles under the trust
++            // verify pass's borrowck ordering. This assert_unchecked is a pure
++            // optimizer hint; removing it does not change the function's result.
+@@ -143,5 +144,4 @@
+-                // SAFETY: Integer logarithm is monotonic non-decreasing, so the computed `result`
+-                // cannot exceed the value produced for the maximum input.
+-                unsafe {
+-                    crate::hint::assert_unchecked(result <= const { $impl_fn($ty::MAX.cast_unsigned()) });
+-                }
++                // Trust extraction workaround (scratchpad copy only): the
++                // `const { $impl_fn(...) }` promotion cycles under the trust
++                // verify pass's borrowck ordering. This assert_unchecked is a
++                // pure optimizer hint; removing it does not change the result.

@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright 2026 Andrew Yates
+# Boundary fixture for `targo trust temporal`: the aterm routing-fabric models
+# (edge_gate fail-closed gate + sink no-loss write loop) give this package a
+# linkable library with an active canonical `trust-spec-temporal` dependency —
+# the automatic-route opt-in signal the live command must reject with exit 2
+# unbound build evidence.  This fixture is not a primary-surface example or a
+# proof-bearing embedded-ty run.
+[package]
+name = "trust-temporal-fabric-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+trust-spec-temporal = { path = "../../../../crates/trust-spec-temporal" }

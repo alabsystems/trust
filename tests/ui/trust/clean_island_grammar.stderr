@@ -1,0 +1,8 @@
+note: Clean island kernel-checked: 2 declaration(s) registered (Always, always_unfolds)
+  --> $DIR/clean_island_grammar.rs:11:5
+   |
+LL | /     def Always (p : Nat -> Prop) : Prop := forall n, p n
+LL | |
+LL | |     theorem always_unfolds (p : Nat -> Prop) : Always p = Always p := rfl
+   | |_________________________________________________________________________^
+

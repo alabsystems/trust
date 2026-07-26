@@ -1,0 +1,6 @@
+[book]
+title = "The Rust Unstable Book"
+
+[output.html]
+git-repository-url = "https://github.com/alabsystems/Trust/tree/main/src/doc/unstable-book"
+edit-url-template = "https://github.com/alabsystems/Trust/edit/main/src/doc/unstable-book/{path}"

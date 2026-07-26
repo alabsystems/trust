@@ -1,0 +1,82 @@
+{
+  "schema_version": "trust.proof-grade-release-transcript.v1",
+  "accepted_proof_grade_rows": [],
+  "blocked_proof_grade_rows": [
+    {
+      "schema_version": "trust.proof-grade-row.v1",
+      "row_type": "binary-decompilation-proof-grade",
+      "evidence_origin": "synthetic_fixture",
+      "status": "blocked",
+      "accepted": false,
+      "rejection_reason": "evidence_origin must be `targo_trust_release_export` for accepted proof-grade release transcript rows; release_transcript_binding_digest cannot be computed until all trust.proof-grade-row-binding.v1 inputs are accepted",
+      "candidate_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "proof_required_vc_count": 1,
+      "binary_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "selected_image": {
+        "identity": "file_offset=0:file_size=64",
+        "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "vc_digests": [
+        {
+          "schema_version": "trust.vc-digest-entry.v1",
+          "artifact_kind": "verification-condition",
+          "digest_algorithm": "sha256",
+          "digest": "sha256:d2515b3f23c3a1f4796b4586cc98ca0d1c836d9257f36e563ca18364b1ae5b89",
+          "candidate_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "binary_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "selected_image": {
+            "identity": "file_offset=0:file_size=64",
+            "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          },
+          "inventory_index": 0,
+          "inventory_count": 1,
+          "vc_id": "proof-required-vc-0"
+        }
+      ],
+      "checked_certificate_digests": [
+        {
+          "schema_version": "trust.checked-certificate-readback-digest-entry.v1",
+          "artifact_kind": "checked-certificate-readback",
+          "digest_algorithm": "sha256",
+          "digest": "sha256:fde7ff75bc69ed97ce75158a5b0757fe91805bacdbe3a6e9418cd27dba574687",
+          "candidate_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "binary_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "selected_image": {
+            "identity": "file_offset=0:file_size=64",
+            "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          },
+          "inventory_index": 0,
+          "inventory_count": 1,
+          "vc_digest": "sha256:d2515b3f23c3a1f4796b4586cc98ca0d1c836d9257f36e563ca18364b1ae5b89",
+          "certificate_role": "checked-certificate",
+          "readback_status": "accepted"
+        }
+      ],
+      "replay_transcript_digests": [
+        "sha256:f4a71a4c2c1caaf6b4d0e1373f57eeaebc2e37ed116cea8328b42ab2c7c39498"
+      ],
+      "provenance_artifact_digests": [
+        "sha256:521407299a145e754eb7ae53f5b7699be62e462ba526664fa2783f564846b2f6"
+      ],
+      "unsupported_ledgers_empty": true,
+      "target_proof_consumer_artifact_digests": [
+        "sha256:9f26a5c7b3205b256e2a62815ea1c890f2d326d344ee3b44b43b6583c610241b",
+        "sha256:b5c192b3a1a419a4f9c579b7bf76ccbfcff900a70e4c0672047eeb4ec40eba1c"
+      ],
+      "exact_source_ownership_evidence": {
+        "status": "accepted",
+        "digest": "sha256:ddd55d17d13f9e4cf6c7b1c92d356ad54e3429723d64dfb96b9f60f5a339d41c"
+      },
+      "type_ownership_evidence": {
+        "status": "accepted",
+        "digest": "sha256:294a76378c8133e8e62e60e061c2516ad11eff0ad4a4a22f1fe5fe7d5a0976b1"
+      },
+      "aarch64_ordering_monitor_evidence": [],
+      "release_transcript_binding_digest": null,
+      "blockers": [
+        "evidence_origin must be `targo_trust_release_export` for accepted proof-grade release transcript rows",
+        "release_transcript_binding_digest cannot be computed until all trust.proof-grade-row-binding.v1 inputs are accepted"
+      ]
+    }
+  ]
+}

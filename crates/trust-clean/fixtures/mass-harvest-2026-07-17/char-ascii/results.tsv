@@ -1,0 +1,19 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+core::num::<impl u8>::eq_ignore_ascii_case	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl u8>::is_ascii_control	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::num::<impl u8>::is_ascii_graphic	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::num::<impl u8>::is_ascii_punctuation	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl u8>::to_ascii_lowercase	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl u8>::to_ascii_uppercase	SHAPE_GAP	false	false	false	false	false	false	false
+std::char::methods::<impl char>::is_ascii	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::char::methods::<impl char>::is_ascii_alphabetic	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::char::methods::<impl char>::is_ascii_digit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+w_char_is_ascii	SAFETY_GAP	false	false	true	true	false	false	false
+w_char_is_ascii_alphabetic	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_char_is_ascii_digit	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_u8_eq_ignore_ascii_case	SHAPE_GAP	false	false	false	false	false	false	false
+w_u8_is_ascii_control	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_u8_is_ascii_graphic	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_u8_is_ascii_punctuation	SHAPE_GAP	false	false	false	false	false	false	false
+w_u8_to_ascii_lowercase	SHAPE_GAP	false	false	false	false	false	false	false
+w_u8_to_ascii_uppercase	SHAPE_GAP	false	false	false	false	false	false	false

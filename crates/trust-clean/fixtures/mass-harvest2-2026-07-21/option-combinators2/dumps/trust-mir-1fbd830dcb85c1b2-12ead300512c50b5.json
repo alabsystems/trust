@@ -1,0 +1,101 @@
+{
+  "name": "{closure#0}",
+  "def_path": "main::is_some_and_pos_i32::{closure#0}",
+  "span": {
+    "file": "main.rs",
+    "line_start": 82,
+    "col_start": 18,
+    "line_end": 82,
+    "col_end": 27
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Closure": {
+            "name": "main::is_some_and_pos_i32::{closure#0}",
+            "upvars": [],
+            "call": {
+              "kind": "FnOnce",
+              "params": [
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": true
+                  }
+                }
+              ],
+              "ret": "Bool"
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 0
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "main.rs",
+                "line_start": 82,
+                "col_start": 18,
+                "line_end": 82,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": "Bool"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

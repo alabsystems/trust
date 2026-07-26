@@ -1,0 +1,30 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# R4 landing (two-language spec surface, §5 note 1): the L1→clean_kernel::Expr
+# spec elaborator moves into trust proper as toolchain infrastructure — "the
+# elaborator serves every engine", so it cannot live inside one engine's repo.
+# This crate is the design's named `crates/trust-spec-elab`, seeded from the
+# reference implementation (first-party/trust-wp/spikes/clean-spec-elaborate,
+# ported bin→lib verbatim). Growth path (R3/R4): consume the typed
+# `trust_contracts` query, absorb trust-wp-driver's formula_kernel_lane
+# (PureExpr→Expr) and proof_assert (authored lane), widen the fragment.
+
+[package]
+name = "trust-spec-elab"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "L1→L2 spec elaborator: surface contract clauses → clean_kernel::Expr goals (total over the supported fragment, fail-closed outside it), with prove+certify plumbing through clean-auto and the honesty meter."
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+license = "Apache-2.0 OR MIT"
+
+[lints]
+workspace = true
+
+[dependencies]
+clean-kernel = { workspace = true }
+clean-auto = { workspace = true }
+cert-meter = { package = "trust-cert-meter", path = "../trust-cert-meter" }
+syn = { workspace = true }
+quote = { workspace = true }

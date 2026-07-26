@@ -1,0 +1,7 @@
+error: invalid `--check-cfg` argument: `---
+       ---
+       cfg(key)`
+  |
+  = note: expected `cfg(name, values("value1", "value2", ... "valueN"))`
+  = note: visit the Trust trustc check-cfg documentation for more details
+

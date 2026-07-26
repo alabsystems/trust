@@ -1,0 +1,304 @@
+{
+  "name": "{closure#0}",
+  "def_path": "main::ord_then_with_cmp::{closure#0}",
+  "span": {
+    "file": "main.rs",
+    "line_start": 22,
+    "col_start": 16,
+    "line_end": 22,
+    "col_end": 28
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Adt": {
+            "name": "core::cmp::Ordering",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Less",
+                "discriminant": 255,
+                "fields": []
+              },
+              {
+                "name": "Equal",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Greater",
+                "discriminant": 1,
+                "fields": []
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Closure": {
+            "name": "main::ord_then_with_cmp::{closure#0}",
+            "upvars": [
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Int": {
+                      "width": 32,
+                      "signed": true
+                    }
+                  }
+                }
+              },
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Int": {
+                      "width": 32,
+                      "signed": true
+                    }
+                  }
+                }
+              }
+            ],
+            "call": {
+              "kind": "FnOnce",
+              "params": [],
+              "ret": {
+                "Adt": {
+                  "name": "core::cmp::Ordering",
+                  "fields": [
+                    [
+                      "__tag",
+                      {
+                        "Int": {
+                          "width": 64,
+                          "signed": true
+                        }
+                      }
+                    ]
+                  ],
+                  "variants": [
+                    {
+                      "name": "Less",
+                      "discriminant": 255,
+                      "fields": []
+                    },
+                    {
+                      "name": "Equal",
+                      "discriminant": 0,
+                      "fields": []
+                    },
+                    {
+                      "name": "Greater",
+                      "discriminant": 1,
+                      "fields": []
+                    }
+                  ],
+                  "disc_index_safe": true,
+                  "faithful_enum_repr": null,
+                  "layout": null
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            }
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "main.rs",
+                "line_start": 22,
+                "col_start": 19,
+                "line_end": 22,
+                "col_end": 20
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "main.rs",
+                "line_start": 22,
+                "col_start": 25,
+                "line_end": 22,
+                "col_end": 27
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<i32 as core::cmp::Ord>::cmp",
+            "args": [
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 3,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "main.rs",
+              "line_start": 22,
+              "col_start": 19,
+              "line_end": 22,
+              "col_end": 28
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Adt": {
+        "name": "core::cmp::Ordering",
+        "fields": [
+          [
+            "__tag",
+            {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            }
+          ]
+        ],
+        "variants": [
+          {
+            "name": "Less",
+            "discriminant": 255,
+            "fields": []
+          },
+          {
+            "name": "Equal",
+            "discriminant": 0,
+            "fields": []
+          },
+          {
+            "name": "Greater",
+            "discriminant": 1,
+            "fields": []
+          }
+        ],
+        "disc_index_safe": true,
+        "faithful_enum_repr": null,
+        "layout": null
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -1,0 +1,48 @@
+# trust-js-autoform: the TrustJS M4 strict-mode arithmetic FLOOR — deterministic,
+# correct-by-construction lowering of ONE tiny pure-arith JS fragment.
+#
+# This is NOT the M4 autoformalization tier. There is NO LLM, NO intent
+# inference, NO native install, NO general fragment. It is the deterministic
+# strict-mode baseline floor of docs/design/2026-07-20-trust-native-javascript-engine.md
+# §4, for exactly one fragment: a top-level `function f(p..) { return <expr>; }`
+# whose body is a single arithmetic expression over parameters, JS numeric
+# literals, `+ - * / %`, unary `-`/`+`, and parentheses. Anything else REFUSES
+# (the faithful-tier fallback, object 4 — always sound).
+#
+# The four §4 honesty objects, at this floor:
+#   1. independent semantics  = trust-js-interp (the oracle)
+#   2. formal artifact        = render_rust (inspectable Rust) + eval_ir over an f64 IR
+#   3. delta ledger           = a fixed edge-case sample corpus checked bit-for-bit
+#                               against the interp oracle; ANY mismatch => refuse
+#   4. faithful-tier fallback = every refusal
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-js-autoform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The zero-authority frontend firewall: the provenance tag every proposal
+# leaving this crate carries, and the pinned-manifest type that keeps the
+# fidelity corpus, the oracle, and the (empty) waiver list out of the
+# elaborator's hands.
+trust-types = { workspace = true }
+serde_json = { workspace = true }
+trust-js-parse = { workspace = true }
+trust-js-value = { workspace = true }
+trust-js-interp = { workspace = true }
+trust-js-trace = { workspace = true }
+# The erasable-TypeScript front door (increment 7): the TS→JS type eraser.
+# `lower_ts_and_verify` composes its erasable-strip with the existing JS
+# lowering, so erasable TypeScript autoformalizes transitively. BOTH hops are
+# corpus-bounded evidence, not proof: TS ≡ stripped-JS is trust-ts-strip's
+# Node-differential faithfulness gate, stripped-JS ≡ Rust is our delta ledger.
+trust-ts-strip = { workspace = true }

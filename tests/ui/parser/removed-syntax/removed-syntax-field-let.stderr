@@ -1,0 +1,14 @@
+error: expected identifier, found keyword `let`
+  --> $DIR/removed-syntax-field-let.rs:2:5
+   |
+LL |     let foo: (),
+   |     ^^^-
+   |     |
+   |     expected identifier, found keyword
+   |     help: remove this `let` keyword
+   |
+   = note: the `let` keyword is not allowed in `struct` fields
+   = note: see the Trust Book's defining structs section for more information
+
+error: aborting due to 1 previous error
+

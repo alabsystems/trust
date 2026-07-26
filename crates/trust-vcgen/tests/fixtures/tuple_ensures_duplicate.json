@@ -1,0 +1,222 @@
+{
+  "name": "duplicate",
+  "def_path": "duplicate",
+  "span": {
+    "file": "<dump-root>/deref_tuple_test.rs",
+    "line_start": 19,
+    "col_start": 0,
+    "line_end": 21,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 32,
+                "signed": false
+              }
+            },
+            {
+              "Int": {
+                "width": 32,
+                "signed": false
+              }
+            }
+          ]
+        },
+        "name": "__ret"
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "std::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Closure": {
+                    "name": "duplicate::{closure#0}",
+                    "upvars": []
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Closure": {
+                        "name": "duplicate::{closure#0}",
+                        "upvars": []
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true
+          }
+        },
+        "name": "__ensures_checker"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "std::option::Option",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/deref_tuple_test.rs",
+                "line_start": 18,
+                "col_start": 0,
+                "line_end": 18,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Copy": {
+                        "local": 1,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Copy": {
+                        "local": 1,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/deref_tuple_test.rs",
+                "line_start": 20,
+                "col_start": 4,
+                "line_end": 20,
+                "col_end": 10
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Tuple": [
+        {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        }
+      ]
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "<dump-root>/deref_tuple_test.rs",
+        "line_start": 18,
+        "col_start": 0,
+        "line_end": 18,
+        "col_end": 45
+      },
+      "body": "__trust_lowered_compiler_contract__:(result.0) == (result.1)"
+    }
+  ],
+  "preconditions": [],
+  "postconditions": [
+    {
+      "Eq": [
+        {
+          "Var": [
+            "_0.0",
+            "Int"
+          ]
+        },
+        {
+          "Var": [
+            "_0.1",
+            "Int"
+          ]
+        }
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [],
+    "ensures": [
+      "(result.0) == (result.1)"
+    ],
+    "invariants": []
+  }
+}

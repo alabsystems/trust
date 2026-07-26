@@ -1,0 +1,105 @@
+{
+  "name": "stack_safe",
+  "def_path": "expr::stack_safe",
+  "span": {
+    "file": "src/expr/mod.rs",
+    "line_start": 55,
+    "col_start": 0,
+    "line_end": 57,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Unsupported": {
+            "kind": "TyKind::Param",
+            "detail": "generic parameter R/#0 needs monomorphization"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Unsupported": {
+            "kind": "TyKind::Param",
+            "detail": "generic parameter impl FnOnce() -> R/#1 needs monomorphization"
+          }
+        },
+        "name": "f"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "stacker::maybe_grow",
+            "args": [
+              {
+                "Constant": {
+                  "Uint": [
+                    32768,
+                    64
+                  ]
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1048576,
+                    64
+                  ]
+                }
+              },
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "src/expr/mod.rs",
+              "line_start": 56,
+              "col_start": 4,
+              "line_end": 56,
+              "col_end": 65
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Unsupported": {
+        "kind": "TyKind::Param",
+        "detail": "generic parameter R/#0 needs monomorphization"
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

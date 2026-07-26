@@ -1,0 +1,4 @@
+{
+  "safety_property": "NoCommitWithoutPrepare",
+  "status": "expected-valid"
+}

@@ -1,0 +1,122 @@
+{
+  "name": "use_generic_max",
+  "def_path": "test_functions::use_generic_max",
+  "span": {
+    "file": "test_functions.rs",
+    "line_start": 132,
+    "col_start": 1,
+    "line_end": 134,
+    "col_end": 2
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 1
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "test_functions::generic_max::<i32>",
+            "args": [
+              {
+                "Constant": {
+                  "Int": 10
+                }
+              },
+              {
+                "Constant": {
+                  "Int": 20
+                }
+              }
+            ],
+            "dest": {
+              "local": 1,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "test_functions.rs",
+              "line_start": 133,
+              "col_start": 5,
+              "line_end": 133,
+              "col_end": 29
+            },
+            "atomic": null
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "test_functions.rs",
+                "line_start": 133,
+                "col_start": 5,
+                "line_end": 133,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "StorageDead": 1
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 0,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

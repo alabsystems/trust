@@ -1,0 +1,38 @@
+note: Clean island kernel-checked: 1 declaration(s) registered (u64_ge_refl)
+  --> $DIR/e9_multi_clause_discharge.rs:12:5
+   |
+LL | /     theorem u64_ge_refl : forall (x : UInt64),
+LL | |         Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
+LL | |         fun x => Nat.le.refl (UInt64.toNat x)
+   | |_____________________________________________^
+
+
+=== Trust Verification Report (e9_multi_clause_discharge) ===
+
+note: Trust verification: 4 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 4 obligation(s)
+  --> $DIR/e9_multi_clause_discharge.rs:17:1
+   |
+LL | / pub fn two(x: u64) -> u64
+LL | |     ensures x >= x by u64_ge_refl
+LL | |     ensures x <= x by u64_ge_refl
+LL | | { x }
+   | |_____^
+   |
+   = note: of which 4 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `two`, with a clean certification audit
+  --> $DIR/e9_multi_clause_discharge.rs:18:23
+   |
+LL |     ensures x >= x by u64_ge_refl
+   |                       ^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+
+note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `two`, with a clean certification audit
+  --> $DIR/e9_multi_clause_discharge.rs:19:23
+   |
+LL |     ensures x <= x by u64_ge_refl
+   |                       ^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+

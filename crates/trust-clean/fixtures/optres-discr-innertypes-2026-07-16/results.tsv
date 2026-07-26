@@ -1,0 +1,12 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+std::option::Option::<&i32>::is_some	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::option::Option::<(i32, i32)>::is_some	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::option::Option::<bool>::is_some	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::option::Option::<char>::is_some	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::option::Option::<i32>::is_none	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::option::Option::<i32>::is_some	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::option::Option::<std::boxed::Box<i32>>::is_some	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::option::Option::<std::num::NonZero<u32>>::is_some	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::option::Option::<u8>::is_some	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::result::Result::<i32, u8>::is_ok	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::result::Result::<i64, i64>::is_ok	FULLY_FAITHFUL	false	false	true	true	true	false	true

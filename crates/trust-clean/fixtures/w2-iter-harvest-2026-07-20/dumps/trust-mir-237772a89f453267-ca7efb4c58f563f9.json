@@ -1,0 +1,984 @@
+{
+  "name": "new",
+  "def_path": "std::slice::Iter::<'_, i32>::new",
+  "span": {
+    "file": "core/src/slice/iter.rs",
+    "line_start": 94,
+    "col_start": 4,
+    "line_end": 104,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Adt": {
+            "name": "std::slice::Iter",
+            "fields": [
+              [
+                "ptr",
+                {
+                  "Adt": {
+                    "name": "std::ptr::NonNull",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Int": {
+                                "width": 32,
+                                "signed": true
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ],
+              [
+                "end_or_len",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Int": {
+                        "width": 32,
+                        "signed": true
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "_marker",
+                {
+                  "Adt": {
+                    "name": "std::marker::PhantomData",
+                    "fields": [],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "r"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "count"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "std::ptr::NonNull",
+            "fields": [
+              [
+                "pointer",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Int": {
+                        "width": 32,
+                        "signed": true
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Adt": {
+            "name": "std::ptr::NonNull",
+            "fields": [
+              [
+                "pointer",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Slice": {
+                        "elem": {
+                          "Int": {
+                            "width": 32,
+                            "signed": true
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 5,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            }
+          }
+        },
+        "name": "end_or_len"
+      },
+      {
+        "index": 6,
+        "ty": {
+          "RawPtr": {
+            "mutable": true,
+            "pointee": {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "RawPtr": {
+            "mutable": true,
+            "pointee": {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 8,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "RawPtr": {
+            "mutable": true,
+            "pointee": {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "RawPtr": {
+            "mutable": true,
+            "pointee": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 2
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/slice/iter.rs",
+                "line_start": 95,
+                "col_start": 18,
+                "line_end": 95,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "StorageLive": 3
+          },
+          {
+            "StorageLive": 4
+          },
+          {
+            "StorageLive": 8
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "AddressOf": [
+                  false,
+                  {
+                    "local": 1,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/ptr/non_null.rs",
+                "line_start": 281,
+                "col_start": 27,
+                "line_end": 281,
+                "col_end": 28
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Adt": {
+                      "name": "std::ptr::NonNull",
+                      "fields": [
+                        [
+                          "pointer",
+                          {
+                            "RawPtr": {
+                              "mutable": false,
+                              "pointee": {
+                                "Slice": {
+                                  "elem": {
+                                    "Int": {
+                                      "width": 32,
+                                      "signed": true
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        ]
+                      ],
+                      "variants": [],
+                      "disc_index_safe": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/ptr/non_null.rs",
+                "line_start": 281,
+                "col_start": 17,
+                "line_end": 281,
+                "col_end": 41
+              }
+            }
+          },
+          {
+            "StorageDead": 8
+          },
+          {
+            "StorageLive": 9
+          },
+          {
+            "StorageLive": 10
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": true,
+                      "pointee": {
+                        "Slice": {
+                          "elem": {
+                            "Int": {
+                              "width": 32,
+                              "signed": true
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/ptr/non_null.rs",
+                "line_start": 404,
+                "col_start": 17,
+                "line_end": 404,
+                "col_end": 53
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 10,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": true,
+                      "pointee": {
+                        "Int": {
+                          "width": 32,
+                          "signed": true
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/ptr/non_null.rs",
+                "line_start": 501,
+                "col_start": 27,
+                "line_end": 501,
+                "col_end": 50
+              }
+            }
+          },
+          {
+            "StorageDead": 10
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 9,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Adt": {
+                      "name": "std::ptr::NonNull",
+                      "fields": [
+                        [
+                          "pointer",
+                          {
+                            "RawPtr": {
+                              "mutable": false,
+                              "pointee": {
+                                "Int": {
+                                  "width": 32,
+                                  "signed": true
+                                }
+                              }
+                            }
+                          }
+                        ]
+                      ],
+                      "variants": [],
+                      "disc_index_safe": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/ptr/non_null.rs",
+                "line_start": 501,
+                "col_start": 17,
+                "line_end": 501,
+                "col_end": 51
+              }
+            }
+          },
+          {
+            "StorageDead": 9
+          },
+          {
+            "StorageDead": 4
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Constant": {
+                "Bool": false
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "core/src/slice/iter.rs",
+              "line_start": 100,
+              "col_start": 19,
+              "line_end": 100,
+              "col_end": 28
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": {
+                        "Int": {
+                          "width": 32,
+                          "signed": true
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/ptr/mod.rs",
+                "line_start": 900,
+                "col_start": 4,
+                "line_end": 900,
+                "col_end": 32
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "StorageLive": 6
+          },
+          {
+            "StorageLive": 7
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": true,
+                      "pointee": {
+                        "Int": {
+                          "width": 32,
+                          "signed": true
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/ptr/non_null.rs",
+                "line_start": 404,
+                "col_start": 17,
+                "line_end": 404,
+                "col_end": 53
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Constant": {
+                "Bool": true
+              }
+            },
+            "targets": [
+              [
+                0,
+                6
+              ]
+            ],
+            "otherwise": 4,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "core/src/ub_checks.rs",
+              "line_start": 77,
+              "col_start": 34,
+              "line_end": 77,
+              "col_end": 41
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "std::slice::Iter",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  [
+                    {
+                      "Copy": {
+                        "local": 3,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Copy": {
+                        "local": 5,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Constant": "Unit"
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "core/src/slice/iter.rs",
+                "line_start": 102,
+                "col_start": 12,
+                "line_end": 102,
+                "col_end": 58
+              }
+            }
+          },
+          {
+            "StorageDead": 3
+          },
+          {
+            "StorageDead": 2
+          }
+        ],
+        "terminator": "Return"
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "StorageLive": 12
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/ptr/mut_ptr.rs",
+                "line_start": 963,
+                "col_start": 34,
+                "line_end": 963,
+                "col_end": 51
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "std::ptr::mut_ptr::<impl *mut T>::add::precondition_check",
+            "args": [
+              {
+                "Move": {
+                  "local": 12,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    4,
+                    64
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 11,
+              "projections": []
+            },
+            "target": 5,
+            "span": {
+              "file": "core/src/ub_checks.rs",
+              "line_start": 78,
+              "col_start": 16,
+              "line_end": 78,
+              "col_end": 45
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "StorageDead": 12
+          }
+        ],
+        "terminator": {
+          "Goto": 6
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Unsupported": {
+                  "kind": "BinOp::Offset",
+                  "detail": "operation requires explicit MIR semantics before proof",
+                  "operands": [
+                    {
+                      "Copy": {
+                        "local": 7,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Copy": {
+                        "local": 2,
+                        "projections": []
+                      }
+                    }
+                  ]
+                }
+              },
+              "span": {
+                "file": "core/src/ptr/mut_ptr.rs",
+                "line_start": 970,
+                "col_start": 17,
+                "line_end": 970,
+                "col_end": 48
+              }
+            }
+          },
+          {
+            "StorageDead": 7
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": {
+                        "Int": {
+                          "width": 32,
+                          "signed": true
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/slice/iter.rs",
+                "line_start": 100,
+                "col_start": 62,
+                "line_end": 100,
+                "col_end": 87
+              }
+            }
+          },
+          {
+            "StorageDead": 6
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Adt": {
+        "name": "std::slice::Iter",
+        "fields": [
+          [
+            "ptr",
+            {
+              "Adt": {
+                "name": "std::ptr::NonNull",
+                "fields": [
+                  [
+                    "pointer",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Int": {
+                            "width": 32,
+                            "signed": true
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          ],
+          [
+            "end_or_len",
+            {
+              "RawPtr": {
+                "mutable": false,
+                "pointee": {
+                  "Int": {
+                    "width": 32,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          ],
+          [
+            "_marker",
+            {
+              "Adt": {
+                "name": "std::marker::PhantomData",
+                "fields": [],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          ]
+        ],
+        "variants": [],
+        "disc_index_safe": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

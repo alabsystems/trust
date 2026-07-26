@@ -1,0 +1,18 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+main::ord_then_with_cmp::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+core::cmp::Ordering::then_with::<{closure@main.rs:22:17: 22:19}>	SHAPE_GAP	false	false	false	false	false	false	false
+main::cmp_then_with_pair::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+core::cmp::Ordering::then_with::<{closure@main.rs:49:27: 49:29}>	SHAPE_GAP	false	false	false	false	false	false	false
+main::cmp_i32	SHAPE_GAP	false	false	false	false	false	false	false
+main::cmp_is_eq_i32	SHAPE_GAP	false	false	false	false	false	false	false
+main::cmp_reverse_i32	SHAPE_GAP	false	false	false	false	false	false	false
+main::cmp_then_pair	SHAPE_GAP	false	false	false	false	false	false	false
+main::cmp_then_with_pair	SHAPE_GAP	false	false	false	false	false	false	false
+main::cmp_u8	SHAPE_GAP	false	false	false	false	false	false	false
+main::double_reverse	SHAPE_GAP	false	false	false	false	false	false	false
+main::ord_is_lt	SHAPE_GAP	false	false	false	false	false	false	false
+main::ord_reverse	SHAPE_GAP	false	false	false	false	false	false	false
+main::ord_then	SHAPE_GAP	false	false	false	false	false	false	false
+main::ord_then_with_cmp	SHAPE_GAP	false	false	false	false	false	false	false
+main::ord_to_i8	FULLY_FAITHFUL	false	false	true	true	true	false	true
+main::reverse_then	SHAPE_GAP	false	false	false	false	false	false	false

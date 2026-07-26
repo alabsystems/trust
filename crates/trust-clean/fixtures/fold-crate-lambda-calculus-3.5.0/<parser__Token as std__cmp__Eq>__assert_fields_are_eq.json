@@ -1,0 +1,104 @@
+{
+  "name": "assert_fields_are_eq",
+  "def_path": "<parser::Token as std::cmp::Eq>::assert_fields_are_eq",
+  "span": {
+    "file": "<dump-root>/parser.rs",
+    "line_start": 48,
+    "col_start": 27,
+    "line_end": 48,
+    "col_end": 29
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "parser::Token",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ],
+                  [
+                    "__v3_0",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "Lambda",
+                    "discriminant": 0,
+                    "fields": []
+                  },
+                  {
+                    "name": "Lparen",
+                    "discriminant": 1,
+                    "fields": []
+                  },
+                  {
+                    "name": "Rparen",
+                    "discriminant": 2,
+                    "fields": []
+                  },
+                  {
+                    "name": "Number",
+                    "discriminant": 3,
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ]
+                  }
+                ],
+                "disc_index_safe": true
+              }
+            }
+          }
+        },
+        "name": "self"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

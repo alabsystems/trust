@@ -1,0 +1,44 @@
+- // MIR for `is_ascii_digit` before MatchBranchSimplification
++ // MIR for `is_ascii_digit` after MatchBranchSimplification
+  
+  fn is_ascii_digit(_1: u8) -> bool {
+      debug b => _1;
+      let mut _0: bool;
+      let mut _2: bool;
+      let mut _3: bool;
++     let mut _4: u8;
++     let mut _5: bool;
++     let mut _6: bool;
+      scope 1 {
+      }
+  
+      bb0: {
+-         _2 = Le(const 48_u8, copy _1);
+-         switchInt(move _2) -> [0: bb1, otherwise: bb3];
++         _4 = Sub(copy _1, const 48_u8);
++         _5 = Le(copy _4, const 9_u8);
++         switchInt(copy _5) -> [0: bb1, otherwise: bb2];
+      }
+  
+      bb1: {
+          _0 = const false;
+-         goto -> bb4;
++         goto -> bb3;
+      }
+  
+      bb2: {
+          _0 = const true;
+-         goto -> bb4;
++         goto -> bb3;
+      }
+  
+      bb3: {
+-         _3 = Le(copy _1, const 57_u8);
+-         switchInt(move _3) -> [0: bb1, otherwise: bb2];
+-     }
+- 
+-     bb4: {
+          return;
+      }
+  }
+  

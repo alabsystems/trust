@@ -1,0 +1,8 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful	total	inhabited	type_grounded_not_inhabited	not_grounded	kernel_rejected	safety_obligations	safety_discharged	census_fully_faithful	via_trustir	mirsem_fallback	declined	expr_fold_decline
+w_ord_min_i32	SHAPE_GAP	false	false	false	false	false	false	false	1	1	0	0	0	0	0	0	0	0	0	-
+w_ord_max_i32	SHAPE_GAP	false	false	false	false	false	false	false	1	1	0	0	0	0	0	0	0	0	0	-
+w_cmp_min_i32	SHAPE_GAP	false	false	false	false	false	false	false	1	1	0	0	0	0	0	0	0	0	0	-
+w_cmp_max_i32	SHAPE_GAP	false	false	false	false	false	false	false	1	1	0	0	0	0	0	0	0	0	0	-
+w_clamp_i32	SHAPE_GAP	false	false	false	false	false	false	false	1	1	0	0	0	0	0	0	0	0	0	-
+w_min_u8	SHAPE_GAP	false	false	false	false	false	false	false	1	1	0	0	0	0	0	0	0	0	0	-
+w_max_u8	SHAPE_GAP	false	false	false	false	false	false	false	1	1	0	0	0	0	0	0	0	0	0	-

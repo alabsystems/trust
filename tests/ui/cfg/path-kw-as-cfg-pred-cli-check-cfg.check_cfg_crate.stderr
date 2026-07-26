@@ -1,0 +1,5 @@
+error: invalid `--check-cfg` argument: `cfg(crate)`
+   |
+   = note: malformed `cfg` input, expected a valid identifier
+   = note: visit the Trust trustc check-cfg documentation for more details
+

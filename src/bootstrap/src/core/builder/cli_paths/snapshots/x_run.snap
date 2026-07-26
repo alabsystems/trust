@@ -1,0 +1,5 @@
+---
+source: src/core/builder/cli_paths/tests.rs
+expression: run
+---
+

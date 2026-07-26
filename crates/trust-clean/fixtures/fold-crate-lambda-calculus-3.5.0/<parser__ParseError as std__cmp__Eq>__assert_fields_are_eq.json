@@ -1,0 +1,124 @@
+{
+  "name": "assert_fields_are_eq",
+  "def_path": "<parser::ParseError as std::cmp::Eq>::assert_fields_are_eq",
+  "span": {
+    "file": "<dump-root>/parser.rs",
+    "line_start": 15,
+    "col_start": 27,
+    "line_end": 15,
+    "col_end": 29
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "parser::ParseError",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ],
+                  [
+                    "__v0_0",
+                    {
+                      "Tuple": [
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": false
+                          }
+                        },
+                        {
+                          "Int": {
+                            "width": 32,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "InvalidCharacter",
+                    "discriminant": 0,
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Tuple": [
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": false
+                              }
+                            },
+                            {
+                              "Int": {
+                                "width": 32,
+                                "signed": false
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    ]
+                  },
+                  {
+                    "name": "UndefinedFreeVariable",
+                    "discriminant": 1,
+                    "fields": []
+                  },
+                  {
+                    "name": "InvalidExpression",
+                    "discriminant": 2,
+                    "fields": []
+                  },
+                  {
+                    "name": "EmptyExpression",
+                    "discriminant": 3,
+                    "fields": []
+                  }
+                ],
+                "disc_index_safe": false
+              }
+            }
+          }
+        },
+        "name": "self"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -1,0 +1,24 @@
+error: maximum number of nodes exceeded in constant force_valtree::{constant#0}
+  --> $DIR/valtree-node-limit-unit-enum-array.rs:21:29
+   |
+LL | fn force_valtree(_: Witness<LARGE>) {}
+   |                             ^^^^^
+
+error: maximum number of nodes exceeded in constant force_valtree::{constant#0}
+  --> $DIR/valtree-node-limit-unit-enum-array.rs:21:29
+   |
+LL | fn force_valtree(_: Witness<LARGE>) {}
+   |                             ^^^^^
+   |
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+
+error: maximum number of nodes exceeded in constant force_valtree::{constant#0}
+  --> $DIR/valtree-node-limit-unit-enum-array.rs:21:29
+   |
+LL | fn force_valtree(_: Witness<LARGE>) {}
+   |                             ^^^^^
+   |
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+
+error: aborting due to 3 previous errors
+

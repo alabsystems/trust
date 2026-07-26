@@ -1,0 +1,4223 @@
+{
+  "name": "tokenize_dbr",
+  "def_path": "parser::tokenize_dbr",
+  "span": {
+    "file": "<dump-root>/parser.rs",
+    "line_start": 75,
+    "col_start": 0,
+    "line_end": 97,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Adt": {
+            "name": "std::result::Result",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v0_0",
+                {
+                  "Adt": {
+                    "name": "std::vec::Vec",
+                    "fields": [
+                      [
+                        "buf",
+                        {
+                          "Adt": {
+                            "name": "alloc::raw_vec::RawVec",
+                            "fields": [
+                              [
+                                "inner",
+                                {
+                                  "Adt": {
+                                    "name": "alloc::raw_vec::RawVecInner",
+                                    "fields": [
+                                      [
+                                        "ptr",
+                                        {
+                                          "Adt": {
+                                            "name": "std::ptr::Unique",
+                                            "fields": [
+                                              [
+                                                "pointer",
+                                                {
+                                                  "Adt": {
+                                                    "name": "std::ptr::NonNull",
+                                                    "fields": [
+                                                      [
+                                                        "pointer",
+                                                        {
+                                                          "RawPtr": {
+                                                            "mutable": false,
+                                                            "pointee": {
+                                                              "Int": {
+                                                                "width": 8,
+                                                                "signed": false
+                                                              }
+                                                            }
+                                                          }
+                                                        }
+                                                      ]
+                                                    ],
+                                                    "variants": [],
+                                                    "disc_index_safe": false
+                                                  }
+                                                }
+                                              ],
+                                              [
+                                                "_marker",
+                                                {
+                                                  "Adt": {
+                                                    "name": "std::marker::PhantomData",
+                                                    "fields": [],
+                                                    "variants": [],
+                                                    "disc_index_safe": false
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      ],
+                                      [
+                                        "cap",
+                                        {
+                                          "Adt": {
+                                            "name": "core::num::niche_types::UsizeNoHighBit",
+                                            "fields": [
+                                              [
+                                                "0",
+                                                {
+                                                  "Int": {
+                                                    "width": 64,
+                                                    "signed": false
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      ],
+                                      [
+                                        "alloc",
+                                        {
+                                          "Adt": {
+                                            "name": "std::alloc::Global",
+                                            "fields": [],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              ],
+                              [
+                                "_marker",
+                                {
+                                  "Adt": {
+                                    "name": "std::marker::PhantomData",
+                                    "fields": [],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false
+                          }
+                        }
+                      ],
+                      [
+                        "len",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Adt": {
+                    "name": "parser::ParseError",
+                    "fields": [
+                      [
+                        "__tag",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": true
+                          }
+                        }
+                      ],
+                      [
+                        "__v0_0",
+                        {
+                          "Tuple": [
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": false
+                              }
+                            },
+                            {
+                              "Int": {
+                                "width": 32,
+                                "signed": false
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    ],
+                    "variants": [
+                      {
+                        "name": "InvalidCharacter",
+                        "discriminant": 0,
+                        "fields": [
+                          [
+                            "0",
+                            {
+                              "Tuple": [
+                                {
+                                  "Int": {
+                                    "width": 64,
+                                    "signed": false
+                                  }
+                                },
+                                {
+                                  "Int": {
+                                    "width": 32,
+                                    "signed": false
+                                  }
+                                }
+                              ]
+                            }
+                          ]
+                        ]
+                      },
+                      {
+                        "name": "UndefinedFreeVariable",
+                        "discriminant": 1,
+                        "fields": []
+                      },
+                      {
+                        "name": "InvalidExpression",
+                        "discriminant": 2,
+                        "fields": []
+                      },
+                      {
+                        "name": "EmptyExpression",
+                        "discriminant": 3,
+                        "fields": []
+                      }
+                    ],
+                    "disc_index_safe": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Ok",
+                "discriminant": 0,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Adt": {
+                        "name": "std::vec::Vec",
+                        "fields": [
+                          [
+                            "buf",
+                            {
+                              "Adt": {
+                                "name": "alloc::raw_vec::RawVec",
+                                "fields": [
+                                  [
+                                    "inner",
+                                    {
+                                      "Adt": {
+                                        "name": "alloc::raw_vec::RawVecInner",
+                                        "fields": [
+                                          [
+                                            "ptr",
+                                            {
+                                              "Adt": {
+                                                "name": "std::ptr::Unique",
+                                                "fields": [
+                                                  [
+                                                    "pointer",
+                                                    {
+                                                      "Adt": {
+                                                        "name": "std::ptr::NonNull",
+                                                        "fields": [
+                                                          [
+                                                            "pointer",
+                                                            {
+                                                              "RawPtr": {
+                                                                "mutable": false,
+                                                                "pointee": {
+                                                                  "Int": {
+                                                                    "width": 8,
+                                                                    "signed": false
+                                                                  }
+                                                                }
+                                                              }
+                                                            }
+                                                          ]
+                                                        ],
+                                                        "variants": [],
+                                                        "disc_index_safe": false
+                                                      }
+                                                    }
+                                                  ],
+                                                  [
+                                                    "_marker",
+                                                    {
+                                                      "Adt": {
+                                                        "name": "std::marker::PhantomData",
+                                                        "fields": [],
+                                                        "variants": [],
+                                                        "disc_index_safe": false
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "cap",
+                                            {
+                                              "Adt": {
+                                                "name": "core::num::niche_types::UsizeNoHighBit",
+                                                "fields": [
+                                                  [
+                                                    "0",
+                                                    {
+                                                      "Int": {
+                                                        "width": 64,
+                                                        "signed": false
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "alloc",
+                                            {
+                                              "Adt": {
+                                                "name": "std::alloc::Global",
+                                                "fields": [],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "_marker",
+                                    {
+                                      "Adt": {
+                                        "name": "std::marker::PhantomData",
+                                        "fields": [],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ],
+                          [
+                            "len",
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ]
+                ]
+              },
+              {
+                "name": "Err",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Adt": {
+                        "name": "parser::ParseError",
+                        "fields": [
+                          [
+                            "__tag",
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": true
+                              }
+                            }
+                          ],
+                          [
+                            "__v0_0",
+                            {
+                              "Tuple": [
+                                {
+                                  "Int": {
+                                    "width": 64,
+                                    "signed": false
+                                  }
+                                },
+                                {
+                                  "Int": {
+                                    "width": 32,
+                                    "signed": false
+                                  }
+                                }
+                              ]
+                            }
+                          ]
+                        ],
+                        "variants": [
+                          {
+                            "name": "InvalidCharacter",
+                            "discriminant": 0,
+                            "fields": [
+                              [
+                                "0",
+                                {
+                                  "Tuple": [
+                                    {
+                                      "Int": {
+                                        "width": 64,
+                                        "signed": false
+                                      }
+                                    },
+                                    {
+                                      "Int": {
+                                        "width": 32,
+                                        "signed": false
+                                      }
+                                    }
+                                  ]
+                                }
+                              ]
+                            ]
+                          },
+                          {
+                            "name": "UndefinedFreeVariable",
+                            "discriminant": 1,
+                            "fields": []
+                          },
+                          {
+                            "name": "InvalidExpression",
+                            "discriminant": 2,
+                            "fields": []
+                          },
+                          {
+                            "name": "EmptyExpression",
+                            "discriminant": 3,
+                            "fields": []
+                          }
+                        ],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "input"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "std::iter::Enumerate",
+            "fields": [
+              [
+                "iter",
+                {
+                  "Adt": {
+                    "name": "std::str::Chars",
+                    "fields": [
+                      [
+                        "iter",
+                        {
+                          "Adt": {
+                            "name": "std::slice::Iter",
+                            "fields": [
+                              [
+                                "ptr",
+                                {
+                                  "Adt": {
+                                    "name": "std::ptr::NonNull",
+                                    "fields": [
+                                      [
+                                        "pointer",
+                                        {
+                                          "RawPtr": {
+                                            "mutable": false,
+                                            "pointee": {
+                                              "Int": {
+                                                "width": 8,
+                                                "signed": false
+                                              }
+                                            }
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              ],
+                              [
+                                "end_or_len",
+                                {
+                                  "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": {
+                                      "Int": {
+                                        "width": 8,
+                                        "signed": false
+                                      }
+                                    }
+                                  }
+                                }
+                              ],
+                              [
+                                "_marker",
+                                {
+                                  "Adt": {
+                                    "name": "std::marker::PhantomData",
+                                    "fields": [],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ],
+              [
+                "count",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": "chars"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "std::str::Chars",
+            "fields": [
+              [
+                "iter",
+                {
+                  "Adt": {
+                    "name": "std::slice::Iter",
+                    "fields": [
+                      [
+                        "ptr",
+                        {
+                          "Adt": {
+                            "name": "std::ptr::NonNull",
+                            "fields": [
+                              [
+                                "pointer",
+                                {
+                                  "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": {
+                                      "Int": {
+                                        "width": 8,
+                                        "signed": false
+                                      }
+                                    }
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false
+                          }
+                        }
+                      ],
+                      [
+                        "end_or_len",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ],
+                      [
+                        "_marker",
+                        {
+                          "Adt": {
+                            "name": "std::marker::PhantomData",
+                            "fields": [],
+                            "variants": [],
+                            "disc_index_safe": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Adt": {
+            "name": "std::vec::Vec",
+            "fields": [
+              [
+                "buf",
+                {
+                  "Adt": {
+                    "name": "alloc::raw_vec::RawVec",
+                    "fields": [
+                      [
+                        "inner",
+                        {
+                          "Adt": {
+                            "name": "alloc::raw_vec::RawVecInner",
+                            "fields": [
+                              [
+                                "ptr",
+                                {
+                                  "Adt": {
+                                    "name": "std::ptr::Unique",
+                                    "fields": [
+                                      [
+                                        "pointer",
+                                        {
+                                          "Adt": {
+                                            "name": "std::ptr::NonNull",
+                                            "fields": [
+                                              [
+                                                "pointer",
+                                                {
+                                                  "RawPtr": {
+                                                    "mutable": false,
+                                                    "pointee": {
+                                                      "Int": {
+                                                        "width": 8,
+                                                        "signed": false
+                                                      }
+                                                    }
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      ],
+                                      [
+                                        "_marker",
+                                        {
+                                          "Adt": {
+                                            "name": "std::marker::PhantomData",
+                                            "fields": [],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              ],
+                              [
+                                "cap",
+                                {
+                                  "Adt": {
+                                    "name": "core::num::niche_types::UsizeNoHighBit",
+                                    "fields": [
+                                      [
+                                        "0",
+                                        {
+                                          "Int": {
+                                            "width": 64,
+                                            "signed": false
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              ],
+                              [
+                                "alloc",
+                                {
+                                  "Adt": {
+                                    "name": "std::alloc::Global",
+                                    "fields": [],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false
+                          }
+                        }
+                      ],
+                      [
+                        "_marker",
+                        {
+                          "Adt": {
+                            "name": "std::marker::PhantomData",
+                            "fields": [],
+                            "variants": [],
+                            "disc_index_safe": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ],
+              [
+                "len",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": "tokens"
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Adt": {
+            "name": "std::iter::Enumerate",
+            "fields": [
+              [
+                "iter",
+                {
+                  "Adt": {
+                    "name": "std::str::Chars",
+                    "fields": [
+                      [
+                        "iter",
+                        {
+                          "Adt": {
+                            "name": "std::slice::Iter",
+                            "fields": [
+                              [
+                                "ptr",
+                                {
+                                  "Adt": {
+                                    "name": "std::ptr::NonNull",
+                                    "fields": [
+                                      [
+                                        "pointer",
+                                        {
+                                          "RawPtr": {
+                                            "mutable": false,
+                                            "pointee": {
+                                              "Int": {
+                                                "width": 8,
+                                                "signed": false
+                                              }
+                                            }
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              ],
+                              [
+                                "end_or_len",
+                                {
+                                  "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": {
+                                      "Int": {
+                                        "width": 8,
+                                        "signed": false
+                                      }
+                                    }
+                                  }
+                                }
+                              ],
+                              [
+                                "_marker",
+                                {
+                                  "Adt": {
+                                    "name": "std::marker::PhantomData",
+                                    "fields": [],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ],
+              [
+                "count",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Adt": {
+            "name": "std::iter::Enumerate",
+            "fields": [
+              [
+                "iter",
+                {
+                  "Adt": {
+                    "name": "std::str::Chars",
+                    "fields": [
+                      [
+                        "iter",
+                        {
+                          "Adt": {
+                            "name": "std::slice::Iter",
+                            "fields": [
+                              [
+                                "ptr",
+                                {
+                                  "Adt": {
+                                    "name": "std::ptr::NonNull",
+                                    "fields": [
+                                      [
+                                        "pointer",
+                                        {
+                                          "RawPtr": {
+                                            "mutable": false,
+                                            "pointee": {
+                                              "Int": {
+                                                "width": 8,
+                                                "signed": false
+                                              }
+                                            }
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              ],
+                              [
+                                "end_or_len",
+                                {
+                                  "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": {
+                                      "Int": {
+                                        "width": 8,
+                                        "signed": false
+                                      }
+                                    }
+                                  }
+                                }
+                              ],
+                              [
+                                "_marker",
+                                {
+                                  "Adt": {
+                                    "name": "std::marker::PhantomData",
+                                    "fields": [],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ],
+              [
+                "count",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": "iter"
+      },
+      {
+        "index": 8,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Adt": {
+            "name": "std::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Tuple": [
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    },
+                    {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  ]
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Tuple": [
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": false
+                          }
+                        },
+                        {
+                          "Int": {
+                            "width": 32,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "std::iter::Enumerate",
+                "fields": [
+                  [
+                    "iter",
+                    {
+                      "Adt": {
+                        "name": "std::str::Chars",
+                        "fields": [
+                          [
+                            "iter",
+                            {
+                              "Adt": {
+                                "name": "std::slice::Iter",
+                                "fields": [
+                                  [
+                                    "ptr",
+                                    {
+                                      "Adt": {
+                                        "name": "std::ptr::NonNull",
+                                        "fields": [
+                                          [
+                                            "pointer",
+                                            {
+                                              "RawPtr": {
+                                                "mutable": false,
+                                                "pointee": {
+                                                  "Int": {
+                                                    "width": 8,
+                                                    "signed": false
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "end_or_len",
+                                    {
+                                      "RawPtr": {
+                                        "mutable": false,
+                                        "pointee": {
+                                          "Int": {
+                                            "width": 8,
+                                            "signed": false
+                                          }
+                                        }
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "_marker",
+                                    {
+                                      "Adt": {
+                                        "name": "std::marker::PhantomData",
+                                        "fields": [],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ],
+                  [
+                    "count",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "i"
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "c"
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "std::vec::Vec",
+                "fields": [
+                  [
+                    "buf",
+                    {
+                      "Adt": {
+                        "name": "alloc::raw_vec::RawVec",
+                        "fields": [
+                          [
+                            "inner",
+                            {
+                              "Adt": {
+                                "name": "alloc::raw_vec::RawVecInner",
+                                "fields": [
+                                  [
+                                    "ptr",
+                                    {
+                                      "Adt": {
+                                        "name": "std::ptr::Unique",
+                                        "fields": [
+                                          [
+                                            "pointer",
+                                            {
+                                              "Adt": {
+                                                "name": "std::ptr::NonNull",
+                                                "fields": [
+                                                  [
+                                                    "pointer",
+                                                    {
+                                                      "RawPtr": {
+                                                        "mutable": false,
+                                                        "pointee": {
+                                                          "Int": {
+                                                            "width": 8,
+                                                            "signed": false
+                                                          }
+                                                        }
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "_marker",
+                                            {
+                                              "Adt": {
+                                                "name": "std::marker::PhantomData",
+                                                "fields": [],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "cap",
+                                    {
+                                      "Adt": {
+                                        "name": "core::num::niche_types::UsizeNoHighBit",
+                                        "fields": [
+                                          [
+                                            "0",
+                                            {
+                                              "Int": {
+                                                "width": 64,
+                                                "signed": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "alloc",
+                                    {
+                                      "Adt": {
+                                        "name": "std::alloc::Global",
+                                        "fields": [],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ],
+                          [
+                            "_marker",
+                            {
+                              "Adt": {
+                                "name": "std::marker::PhantomData",
+                                "fields": [],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ],
+                  [
+                    "len",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Adt": {
+            "name": "parser::Token",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v3_0",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Lambda",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Lparen",
+                "discriminant": 1,
+                "fields": []
+              },
+              {
+                "name": "Rparen",
+                "discriminant": 2,
+                "fields": []
+              },
+              {
+                "name": "Number",
+                "discriminant": 3,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "std::vec::Vec",
+                "fields": [
+                  [
+                    "buf",
+                    {
+                      "Adt": {
+                        "name": "alloc::raw_vec::RawVec",
+                        "fields": [
+                          [
+                            "inner",
+                            {
+                              "Adt": {
+                                "name": "alloc::raw_vec::RawVecInner",
+                                "fields": [
+                                  [
+                                    "ptr",
+                                    {
+                                      "Adt": {
+                                        "name": "std::ptr::Unique",
+                                        "fields": [
+                                          [
+                                            "pointer",
+                                            {
+                                              "Adt": {
+                                                "name": "std::ptr::NonNull",
+                                                "fields": [
+                                                  [
+                                                    "pointer",
+                                                    {
+                                                      "RawPtr": {
+                                                        "mutable": false,
+                                                        "pointee": {
+                                                          "Int": {
+                                                            "width": 8,
+                                                            "signed": false
+                                                          }
+                                                        }
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "_marker",
+                                            {
+                                              "Adt": {
+                                                "name": "std::marker::PhantomData",
+                                                "fields": [],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "cap",
+                                    {
+                                      "Adt": {
+                                        "name": "core::num::niche_types::UsizeNoHighBit",
+                                        "fields": [
+                                          [
+                                            "0",
+                                            {
+                                              "Int": {
+                                                "width": 64,
+                                                "signed": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "alloc",
+                                    {
+                                      "Adt": {
+                                        "name": "std::alloc::Global",
+                                        "fields": [],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ],
+                          [
+                            "_marker",
+                            {
+                              "Adt": {
+                                "name": "std::marker::PhantomData",
+                                "fields": [],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ],
+                  [
+                    "len",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Adt": {
+            "name": "parser::Token",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v3_0",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Lambda",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Lparen",
+                "discriminant": 1,
+                "fields": []
+              },
+              {
+                "name": "Rparen",
+                "discriminant": 2,
+                "fields": []
+              },
+              {
+                "name": "Number",
+                "discriminant": 3,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "std::vec::Vec",
+                "fields": [
+                  [
+                    "buf",
+                    {
+                      "Adt": {
+                        "name": "alloc::raw_vec::RawVec",
+                        "fields": [
+                          [
+                            "inner",
+                            {
+                              "Adt": {
+                                "name": "alloc::raw_vec::RawVecInner",
+                                "fields": [
+                                  [
+                                    "ptr",
+                                    {
+                                      "Adt": {
+                                        "name": "std::ptr::Unique",
+                                        "fields": [
+                                          [
+                                            "pointer",
+                                            {
+                                              "Adt": {
+                                                "name": "std::ptr::NonNull",
+                                                "fields": [
+                                                  [
+                                                    "pointer",
+                                                    {
+                                                      "RawPtr": {
+                                                        "mutable": false,
+                                                        "pointee": {
+                                                          "Int": {
+                                                            "width": 8,
+                                                            "signed": false
+                                                          }
+                                                        }
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "_marker",
+                                            {
+                                              "Adt": {
+                                                "name": "std::marker::PhantomData",
+                                                "fields": [],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "cap",
+                                    {
+                                      "Adt": {
+                                        "name": "core::num::niche_types::UsizeNoHighBit",
+                                        "fields": [
+                                          [
+                                            "0",
+                                            {
+                                              "Int": {
+                                                "width": 64,
+                                                "signed": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "alloc",
+                                    {
+                                      "Adt": {
+                                        "name": "std::alloc::Global",
+                                        "fields": [],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ],
+                          [
+                            "_marker",
+                            {
+                              "Adt": {
+                                "name": "std::marker::PhantomData",
+                                "fields": [],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ],
+                  [
+                    "len",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": {
+          "Adt": {
+            "name": "parser::Token",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v3_0",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Lambda",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Lparen",
+                "discriminant": 1,
+                "fields": []
+              },
+              {
+                "name": "Rparen",
+                "discriminant": 2,
+                "fields": []
+              },
+              {
+                "name": "Number",
+                "discriminant": 3,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Adt": {
+            "name": "std::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "n"
+      },
+      {
+        "index": 23,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "std::vec::Vec",
+                "fields": [
+                  [
+                    "buf",
+                    {
+                      "Adt": {
+                        "name": "alloc::raw_vec::RawVec",
+                        "fields": [
+                          [
+                            "inner",
+                            {
+                              "Adt": {
+                                "name": "alloc::raw_vec::RawVecInner",
+                                "fields": [
+                                  [
+                                    "ptr",
+                                    {
+                                      "Adt": {
+                                        "name": "std::ptr::Unique",
+                                        "fields": [
+                                          [
+                                            "pointer",
+                                            {
+                                              "Adt": {
+                                                "name": "std::ptr::NonNull",
+                                                "fields": [
+                                                  [
+                                                    "pointer",
+                                                    {
+                                                      "RawPtr": {
+                                                        "mutable": false,
+                                                        "pointee": {
+                                                          "Int": {
+                                                            "width": 8,
+                                                            "signed": false
+                                                          }
+                                                        }
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "_marker",
+                                            {
+                                              "Adt": {
+                                                "name": "std::marker::PhantomData",
+                                                "fields": [],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "cap",
+                                    {
+                                      "Adt": {
+                                        "name": "core::num::niche_types::UsizeNoHighBit",
+                                        "fields": [
+                                          [
+                                            "0",
+                                            {
+                                              "Int": {
+                                                "width": 64,
+                                                "signed": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "alloc",
+                                    {
+                                      "Adt": {
+                                        "name": "std::alloc::Global",
+                                        "fields": [],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ],
+                          [
+                            "_marker",
+                            {
+                              "Adt": {
+                                "name": "std::marker::PhantomData",
+                                "fields": [],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ],
+                  [
+                    "len",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 24,
+        "ty": {
+          "Adt": {
+            "name": "parser::Token",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v3_0",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Lambda",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Lparen",
+                "discriminant": 1,
+                "fields": []
+              },
+              {
+                "name": "Rparen",
+                "discriminant": 2,
+                "fields": []
+              },
+              {
+                "name": "Number",
+                "discriminant": 3,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 25,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 26,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 27,
+        "ty": {
+          "Adt": {
+            "name": "parser::ParseError",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v0_0",
+                {
+                  "Tuple": [
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    },
+                    {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  ]
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "InvalidCharacter",
+                "discriminant": 0,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Tuple": [
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": false
+                          }
+                        },
+                        {
+                          "Int": {
+                            "width": 32,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                ]
+              },
+              {
+                "name": "UndefinedFreeVariable",
+                "discriminant": 1,
+                "fields": []
+              },
+              {
+                "name": "InvalidExpression",
+                "discriminant": 2,
+                "fields": []
+              },
+              {
+                "name": "EmptyExpression",
+                "discriminant": 3,
+                "fields": []
+              }
+            ],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 28,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            {
+              "Int": {
+                "width": 32,
+                "signed": false
+              }
+            }
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 29,
+        "ty": {
+          "Adt": {
+            "name": "std::vec::Vec",
+            "fields": [
+              [
+                "buf",
+                {
+                  "Adt": {
+                    "name": "alloc::raw_vec::RawVec",
+                    "fields": [
+                      [
+                        "inner",
+                        {
+                          "Adt": {
+                            "name": "alloc::raw_vec::RawVecInner",
+                            "fields": [
+                              [
+                                "ptr",
+                                {
+                                  "Adt": {
+                                    "name": "std::ptr::Unique",
+                                    "fields": [
+                                      [
+                                        "pointer",
+                                        {
+                                          "Adt": {
+                                            "name": "std::ptr::NonNull",
+                                            "fields": [
+                                              [
+                                                "pointer",
+                                                {
+                                                  "RawPtr": {
+                                                    "mutable": false,
+                                                    "pointee": {
+                                                      "Int": {
+                                                        "width": 8,
+                                                        "signed": false
+                                                      }
+                                                    }
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      ],
+                                      [
+                                        "_marker",
+                                        {
+                                          "Adt": {
+                                            "name": "std::marker::PhantomData",
+                                            "fields": [],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              ],
+                              [
+                                "cap",
+                                {
+                                  "Adt": {
+                                    "name": "core::num::niche_types::UsizeNoHighBit",
+                                    "fields": [
+                                      [
+                                        "0",
+                                        {
+                                          "Int": {
+                                            "width": 64,
+                                            "signed": false
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              ],
+                              [
+                                "alloc",
+                                {
+                                  "Adt": {
+                                    "name": "std::alloc::Global",
+                                    "fields": [],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false
+                          }
+                        }
+                      ],
+                      [
+                        "_marker",
+                        {
+                          "Adt": {
+                            "name": "std::marker::PhantomData",
+                            "fields": [],
+                            "variants": [],
+                            "disc_index_safe": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ],
+              [
+                "len",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::str::<impl str>::chars",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "<dump-root>/parser.rs",
+              "line_start": 76,
+              "col_start": 16,
+              "line_end": 76,
+              "col_end": 29
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "std::iter::Iterator::enumerate",
+            "args": [
+              {
+                "Move": {
+                  "local": 3,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "<dump-root>/parser.rs",
+              "line_start": 76,
+              "col_start": 16,
+              "line_end": 76,
+              "col_end": 41
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::str::<impl str>::len",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 5,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "<dump-root>/parser.rs",
+              "line_start": 77,
+              "col_start": 40,
+              "line_end": 77,
+              "col_end": 51
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "std::vec::Vec::<parser::Token>::with_capacity::<__trust_elem_bytes_16>",
+            "args": [
+              {
+                "Move": {
+                  "local": 5,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "<dump-root>/parser.rs",
+              "line_start": 77,
+              "col_start": 21,
+              "line_end": 77,
+              "col_end": 52
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "std::iter::IntoIterator::into_iter",
+            "args": [
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 6,
+              "projections": []
+            },
+            "target": 5,
+            "span": {
+              "file": "<dump-root>/parser.rs",
+              "line_start": 79,
+              "col_start": 18,
+              "line_end": 79,
+              "col_end": 23
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 6,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 79,
+                "col_start": 18,
+                "line_end": 79,
+                "col_end": 23
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 6
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 7,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 79,
+                "col_start": 18,
+                "line_end": 79,
+                "col_end": 23
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "std::iter::Iterator::next",
+            "args": [
+              {
+                "Copy": {
+                  "local": 10,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 9,
+              "projections": []
+            },
+            "target": 7,
+            "span": {
+              "file": "<dump-root>/parser.rs",
+              "line_start": 79,
+              "col_start": 18,
+              "line_end": 79,
+              "col_end": 23
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 9,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 79,
+                "col_start": 18,
+                "line_end": 79,
+                "col_end": 23
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 11,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                10
+              ],
+              [
+                1,
+                9
+              ]
+            ],
+            "otherwise": 8,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "<dump-root>/parser.rs",
+              "line_start": 79,
+              "col_start": 18,
+              "line_end": 79,
+              "col_end": 23
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": [
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 79,
+                "col_start": 9,
+                "line_end": 79,
+                "col_end": 10
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": [
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      },
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 79,
+                "col_start": 12,
+                "line_end": 79,
+                "col_end": 13
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 13,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                92,
+                14
+              ],
+              [
+                955,
+                14
+              ],
+              [
+                40,
+                13
+              ],
+              [
+                41,
+                12
+              ]
+            ],
+            "otherwise": 11,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "<dump-root>/parser.rs",
+              "line_start": 80,
+              "col_start": 8,
+              "line_end": 80,
+              "col_end": 15
+            }
+          }
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 29,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 96,
+                "col_start": 7,
+                "line_end": 96,
+                "col_end": 13
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "std::result::Result",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 29,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 96,
+                "col_start": 4,
+                "line_end": 96,
+                "col_end": 14
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 20
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "std::char::methods::<impl char>::to_digit",
+            "args": [
+              {
+                "Copy": {
+                  "local": 13,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    16,
+                    32
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 20,
+              "projections": []
+            },
+            "target": 15,
+            "span": {
+              "file": "<dump-root>/parser.rs",
+              "line_start": 85,
+              "col_start": 33,
+              "line_end": 85,
+              "col_end": 47
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 83,
+                "col_start": 19,
+                "line_end": 83,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "parser::Token",
+                      "variant": 2,
+                      "active_field": null
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 83,
+                "col_start": 31,
+                "line_end": 83,
+                "col_end": 37
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "std::vec::Vec::<T, A>::push",
+            "args": [
+              {
+                "Move": {
+                  "local": 18,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 19,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 8,
+              "projections": []
+            },
+            "target": 23,
+            "span": {
+              "file": "<dump-root>/parser.rs",
+              "line_start": 83,
+              "col_start": 19,
+              "line_end": 83,
+              "col_end": 38
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 82,
+                "col_start": 19,
+                "line_end": 82,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "parser::Token",
+                      "variant": 1,
+                      "active_field": null
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 82,
+                "col_start": 31,
+                "line_end": 82,
+                "col_end": 37
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "std::vec::Vec::<T, A>::push",
+            "args": [
+              {
+                "Move": {
+                  "local": 16,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 17,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 8,
+              "projections": []
+            },
+            "target": 24,
+            "span": {
+              "file": "<dump-root>/parser.rs",
+              "line_start": 82,
+              "col_start": 19,
+              "line_end": 82,
+              "col_end": 38
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 14,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 81,
+                "col_start": 26,
+                "line_end": 81,
+                "col_end": 32
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "parser::Token",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 81,
+                "col_start": 38,
+                "line_end": 81,
+                "col_end": 44
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "std::vec::Vec::<T, A>::push",
+            "args": [
+              {
+                "Move": {
+                  "local": 14,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 15,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 8,
+              "projections": []
+            },
+            "target": 25,
+            "span": {
+              "file": "<dump-root>/parser.rs",
+              "line_start": 81,
+              "col_start": 26,
+              "line_end": 81,
+              "col_end": 45
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 15,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 20,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 85,
+                "col_start": 33,
+                "line_end": 85,
+                "col_end": 47
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 21,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                1,
+                16
+              ],
+              [
+                0,
+                17
+              ]
+            ],
+            "otherwise": 8,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "<dump-root>/parser.rs",
+              "line_start": 85,
+              "col_start": 23,
+              "line_end": 85,
+              "col_end": 30
+            }
+          }
+        }
+      },
+      {
+        "id": 16,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 20,
+                    "projections": [
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 85,
+                "col_start": 28,
+                "line_end": 85,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 23,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 86,
+                "col_start": 20,
+                "line_end": 86,
+                "col_end": 26
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 25,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 22,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 86,
+                "col_start": 39,
+                "line_end": 86,
+                "col_end": 49
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "parser::Token",
+                      "variant": 3,
+                      "active_field": null
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 25,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 86,
+                "col_start": 32,
+                "line_end": 86,
+                "col_end": 50
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "std::vec::Vec::<T, A>::push",
+            "args": [
+              {
+                "Move": {
+                  "local": 23,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 24,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 8,
+              "projections": []
+            },
+            "target": 26,
+            "span": {
+              "file": "<dump-root>/parser.rs",
+              "line_start": 86,
+              "col_start": 20,
+              "line_end": 86,
+              "col_end": 51
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 17,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "std::char::methods::<impl char>::is_whitespace",
+            "args": [
+              {
+                "Copy": {
+                  "local": 13,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 26,
+              "projections": []
+            },
+            "target": 18,
+            "span": {
+              "file": "<dump-root>/parser.rs",
+              "line_start": 87,
+              "col_start": 26,
+              "line_end": 87,
+              "col_end": 43
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 18,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 26,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                19
+              ]
+            ],
+            "otherwise": 6,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "<dump-root>/parser.rs",
+              "line_start": 87,
+              "col_start": 26,
+              "line_end": 87,
+              "col_end": 43
+            }
+          }
+        }
+      },
+      {
+        "id": 19,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 28,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Copy": {
+                        "local": 12,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Copy": {
+                        "local": 13,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 90,
+                "col_start": 48,
+                "line_end": 90,
+                "col_end": 54
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 27,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "parser::ParseError",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 28,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 90,
+                "col_start": 31,
+                "line_end": 90,
+                "col_end": 55
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "std::result::Result",
+                      "variant": 1,
+                      "active_field": null
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 27,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/parser.rs",
+                "line_start": 90,
+                "col_start": 27,
+                "line_end": 90,
+                "col_end": 56
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 20,
+            "span": {
+              "file": "<dump-root>/parser.rs",
+              "line_start": 97,
+              "col_start": 0,
+              "line_end": 97,
+              "col_end": 1
+            }
+          }
+        }
+      },
+      {
+        "id": 20,
+        "stmts": [],
+        "terminator": "Return"
+      },
+      {
+        "id": 21,
+        "stmts": [],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 22,
+            "span": {
+              "file": "<dump-root>/parser.rs",
+              "line_start": 97,
+              "col_start": 0,
+              "line_end": 97,
+              "col_end": 1
+            }
+          }
+        }
+      },
+      {
+        "id": 22,
+        "stmts": [],
+        "terminator": "Resume"
+      },
+      {
+        "id": 23,
+        "stmts": [],
+        "terminator": {
+          "Goto": 6
+        }
+      },
+      {
+        "id": 24,
+        "stmts": [],
+        "terminator": {
+          "Goto": 6
+        }
+      },
+      {
+        "id": 25,
+        "stmts": [],
+        "terminator": {
+          "Goto": 6
+        }
+      },
+      {
+        "id": 26,
+        "stmts": [],
+        "terminator": {
+          "Goto": 6
+        }
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Adt": {
+        "name": "std::result::Result",
+        "fields": [
+          [
+            "__tag",
+            {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            }
+          ],
+          [
+            "__v0_0",
+            {
+              "Adt": {
+                "name": "std::vec::Vec",
+                "fields": [
+                  [
+                    "buf",
+                    {
+                      "Adt": {
+                        "name": "alloc::raw_vec::RawVec",
+                        "fields": [
+                          [
+                            "inner",
+                            {
+                              "Adt": {
+                                "name": "alloc::raw_vec::RawVecInner",
+                                "fields": [
+                                  [
+                                    "ptr",
+                                    {
+                                      "Adt": {
+                                        "name": "std::ptr::Unique",
+                                        "fields": [
+                                          [
+                                            "pointer",
+                                            {
+                                              "Adt": {
+                                                "name": "std::ptr::NonNull",
+                                                "fields": [
+                                                  [
+                                                    "pointer",
+                                                    {
+                                                      "RawPtr": {
+                                                        "mutable": false,
+                                                        "pointee": {
+                                                          "Int": {
+                                                            "width": 8,
+                                                            "signed": false
+                                                          }
+                                                        }
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "_marker",
+                                            {
+                                              "Adt": {
+                                                "name": "std::marker::PhantomData",
+                                                "fields": [],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "cap",
+                                    {
+                                      "Adt": {
+                                        "name": "core::num::niche_types::UsizeNoHighBit",
+                                        "fields": [
+                                          [
+                                            "0",
+                                            {
+                                              "Int": {
+                                                "width": 64,
+                                                "signed": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "alloc",
+                                    {
+                                      "Adt": {
+                                        "name": "std::alloc::Global",
+                                        "fields": [],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ],
+                          [
+                            "_marker",
+                            {
+                              "Adt": {
+                                "name": "std::marker::PhantomData",
+                                "fields": [],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ],
+                  [
+                    "len",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          ],
+          [
+            "__v1_0",
+            {
+              "Adt": {
+                "name": "parser::ParseError",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ],
+                  [
+                    "__v0_0",
+                    {
+                      "Tuple": [
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": false
+                          }
+                        },
+                        {
+                          "Int": {
+                            "width": 32,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "InvalidCharacter",
+                    "discriminant": 0,
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Tuple": [
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": false
+                              }
+                            },
+                            {
+                              "Int": {
+                                "width": 32,
+                                "signed": false
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    ]
+                  },
+                  {
+                    "name": "UndefinedFreeVariable",
+                    "discriminant": 1,
+                    "fields": []
+                  },
+                  {
+                    "name": "InvalidExpression",
+                    "discriminant": 2,
+                    "fields": []
+                  },
+                  {
+                    "name": "EmptyExpression",
+                    "discriminant": 3,
+                    "fields": []
+                  }
+                ],
+                "disc_index_safe": false
+              }
+            }
+          ]
+        ],
+        "variants": [
+          {
+            "name": "Ok",
+            "discriminant": 0,
+            "fields": [
+              [
+                "0",
+                {
+                  "Adt": {
+                    "name": "std::vec::Vec",
+                    "fields": [
+                      [
+                        "buf",
+                        {
+                          "Adt": {
+                            "name": "alloc::raw_vec::RawVec",
+                            "fields": [
+                              [
+                                "inner",
+                                {
+                                  "Adt": {
+                                    "name": "alloc::raw_vec::RawVecInner",
+                                    "fields": [
+                                      [
+                                        "ptr",
+                                        {
+                                          "Adt": {
+                                            "name": "std::ptr::Unique",
+                                            "fields": [
+                                              [
+                                                "pointer",
+                                                {
+                                                  "Adt": {
+                                                    "name": "std::ptr::NonNull",
+                                                    "fields": [
+                                                      [
+                                                        "pointer",
+                                                        {
+                                                          "RawPtr": {
+                                                            "mutable": false,
+                                                            "pointee": {
+                                                              "Int": {
+                                                                "width": 8,
+                                                                "signed": false
+                                                              }
+                                                            }
+                                                          }
+                                                        }
+                                                      ]
+                                                    ],
+                                                    "variants": [],
+                                                    "disc_index_safe": false
+                                                  }
+                                                }
+                                              ],
+                                              [
+                                                "_marker",
+                                                {
+                                                  "Adt": {
+                                                    "name": "std::marker::PhantomData",
+                                                    "fields": [],
+                                                    "variants": [],
+                                                    "disc_index_safe": false
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      ],
+                                      [
+                                        "cap",
+                                        {
+                                          "Adt": {
+                                            "name": "core::num::niche_types::UsizeNoHighBit",
+                                            "fields": [
+                                              [
+                                                "0",
+                                                {
+                                                  "Int": {
+                                                    "width": 64,
+                                                    "signed": false
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      ],
+                                      [
+                                        "alloc",
+                                        {
+                                          "Adt": {
+                                            "name": "std::alloc::Global",
+                                            "fields": [],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              ],
+                              [
+                                "_marker",
+                                {
+                                  "Adt": {
+                                    "name": "std::marker::PhantomData",
+                                    "fields": [],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false
+                          }
+                        }
+                      ],
+                      [
+                        "len",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ]
+            ]
+          },
+          {
+            "name": "Err",
+            "discriminant": 1,
+            "fields": [
+              [
+                "0",
+                {
+                  "Adt": {
+                    "name": "parser::ParseError",
+                    "fields": [
+                      [
+                        "__tag",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": true
+                          }
+                        }
+                      ],
+                      [
+                        "__v0_0",
+                        {
+                          "Tuple": [
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": false
+                              }
+                            },
+                            {
+                              "Int": {
+                                "width": 32,
+                                "signed": false
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    ],
+                    "variants": [
+                      {
+                        "name": "InvalidCharacter",
+                        "discriminant": 0,
+                        "fields": [
+                          [
+                            "0",
+                            {
+                              "Tuple": [
+                                {
+                                  "Int": {
+                                    "width": 64,
+                                    "signed": false
+                                  }
+                                },
+                                {
+                                  "Int": {
+                                    "width": 32,
+                                    "signed": false
+                                  }
+                                }
+                              ]
+                            }
+                          ]
+                        ]
+                      },
+                      {
+                        "name": "UndefinedFreeVariable",
+                        "discriminant": 1,
+                        "fields": []
+                      },
+                      {
+                        "name": "InvalidExpression",
+                        "discriminant": 2,
+                        "fields": []
+                      },
+                      {
+                        "name": "EmptyExpression",
+                        "discriminant": 3,
+                        "fields": []
+                      }
+                    ],
+                    "disc_index_safe": false
+                  }
+                }
+              ]
+            ]
+          }
+        ],
+        "disc_index_safe": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_11",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_11",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_21",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_21",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "c",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "c",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1114111
+            }
+          ]
+        },
+        {
+          "Not": {
+            "And": [
+              {
+                "Ge": [
+                  {
+                    "Var": [
+                      "c",
+                      "Int"
+                    ]
+                  },
+                  {
+                    "Int": 55296
+                  }
+                ]
+              },
+              {
+                "Le": [
+                  {
+                    "Var": [
+                      "c",
+                      "Int"
+                    ]
+                  },
+                  {
+                    "Int": 57343
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

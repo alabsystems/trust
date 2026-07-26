@@ -1,0 +1,4710 @@
+{
+  "name": "from_basis",
+  "def_path": "Quat::from_basis",
+  "span": {
+    "file": "crates/a3d-geom/src/lib.rs",
+    "line_start": 751,
+    "col_start": 4,
+    "line_end": 785,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Adt": {
+            "name": "Quat",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "w",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "Vec3",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "Vec3",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": "y"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "Vec3",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": "z"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Closure": {
+            "name": "Quat::from_basis::{closure#0}",
+            "upvars": [
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                }
+              },
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                }
+              },
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                }
+              },
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                }
+              },
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                }
+              },
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                }
+              },
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                }
+              },
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                }
+              },
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                }
+              }
+            ],
+            "call": {
+              "kind": "Fn",
+              "params": [],
+              "ret": "Bool"
+            }
+          }
+        },
+        "name": "__requires_checker"
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": "m00"
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": "m01"
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": "m02"
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Tuple": [
+            {
+              "Float": {
+                "width": 64
+              }
+            },
+            {
+              "Float": {
+                "width": 64
+              }
+            },
+            {
+              "Float": {
+                "width": 64
+              }
+            }
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": "m10"
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": "m11"
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": "m12"
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Tuple": [
+            {
+              "Float": {
+                "width": 64
+              }
+            },
+            {
+              "Float": {
+                "width": 64
+              }
+            },
+            {
+              "Float": {
+                "width": 64
+              }
+            }
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": "m20"
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": "m21"
+      },
+      {
+        "index": 21,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": "m22"
+      },
+      {
+        "index": 22,
+        "ty": {
+          "Tuple": [
+            {
+              "Float": {
+                "width": 64
+              }
+            },
+            {
+              "Float": {
+                "width": 64
+              }
+            },
+            {
+              "Float": {
+                "width": 64
+              }
+            }
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 23,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 24,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 25,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 26,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": "trace"
+      },
+      {
+        "index": 27,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 28,
+        "ty": {
+          "Adt": {
+            "name": "Quat",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "w",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": "q"
+      },
+      {
+        "index": 29,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 30,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": "s"
+      },
+      {
+        "index": 31,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 32,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 33,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 34,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 35,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 36,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 37,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 38,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 39,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 40,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 41,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 42,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": "d"
+      },
+      {
+        "index": 43,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 44,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 45,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 46,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": "s"
+      },
+      {
+        "index": 47,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 48,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 49,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 50,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 51,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 52,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 53,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 54,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 55,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 56,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": "d"
+      },
+      {
+        "index": 57,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 58,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 59,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 60,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": "s"
+      },
+      {
+        "index": 61,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 62,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 63,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 64,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 65,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 66,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 67,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 68,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 69,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": "d"
+      },
+      {
+        "index": 70,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 71,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 72,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 73,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": "s"
+      },
+      {
+        "index": 74,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 75,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 76,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 77,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 78,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 79,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 80,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 81,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 82,
+        "ty": {
+          "Adt": {
+            "name": "Quat",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "w",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 753,
+                "col_start": 31,
+                "line_end": 753,
+                "col_end": 34
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 753,
+                "col_start": 36,
+                "line_end": 753,
+                "col_end": 39
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 753,
+                "col_start": 41,
+                "line_end": 753,
+                "col_end": 44
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Move": {
+                        "local": 9,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 10,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 11,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 753,
+                "col_start": 30,
+                "line_end": 753,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 8,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 753,
+                "col_start": 13,
+                "line_end": 753,
+                "col_end": 16
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 8,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 753,
+                "col_start": 18,
+                "line_end": 753,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 8,
+                    "projections": [
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 753,
+                "col_start": 23,
+                "line_end": 753,
+                "col_end": 26
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 754,
+                "col_start": 31,
+                "line_end": 754,
+                "col_end": 34
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 754,
+                "col_start": 36,
+                "line_end": 754,
+                "col_end": 39
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 754,
+                "col_start": 41,
+                "line_end": 754,
+                "col_end": 44
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Move": {
+                        "local": 16,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 17,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 18,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 754,
+                "col_start": 30,
+                "line_end": 754,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 15,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 754,
+                "col_start": 13,
+                "line_end": 754,
+                "col_end": 16
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 15,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 754,
+                "col_start": 18,
+                "line_end": 754,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 15,
+                    "projections": [
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 754,
+                "col_start": 23,
+                "line_end": 754,
+                "col_end": 26
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 23,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 755,
+                "col_start": 31,
+                "line_end": 755,
+                "col_end": 34
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 755,
+                "col_start": 36,
+                "line_end": 755,
+                "col_end": 39
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 25,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": [
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 755,
+                "col_start": 41,
+                "line_end": 755,
+                "col_end": 44
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Move": {
+                        "local": 23,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 24,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 25,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 755,
+                "col_start": 30,
+                "line_end": 755,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 22,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 755,
+                "col_start": 13,
+                "line_end": 755,
+                "col_end": 16
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 20,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 22,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 755,
+                "col_start": 18,
+                "line_end": 755,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 22,
+                    "projections": [
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 755,
+                "col_start": 23,
+                "line_end": 755,
+                "col_end": 26
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 27,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 13,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 756,
+                "col_start": 20,
+                "line_end": 756,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 26,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Move": {
+                      "local": 27,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 21,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 756,
+                "col_start": 20,
+                "line_end": 756,
+                "col_end": 35
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 29,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Copy": {
+                      "local": 26,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "FloatBits": {
+                        "bits": 0,
+                        "width": 64
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 757,
+                "col_start": 19,
+                "line_end": 757,
+                "col_end": 30
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 29,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                3
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 757,
+              "col_start": 19,
+              "line_end": 757,
+              "col_end": 30
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 32,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 26,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "FloatBits": {
+                        "bits": 4607182418800017408,
+                        "width": 64
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 760,
+                "col_start": 26,
+                "line_end": 760,
+                "col_end": 39
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "std::f64::<impl f64>::sqrt",
+            "args": [
+              {
+                "Move": {
+                  "local": 32,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 31,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 760,
+              "col_start": 26,
+              "line_end": 760,
+              "col_end": 46
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 30,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Constant": {
+                      "FloatBits": {
+                        "bits": 4602678819172646912,
+                        "width": 64
+                      }
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 31,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 760,
+                "col_start": 20,
+                "line_end": 760,
+                "col_end": 46
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 33,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Constant": {
+                      "FloatBits": {
+                        "bits": 4598175219545276416,
+                        "width": 64
+                      }
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 30,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 761,
+                "col_start": 22,
+                "line_end": 761,
+                "col_end": 30
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 35,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Sub",
+                  {
+                    "Copy": {
+                      "local": 20,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 14,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 761,
+                "col_start": 35,
+                "line_end": 761,
+                "col_end": 46
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 34,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Mul",
+                  {
+                    "Move": {
+                      "local": 35,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 30,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 761,
+                "col_start": 35,
+                "line_end": 761,
+                "col_end": 50
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 37,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Sub",
+                  {
+                    "Copy": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 19,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 761,
+                "col_start": 55,
+                "line_end": 761,
+                "col_end": 66
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 36,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Mul",
+                  {
+                    "Move": {
+                      "local": 37,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 30,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 761,
+                "col_start": 55,
+                "line_end": 761,
+                "col_end": 70
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 39,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Sub",
+                  {
+                    "Copy": {
+                      "local": 12,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 761,
+                "col_start": 75,
+                "line_end": 761,
+                "col_end": 86
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 38,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Mul",
+                  {
+                    "Move": {
+                      "local": 39,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 30,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 761,
+                "col_start": 75,
+                "line_end": 761,
+                "col_end": 90
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 28,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "Quat",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 34,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 36,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 38,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 33,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 761,
+                "col_start": 12,
+                "line_end": 761,
+                "col_end": 92
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 18
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 40,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 13,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 762,
+                "col_start": 18,
+                "line_end": 762,
+                "col_end": 27
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 40,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                9
+              ]
+            ],
+            "otherwise": 4,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 762,
+              "col_start": 18,
+              "line_end": 762,
+              "col_end": 27
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 41,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 21,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 762,
+                "col_start": 31,
+                "line_end": 762,
+                "col_end": 40
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 41,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                9
+              ]
+            ],
+            "otherwise": 5,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 762,
+              "col_start": 31,
+              "line_end": 762,
+              "col_end": 40
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 44,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Constant": {
+                      "FloatBits": {
+                        "bits": 4607182418800017408,
+                        "width": 64
+                      }
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 763,
+                "col_start": 20,
+                "line_end": 763,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 43,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Sub",
+                  {
+                    "Move": {
+                      "local": 44,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 13,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 763,
+                "col_start": 20,
+                "line_end": 763,
+                "col_end": 35
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 42,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Sub",
+                  {
+                    "Move": {
+                      "local": 43,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 21,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 763,
+                "col_start": 20,
+                "line_end": 763,
+                "col_end": 41
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 45,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Copy": {
+                      "local": 42,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "FloatBits": {
+                        "bits": 4008604054463141788,
+                        "width": 64
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 764,
+                "col_start": 16,
+                "line_end": 764,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 45,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                7
+              ]
+            ],
+            "otherwise": 6,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 764,
+              "col_start": 16,
+              "line_end": 764,
+              "col_end": 29
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "std::f64::<impl f64>::sqrt",
+            "args": [
+              {
+                "Copy": {
+                  "local": 42,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 47,
+              "projections": []
+            },
+            "target": 8,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 767,
+              "col_start": 26,
+              "line_end": 767,
+              "col_end": 34
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "Quat",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  [
+                    {
+                      "Constant": {
+                        "FloatBits": {
+                          "bits": 0,
+                          "width": 64
+                        }
+                      }
+                    },
+                    {
+                      "Constant": {
+                        "FloatBits": {
+                          "bits": 0,
+                          "width": 64
+                        }
+                      }
+                    },
+                    {
+                      "Constant": {
+                        "FloatBits": {
+                          "bits": 0,
+                          "width": 64
+                        }
+                      }
+                    },
+                    {
+                      "Constant": {
+                        "FloatBits": {
+                          "bits": 4607182418800017408,
+                          "width": 64
+                        }
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 765,
+                "col_start": 23,
+                "line_end": 765,
+                "col_end": 37
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 19
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 46,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Mul",
+                  {
+                    "Constant": {
+                      "FloatBits": {
+                        "bits": 4611686018427387904,
+                        "width": 64
+                      }
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 47,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 767,
+                "col_start": 20,
+                "line_end": 767,
+                "col_end": 34
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 49,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Sub",
+                  {
+                    "Copy": {
+                      "local": 20,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 14,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 768,
+                "col_start": 22,
+                "line_end": 768,
+                "col_end": 33
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 48,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Move": {
+                      "local": 49,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 46,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 768,
+                "col_start": 22,
+                "line_end": 768,
+                "col_end": 37
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 50,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Mul",
+                  {
+                    "Constant": {
+                      "FloatBits": {
+                        "bits": 4598175219545276416,
+                        "width": 64
+                      }
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 46,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 768,
+                "col_start": 42,
+                "line_end": 768,
+                "col_end": 50
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 52,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 12,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 768,
+                "col_start": 55,
+                "line_end": 768,
+                "col_end": 66
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 51,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Move": {
+                      "local": 52,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 46,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 768,
+                "col_start": 55,
+                "line_end": 768,
+                "col_end": 70
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 54,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 19,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 768,
+                "col_start": 75,
+                "line_end": 768,
+                "col_end": 86
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 53,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Move": {
+                      "local": 54,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 46,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 768,
+                "col_start": 75,
+                "line_end": 768,
+                "col_end": 90
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 28,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "Quat",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 50,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 51,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 53,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 48,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 768,
+                "col_start": 12,
+                "line_end": 768,
+                "col_end": 92
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 18
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 55,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Copy": {
+                      "local": 13,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 21,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 769,
+                "col_start": 18,
+                "line_end": 769,
+                "col_end": 27
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 55,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                14
+              ]
+            ],
+            "otherwise": 10,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 769,
+              "col_start": 18,
+              "line_end": 769,
+              "col_end": 27
+            }
+          }
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 58,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Constant": {
+                      "FloatBits": {
+                        "bits": 4607182418800017408,
+                        "width": 64
+                      }
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 13,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 770,
+                "col_start": 20,
+                "line_end": 770,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 57,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Sub",
+                  {
+                    "Move": {
+                      "local": 58,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 770,
+                "col_start": 20,
+                "line_end": 770,
+                "col_end": 35
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 56,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Sub",
+                  {
+                    "Move": {
+                      "local": 57,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 21,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 770,
+                "col_start": 20,
+                "line_end": 770,
+                "col_end": 41
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 59,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Copy": {
+                      "local": 56,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "FloatBits": {
+                        "bits": 4008604054463141788,
+                        "width": 64
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 771,
+                "col_start": 16,
+                "line_end": 771,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 59,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                12
+              ]
+            ],
+            "otherwise": 11,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 771,
+              "col_start": 16,
+              "line_end": 771,
+              "col_end": 29
+            }
+          }
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "std::f64::<impl f64>::sqrt",
+            "args": [
+              {
+                "Copy": {
+                  "local": 56,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 61,
+              "projections": []
+            },
+            "target": 13,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 774,
+              "col_start": 26,
+              "line_end": 774,
+              "col_end": 34
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "Quat",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  [
+                    {
+                      "Constant": {
+                        "FloatBits": {
+                          "bits": 0,
+                          "width": 64
+                        }
+                      }
+                    },
+                    {
+                      "Constant": {
+                        "FloatBits": {
+                          "bits": 0,
+                          "width": 64
+                        }
+                      }
+                    },
+                    {
+                      "Constant": {
+                        "FloatBits": {
+                          "bits": 0,
+                          "width": 64
+                        }
+                      }
+                    },
+                    {
+                      "Constant": {
+                        "FloatBits": {
+                          "bits": 4607182418800017408,
+                          "width": 64
+                        }
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 772,
+                "col_start": 23,
+                "line_end": 772,
+                "col_end": 37
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 19
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 60,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Mul",
+                  {
+                    "Constant": {
+                      "FloatBits": {
+                        "bits": 4611686018427387904,
+                        "width": 64
+                      }
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 61,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 774,
+                "col_start": 20,
+                "line_end": 774,
+                "col_end": 34
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 63,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Sub",
+                  {
+                    "Copy": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 19,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 775,
+                "col_start": 22,
+                "line_end": 775,
+                "col_end": 33
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 62,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Move": {
+                      "local": 63,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 60,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 775,
+                "col_start": 22,
+                "line_end": 775,
+                "col_end": 37
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 65,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 12,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 775,
+                "col_start": 42,
+                "line_end": 775,
+                "col_end": 53
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 64,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Move": {
+                      "local": 65,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 60,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 775,
+                "col_start": 42,
+                "line_end": 775,
+                "col_end": 57
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 66,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Mul",
+                  {
+                    "Constant": {
+                      "FloatBits": {
+                        "bits": 4598175219545276416,
+                        "width": 64
+                      }
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 60,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 775,
+                "col_start": 62,
+                "line_end": 775,
+                "col_end": 70
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 68,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 14,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 20,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 775,
+                "col_start": 75,
+                "line_end": 775,
+                "col_end": 86
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 67,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Move": {
+                      "local": 68,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 60,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 775,
+                "col_start": 75,
+                "line_end": 775,
+                "col_end": 90
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 28,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "Quat",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 64,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 66,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 67,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 62,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 775,
+                "col_start": 12,
+                "line_end": 775,
+                "col_end": 92
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 18
+        }
+      },
+      {
+        "id": 14,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 71,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Constant": {
+                      "FloatBits": {
+                        "bits": 4607182418800017408,
+                        "width": 64
+                      }
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 21,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 777,
+                "col_start": 20,
+                "line_end": 777,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 70,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Sub",
+                  {
+                    "Move": {
+                      "local": 71,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 777,
+                "col_start": 20,
+                "line_end": 777,
+                "col_end": 35
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 69,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Sub",
+                  {
+                    "Move": {
+                      "local": 70,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 13,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 777,
+                "col_start": 20,
+                "line_end": 777,
+                "col_end": 41
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 72,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Copy": {
+                      "local": 69,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "FloatBits": {
+                        "bits": 4008604054463141788,
+                        "width": 64
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 778,
+                "col_start": 16,
+                "line_end": 778,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 72,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                16
+              ]
+            ],
+            "otherwise": 15,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 778,
+              "col_start": 16,
+              "line_end": 778,
+              "col_end": 29
+            }
+          }
+        }
+      },
+      {
+        "id": 15,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "std::f64::<impl f64>::sqrt",
+            "args": [
+              {
+                "Copy": {
+                  "local": 69,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 74,
+              "projections": []
+            },
+            "target": 17,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 781,
+              "col_start": 26,
+              "line_end": 781,
+              "col_end": 34
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 16,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "Quat",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  [
+                    {
+                      "Constant": {
+                        "FloatBits": {
+                          "bits": 0,
+                          "width": 64
+                        }
+                      }
+                    },
+                    {
+                      "Constant": {
+                        "FloatBits": {
+                          "bits": 0,
+                          "width": 64
+                        }
+                      }
+                    },
+                    {
+                      "Constant": {
+                        "FloatBits": {
+                          "bits": 0,
+                          "width": 64
+                        }
+                      }
+                    },
+                    {
+                      "Constant": {
+                        "FloatBits": {
+                          "bits": 4607182418800017408,
+                          "width": 64
+                        }
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 779,
+                "col_start": 23,
+                "line_end": 779,
+                "col_end": 37
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 19
+        }
+      },
+      {
+        "id": 17,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 73,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Mul",
+                  {
+                    "Constant": {
+                      "FloatBits": {
+                        "bits": 4611686018427387904,
+                        "width": 64
+                      }
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 74,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 781,
+                "col_start": 20,
+                "line_end": 781,
+                "col_end": 34
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 76,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Sub",
+                  {
+                    "Copy": {
+                      "local": 12,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 782,
+                "col_start": 22,
+                "line_end": 782,
+                "col_end": 33
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 75,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Move": {
+                      "local": 76,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 73,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 782,
+                "col_start": 22,
+                "line_end": 782,
+                "col_end": 37
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 78,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 19,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 782,
+                "col_start": 42,
+                "line_end": 782,
+                "col_end": 53
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 77,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Move": {
+                      "local": 78,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 73,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 782,
+                "col_start": 42,
+                "line_end": 782,
+                "col_end": 57
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 80,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 14,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 20,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 782,
+                "col_start": 62,
+                "line_end": 782,
+                "col_end": 73
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 79,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Move": {
+                      "local": 80,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 73,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 782,
+                "col_start": 62,
+                "line_end": 782,
+                "col_end": 77
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 81,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Mul",
+                  {
+                    "Constant": {
+                      "FloatBits": {
+                        "bits": 4598175219545276416,
+                        "width": 64
+                      }
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 73,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 782,
+                "col_start": 82,
+                "line_end": 782,
+                "col_end": 90
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 28,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "Quat",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 77,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 79,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 81,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 75,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 782,
+                "col_start": 12,
+                "line_end": 782,
+                "col_end": 92
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 18
+        }
+      },
+      {
+        "id": 18,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 82,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 28,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 784,
+                "col_start": 8,
+                "line_end": 784,
+                "col_end": 9
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "Quat::normalized",
+            "args": [
+              {
+                "Move": {
+                  "local": 82,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 19,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 784,
+              "col_start": 8,
+              "line_end": 784,
+              "col_end": 22
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 19,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 3,
+    "return_ty": {
+      "Adt": {
+        "name": "Quat",
+        "fields": [
+          [
+            "x",
+            {
+              "Float": {
+                "width": 64
+              }
+            }
+          ],
+          [
+            "y",
+            {
+              "Float": {
+                "width": 64
+              }
+            }
+          ],
+          [
+            "z",
+            {
+              "Float": {
+                "width": 64
+              }
+            }
+          ],
+          [
+            "w",
+            {
+              "Float": {
+                "width": 64
+              }
+            }
+          ]
+        ],
+        "variants": [],
+        "disc_index_safe": false
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Requires",
+      "span": {
+        "file": "crates/a3d-geom/src/lib.rs",
+        "line_start": 748,
+        "col_start": 8,
+        "line_end": 750,
+        "col_end": 112
+      },
+      "body": "__trust_lowered_compiler_contract__:((((((((((((((((((x.0) <= (1.0e15)) && ((x.0) >= (-(1.0e15)))) && ((x.1) <= (1.0e15))) && ((x.1) >= (-(1.0e15)))) && ((x.2) <= (1.0e15))) && ((x.2) >= (-(1.0e15)))) && ((y.0) <= (1.0e15))) && ((y.0) >= (-(1.0e15)))) && ((y.1) <= (1.0e15))) && ((y.1) >= (-(1.0e15)))) && ((y.2) <= (1.0e15))) && ((y.2) >= (-(1.0e15)))) && ((z.0) <= (1.0e15))) && ((z.0) >= (-(1.0e15)))) && ((z.1) <= (1.0e15))) && ((z.1) >= (-(1.0e15)))) && ((z.2) <= (1.0e15))) && ((z.2) >= (-(1.0e15)))"
+    }
+  ],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "And": [
+            {
+              "And": [
+                {
+                  "And": [
+                    {
+                      "And": [
+                        {
+                          "And": [
+                            {
+                              "And": [
+                                {
+                                  "And": [
+                                    {
+                                      "And": [
+                                        {
+                                          "And": [
+                                            {
+                                              "And": [
+                                                {
+                                                  "And": [
+                                                    {
+                                                      "And": [
+                                                        {
+                                                          "And": [
+                                                            {
+                                                              "And": [
+                                                                {
+                                                                  "And": [
+                                                                    {
+                                                                      "And": [
+                                                                        {
+                                                                          "Le": [
+                                                                            {
+                                                                              "Var": [
+                                                                                "x.0",
+                                                                                {
+                                                                                  "Float": {
+                                                                                    "eb": 11,
+                                                                                    "sb": 53
+                                                                                  }
+                                                                                }
+                                                                              ]
+                                                                            },
+                                                                            {
+                                                                              "FpConst": {
+                                                                                "bits": 4831355200913801216,
+                                                                                "eb": 11,
+                                                                                "sb": 53
+                                                                              }
+                                                                            }
+                                                                          ]
+                                                                        },
+                                                                        {
+                                                                          "Ge": [
+                                                                            {
+                                                                              "Var": [
+                                                                                "x.0",
+                                                                                {
+                                                                                  "Float": {
+                                                                                    "eb": 11,
+                                                                                    "sb": 53
+                                                                                  }
+                                                                                }
+                                                                              ]
+                                                                            },
+                                                                            {
+                                                                              "FpConst": {
+                                                                                "bits": 14054727237768577024,
+                                                                                "eb": 11,
+                                                                                "sb": 53
+                                                                              }
+                                                                            }
+                                                                          ]
+                                                                        }
+                                                                      ]
+                                                                    },
+                                                                    {
+                                                                      "Le": [
+                                                                        {
+                                                                          "Var": [
+                                                                            "x.1",
+                                                                            {
+                                                                              "Float": {
+                                                                                "eb": 11,
+                                                                                "sb": 53
+                                                                              }
+                                                                            }
+                                                                          ]
+                                                                        },
+                                                                        {
+                                                                          "FpConst": {
+                                                                            "bits": 4831355200913801216,
+                                                                            "eb": 11,
+                                                                            "sb": 53
+                                                                          }
+                                                                        }
+                                                                      ]
+                                                                    }
+                                                                  ]
+                                                                },
+                                                                {
+                                                                  "Ge": [
+                                                                    {
+                                                                      "Var": [
+                                                                        "x.1",
+                                                                        {
+                                                                          "Float": {
+                                                                            "eb": 11,
+                                                                            "sb": 53
+                                                                          }
+                                                                        }
+                                                                      ]
+                                                                    },
+                                                                    {
+                                                                      "FpConst": {
+                                                                        "bits": 14054727237768577024,
+                                                                        "eb": 11,
+                                                                        "sb": 53
+                                                                      }
+                                                                    }
+                                                                  ]
+                                                                }
+                                                              ]
+                                                            },
+                                                            {
+                                                              "Le": [
+                                                                {
+                                                                  "Var": [
+                                                                    "x.2",
+                                                                    {
+                                                                      "Float": {
+                                                                        "eb": 11,
+                                                                        "sb": 53
+                                                                      }
+                                                                    }
+                                                                  ]
+                                                                },
+                                                                {
+                                                                  "FpConst": {
+                                                                    "bits": 4831355200913801216,
+                                                                    "eb": 11,
+                                                                    "sb": 53
+                                                                  }
+                                                                }
+                                                              ]
+                                                            }
+                                                          ]
+                                                        },
+                                                        {
+                                                          "Ge": [
+                                                            {
+                                                              "Var": [
+                                                                "x.2",
+                                                                {
+                                                                  "Float": {
+                                                                    "eb": 11,
+                                                                    "sb": 53
+                                                                  }
+                                                                }
+                                                              ]
+                                                            },
+                                                            {
+                                                              "FpConst": {
+                                                                "bits": 14054727237768577024,
+                                                                "eb": 11,
+                                                                "sb": 53
+                                                              }
+                                                            }
+                                                          ]
+                                                        }
+                                                      ]
+                                                    },
+                                                    {
+                                                      "Le": [
+                                                        {
+                                                          "Var": [
+                                                            "y.0",
+                                                            {
+                                                              "Float": {
+                                                                "eb": 11,
+                                                                "sb": 53
+                                                              }
+                                                            }
+                                                          ]
+                                                        },
+                                                        {
+                                                          "FpConst": {
+                                                            "bits": 4831355200913801216,
+                                                            "eb": 11,
+                                                            "sb": 53
+                                                          }
+                                                        }
+                                                      ]
+                                                    }
+                                                  ]
+                                                },
+                                                {
+                                                  "Ge": [
+                                                    {
+                                                      "Var": [
+                                                        "y.0",
+                                                        {
+                                                          "Float": {
+                                                            "eb": 11,
+                                                            "sb": 53
+                                                          }
+                                                        }
+                                                      ]
+                                                    },
+                                                    {
+                                                      "FpConst": {
+                                                        "bits": 14054727237768577024,
+                                                        "eb": 11,
+                                                        "sb": 53
+                                                      }
+                                                    }
+                                                  ]
+                                                }
+                                              ]
+                                            },
+                                            {
+                                              "Le": [
+                                                {
+                                                  "Var": [
+                                                    "y.1",
+                                                    {
+                                                      "Float": {
+                                                        "eb": 11,
+                                                        "sb": 53
+                                                      }
+                                                    }
+                                                  ]
+                                                },
+                                                {
+                                                  "FpConst": {
+                                                    "bits": 4831355200913801216,
+                                                    "eb": 11,
+                                                    "sb": 53
+                                                  }
+                                                }
+                                              ]
+                                            }
+                                          ]
+                                        },
+                                        {
+                                          "Ge": [
+                                            {
+                                              "Var": [
+                                                "y.1",
+                                                {
+                                                  "Float": {
+                                                    "eb": 11,
+                                                    "sb": 53
+                                                  }
+                                                }
+                                              ]
+                                            },
+                                            {
+                                              "FpConst": {
+                                                "bits": 14054727237768577024,
+                                                "eb": 11,
+                                                "sb": 53
+                                              }
+                                            }
+                                          ]
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "Le": [
+                                        {
+                                          "Var": [
+                                            "y.2",
+                                            {
+                                              "Float": {
+                                                "eb": 11,
+                                                "sb": 53
+                                              }
+                                            }
+                                          ]
+                                        },
+                                        {
+                                          "FpConst": {
+                                            "bits": 4831355200913801216,
+                                            "eb": 11,
+                                            "sb": 53
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                },
+                                {
+                                  "Ge": [
+                                    {
+                                      "Var": [
+                                        "y.2",
+                                        {
+                                          "Float": {
+                                            "eb": 11,
+                                            "sb": 53
+                                          }
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "FpConst": {
+                                        "bits": 14054727237768577024,
+                                        "eb": 11,
+                                        "sb": 53
+                                      }
+                                    }
+                                  ]
+                                }
+                              ]
+                            },
+                            {
+                              "Le": [
+                                {
+                                  "Var": [
+                                    "z.0",
+                                    {
+                                      "Float": {
+                                        "eb": 11,
+                                        "sb": 53
+                                      }
+                                    }
+                                  ]
+                                },
+                                {
+                                  "FpConst": {
+                                    "bits": 4831355200913801216,
+                                    "eb": 11,
+                                    "sb": 53
+                                  }
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        {
+                          "Ge": [
+                            {
+                              "Var": [
+                                "z.0",
+                                {
+                                  "Float": {
+                                    "eb": 11,
+                                    "sb": 53
+                                  }
+                                }
+                              ]
+                            },
+                            {
+                              "FpConst": {
+                                "bits": 14054727237768577024,
+                                "eb": 11,
+                                "sb": 53
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Le": [
+                        {
+                          "Var": [
+                            "z.1",
+                            {
+                              "Float": {
+                                "eb": 11,
+                                "sb": 53
+                              }
+                            }
+                          ]
+                        },
+                        {
+                          "FpConst": {
+                            "bits": 4831355200913801216,
+                            "eb": 11,
+                            "sb": 53
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "Ge": [
+                    {
+                      "Var": [
+                        "z.1",
+                        {
+                          "Float": {
+                            "eb": 11,
+                            "sb": 53
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "FpConst": {
+                        "bits": 14054727237768577024,
+                        "eb": 11,
+                        "sb": 53
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "Le": [
+                {
+                  "Var": [
+                    "z.2",
+                    {
+                      "Float": {
+                        "eb": 11,
+                        "sb": 53
+                      }
+                    }
+                  ]
+                },
+                {
+                  "FpConst": {
+                    "bits": 4831355200913801216,
+                    "eb": 11,
+                    "sb": 53
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Ge": [
+            {
+              "Var": [
+                "z.2",
+                {
+                  "Float": {
+                    "eb": 11,
+                    "sb": 53
+                  }
+                }
+              ]
+            },
+            {
+              "FpConst": {
+                "bits": 14054727237768577024,
+                "eb": 11,
+                "sb": 53
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [
+      "((((((((((((((((((x.0) <= (1.0e15)) && ((x.0) >= (-(1.0e15)))) && ((x.1) <= (1.0e15))) && ((x.1) >= (-(1.0e15)))) && ((x.2) <= (1.0e15))) && ((x.2) >= (-(1.0e15)))) && ((y.0) <= (1.0e15))) && ((y.0) >= (-(1.0e15)))) && ((y.1) <= (1.0e15))) && ((y.1) >= (-(1.0e15)))) && ((y.2) <= (1.0e15))) && ((y.2) >= (-(1.0e15)))) && ((z.0) <= (1.0e15))) && ((z.0) >= (-(1.0e15)))) && ((z.1) <= (1.0e15))) && ((z.1) >= (-(1.0e15)))) && ((z.2) <= (1.0e15))) && ((z.2) >= (-(1.0e15)))"
+    ],
+    "ensures": [],
+    "invariants": []
+  }
+}

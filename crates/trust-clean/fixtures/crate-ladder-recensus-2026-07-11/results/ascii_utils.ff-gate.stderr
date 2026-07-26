@@ -1,0 +1,16 @@
+
+=== FF-gate cluster summary (25 functions) ===
+  FULLY_FAITHFUL   18
+  SHAPE_GAP        7
+
+=== SHAPE_GAP functions (recognizer declines on both lanes) ===
+  <errors::AsciiError as std::cmp::Eq>::assert_fields_are_eq  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  <errors::AsciiError as std::cmp::PartialEq>::eq  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  <errors::AsciiError as std::error::Error>::cause  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  <errors::AsciiError as std::error::Error>::description  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  <errors::AsciiError as std::fmt::Debug>::fmt  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  <errors::AsciiError as std::fmt::Display>::fmt  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  check_ascii_printable  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+
+=== SAFETY_GAP functions (shape recognized, safety/discharge open) ===
+       93.97 real        93.64 user         0.14 sys

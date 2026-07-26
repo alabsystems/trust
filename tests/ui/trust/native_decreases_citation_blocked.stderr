@@ -1,0 +1,16 @@
+note: Clean island kernel-checked: 1 declaration(s) registered (zero_eq)
+  --> $DIR/native_decreases_citation_blocked.rs:9:5
+   |
+LL |     theorem zero_eq : 0 = 0 := rfl
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: citation `zero_eq` on a `decreases` clause cannot be validated as a typed well-founded transition obligation
+  --> $DIR/native_decreases_citation_blocked.rs:15:24
+   |
+LL |         decreases 0 by zero_eq
+   |                        ^^^^^^^
+   |
+   = note: decreases citations remain blocked until the before/after measure, strict descent, and well-founded carrier are bound into TrustIR
+
+error: aborting due to 1 previous error
+

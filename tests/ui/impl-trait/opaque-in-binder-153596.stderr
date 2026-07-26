@@ -1,0 +1,91 @@
+error[E0582]: binding for associated type `Output` references lifetime `'a`, which does not appear in the trait input types
+  --> $DIR/opaque-in-binder-153596.rs:27:38
+   |
+LL |         F: for<'a> Fn(Opaque<'a>) -> Opaque<'a>,
+   |                                      ^^^^^^^^^^
+
+error: unconstrained opaque type
+  --> $DIR/opaque-in-binder-153596.rs:17:23
+   |
+LL |     type Opaque<'a> = impl Sized + 'a;
+   |                       ^^^^^^^^^^^^^^^
+   |
+   = note: `Opaque` must be used in combination with a concrete type within the same crate
+
+error: unconstrained opaque type
+  --> $DIR/opaque-in-binder-153596.rs:36:28
+   |
+LL |     type OpaqueDebug<'a> = impl Debug + 'a;
+   |                            ^^^^^^^^^^^^^^^
+   |
+   = note: `OpaqueDebug` must be used in combination with a concrete type within the same crate
+
+error: unconstrained opaque type
+  --> $DIR/opaque-in-binder-153596.rs:55:23
+   |
+LL |     type Opaque<'a> = impl Sized + 'a;
+   |                       ^^^^^^^^^^^^^^^
+   |
+   = note: `Opaque` must be used in combination with a concrete type within the same crate
+
+error[E0308]: mismatched types
+  --> $DIR/opaque-in-binder-153596.rs:20:9
+   |
+LL |     type Opaque<'a> = impl Sized + 'a;
+   |                       --------------- the expected opaque type
+LL |
+LL |     fn define<'a>(x: &'a ()) -> Opaque<'a> {
+   |                                 ---------- expected `basic::Opaque<'a>` because of return type
+LL |         x
+   |         ^ expected opaque type, found `&()`
+   |
+   = note: expected opaque type `basic::Opaque<'a>`
+                found reference `&'a ()`
+note: this item must have a `#[define_opaque(basic::Opaque)]` attribute to be able to define hidden types
+  --> $DIR/opaque-in-binder-153596.rs:19:8
+   |
+LL |     fn define<'a>(x: &'a ()) -> Opaque<'a> {
+   |        ^^^^^^
+
+error[E0308]: mismatched types
+  --> $DIR/opaque-in-binder-153596.rs:39:9
+   |
+LL |     type OpaqueDebug<'a> = impl Debug + 'a;
+   |                            --------------- the expected opaque type
+LL |
+LL |     fn define_debug<'a>(x: &'a str) -> OpaqueDebug<'a> {
+   |                                        --------------- expected `OpaqueDebug<'a>` because of return type
+LL |         x
+   |         ^ expected opaque type, found `&str`
+   |
+   = note: expected opaque type `OpaqueDebug<'a>`
+                found reference `&'a str`
+note: this item must have a `#[define_opaque(OpaqueDebug)]` attribute to be able to define hidden types
+  --> $DIR/opaque-in-binder-153596.rs:38:8
+   |
+LL |     fn define_debug<'a>(x: &'a str) -> OpaqueDebug<'a> {
+   |        ^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+  --> $DIR/opaque-in-binder-153596.rs:58:9
+   |
+LL |     type Opaque<'a> = impl Sized + 'a;
+   |                       --------------- the expected opaque type
+LL |
+LL |     fn define<'a>(x: &'a i32) -> Opaque<'a> {
+   |                                  ---------- expected `as_trait_arg::Opaque<'a>` because of return type
+LL |         x
+   |         ^ expected opaque type, found `&i32`
+   |
+   = note: expected opaque type `as_trait_arg::Opaque<'a>`
+                found reference `&'a i32`
+note: this item must have a `#[define_opaque(as_trait_arg::Opaque)]` attribute to be able to define hidden types
+  --> $DIR/opaque-in-binder-153596.rs:57:8
+   |
+LL |     fn define<'a>(x: &'a i32) -> Opaque<'a> {
+   |        ^^^^^^
+
+error: aborting due to 7 previous errors
+
+Some errors have detailed explanations: E0308, E0582.
+For more information about an error, try `trustc --explain E0308`.

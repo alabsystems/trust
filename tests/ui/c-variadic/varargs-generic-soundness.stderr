@@ -1,0 +1,52 @@
+error[E0308]: mismatched types
+  --> $DIR/varargs-generic-soundness.rs:16:40
+   |
+LL |     let _: unsafe extern "C" fn(i32) = c_variadic_fn;
+   |            -------------------------   ^^^^^^^^^^^^^ expected non-variadic fn, found variadic function
+   |            |
+   |            expected due to this
+   |
+   = note: expected fn pointer `unsafe extern "C" fn(_)`
+                 found fn item `unsafe extern "C" fn(_, ...) {c_variadic_fn}`
+
+error[E0308]: mismatched types
+  --> $DIR/varargs-generic-soundness.rs:22:38
+   |
+LL |     let _: extern "C" fn(i32, ...) = non_variadic_fn;
+   |            -----------------------   ^^^^^^^^^^^^^^^ expected variadic fn, found non-variadic function
+   |            |
+   |            expected due to this
+   |
+   = note: expected fn pointer `extern "C" fn(_, ...)`
+                 found fn item `extern "C" fn(_) {non_variadic_fn}`
+
+error[E0308]: mismatched types
+  --> $DIR/varargs-generic-soundness.rs:29:40
+   |
+LL |     let _: unsafe extern "C" fn(i32) = variadic_ptr;
+   |            -------------------------   ^^^^^^^^^^^^ expected non-variadic fn, found variadic function
+   |            |
+   |            expected due to this
+   |
+   = note: expected fn pointer `unsafe extern "C" fn(_)`
+              found fn pointer `unsafe extern "C" fn(_, ...)`
+
+error[E0277]: expected an `Fn(i32)` closure, found `extern "C" fn(i32) {non_variadic_fn}`
+  --> $DIR/varargs-generic-soundness.rs:38:18
+   |
+LL |     call_with_fn(non_variadic_fn, 42); // OK: non-variadic fn implements Fn
+   |     ------------ ^^^^^^^^^^^^^^^ expected an `Fn(i32)` closure, found `extern "C" fn(i32) {non_variadic_fn}`
+   |     |
+   |     required by a bound introduced by this call
+   |
+   = help: the trait `Fn(i32)` is not implemented for fn item `extern "C" fn(i32) {non_variadic_fn}`
+note: required by a bound in `call_with_fn`
+  --> $DIR/varargs-generic-soundness.rs:35:20
+   |
+LL | fn call_with_fn<F: Fn(i32)>(_f: F, _x: i32) {}
+   |                    ^^^^^^^ required by this bound in `call_with_fn`
+
+error: aborting due to 4 previous errors
+
+Some errors have detailed explanations: E0277, E0308.
+For more information about an error, try `trustc --explain E0277`.

@@ -1,0 +1,166 @@
+{
+  "checked_certificate_production": {
+    "already_checked_certificates": 0,
+    "blocker_records": [
+      {
+        "code": "checker-selection-missing",
+        "detail": "no production checked-certificate checker was selected; pass --checked-cert-checker <path>",
+        "evidence_required": [
+          "production_checker"
+        ],
+        "stage": "checked-certificate-production"
+      },
+      {
+        "code": "raw-solver-proof-bytes-audit-only",
+        "detail": "raw solver proof bytes are audit-only evidence and cannot be checked without a normalized solver proof export: sha256=9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a byte_len=4",
+        "dispatch_id": "raw-export-run:vc0",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "production_checker"
+        ],
+        "stage": "checked-certificate-production"
+      },
+      {
+        "code": "normalized-proof-export-missing",
+        "detail": "solver dispatch has no normalized solver proof export bound to the canonical VC digest",
+        "dispatch_id": "raw-export-run:vc0",
+        "evidence_required": [
+          "normalized_solver_proof_export"
+        ],
+        "stage": "checked-certificate-production"
+      },
+      {
+        "code": "checked-certificate-missing",
+        "detail": "solver dispatch has no independently checked certificate artifact",
+        "dispatch_id": "raw-export-run:vc0",
+        "evidence_required": [
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "stage": "checked-certificate-production"
+      }
+    ],
+    "blockers": [
+      "no production checked-certificate checker was selected; pass --checked-cert-checker <path>",
+      "raw solver proof bytes were observed for 1 dispatch(es), but no production checker/exportable proof artifact exists; raw bytes are not checked certificates",
+      "solver dispatch evidence contains no normalized proof exports for checked-certificate production",
+      "structural proof metadata and raw solver proof bytes cannot be promoted to checked certificates without a selected production checker"
+    ],
+    "candidate_dispatches": 1,
+    "canonical_binding_candidates": 1,
+    "certificate_check_records": [
+      {
+        "binary_artifact_digest_identity": {
+          "root_artifact_digest": {
+            "algorithm": "sha256",
+            "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          },
+          "selected_image": {
+            "file_offset": 0,
+            "file_size": 64,
+            "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          }
+        },
+        "blocker_codes": [
+          "raw-solver-proof-bytes-audit-only",
+          "normalized-proof-export-missing",
+          "checked-certificate-missing"
+        ],
+        "certificate_status": "present",
+        "checker": "ay-incremental",
+        "diagnostic": "raw solver proof bytes are audit-only evidence: 9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a",
+        "dispatch_id": "raw-export-run:vc0",
+        "error_kind": "raw_solver_bytes_audit_only",
+        "format": "solver-native",
+        "function": "main",
+        "replay_digest_identity": {
+          "binary_artifact_digest_identity": {
+            "root_artifact_digest": {
+              "algorithm": "sha256",
+              "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            },
+            "selected_image": {
+              "file_offset": 0,
+              "file_size": 64,
+              "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            }
+          },
+          "blockers": [
+            "checked certificate replay was not completed",
+            "checked certificate replay transcript digest is missing"
+          ],
+          "replay": "not_attempted",
+          "status": "rejected"
+        },
+        "status": "rejected"
+      }
+    ],
+    "checker_selection": "absent",
+    "diagnostics": [],
+    "export_dir": "target/raw-checked-certs",
+    "exported_artifacts": 0,
+    "proof_export_candidates": 0,
+    "proof_export_records": [
+      {
+        "backend": "ay-incremental",
+        "blocker_codes": [
+          "raw-solver-proof-bytes-audit-only",
+          "normalized-proof-export-missing",
+          "checked-certificate-missing"
+        ],
+        "canonical_binding": true,
+        "dispatch_id": "raw-export-run:vc0",
+        "function": "main",
+        "origin_sha256": "521407299a145e754eb7ae53f5b7699be62e462ba526664fa2783f564846b2f6",
+        "raw_solver_proof_bytes": {
+          "audit_only": true,
+          "byte_len": 4,
+          "format": "solver-native",
+          "sha256": "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a",
+          "solver": "ay-incremental"
+        },
+        "solver": "ay-incremental",
+        "status": "blocked_raw_solver_bytes",
+        "vc_sha256": "d2515b3f23c3a1f4796b4586cc98ca0d1c836d9257f36e563ca18364b1ae5b89"
+      }
+    ],
+    "raw_solver_proof_byte_dispatches": 1,
+    "rejected_dispatches": 1,
+    "requested": true,
+    "source_backpropagation_gate": {
+      "accepted_reconstruction_validation": false,
+      "accepted_target_validation": false,
+      "blockers": [
+        "source_backpropagation_gate_not_evaluated"
+      ],
+      "checked_certificate_identity": false,
+      "exact_replay_identity": false,
+      "exact_source_provenance": false,
+      "replay_grade_artifact_identity": false,
+      "schema_version": "checked-binary-certificate-source-backpropagation-gate.v1",
+      "source_backpropagation_allowed": false,
+      "source_provenance": {
+        "ambiguous_mapping_count": 0,
+        "diagnostics": [],
+        "exact_mapping_count": 0,
+        "source_backpropagation_allowed": false,
+        "status": "unavailable"
+      }
+    },
+    "status": "blocked"
+  },
+  "proof_evidence": {
+    "checked_certificates": 0,
+    "missing_checked_certificates": 1,
+    "raw_solver_proof_bytes": 1,
+    "raw_solver_proof_bytes_satisfy_coverage": false
+  },
+  "proof_grade_gate": {
+    "accepted": false,
+    "checked_certificates": 0,
+    "raw_solver_proof_bytes": 1,
+    "raw_solver_proof_bytes_sufficient": false,
+    "status": "rejected"
+  },
+  "verify_binary_should_fail": true
+}

@@ -1,0 +1,73 @@
+error[E0277]: the trait bound `NotClone: Clone` is not satisfied
+  --> $DIR/normalize-unsound.rs:21:18
+   |
+LL |     type Assoc = NotClone;
+   |                  ^^^^^^^^ the trait `Clone` is not implemented for `NotClone`
+   |
+note: required by a bound in `HasCloneAssoc::Assoc`
+  --> $DIR/normalize-unsound.rs:13:17
+   |
+LL |     type Assoc: Clone;
+   |                 ^^^^^ required by this bound in `HasCloneAssoc::Assoc`
+help: consider annotating `NotClone` with `#[derive(Clone)]`
+   |
+LL + #[derive(Clone)]
+LL | struct NotClone;
+   |
+
+error[E0277]: `*mut u8` cannot be shared between threads safely
+  --> $DIR/normalize-unsound.rs:35:19
+   |
+LL |     type Output = NotSendSync;
+   |                   ^^^^^^^^^^^ `*mut u8` cannot be shared between threads safely
+   |
+   = help: within `NotSendSync`, the trait `Sync` is not implemented for `*mut u8`
+note: required because it appears within the type `NotSendSync`
+  --> $DIR/normalize-unsound.rs:30:8
+   |
+LL | struct NotSendSync {
+   |        ^^^^^^^^^^^
+note: required by a bound in `Transformer::Output`
+  --> $DIR/normalize-unsound.rs:27:25
+   |
+LL |     type Output: Send + Sync;
+   |                         ^^^^ required by this bound in `Transformer::Output`
+
+error[E0277]: `*mut u8` cannot be sent between threads safely
+  --> $DIR/normalize-unsound.rs:35:19
+   |
+LL |     type Output = NotSendSync;
+   |                   ^^^^^^^^^^^ `*mut u8` cannot be sent between threads safely
+   |
+   = help: within `NotSendSync`, the trait `Send` is not implemented for `*mut u8`
+note: required because it appears within the type `NotSendSync`
+  --> $DIR/normalize-unsound.rs:30:8
+   |
+LL | struct NotSendSync {
+   |        ^^^^^^^^^^^
+note: required by a bound in `Transformer::Output`
+  --> $DIR/normalize-unsound.rs:27:18
+   |
+LL |     type Output: Send + Sync;
+   |                  ^^^^ required by this bound in `Transformer::Output`
+
+error[E0277]: the trait bound `NoDefault: Default` is not satisfied
+  --> $DIR/normalize-unsound.rs:48:18
+   |
+LL |     type Inner = NoDefault;
+   |                  ^^^^^^^^^ the trait `Default` is not implemented for `NoDefault`
+   |
+note: required by a bound in `Outer::Inner`
+  --> $DIR/normalize-unsound.rs:42:17
+   |
+LL |     type Inner: Default;
+   |                 ^^^^^^^ required by this bound in `Outer::Inner`
+help: consider annotating `NoDefault` with `#[derive(Default)]`
+   |
+LL + #[derive(Default)]
+LL | struct NoDefault;
+   |
+
+error: aborting due to 4 previous errors
+
+For more information about this error, try `trustc --explain E0277`.

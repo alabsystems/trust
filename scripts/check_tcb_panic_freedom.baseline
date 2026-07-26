@@ -1,0 +1,33 @@
+# TCB production-path panic-surface ratchet. Read by
+# scripts/check_tcb_panic_freedom.sh; the gate FAILS if the live count exceeds
+# the number below. Ratchet DOWN only. Whoever moves it records why here.
+#
+# 2026-07-24 — 180 -> 297. Two independent things were wrong at once.
+#
+#   Measurement. The 180 was produced by a raw line grep that counted comment
+#   prose and string-literal text as panic sites. In the TCB that is not a
+#   rounding error: vcgen and trust_verify DOCUMENT the panicking code they
+#   reason about, so 107 of the 404 the old counter reported at this commit
+#   were sentences, not statements — and the old number could be lowered by
+#   deleting explanations. The counter now erases comments and literal
+#   contents and drops every `#[cfg(test)]` item whole before matching. Its
+#   answer at the 2026-06-23 snapshot commit (8a653fe5cb) is 167, which lands
+#   on the hand-classified "real code" table in reports/tcb-hardening-audit.md
+#   (unwrap 15 = 15, unreachable 47 vs 48); the 180 never matched even its own
+#   counter, which read 201 on that tree.
+#
+#   Drift. Measured consistently, the code surface still grew 167 -> 297 over
+#   the ~3700 commits since the snapshot, concentrated in trust-types (+33),
+#   trust-cg-bridge (+26), trust-vcgen (+20), trust_verify (+16). The gate was
+#   red that whole time, so it caught none of it. 297 is the honest count
+#   today, not an acceptable one: it is a burn-down backlog, and the ratchet
+#   works again from here. Reproduce it from a clean checkout at d9616037e0:
+#   scripts/check_tcb_panic_freedom.sh --print.
+# 2026-07-25: 297 -> 283. `chc::binop_to_formula` deleted — it was a thin
+# panicking wrapper (`unwrap_or_else(|err| panic!(...))`) over the fallible
+# `try_binop_to_formula`, sitting in the verification path. It had NO production
+# callers left: trust-transval had already migrated with a comment saying
+# "rather than panicking inside chc::binop_to_formula -- the verifier core", and
+# the two remaining in-crate sites now pass the Result straight through their
+# match arms. Test call sites unwrap, which is where unwrapping belongs.
+283

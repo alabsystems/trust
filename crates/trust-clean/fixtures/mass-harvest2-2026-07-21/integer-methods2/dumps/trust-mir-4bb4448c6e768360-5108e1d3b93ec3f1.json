@@ -1,0 +1,4312 @@
+{
+  "name": "overflowing_pow",
+  "def_path": "core::num::<impl i32>::overflowing_pow",
+  "span": {
+    "file": "corelib/library/core/src/num/int_macros.rs",
+    "line_start": 3066,
+    "col_start": 8,
+    "line_end": 3118,
+    "col_end": 9
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "exp"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "base"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "acc"
+      },
+      {
+        "index": 5,
+        "ty": "Bool",
+        "name": "overflow"
+      },
+      {
+        "index": 6,
+        "ty": "Bool",
+        "name": "tmp_overflow"
+      },
+      {
+        "index": 7,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "k"
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "shift"
+      },
+      {
+        "index": 16,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "base"
+      },
+      {
+        "index": 20,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 23,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 24,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 25,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 26,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 27,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 28,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 29,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "core::option::Option",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ],
+                  [
+                    "__v1_0",
+                    {
+                      "Int": {
+                        "width": 32,
+                        "signed": true
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "None",
+                    "discriminant": 0,
+                    "fields": []
+                  },
+                  {
+                    "name": "Some",
+                    "discriminant": 1,
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Int": {
+                            "width": 32,
+                            "signed": true
+                          }
+                        }
+                      ]
+                    ]
+                  }
+                ],
+                "disc_index_safe": true,
+                "faithful_enum_repr": null,
+                "layout": null
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 30,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 32,
+                        "signed": true
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 31,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 32,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 33,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 34,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 35,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 36,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 37,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 38,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 39,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 40,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 41,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 42,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 43,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 44,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 45,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 46,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 47,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 48,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 49,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 50,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 51,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 52,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 53,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 54,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 55,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 56,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 57,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 58,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 59,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 60,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 61,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 62,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 63,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 64,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 65,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 66,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 67,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 68,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 69,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 70,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 71,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 72,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 73,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 74,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 75,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 76,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 77,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 78,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 79,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 80,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 81,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3067,
+                "col_start": 27,
+                "line_end": 3067,
+                "col_end": 31
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Int": 1
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3068,
+                "col_start": 32,
+                "line_end": 3068,
+                "col_end": 33
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": false
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3069,
+                "col_start": 31,
+                "line_end": 3069,
+                "col_end": 36
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3072,
+                "col_start": 51,
+                "line_end": 3072,
+                "col_end": 55
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::intrinsics::is_val_statically_known::<i32>",
+            "args": [
+              {
+                "Move": {
+                  "local": 8,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 7,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3072,
+              "col_start": 15,
+              "line_end": 3072,
+              "col_end": 56
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 7,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                19
+              ]
+            ],
+            "otherwise": 2,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3072,
+              "col_start": 15,
+              "line_end": 3072,
+              "col_end": 56
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3072,
+                "col_start": 60,
+                "line_end": 3072,
+                "col_end": 64
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl i32>::unsigned_abs",
+            "args": [
+              {
+                "Move": {
+                  "local": 11,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 10,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3072,
+              "col_start": 60,
+              "line_end": 3072,
+              "col_end": 79
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl u32>::is_power_of_two",
+            "args": [
+              {
+                "Move": {
+                  "local": 10,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 9,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3072,
+              "col_start": 60,
+              "line_end": 3072,
+              "col_end": 97
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 9,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                19
+              ]
+            ],
+            "otherwise": 5,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3072,
+              "col_start": 60,
+              "line_end": 3072,
+              "col_end": 97
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3073,
+                "col_start": 24,
+                "line_end": 3073,
+                "col_end": 28
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl i32>::unsigned_abs",
+            "args": [
+              {
+                "Move": {
+                  "local": 14,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 13,
+              "projections": []
+            },
+            "target": 6,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3073,
+              "col_start": 24,
+              "line_end": 3073,
+              "col_end": 43
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl u32>::ilog2",
+            "args": [
+              {
+                "Move": {
+                  "local": 13,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 12,
+              "projections": []
+            },
+            "target": 7,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3073,
+              "col_start": 24,
+              "line_end": 3073,
+              "col_end": 51
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3074,
+                "col_start": 48,
+                "line_end": 3074,
+                "col_end": 51
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl u32>::checked_mul",
+            "args": [
+              {
+                "Copy": {
+                  "local": 12,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 17,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 16,
+              "projections": []
+            },
+            "target": 8,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3074,
+              "col_start": 34,
+              "line_end": 3074,
+              "col_end": 52
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 16,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3074,
+                "col_start": 34,
+                "line_end": 3074,
+                "col_end": 52
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 18,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                1,
+                9
+              ],
+              [
+                0,
+                10
+              ]
+            ],
+            "otherwise": 40,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3074,
+              "col_start": 20,
+              "line_end": 3074,
+              "col_end": 31
+            }
+          }
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 16,
+                    "projections": [
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3074,
+                "col_start": 25,
+                "line_end": 3074,
+                "col_end": 30
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3077,
+                "col_start": 36,
+                "line_end": 3077,
+                "col_end": 40
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 20,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Move": {
+                      "local": 21,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 0
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3077,
+                "col_start": 36,
+                "line_end": 3077,
+                "col_end": 44
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 20,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                14
+              ]
+            ],
+            "otherwise": 11,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3077,
+              "col_start": 36,
+              "line_end": 3077,
+              "col_end": 44
+            }
+          }
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Constant": {
+                        "Int": 0
+                      }
+                    },
+                    {
+                      "Constant": {
+                        "Bool": true
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3075,
+                "col_start": 27,
+                "line_end": 3075,
+                "col_end": 36
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 39
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3077,
+                "col_start": 49,
+                "line_end": 3077,
+                "col_end": 52
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 25,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        2,
+                        32
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3077,
+                "col_start": 48,
+                "line_end": 3077,
+                "col_end": 57
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 25,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "RemainderByZero",
+            "target": 12,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3077,
+              "col_start": 48,
+              "line_end": 3077,
+              "col_end": 57
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 23,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Rem",
+                  {
+                    "Move": {
+                      "local": 24,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        2,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3077,
+                "col_start": 48,
+                "line_end": 3077,
+                "col_end": 57
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ne",
+                  {
+                    "Move": {
+                      "local": 23,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3077,
+                "col_start": 48,
+                "line_end": 3077,
+                "col_end": 62
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 22,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                14
+              ]
+            ],
+            "otherwise": 13,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3077,
+              "col_start": 48,
+              "line_end": 3077,
+              "col_end": 62
+            }
+          }
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Int": -1
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3077,
+                "col_start": 65,
+                "line_end": 3077,
+                "col_end": 67
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 15
+        }
+      },
+      {
+        "id": 14,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Int": 1
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3077,
+                "col_start": 77,
+                "line_end": 3077,
+                "col_end": 78
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 15
+        }
+      },
+      {
+        "id": 15,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 27,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 19,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3078,
+                "col_start": 24,
+                "line_end": 3078,
+                "col_end": 28
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl i32>::unbounded_shl",
+            "args": [
+              {
+                "Move": {
+                  "local": 27,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 15,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 26,
+              "projections": []
+            },
+            "target": 16,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3078,
+              "col_start": 24,
+              "line_end": 3078,
+              "col_end": 49
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 16,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 31,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 19,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3078,
+                "col_start": 51,
+                "line_end": 3078,
+                "col_end": 55
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl i32>::shl_exact",
+            "args": [
+              {
+                "Move": {
+                  "local": 31,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 15,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 30,
+              "projections": []
+            },
+            "target": 17,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3078,
+              "col_start": 51,
+              "line_end": 3078,
+              "col_end": 72
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 17,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 29,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 30,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3078,
+                "col_start": 51,
+                "line_end": 3078,
+                "col_end": 72
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::option::Option::<i32>::is_none",
+            "args": [
+              {
+                "Move": {
+                  "local": 29,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 28,
+              "projections": []
+            },
+            "target": 18,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3078,
+              "col_start": 51,
+              "line_end": 3078,
+              "col_end": 82
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 18,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Move": {
+                        "local": 26,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 28,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3078,
+                "col_start": 23,
+                "line_end": 3078,
+                "col_end": 83
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 39
+        }
+      },
+      {
+        "id": 19,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 33,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3081,
+                "col_start": 15,
+                "line_end": 3081,
+                "col_end": 18
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 32,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Move": {
+                      "local": 33,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3081,
+                "col_start": 15,
+                "line_end": 3081,
+                "col_end": 23
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 32,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                21
+              ]
+            ],
+            "otherwise": 20,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3081,
+              "col_start": 15,
+              "line_end": 3081,
+              "col_end": 23
+            }
+          }
+        }
+      },
+      {
+        "id": 20,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Constant": {
+                        "Int": 1
+                      }
+                    },
+                    {
+                      "Constant": {
+                        "Bool": false
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3082,
+                "col_start": 23,
+                "line_end": 3082,
+                "col_end": 33
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 39
+        }
+      },
+      {
+        "id": 21,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 35,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3085,
+                "col_start": 51,
+                "line_end": 3085,
+                "col_end": 54
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::intrinsics::is_val_statically_known::<u32>",
+            "args": [
+              {
+                "Move": {
+                  "local": 35,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 34,
+              "projections": []
+            },
+            "target": 22,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3085,
+              "col_start": 15,
+              "line_end": 3085,
+              "col_end": 55
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 22,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 34,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                32
+              ]
+            ],
+            "otherwise": 23,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3085,
+              "col_start": 15,
+              "line_end": 3085,
+              "col_end": 55
+            }
+          }
+        }
+      },
+      {
+        "id": 23,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 37,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3086,
+                "col_start": 22,
+                "line_end": 3086,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 36,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Move": {
+                      "local": 37,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3086,
+                "col_start": 22,
+                "line_end": 3086,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 36,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                30
+              ]
+            ],
+            "otherwise": 24,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3086,
+              "col_start": 22,
+              "line_end": 3086,
+              "col_end": 29
+            }
+          }
+        }
+      },
+      {
+        "id": 24,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 40,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3087,
+                "col_start": 24,
+                "line_end": 3087,
+                "col_end": 27
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 39,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Move": {
+                      "local": 40,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3087,
+                "col_start": 23,
+                "line_end": 3087,
+                "col_end": 32
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 38,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Move": {
+                      "local": 39,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3087,
+                "col_start": 23,
+                "line_end": 3087,
+                "col_end": 37
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 38,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                27
+              ]
+            ],
+            "otherwise": 25,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3087,
+              "col_start": 23,
+              "line_end": 3087,
+              "col_end": 37
+            }
+          }
+        }
+      },
+      {
+        "id": 25,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 44,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3088,
+                "col_start": 46,
+                "line_end": 3088,
+                "col_end": 49
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 45,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3088,
+                "col_start": 66,
+                "line_end": 3088,
+                "col_end": 70
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl i32>::overflowing_mul",
+            "args": [
+              {
+                "Move": {
+                  "local": 44,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 45,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 43,
+              "projections": []
+            },
+            "target": 26,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3088,
+              "col_start": 46,
+              "line_end": 3088,
+              "col_end": 71
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 26,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 41,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 43,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3088,
+                "col_start": 25,
+                "line_end": 3088,
+                "col_end": 28
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 42,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 43,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3088,
+                "col_start": 30,
+                "line_end": 3088,
+                "col_end": 42
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 41,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3088,
+                "col_start": 25,
+                "line_end": 3088,
+                "col_end": 28
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 42,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3088,
+                "col_start": 30,
+                "line_end": 3088,
+                "col_end": 42
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 46,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 6,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3089,
+                "col_start": 36,
+                "line_end": 3089,
+                "col_end": 48
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitOr",
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 46,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3089,
+                "col_start": 24,
+                "line_end": 3089,
+                "col_end": 48
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 27
+        }
+      },
+      {
+        "id": 27,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 47,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        2,
+                        32
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3091,
+                "col_start": 20,
+                "line_end": 3091,
+                "col_end": 28
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 47,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "DivisionByZero",
+            "target": 28,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3091,
+              "col_start": 20,
+              "line_end": 3091,
+              "col_end": 28
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 28,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        2,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3091,
+                "col_start": 20,
+                "line_end": 3091,
+                "col_end": 28
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 51,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3092,
+                "col_start": 43,
+                "line_end": 3092,
+                "col_end": 47
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 52,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3092,
+                "col_start": 64,
+                "line_end": 3092,
+                "col_end": 68
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl i32>::overflowing_mul",
+            "args": [
+              {
+                "Move": {
+                  "local": 51,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 52,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 50,
+              "projections": []
+            },
+            "target": 29,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3092,
+              "col_start": 43,
+              "line_end": 3092,
+              "col_end": 69
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 29,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 48,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 50,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3092,
+                "col_start": 21,
+                "line_end": 3092,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 49,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 50,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3092,
+                "col_start": 27,
+                "line_end": 3092,
+                "col_end": 39
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 48,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3092,
+                "col_start": 21,
+                "line_end": 3092,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 49,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3092,
+                "col_start": 27,
+                "line_end": 3092,
+                "col_end": 39
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 53,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 6,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3093,
+                "col_start": 32,
+                "line_end": 3093,
+                "col_end": 44
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitOr",
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 53,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3093,
+                "col_start": 20,
+                "line_end": 3093,
+                "col_end": 44
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 23
+        }
+      },
+      {
+        "id": 30,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 57,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3100,
+                "col_start": 38,
+                "line_end": 3100,
+                "col_end": 41
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 58,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3100,
+                "col_start": 58,
+                "line_end": 3100,
+                "col_end": 62
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl i32>::overflowing_mul",
+            "args": [
+              {
+                "Move": {
+                  "local": 57,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 58,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 56,
+              "projections": []
+            },
+            "target": 31,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3100,
+              "col_start": 38,
+              "line_end": 3100,
+              "col_end": 63
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 31,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 54,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 56,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3100,
+                "col_start": 17,
+                "line_end": 3100,
+                "col_end": 20
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 55,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 56,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3100,
+                "col_start": 22,
+                "line_end": 3100,
+                "col_end": 34
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 54,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3100,
+                "col_start": 17,
+                "line_end": 3100,
+                "col_end": 20
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 55,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3100,
+                "col_start": 22,
+                "line_end": 3100,
+                "col_end": 34
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 59,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 6,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3101,
+                "col_start": 28,
+                "line_end": 3101,
+                "col_end": 40
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitOr",
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 59,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3101,
+                "col_start": 16,
+                "line_end": 3101,
+                "col_end": 40
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 60,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3102,
+                "col_start": 24,
+                "line_end": 3102,
+                "col_end": 27
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 61,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 5,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3102,
+                "col_start": 29,
+                "line_end": 3102,
+                "col_end": 37
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Move": {
+                        "local": 60,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 61,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3102,
+                "col_start": 23,
+                "line_end": 3102,
+                "col_end": 38
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 39
+        }
+      },
+      {
+        "id": 32,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 64,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3106,
+                "col_start": 20,
+                "line_end": 3106,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 63,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Move": {
+                      "local": 64,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3106,
+                "col_start": 19,
+                "line_end": 3106,
+                "col_end": 28
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 62,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Move": {
+                      "local": 63,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3106,
+                "col_start": 19,
+                "line_end": 3106,
+                "col_end": 33
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 62,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                36
+              ]
+            ],
+            "otherwise": 33,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3106,
+              "col_start": 19,
+              "line_end": 3106,
+              "col_end": 33
+            }
+          }
+        }
+      },
+      {
+        "id": 33,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 68,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3107,
+                "col_start": 42,
+                "line_end": 3107,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 69,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3107,
+                "col_start": 62,
+                "line_end": 3107,
+                "col_end": 66
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl i32>::overflowing_mul",
+            "args": [
+              {
+                "Move": {
+                  "local": 68,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 69,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 67,
+              "projections": []
+            },
+            "target": 34,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3107,
+              "col_start": 42,
+              "line_end": 3107,
+              "col_end": 67
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 34,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 65,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 67,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3107,
+                "col_start": 21,
+                "line_end": 3107,
+                "col_end": 24
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 66,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 67,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3107,
+                "col_start": 26,
+                "line_end": 3107,
+                "col_end": 38
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 65,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3107,
+                "col_start": 21,
+                "line_end": 3107,
+                "col_end": 24
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 66,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3107,
+                "col_start": 26,
+                "line_end": 3107,
+                "col_end": 38
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 70,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 6,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3108,
+                "col_start": 32,
+                "line_end": 3108,
+                "col_end": 44
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitOr",
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 70,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3108,
+                "col_start": 20,
+                "line_end": 3108,
+                "col_end": 44
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 72,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3110,
+                "col_start": 23,
+                "line_end": 3110,
+                "col_end": 26
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 71,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Move": {
+                      "local": 72,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3110,
+                "col_start": 23,
+                "line_end": 3110,
+                "col_end": 31
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 71,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                36
+              ]
+            ],
+            "otherwise": 35,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3110,
+              "col_start": 23,
+              "line_end": 3110,
+              "col_end": 31
+            }
+          }
+        }
+      },
+      {
+        "id": 35,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 73,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3111,
+                "col_start": 32,
+                "line_end": 3111,
+                "col_end": 35
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 74,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 5,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3111,
+                "col_start": 37,
+                "line_end": 3111,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Move": {
+                        "local": 73,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 74,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3111,
+                "col_start": 31,
+                "line_end": 3111,
+                "col_end": 46
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 39
+        }
+      },
+      {
+        "id": 36,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 75,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        2,
+                        32
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3114,
+                "col_start": 16,
+                "line_end": 3114,
+                "col_end": 24
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 75,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "DivisionByZero",
+            "target": 37,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3114,
+              "col_start": 16,
+              "line_end": 3114,
+              "col_end": 24
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 37,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        2,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3114,
+                "col_start": 16,
+                "line_end": 3114,
+                "col_end": 24
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 79,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3115,
+                "col_start": 39,
+                "line_end": 3115,
+                "col_end": 43
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 80,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3115,
+                "col_start": 60,
+                "line_end": 3115,
+                "col_end": 64
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl i32>::overflowing_mul",
+            "args": [
+              {
+                "Move": {
+                  "local": 79,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 80,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 78,
+              "projections": []
+            },
+            "target": 38,
+            "span": {
+              "file": "corelib/library/core/src/num/int_macros.rs",
+              "line_start": 3115,
+              "col_start": 39,
+              "line_end": 3115,
+              "col_end": 65
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 38,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 76,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 78,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3115,
+                "col_start": 17,
+                "line_end": 3115,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 77,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 78,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3115,
+                "col_start": 23,
+                "line_end": 3115,
+                "col_end": 35
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 76,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3115,
+                "col_start": 17,
+                "line_end": 3115,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 77,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3115,
+                "col_start": 23,
+                "line_end": 3115,
+                "col_end": 35
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 81,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 6,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3116,
+                "col_start": 28,
+                "line_end": 3116,
+                "col_end": 40
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitOr",
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 81,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/num/int_macros.rs",
+                "line_start": 3116,
+                "col_start": 16,
+                "line_end": 3116,
+                "col_end": 40
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 32
+        }
+      },
+      {
+        "id": 39,
+        "stmts": [],
+        "terminator": "Return"
+      },
+      {
+        "id": 40,
+        "stmts": [],
+        "terminator": "Unreachable"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Tuple": [
+        {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "Bool"
+      ]
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_18",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_18",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "self",
+                "Int"
+              ]
+            },
+            {
+              "Int": -2147483648
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "self",
+                "Int"
+              ]
+            },
+            {
+              "Int": 2147483647
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "exp",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "exp",
+                "Int"
+              ]
+            },
+            {
+              "Int": 4294967295
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

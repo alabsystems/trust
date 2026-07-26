@@ -1,0 +1,8 @@
+
+=== FF-gate cluster summary (3 functions) ===
+  FULLY_FAITHFUL   3
+
+=== SHAPE_GAP functions (recognizer declines on both lanes) ===
+
+=== SAFETY_GAP functions (shape recognized, safety/discharge open) ===
+       10.05 real        10.02 user         0.01 sys

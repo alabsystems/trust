@@ -1,0 +1,861 @@
+{
+  "name": "normalized",
+  "def_path": "Vec3::normalized",
+  "span": {
+    "file": "crates/a3d-geom/src/lib.rs",
+    "line_start": 201,
+    "col_start": 4,
+    "line_end": 208,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Adt": {
+            "name": "std::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Adt": {
+                    "name": "Vec3",
+                    "fields": [
+                      [
+                        "x",
+                        {
+                          "Float": {
+                            "width": 64
+                          }
+                        }
+                      ],
+                      [
+                        "y",
+                        {
+                          "Float": {
+                            "width": 64
+                          }
+                        }
+                      ],
+                      [
+                        "z",
+                        {
+                          "Float": {
+                            "width": 64
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Adt": {
+                        "name": "Vec3",
+                        "fields": [
+                          [
+                            "x",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ],
+                          [
+                            "y",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ],
+                          [
+                            "z",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "Vec3",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Closure": {
+            "name": "Vec3::normalized::{closure#0}",
+            "upvars": [
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                }
+              },
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                }
+              },
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                }
+              }
+            ],
+            "call": {
+              "kind": "Fn",
+              "params": [],
+              "ret": "Bool"
+            }
+          }
+        },
+        "name": "__requires_checker"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": "len"
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Adt": {
+            "name": "Vec3",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "Vec3::length",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 202,
+              "col_start": 18,
+              "line_end": 202,
+              "col_end": 31
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "FloatBits": {
+                        "bits": 4307583784117748259,
+                        "width": 64
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 203,
+                "col_start": 11,
+                "line_end": 203,
+                "col_end": 24
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                6
+              ]
+            ],
+            "otherwise": 2,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 203,
+              "col_start": 11,
+              "line_end": 203,
+              "col_end": 24
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::f64::<impl f64>::is_finite",
+            "args": [
+              {
+                "Copy": {
+                  "local": 3,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 5,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 203,
+              "col_start": 28,
+              "line_end": 203,
+              "col_end": 43
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 5,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                6
+              ]
+            ],
+            "otherwise": 4,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 203,
+              "col_start": 28,
+              "line_end": 203,
+              "col_end": 43
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Constant": {
+                      "FloatBits": {
+                        "bits": 4607182418800017408,
+                        "width": 64
+                      }
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 204,
+                "col_start": 28,
+                "line_end": 204,
+                "col_end": 37
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "Vec3::scale",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 7,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 6,
+              "projections": []
+            },
+            "target": 5,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 204,
+              "col_start": 17,
+              "line_end": 204,
+              "col_end": 38
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "std::option::Option",
+                      "variant": 1,
+                      "active_field": null
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 6,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 204,
+                "col_start": 12,
+                "line_end": 204,
+                "col_end": 39
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 7
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "std::option::Option",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 206,
+                "col_start": 12,
+                "line_end": 206,
+                "col_end": 16
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 7
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Adt": {
+        "name": "std::option::Option",
+        "fields": [
+          [
+            "__tag",
+            {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            }
+          ],
+          [
+            "__v1_0",
+            {
+              "Adt": {
+                "name": "Vec3",
+                "fields": [
+                  [
+                    "x",
+                    {
+                      "Float": {
+                        "width": 64
+                      }
+                    }
+                  ],
+                  [
+                    "y",
+                    {
+                      "Float": {
+                        "width": 64
+                      }
+                    }
+                  ],
+                  [
+                    "z",
+                    {
+                      "Float": {
+                        "width": 64
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          ]
+        ],
+        "variants": [
+          {
+            "name": "None",
+            "discriminant": 0,
+            "fields": []
+          },
+          {
+            "name": "Some",
+            "discriminant": 1,
+            "fields": [
+              [
+                "0",
+                {
+                  "Adt": {
+                    "name": "Vec3",
+                    "fields": [
+                      [
+                        "x",
+                        {
+                          "Float": {
+                            "width": 64
+                          }
+                        }
+                      ],
+                      [
+                        "y",
+                        {
+                          "Float": {
+                            "width": 64
+                          }
+                        }
+                      ],
+                      [
+                        "z",
+                        {
+                          "Float": {
+                            "width": 64
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ]
+            ]
+          }
+        ],
+        "disc_index_safe": true
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Requires",
+      "span": {
+        "file": "crates/a3d-geom/src/lib.rs",
+        "line_start": 200,
+        "col_start": 8,
+        "line_end": 200,
+        "col_end": 133
+      },
+      "body": "__trust_lowered_compiler_contract__:((((((self.0) <= (1.0e150)) && ((self.0) >= (-(1.0e150)))) && ((self.1) <= (1.0e150))) && ((self.1) >= (-(1.0e150)))) && ((self.2) <= (1.0e150))) && ((self.2) >= (-(1.0e150)))"
+    }
+  ],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "And": [
+            {
+              "And": [
+                {
+                  "And": [
+                    {
+                      "And": [
+                        {
+                          "Le": [
+                            {
+                              "Var": [
+                                "self.0",
+                                {
+                                  "Float": {
+                                    "eb": 11,
+                                    "sb": 53
+                                  }
+                                }
+                              ]
+                            },
+                            {
+                              "FpConst": {
+                                "bits": 6850974717710472879,
+                                "eb": 11,
+                                "sb": 53
+                              }
+                            }
+                          ]
+                        },
+                        {
+                          "Ge": [
+                            {
+                              "Var": [
+                                "self.0",
+                                {
+                                  "Float": {
+                                    "eb": 11,
+                                    "sb": 53
+                                  }
+                                }
+                              ]
+                            },
+                            {
+                              "FpConst": {
+                                "bits": 16074346754565248687,
+                                "eb": 11,
+                                "sb": 53
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Le": [
+                        {
+                          "Var": [
+                            "self.1",
+                            {
+                              "Float": {
+                                "eb": 11,
+                                "sb": 53
+                              }
+                            }
+                          ]
+                        },
+                        {
+                          "FpConst": {
+                            "bits": 6850974717710472879,
+                            "eb": 11,
+                            "sb": 53
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "Ge": [
+                    {
+                      "Var": [
+                        "self.1",
+                        {
+                          "Float": {
+                            "eb": 11,
+                            "sb": 53
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "FpConst": {
+                        "bits": 16074346754565248687,
+                        "eb": 11,
+                        "sb": 53
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "Le": [
+                {
+                  "Var": [
+                    "self.2",
+                    {
+                      "Float": {
+                        "eb": 11,
+                        "sb": 53
+                      }
+                    }
+                  ]
+                },
+                {
+                  "FpConst": {
+                    "bits": 6850974717710472879,
+                    "eb": 11,
+                    "sb": 53
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Ge": [
+            {
+              "Var": [
+                "self.2",
+                {
+                  "Float": {
+                    "eb": 11,
+                    "sb": 53
+                  }
+                }
+              ]
+            },
+            {
+              "FpConst": {
+                "bits": 16074346754565248687,
+                "eb": 11,
+                "sb": 53
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [
+      "((((((self.0) <= (1.0e150)) && ((self.0) >= (-(1.0e150)))) && ((self.1) <= (1.0e150))) && ((self.1) >= (-(1.0e150)))) && ((self.2) <= (1.0e150))) && ((self.2) >= (-(1.0e150)))"
+    ],
+    "ensures": [],
+    "invariants": []
+  }
+}

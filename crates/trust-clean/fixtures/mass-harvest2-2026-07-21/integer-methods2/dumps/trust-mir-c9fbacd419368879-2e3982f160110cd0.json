@@ -1,0 +1,37 @@
+{
+  "name": "cold_path",
+  "def_path": "core::intrinsics::cold_path",
+  "span": {
+    "file": "corelib/library/core/src/intrinsics/mod.rs",
+    "line_start": 419,
+    "col_start": 0,
+    "line_end": 419,
+    "col_end": 27
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 0,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

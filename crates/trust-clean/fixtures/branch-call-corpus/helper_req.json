@@ -1,0 +1,109 @@
+{
+  "name": "helper_req",
+  "def_path": "helper_req",
+  "span": {
+    "file": "SOURCE.rs",
+    "line_start": 1,
+    "col_start": 0,
+    "line_end": 3,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "x"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "SOURCE.rs",
+                "line_start": 1,
+                "col_start": 0,
+                "line_end": 1,
+                "col_end": 1
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Requires",
+      "span": {
+        "file": "SOURCE.rs",
+        "line_start": 1,
+        "col_start": 0,
+        "line_end": 1,
+        "col_end": 1
+      },
+      "body": "__trust_lowered_compiler_contract__:(x) < (1000)"
+    }
+  ],
+  "preconditions": [
+    {
+      "Lt": [
+        {
+          "Var": [
+            "x",
+            "Int"
+          ]
+        },
+        {
+          "Int": 1000
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [
+      "(x) < (1000)"
+    ],
+    "ensures": [],
+    "invariants": []
+  }
+}

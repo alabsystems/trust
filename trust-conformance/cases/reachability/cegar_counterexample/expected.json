@@ -1,0 +1,8 @@
+{
+  "target": "reachable",
+  "trace": [
+    "start",
+    "branch",
+    "bug"
+  ]
+}

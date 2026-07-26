@@ -1,0 +1,610 @@
+{
+  "name": "cast",
+  "def_path": "lib::_64::<impl lib::From<i16> for u16>::cast",
+  "span": {
+    "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/cast-0.3.0/src/lib.rs",
+    "line_start": 203,
+    "col_start": 20,
+    "line_end": 209,
+    "col_end": 21
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Adt": {
+            "name": "core::result::Result",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v0_0",
+                {
+                  "Int": {
+                    "width": 16,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Adt": {
+                    "name": "lib::Error",
+                    "fields": [
+                      [
+                        "__tag",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": true
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [
+                      {
+                        "name": "Infinite",
+                        "discriminant": 0,
+                        "fields": []
+                      },
+                      {
+                        "name": "NaN",
+                        "discriminant": 1,
+                        "fields": []
+                      },
+                      {
+                        "name": "Overflow",
+                        "discriminant": 2,
+                        "fields": []
+                      },
+                      {
+                        "name": "Underflow",
+                        "discriminant": 3,
+                        "fields": []
+                      }
+                    ],
+                    "disc_index_safe": true,
+                    "faithful_enum_repr": null
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Ok",
+                "discriminant": 0,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 16,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              },
+              {
+                "name": "Err",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Adt": {
+                        "name": "lib::Error",
+                        "fields": [
+                          [
+                            "__tag",
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": true
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [
+                          {
+                            "name": "Infinite",
+                            "discriminant": 0,
+                            "fields": []
+                          },
+                          {
+                            "name": "NaN",
+                            "discriminant": 1,
+                            "fields": []
+                          },
+                          {
+                            "name": "Overflow",
+                            "discriminant": 2,
+                            "fields": []
+                          },
+                          {
+                            "name": "Underflow",
+                            "discriminant": 3,
+                            "fields": []
+                          }
+                        ],
+                        "disc_index_safe": true,
+                        "faithful_enum_repr": null
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": true
+          }
+        },
+        "name": "src"
+      },
+      {
+        "index": 2,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "lib::Error",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Infinite",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "NaN",
+                "discriminant": 1,
+                "fields": []
+              },
+              {
+                "name": "Overflow",
+                "discriminant": 2,
+                "fields": []
+              },
+              {
+                "name": "Underflow",
+                "discriminant": 3,
+                "fields": []
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 0
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/cast-0.3.0/src/lib.rs",
+                "line_start": 204,
+                "col_start": 27,
+                "line_end": 204,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 2,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/cast-0.3.0/src/lib.rs",
+              "line_start": 204,
+              "col_start": 27,
+              "line_end": 204,
+              "col_end": 34
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "lib::Error",
+                      "variant": 3,
+                      "active_field": null
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/cast-0.3.0/src/lib.rs",
+                "line_start": 205,
+                "col_start": 32,
+                "line_end": 205,
+                "col_end": 48
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::result::Result",
+                      "variant": 1,
+                      "active_field": null
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 3,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/cast-0.3.0/src/lib.rs",
+                "line_start": 205,
+                "col_start": 28,
+                "line_end": 205,
+                "col_end": 49
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 16,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/cast-0.3.0/src/lib.rs",
+                "line_start": 199,
+                "col_start": 36,
+                "line_end": 207,
+                "col_end": 37
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::result::Result",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 4,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/cast-0.3.0/src/lib.rs",
+                "line_start": 207,
+                "col_start": 28,
+                "line_end": 207,
+                "col_end": 43
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Adt": {
+        "name": "core::result::Result",
+        "fields": [
+          [
+            "__tag",
+            {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            }
+          ],
+          [
+            "__v0_0",
+            {
+              "Int": {
+                "width": 16,
+                "signed": false
+              }
+            }
+          ],
+          [
+            "__v1_0",
+            {
+              "Adt": {
+                "name": "lib::Error",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "Infinite",
+                    "discriminant": 0,
+                    "fields": []
+                  },
+                  {
+                    "name": "NaN",
+                    "discriminant": 1,
+                    "fields": []
+                  },
+                  {
+                    "name": "Overflow",
+                    "discriminant": 2,
+                    "fields": []
+                  },
+                  {
+                    "name": "Underflow",
+                    "discriminant": 3,
+                    "fields": []
+                  }
+                ],
+                "disc_index_safe": true,
+                "faithful_enum_repr": null
+              }
+            }
+          ]
+        ],
+        "variants": [
+          {
+            "name": "Ok",
+            "discriminant": 0,
+            "fields": [
+              [
+                "0",
+                {
+                  "Int": {
+                    "width": 16,
+                    "signed": false
+                  }
+                }
+              ]
+            ]
+          },
+          {
+            "name": "Err",
+            "discriminant": 1,
+            "fields": [
+              [
+                "0",
+                {
+                  "Adt": {
+                    "name": "lib::Error",
+                    "fields": [
+                      [
+                        "__tag",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": true
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [
+                      {
+                        "name": "Infinite",
+                        "discriminant": 0,
+                        "fields": []
+                      },
+                      {
+                        "name": "NaN",
+                        "discriminant": 1,
+                        "fields": []
+                      },
+                      {
+                        "name": "Overflow",
+                        "discriminant": 2,
+                        "fields": []
+                      },
+                      {
+                        "name": "Underflow",
+                        "discriminant": 3,
+                        "fields": []
+                      }
+                    ],
+                    "disc_index_safe": true,
+                    "faithful_enum_repr": null
+                  }
+                }
+              ]
+            ]
+          }
+        ],
+        "disc_index_safe": true,
+        "faithful_enum_repr": null
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "src",
+                "Int"
+              ]
+            },
+            {
+              "Int": -32768
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "src",
+                "Int"
+              ]
+            },
+            {
+              "Int": 32767
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

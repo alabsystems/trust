@@ -1,0 +1,14 @@
+error: unexpected closing delimiter: `}`
+  --> $DIR/clean_island_lexical_line_comment.rs:11:1
+   |
+LL | clean {
+   |       - this delimiter might not be properly closed...
+LL |     theorem before : 0 = 0 := rfl
+LL |     -- }
+   |        - ...as it matches this but it has different indentation
+LL |     theorem after : 0 = 0 := rfl
+LL | }
+   | ^ unexpected closing delimiter
+
+error: aborting due to 1 previous error
+

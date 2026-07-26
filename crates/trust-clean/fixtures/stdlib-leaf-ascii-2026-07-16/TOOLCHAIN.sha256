@@ -1,0 +1,6 @@
+trustc version: rustc 1.99.0-dev (7df54072f 2026-07-15) (trustc)
+trustc binary sha256: c6434343a7f2605bed29cfeec5729485d8d3a1a87505a451d52b0070d184e47c
+trustc path: <repo>/build/host/stage2/bin/trustc
+repo HEAD at extraction: 499c12768a9c3b0bde121961539a2bd53d984492
+host: aarch64-apple-darwin
+extraction LIBRARY_PATH: /opt/homebrew/lib (contents not retained or hashed)

@@ -1,0 +1,23 @@
+# trust-disasm: Multi-architecture instruction decoder
+#
+# Pure Rust instruction decoder for binary analysis. Zero external dependencies
+# (except thiserror for error types). Starts with AArch64 (A64 ISA); architecture
+# trait enables x86-64 and other ISA decoders to follow the same interface.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-disasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]

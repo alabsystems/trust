@@ -1,0 +1,80 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+core::ub_checks::check_language_ub::runtime	SHAPE_GAP	false	false	false	false	false	false	false
+core::ub_checks::check_language_ub	SHAPE_GAP	false	false	false	false	false	false	false
+core::hint::assert_unchecked::precondition_check	SHAPE_GAP	false	false	false	false	false	false	false
+core::hint::assert_unchecked	SHAPE_GAP	false	false	false	false	false	false	false
+core::intrinsics::cold_path	SHAPE_GAP	false	false	false	false	false	false	false
+core::intrinsics::is_val_statically_known::<i32>	FULLY_FAITHFUL	true	true	true	true	true	false	true
+core::intrinsics::is_val_statically_known::<u32>	FULLY_FAITHFUL	true	true	true	true	true	false	true
+core::intrinsics::unlikely	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl u32>::wrapping_sub	SAFETY_GAP	false	false	true	false	false	false	false
+core::num::<impl i32>::abs_diff	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::cast_unsigned	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::imp::int_sqrt::u8	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl u16>::leading_zeros	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::num::<impl u16>::overflowing_mul	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::imp::int_sqrt::u16_stages	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::imp::int_sqrt::u16	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl u32>::leading_zeros	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::num::<impl u16>::overflowing_sub	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl u16>::wrapping_add	SAFETY_GAP	false	false	true	false	false	false	false
+core::num::<impl u32>::overflowing_mul	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::imp::int_sqrt::u32_stages	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::imp::int_sqrt::u32	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl u32>::unchecked_mul::precondition_check	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl u32>::unchecked_mul	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl u32>::isqrt	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl u32>::cast_signed	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::checked_isqrt	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::overflowing_mul	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::checked_mul	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::is_negative	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::num::<impl i32>::wrapping_sub	SAFETY_GAP	false	false	true	false	false	false	false
+core::num::<impl i32>::wrapping_neg	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::wrapping_abs	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::unsigned_abs	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl u32>::count_ones	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::num::<impl u32>::is_power_of_two	FULLY_FAITHFUL	true	true	true	true	true	false	true
+core::num::nonzero::NonZero::<u32>::new	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::nonzero::NonZero::<u32>::get	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::nonzero::NonZero::<u32>::leading_zeros	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::nonzero::NonZero::<u32>::ilog2	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl u32>::checked_ilog2	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl u32>::ilog2	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl u32>::checked_mul	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::leading_zeros	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::num::<impl u32>::leading_ones	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::num::<impl i32>::leading_ones	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::num::<impl i32>::unchecked_shl::precondition_check	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::unchecked_shl	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::shl_exact	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::checked_pow	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::div_ceil	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::div_floor	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::isqrt	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::midpoint	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::next_multiple_of	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::unbounded_shl	SHAPE_GAP	false	false	false	false	false	false	false
+core::option::Option::<i32>::is_none	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::num::<impl i32>::overflowing_pow	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::strict_pow	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::wrapping_pow	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::pow	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i8>::overflowing_neg	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i8>::checked_neg	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i8>::wrapping_sub	SAFETY_GAP	false	false	true	false	false	false	false
+core::num::<impl i8>::wrapping_neg	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl u32>::one_less_than_next_power_of_two	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl u32>::next_power_of_two	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_abs_diff	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_checked_neg	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_div_ceil	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_div_floor	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_ilog2	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_is_power_of_two	FULLY_FAITHFUL	true	true	true	true	true	false	true
+main::w_isqrt	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_midpoint	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_next_multiple_of	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_next_power_of_two	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_pow2	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_wrapping_neg	SHAPE_GAP	false	false	false	false	false	false	false

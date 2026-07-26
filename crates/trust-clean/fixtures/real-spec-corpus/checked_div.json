@@ -1,0 +1,216 @@
+{
+  "name": "checked_div",
+  "def_path": "checked_div",
+  "span": {
+    "file": "SOURCE.rs",
+    "line_start": 83,
+    "col_start": 0,
+    "line_end": 85,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "a"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "b"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Closure": {
+            "name": "checked_div::{closure#0}",
+            "upvars": [
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Int": {
+                      "width": 32,
+                      "signed": false
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "name": "__requires_checker"
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "SOURCE.rs",
+                "line_start": 84,
+                "col_start": 4,
+                "line_end": 84,
+                "col_end": 9
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "DivisionByZero",
+            "target": 1,
+            "span": {
+              "file": "SOURCE.rs",
+              "line_start": 84,
+              "col_start": 4,
+              "line_end": 84,
+              "col_end": 9
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "SOURCE.rs",
+                "line_start": 84,
+                "col_start": 4,
+                "line_end": 84,
+                "col_end": 9
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Requires",
+      "span": {
+        "file": "SOURCE.rs",
+        "line_start": 82,
+        "col_start": 28,
+        "line_end": 82,
+        "col_end": 34
+      },
+      "body": "__trust_lowered_compiler_contract__:(b) != (0)"
+    }
+  ],
+  "preconditions": [
+    {
+      "Not": {
+        "Eq": [
+          {
+            "Var": [
+              "b",
+              "Int"
+            ]
+          },
+          {
+            "Int": 0
+          }
+        ]
+      }
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [
+      "(b) != (0)"
+    ],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -1,0 +1,92 @@
+{
+  "proof_grade_gate": {
+    "accepted": false,
+    "unsupported_records": 2,
+    "aarch64_atomic_semantic_fact_count": 2,
+    "aarch64_atomic_semantic_facts_consumed_by_proof_model": false,
+    "aarch64_atomic_semantic_fact_rejections": [
+      "AArch64 LDAXR semantic fact is present but not proof-consumed; missing witnesses: acquire ordering event, synchronization edge, exclusive-monitor reservation state, exclusive-monitor invalidation, thread identity, happens-before witness",
+      "AArch64 STLXR semantic fact is present but not proof-consumed; missing witnesses: release ordering event, synchronization edge, exclusive-monitor reservation state, exclusive-monitor invalidation, store-conditional status result, thread identity, happens-before witness"
+    ],
+    "blocker_group_counts": {
+      "unsupported_ledger": 2
+    },
+    "rejection_kinds": [
+      "UnsupportedRecordsPresent",
+      "Aarch64AtomicSemanticFactsNotConsumed"
+    ]
+  },
+  "unsupported": {
+    "total_records": 2,
+    "aarch64_atomic_semantic_fact_count": 2,
+    "memory_order_family": 2,
+    "facts": [
+      {
+        "opcode": "LDAXR",
+        "operand": "[x0]",
+        "location": "0x401014",
+        "access": "Read",
+        "ordering": "Acquire",
+        "exclusive_monitor": "LoadReserve",
+        "reports_status": false,
+        "consumed_by_proof_model": false,
+        "proof_grade_accepted": false,
+        "missing_witnesses": [
+          "acquire ordering event",
+          "synchronization edge",
+          "exclusive-monitor reservation state",
+          "exclusive-monitor invalidation",
+          "thread identity",
+          "happens-before witness"
+        ]
+      },
+      {
+        "opcode": "STLXR",
+        "operand": "w1, [x0]",
+        "location": "0x401018",
+        "access": "Write",
+        "ordering": "Release",
+        "exclusive_monitor": "StoreConditional",
+        "reports_status": true,
+        "consumed_by_proof_model": false,
+        "proof_grade_accepted": false,
+        "missing_witnesses": [
+          "release ordering event",
+          "synchronization edge",
+          "exclusive-monitor reservation state",
+          "exclusive-monitor invalidation",
+          "store-conditional status result",
+          "thread identity",
+          "happens-before witness"
+        ]
+      }
+    ]
+  },
+  "unresolved_blockers": {
+    "unsupported_ledger": 8,
+    "entries": [
+      {
+        "family": "unsupported_ledger",
+        "stage": "proof_grade_gate",
+        "feature": "aarch64_atomic_semantic_facts_not_consumed",
+        "reason": "AArch64 atomic semantic facts not proof-consumed: 2/2 unconsumed; semantics/replay/certificates must account for witnesses: acquire ordering event, exclusive-monitor invalidation, exclusive-monitor reservation state, happens-before witness, release ordering event, store-conditional status result, synchronization edge, thread identity"
+      },
+      {
+        "family": "unsupported_ledger",
+        "stage": "proof_grade_gate",
+        "feature": "aarch64_atomic_semantic_facts_not_consumed",
+        "reason": "AArch64 atomic semantic facts not proof-consumed: 2/2 unconsumed; semantics/replay/certificates must account for witnesses: acquire ordering event, exclusive-monitor invalidation, exclusive-monitor reservation state, happens-before witness, release ordering event, store-conditional status result, synchronization edge, thread identity"
+      }
+    ]
+  },
+  "text_markers": [
+    "aarch64_atomic_semantic_facts=2",
+    "aarch64_atomic_facts_consumed=false",
+    "AArch64 atomic semantic facts:",
+    "LDAXR @0x401014 operand=[x0] | access=Read, ordering=Acquire, exclusive_monitor=LoadReserve",
+    "STLXR @0x401018 operand=w1, [x0] | access=Write, ordering=Release, exclusive_monitor=StoreConditional, reports_status=true",
+    "AArch64 LDAXR semantic fact is present but not proof-consumed",
+    "AArch64 atomic semantic facts not proof-consumed: 2/2 unconsumed",
+    "unsupported_ledger/aarch64_atomic_semantic_facts_not_consumed stage=proof_grade_gate"
+  ]
+}

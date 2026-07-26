@@ -1,0 +1,129 @@
+{
+  "name": "report",
+  "def_path": "<() as std::process::Termination>::report",
+  "span": {
+    "file": "std/src/process.rs",
+    "line_start": 2690,
+    "col_start": 4,
+    "line_end": 2692,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Adt": {
+            "name": "std::process::ExitCode",
+            "fields": [
+              [
+                "0",
+                {
+                  "Adt": {
+                    "name": "std::sys::process::unix::common::ExitCode",
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": "Unit",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": "OpaqueConst"
+                }
+              },
+              "span": {
+                "file": "std/src/process.rs",
+                "line_start": 2691,
+                "col_start": 8,
+                "line_end": 2691,
+                "col_end": 25
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Adt": {
+        "name": "std::process::ExitCode",
+        "fields": [
+          [
+            "0",
+            {
+              "Adt": {
+                "name": "std::sys::process::unix::common::ExitCode",
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null
+              }
+            }
+          ]
+        ],
+        "variants": [],
+        "disc_index_safe": false,
+        "faithful_enum_repr": null,
+        "layout": null
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

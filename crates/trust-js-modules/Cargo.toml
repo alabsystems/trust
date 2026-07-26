@@ -1,0 +1,43 @@
+# trust-js-modules: the TrustJS ECMAScript module-graph engine — M2 D2.
+#
+# The linker / graph engine the M2 runtime (docs/design/2026-07-22-trustjs-m2-scope.md
+# D2) wires under the tier-0 interpreter: ECMAScript module records + the three-phase
+# link/evaluate algorithm of ECMA-262 §16.2.1, modelled GENERICALLY over an opaque
+# `Host` seam. It owns the RECORD and the ALGORITHM — ResolveExport with star-export
+# ambiguity + cycle handling, InnerModuleLinking's DFS with the index/ancestor stack,
+# InnerModuleEvaluation's [[Status]] state machine and [[DFSIndex]]/[[DFSAncestorIndex]],
+# and the top-level-await machinery (pending-async-dependencies, GatherAvailableAncestors,
+# AsyncModuleExecutionFulfilled/Rejected). It owns NO JS object model or expression
+# evaluation: parsing a source to import/export entries, resolving a specifier over the
+# virtual content-addressed module map, creating environment bindings, and running a
+# module's body are all typed seams on the `Host` trait (the interp plugs in its parser,
+# binding store, evaluator, and — for top-level await / dynamic import — its reactor).
+#
+# Determinism is the invariant: given the same module map + host callbacks, Link and
+# Evaluate visit modules and run bodies in a BYTE-IDENTICAL order across runs. No
+# HashMap iteration in any observable path — records live in a dense Vec keyed by a
+# ModuleId newtype, the key->id table + loaded-module maps are insertion-ordered
+# IndexMaps, the DFS stack a Vec, and namespace export names are explicitly sorted by
+# code-unit order.
+#
+# ENGINE only: depends on nothing but thiserror + indexmap.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-js-modules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+indexmap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

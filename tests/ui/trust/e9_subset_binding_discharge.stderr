@@ -1,0 +1,49 @@
+note: Clean island kernel-checked: 2 declaration(s) registered (u64_ge_refl, all_ge_self)
+  --> $DIR/e9_subset_binding_discharge.rs:13:5
+   |
+LL | /     theorem u64_ge_refl : forall (x : UInt64),
+LL | |         Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
+LL | |         fun x => Nat.le.refl (UInt64.toNat x)
+LL | |     theorem all_ge_self : forall (i : UInt64),
+LL | |         Nat.le (UInt64.toNat i) (UInt64.toNat i) :=
+LL | |         fun i => Nat.le.refl (UInt64.toNat i)
+   | |_____________________________________________^
+
+
+=== Trust Verification Report (e9_subset_binding_discharge) ===
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_subset_binding_discharge.rs:21:1
+   |
+LL | pub fn p(x: u64, y: u64) -> u64 ensures x >= x by u64_ge_refl { x }
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+ay-proof: UNVERIFIABLE PROOF from export_alethe_with_problem_scope_and_overrides: reachable assume t0 uses non-problem term t25; preprocessing-derived formulas are not proof authority (see #8821; no :rule trust fallback will be written)
+ay-proof: UNVERIFIABLE PROOF from export_alethe_with_problem_scope_and_overrides: reachable assume t0 uses non-problem term t25; preprocessing-derived formulas are not proof authority (see #8821; no :rule trust fallback will be written)
+ay-proof: UNVERIFIABLE PROOF from export_alethe_with_problem_scope_and_overrides: reachable assume t0 uses non-problem term t25; preprocessing-derived formulas are not proof authority (see #8821; no :rule trust fallback will be written)
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_subset_binding_discharge.rs:23:1
+   |
+LL | pub fn h(x: u64) -> u64 ensures forall i: u64, i >= i by all_ge_self { x }
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `p`, with a clean certification audit
+  --> $DIR/e9_subset_binding_discharge.rs:21:51
+   |
+LL | pub fn p(x: u64, y: u64) -> u64 ensures x >= x by u64_ge_refl { x }
+   |                                                   ^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+
+note: citation `all_ge_self` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `h`, with a clean certification audit
+  --> $DIR/e9_subset_binding_discharge.rs:23:58
+   |
+LL | pub fn h(x: u64) -> u64 ensures forall i: u64, i >= i by all_ge_self { x }
+   |                                                          ^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+

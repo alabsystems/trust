@@ -1,0 +1,1286 @@
+{
+  "name": "rotate",
+  "def_path": "Quat::rotate",
+  "span": {
+    "file": "crates/a3d-geom/src/lib.rs",
+    "line_start": 711,
+    "col_start": 4,
+    "line_end": 716,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Adt": {
+            "name": "Vec3",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "Quat",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "w",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "Vec3",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": "v"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Closure": {
+            "name": "Quat::rotate::{closure#0}",
+            "upvars": [
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                }
+              },
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                }
+              },
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                }
+              },
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                }
+              },
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                }
+              },
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                }
+              },
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Float": {
+                      "width": 64
+                    }
+                  }
+                }
+              }
+            ],
+            "call": {
+              "kind": "Fn",
+              "params": [],
+              "ret": "Bool"
+            }
+          }
+        },
+        "name": "__requires_checker"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Adt": {
+            "name": "Vec3",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": "u"
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Adt": {
+            "name": "Vec3",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": "t"
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Adt": {
+            "name": "Vec3",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Adt": {
+            "name": "Vec3",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Adt": {
+            "name": "Vec3",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Adt": {
+            "name": "Vec3",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 713,
+                "col_start": 26,
+                "line_end": 713,
+                "col_end": 32
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 713,
+                "col_start": 34,
+                "line_end": 713,
+                "col_end": 40
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 713,
+                "col_start": 42,
+                "line_end": 713,
+                "col_end": 48
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "Vec3::new",
+            "args": [
+              {
+                "Move": {
+                  "local": 5,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 6,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 7,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 713,
+              "col_start": 16,
+              "line_end": 713,
+              "col_end": 49
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "Vec3::cross",
+            "args": [
+              {
+                "Copy": {
+                  "local": 4,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 9,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 714,
+              "col_start": 16,
+              "line_end": 714,
+              "col_end": 26
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "Vec3::scale",
+            "args": [
+              {
+                "Move": {
+                  "local": 9,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "FloatBits": {
+                    "bits": 4611686018427387904,
+                    "width": 64
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 8,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 714,
+              "col_start": 16,
+              "line_end": 714,
+              "col_end": 37
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 3
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 715,
+                "col_start": 22,
+                "line_end": 715,
+                "col_end": 28
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "Vec3::scale",
+            "args": [
+              {
+                "Copy": {
+                  "local": 8,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 12,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 11,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 715,
+              "col_start": 14,
+              "line_end": 715,
+              "col_end": 29
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "Vec3::add",
+            "args": [
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 11,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 10,
+              "projections": []
+            },
+            "target": 5,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 715,
+              "col_start": 8,
+              "line_end": 715,
+              "col_end": 30
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "Vec3::cross",
+            "args": [
+              {
+                "Copy": {
+                  "local": 4,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 8,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 13,
+              "projections": []
+            },
+            "target": 6,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 715,
+              "col_start": 35,
+              "line_end": 715,
+              "col_end": 45
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "Vec3::add",
+            "args": [
+              {
+                "Move": {
+                  "local": 10,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 13,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 7,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 715,
+              "col_start": 8,
+              "line_end": 715,
+              "col_end": 46
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Adt": {
+        "name": "Vec3",
+        "fields": [
+          [
+            "x",
+            {
+              "Float": {
+                "width": 64
+              }
+            }
+          ],
+          [
+            "y",
+            {
+              "Float": {
+                "width": 64
+              }
+            }
+          ],
+          [
+            "z",
+            {
+              "Float": {
+                "width": 64
+              }
+            }
+          ]
+        ],
+        "variants": [],
+        "disc_index_safe": false
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Requires",
+      "span": {
+        "file": "crates/a3d-geom/src/lib.rs",
+        "line_start": 707,
+        "col_start": 8,
+        "line_end": 710,
+        "col_end": 44
+      },
+      "body": "__trust_lowered_compiler_contract__:((((((((((((((self.0) <= (4.0)) && ((self.0) >= (-(4.0)))) && ((self.1) <= (4.0))) && ((self.1) >= (-(4.0)))) && ((self.2) <= (4.0))) && ((self.2) >= (-(4.0)))) && ((self.3) <= (4.0))) && ((self.3) >= (-(4.0)))) && ((v.0) <= (1.0e100))) && ((v.0) >= (-(1.0e100)))) && ((v.1) <= (1.0e100))) && ((v.1) >= (-(1.0e100)))) && ((v.2) <= (1.0e100))) && ((v.2) >= (-(1.0e100)))"
+    }
+  ],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "And": [
+            {
+              "And": [
+                {
+                  "And": [
+                    {
+                      "And": [
+                        {
+                          "And": [
+                            {
+                              "And": [
+                                {
+                                  "And": [
+                                    {
+                                      "And": [
+                                        {
+                                          "And": [
+                                            {
+                                              "And": [
+                                                {
+                                                  "And": [
+                                                    {
+                                                      "And": [
+                                                        {
+                                                          "Le": [
+                                                            {
+                                                              "Var": [
+                                                                "self.0",
+                                                                {
+                                                                  "Float": {
+                                                                    "eb": 11,
+                                                                    "sb": 53
+                                                                  }
+                                                                }
+                                                              ]
+                                                            },
+                                                            {
+                                                              "FpConst": {
+                                                                "bits": 4616189618054758400,
+                                                                "eb": 11,
+                                                                "sb": 53
+                                                              }
+                                                            }
+                                                          ]
+                                                        },
+                                                        {
+                                                          "Ge": [
+                                                            {
+                                                              "Var": [
+                                                                "self.0",
+                                                                {
+                                                                  "Float": {
+                                                                    "eb": 11,
+                                                                    "sb": 53
+                                                                  }
+                                                                }
+                                                              ]
+                                                            },
+                                                            {
+                                                              "FpConst": {
+                                                                "bits": 13839561654909534208,
+                                                                "eb": 11,
+                                                                "sb": 53
+                                                              }
+                                                            }
+                                                          ]
+                                                        }
+                                                      ]
+                                                    },
+                                                    {
+                                                      "Le": [
+                                                        {
+                                                          "Var": [
+                                                            "self.1",
+                                                            {
+                                                              "Float": {
+                                                                "eb": 11,
+                                                                "sb": 53
+                                                              }
+                                                            }
+                                                          ]
+                                                        },
+                                                        {
+                                                          "FpConst": {
+                                                            "bits": 4616189618054758400,
+                                                            "eb": 11,
+                                                            "sb": 53
+                                                          }
+                                                        }
+                                                      ]
+                                                    }
+                                                  ]
+                                                },
+                                                {
+                                                  "Ge": [
+                                                    {
+                                                      "Var": [
+                                                        "self.1",
+                                                        {
+                                                          "Float": {
+                                                            "eb": 11,
+                                                            "sb": 53
+                                                          }
+                                                        }
+                                                      ]
+                                                    },
+                                                    {
+                                                      "FpConst": {
+                                                        "bits": 13839561654909534208,
+                                                        "eb": 11,
+                                                        "sb": 53
+                                                      }
+                                                    }
+                                                  ]
+                                                }
+                                              ]
+                                            },
+                                            {
+                                              "Le": [
+                                                {
+                                                  "Var": [
+                                                    "self.2",
+                                                    {
+                                                      "Float": {
+                                                        "eb": 11,
+                                                        "sb": 53
+                                                      }
+                                                    }
+                                                  ]
+                                                },
+                                                {
+                                                  "FpConst": {
+                                                    "bits": 4616189618054758400,
+                                                    "eb": 11,
+                                                    "sb": 53
+                                                  }
+                                                }
+                                              ]
+                                            }
+                                          ]
+                                        },
+                                        {
+                                          "Ge": [
+                                            {
+                                              "Var": [
+                                                "self.2",
+                                                {
+                                                  "Float": {
+                                                    "eb": 11,
+                                                    "sb": 53
+                                                  }
+                                                }
+                                              ]
+                                            },
+                                            {
+                                              "FpConst": {
+                                                "bits": 13839561654909534208,
+                                                "eb": 11,
+                                                "sb": 53
+                                              }
+                                            }
+                                          ]
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "Le": [
+                                        {
+                                          "Var": [
+                                            "self.3",
+                                            {
+                                              "Float": {
+                                                "eb": 11,
+                                                "sb": 53
+                                              }
+                                            }
+                                          ]
+                                        },
+                                        {
+                                          "FpConst": {
+                                            "bits": 4616189618054758400,
+                                            "eb": 11,
+                                            "sb": 53
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                },
+                                {
+                                  "Ge": [
+                                    {
+                                      "Var": [
+                                        "self.3",
+                                        {
+                                          "Float": {
+                                            "eb": 11,
+                                            "sb": 53
+                                          }
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "FpConst": {
+                                        "bits": 13839561654909534208,
+                                        "eb": 11,
+                                        "sb": 53
+                                      }
+                                    }
+                                  ]
+                                }
+                              ]
+                            },
+                            {
+                              "Le": [
+                                {
+                                  "Var": [
+                                    "v.0",
+                                    {
+                                      "Float": {
+                                        "eb": 11,
+                                        "sb": 53
+                                      }
+                                    }
+                                  ]
+                                },
+                                {
+                                  "FpConst": {
+                                    "bits": 6103021453049119613,
+                                    "eb": 11,
+                                    "sb": 53
+                                  }
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        {
+                          "Ge": [
+                            {
+                              "Var": [
+                                "v.0",
+                                {
+                                  "Float": {
+                                    "eb": 11,
+                                    "sb": 53
+                                  }
+                                }
+                              ]
+                            },
+                            {
+                              "FpConst": {
+                                "bits": 15326393489903895421,
+                                "eb": 11,
+                                "sb": 53
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Le": [
+                        {
+                          "Var": [
+                            "v.1",
+                            {
+                              "Float": {
+                                "eb": 11,
+                                "sb": 53
+                              }
+                            }
+                          ]
+                        },
+                        {
+                          "FpConst": {
+                            "bits": 6103021453049119613,
+                            "eb": 11,
+                            "sb": 53
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "Ge": [
+                    {
+                      "Var": [
+                        "v.1",
+                        {
+                          "Float": {
+                            "eb": 11,
+                            "sb": 53
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "FpConst": {
+                        "bits": 15326393489903895421,
+                        "eb": 11,
+                        "sb": 53
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "Le": [
+                {
+                  "Var": [
+                    "v.2",
+                    {
+                      "Float": {
+                        "eb": 11,
+                        "sb": 53
+                      }
+                    }
+                  ]
+                },
+                {
+                  "FpConst": {
+                    "bits": 6103021453049119613,
+                    "eb": 11,
+                    "sb": 53
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Ge": [
+            {
+              "Var": [
+                "v.2",
+                {
+                  "Float": {
+                    "eb": 11,
+                    "sb": 53
+                  }
+                }
+              ]
+            },
+            {
+              "FpConst": {
+                "bits": 15326393489903895421,
+                "eb": 11,
+                "sb": 53
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [
+      "((((((((((((((self.0) <= (4.0)) && ((self.0) >= (-(4.0)))) && ((self.1) <= (4.0))) && ((self.1) >= (-(4.0)))) && ((self.2) <= (4.0))) && ((self.2) >= (-(4.0)))) && ((self.3) <= (4.0))) && ((self.3) >= (-(4.0)))) && ((v.0) <= (1.0e100))) && ((v.0) >= (-(1.0e100)))) && ((v.1) <= (1.0e100))) && ((v.1) >= (-(1.0e100)))) && ((v.2) <= (1.0e100))) && ((v.2) >= (-(1.0e100)))"
+    ],
+    "ensures": [],
+    "invariants": []
+  }
+}

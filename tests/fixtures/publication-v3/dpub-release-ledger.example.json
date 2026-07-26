@@ -1,0 +1,124 @@
+{
+  "admission": {
+    "attestation_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "attestation_kind": "dscan.attestation.v1",
+    "required_result": "accepted",
+    "reviewer": "publication-v3-reviewer",
+    "signer": "dscan-bot@andrewyates"
+  },
+  "artifacts": [
+    {
+      "hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "hash_field": "candidate_manifest_hash",
+      "kind": "manifest",
+      "name": "candidate-manifest",
+      "path": "reports/release/trust-2026.04.25-rc1/candidate-manifest.json",
+      "required": true
+    },
+    {
+      "hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "hash_field": "dscan_attestation_hash",
+      "kind": "attestation",
+      "name": "dscan-attestation",
+      "path": "reports/release/trust-2026.04.25-rc1/dscan.attestation.v1.json",
+      "required": true
+    },
+    {
+      "hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "hash_field": "dpub_release_hash",
+      "kind": "ledger",
+      "name": "dpub-release-ledger",
+      "path": "reports/release/trust-2026.04.25-rc1/dpub.release.v1.json",
+      "required": true
+    },
+    {
+      "hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "hash_field": "trust_engines_lock_hash",
+      "kind": "lockfile",
+      "name": "trust-engines-lock",
+      "path": "trust-engines.lock",
+      "required": true
+    },
+    {
+      "hash": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+      "hash_field": "conformance_report_hash",
+      "kind": "evidence",
+      "name": "conformance-report",
+      "path": "reports/release/trust-2026.04.25-rc1/conformance-report.json",
+      "required": true
+    },
+    {
+      "hash": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "hash_field": "release_gate_report_hash",
+      "kind": "evidence",
+      "name": "release-gate-report",
+      "path": "reports/release/trust-2026.04.25-rc1/release-gate-report.json",
+      "required": true
+    },
+    {
+      "hash": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+      "hash_field": "sbom_hash",
+      "kind": "provenance",
+      "name": "sbom",
+      "path": "reports/release/trust-2026.04.25-rc1/sbom.spdx.json",
+      "required": true
+    },
+    {
+      "hash": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+      "hash_field": "provenance_bundle_hash",
+      "kind": "provenance",
+      "name": "provenance-bundle",
+      "path": "reports/release/trust-2026.04.25-rc1/provenance.bundle.json",
+      "required": true
+    },
+    {
+      "hash": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+      "hash_field": "rollback_plan_hash",
+      "kind": "rollback",
+      "name": "rollback-plan",
+      "path": "reports/release/trust-2026.04.25-rc1/rollback-plan.json",
+      "required": true
+    }
+  ],
+  "candidate_id": "trust-2026.04.25-rc1",
+  "decision": {
+    "reason": "All required Publication V3 gates passed or were explicitly accounted for.",
+    "result": "accepted"
+  },
+  "metadata": {
+    "dpub_plan_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "dry_run": false,
+    "publication_plan": {
+      "canonicalization": "json.sort_keys.separators.v1",
+      "config_path": ".dpub.toml",
+      "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "hash_algorithm": "sha256",
+      "hash_field": "dpub_plan_hash"
+    },
+    "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "source_repo": "github.com/alabsystems/trust"
+  },
+  "mode": "production",
+  "policy": {
+    "reject_dirty_sources": true,
+    "reject_floating_engine_refs": true,
+    "reject_vendor_divergence": true,
+    "require_conformance_report": true,
+    "require_dscan_admission": true,
+    "require_immutable_refs": true,
+    "require_rollback_plan": true,
+    "require_signed_tags": true
+  },
+  "product": "trust",
+  "publication": {
+    "admission_authority": "github.com/alabsystems/dscan",
+    "ci_authority": "github.com/alabsystems/dscan-cicd",
+    "dev_root": "trust-dev",
+    "product_root": "trust-prod",
+    "publication_ledger": "github.com/alabsystems/dpub",
+    "staging_repo": "trust-staging",
+    "staging_root": "github.com/alabsystems/dscan-staging"
+  },
+  "release_id": "trust-2026.04.25-rc1",
+  "schema": "dpub.release.v1"
+}

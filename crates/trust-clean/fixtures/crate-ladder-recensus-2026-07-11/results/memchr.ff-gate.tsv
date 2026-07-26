@@ -1,0 +1,15 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+arch::all::memchr::One::confirm	FULLY_FAITHFUL	true	true	false	false	false	false	true
+arch::all::memchr::One::count_raw	SAFETY_GAP	false	false	true	false	false	false	false
+arch::all::memchr::One::count	SHAPE_GAP	false	false	false	false	false	false	false
+arch::all::memchr::One::find	SHAPE_GAP	false	false	false	false	false	false	false
+arch::all::memchr::One::has_needle	SHAPE_GAP	false	false	false	false	false	false	false
+arch::all::memchr::One::find_raw	SHAPE_GAP	false	false	false	false	false	false	false
+arch::all::memchr::One::find::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+arch::all::memchr::One::find_raw::{closure#0}	FULLY_FAITHFUL	true	true	true	true	true	false	true
+arch::all::memchr::One::iter	SHAPE_GAP	false	false	false	false	false	false	false
+arch::all::memchr::One::new	SHAPE_GAP	false	false	false	false	false	false	false
+arch::all::memchr::One::rfind	SHAPE_GAP	false	false	false	false	false	false	false
+arch::all::memchr::One::rfind_raw	SHAPE_GAP	false	false	false	false	false	false	false
+arch::all::memchr::One::rfind::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+arch::all::memchr::One::rfind_raw::{closure#0}	FULLY_FAITHFUL	true	true	true	true	true	false	true

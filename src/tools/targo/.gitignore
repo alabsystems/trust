@@ -1,0 +1,20 @@
+/target
+/Cargo.lock
+/config.stamp
+/Makefile
+/config.mk
+/src/doc/build
+/src/etc/*.pyc
+/src/registry/target
+rustc
+__pycache__
+.idea/
+.vscode/
+*.iml
+*.swp
+
+# Trust: snapbox source-relative fixtures need the nested Targo workspace root.
+# The outer Trust repository ignores arbitrary `.cargo` directories, but this
+# workspace config is part of the test harness and must remain tracked.
+!/.cargo/
+!/.cargo/config.toml

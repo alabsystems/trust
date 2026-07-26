@@ -1,0 +1,25 @@
+# Fixture crate for the stdlib-leaf-bitmethods-2026-07-16 harvest (P1 — the
+# BIT-METHOD family: the FREE win off the just-landed W-BITINTRIN classifier).
+#
+# This crate exists to DOCUMENT INTENT: it exercises the target core integer
+# bit-permutation/-count leaf family at the concrete widths the harvest certifies
+# (u8/u16/u32/u64 primary; i8/i16/i32/i64 wall-characterization). It is NOT the
+# source of the certified MIR bodies — a downstream crate that merely *calls*
+# `x.leading_zeros()` dumps only the *caller* (the MIR dump records LOCAL bodies;
+# core callees stay opaque `Call` terminators). The certified bodies are extracted
+# by compiling THIS repo's `library/core` itself (see ../regenerate.sh +
+# ../PROVENANCE.md), exactly as the stdlib-leaf-num-2026-07-16 harvest did.
+#
+# Author: Andrew Yates | Copyright 2026 Andrew Yates | Apache-2.0 OR MIT
+[package]
+name = "stdlib-leaf-bitmethods-fixture"
+version = "0.1.0"
+edition = "2024"
+authors = ["Andrew Yates"]
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

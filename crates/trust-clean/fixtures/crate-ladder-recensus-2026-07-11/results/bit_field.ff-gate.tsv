@@ -1,0 +1,29 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+<[T] as BitArray<T>>::bit_length	SHAPE_GAP	false	false	false	false	false	false	false
+<[T] as BitArray<T>>::get_bit	SHAPE_GAP	false	false	false	false	false	false	false
+<[T] as BitArray<T>>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+<i128 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+<i128 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+<i16 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+<i16 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+<i32 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+<i32 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+<i64 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+<i64 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+<i8 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+<i8 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+<isize as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+<isize as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+<u128 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+<u128 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+<u16 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+<u16 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+<u32 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+<u32 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+<u64 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+<u64 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+<u8 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+<u8 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+<usize as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+<usize as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+to_regular_range	SHAPE_GAP	false	false	false	false	false	false	false

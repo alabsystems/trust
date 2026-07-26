@@ -1,0 +1,25 @@
+def_path	verdict	lane	kernel_rejected	safety_obligations	safety_discharged	wall
+num::<impl i8>::is_positive	FULLY_FAITHFUL	via_mirsem	0	0	0	-
+num::<impl i8>::is_negative	FULLY_FAITHFUL	via_mirsem	0	0	0	-
+num::<impl i8>::signum	FULLY_FAITHFUL	via_mirsem	0	0	0	-
+num::<impl i16>::is_positive	FULLY_FAITHFUL	via_mirsem	0	0	0	-
+num::<impl i16>::is_negative	FULLY_FAITHFUL	via_mirsem	0	0	0	-
+num::<impl i16>::signum	FULLY_FAITHFUL	via_mirsem	0	0	0	-
+num::<impl i32>::is_positive	FULLY_FAITHFUL	via_mirsem	0	0	0	-
+num::<impl i32>::is_negative	FULLY_FAITHFUL	via_mirsem	0	0	0	-
+num::<impl i32>::signum	FULLY_FAITHFUL	via_mirsem	0	0	0	-
+num::<impl i64>::is_positive	FULLY_FAITHFUL	via_mirsem	0	0	0	-
+num::<impl i64>::is_negative	FULLY_FAITHFUL	via_mirsem	0	0	0	-
+num::<impl i64>::signum	FULLY_FAITHFUL	via_mirsem	0	0	0	-
+num::<impl u8>::is_power_of_two	FULLY_FAITHFUL	via_trustir	0	0	0	-
+num::<impl u8>::count_ones	FULLY_FAITHFUL	via_mirsem	0	1	0	-
+num::<impl u8>::trailing_zeros	FULLY_FAITHFUL	via_mirsem	0	1	0	-
+num::<impl u16>::is_power_of_two	FULLY_FAITHFUL	via_trustir	0	0	0	-
+num::<impl u16>::count_ones	FULLY_FAITHFUL	via_mirsem	0	1	0	-
+num::<impl u16>::trailing_zeros	FULLY_FAITHFUL	via_mirsem	0	1	0	-
+num::<impl u32>::is_power_of_two	FULLY_FAITHFUL	via_trustir	0	0	0	-
+num::<impl u32>::count_ones	FULLY_FAITHFUL	via_mirsem	0	1	0	-
+num::<impl u32>::trailing_zeros	FULLY_FAITHFUL	via_mirsem	0	1	0	-
+num::<impl u64>::is_power_of_two	FULLY_FAITHFUL	via_trustir	0	0	0	-
+num::<impl u64>::count_ones	FULLY_FAITHFUL	via_mirsem	0	1	0	-
+num::<impl u64>::trailing_zeros	FULLY_FAITHFUL	via_mirsem	0	1	0	-

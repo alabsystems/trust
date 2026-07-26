@@ -1,0 +1,34 @@
+# trust-js-trace: the TrustJS ObservableTrace projection — the M0 keystone
+#
+# The canonical, non-invasive, deterministic behavioral projection every oracle
+# head (Node, Bun, trust-js-sem, and later the in-house engine) serializes to.
+# Two parts: the Rust trace schema (this crate's types, one serde shape shared
+# by every head) and the in-JS trace driver (js/trace_driver.mjs, embedded here
+# so its bytes are part of the evidence identity). The schema keeps the
+# language-agnostic core (ordered host effects, completion, deep-printed
+# witnesses, cycle back-refs) visibly separate from the JS-specific observable
+# set (property enumeration order, -0 vs +0, symbol descriptions) so the
+# TrustPy observable set can swap in without reworking the core.
+#
+# Deliberately depends on serde only: the projection contract stays stable and
+# buildable independent of engine churn, so a trace schema consumer never has to
+# link the engine that produced the trace.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-js-trace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }

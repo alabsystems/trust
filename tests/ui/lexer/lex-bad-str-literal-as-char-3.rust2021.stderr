@@ -1,0 +1,34 @@
+error: expected `while`, `for`, `loop` or `{` after a label
+  --> $DIR/lex-bad-str-literal-as-char-3.rs:6:21
+   |
+LL |     println!('hello world');
+   |                     ^^^^^ expected `while`, `for`, `loop` or `{` after a label
+   |
+help: consider removing the label
+   |
+LL -     println!('hello world');
+LL +     println!(world');
+   |
+
+error: labeled expression must be followed by `:`
+  --> $DIR/lex-bad-str-literal-as-char-3.rs:6:21
+   |
+LL |     println!('hello world');
+   |              ------ ^^^^^
+   |              |
+   |              the label
+   |
+   = note: labels are used before loops and blocks, allowing e.g., `break 'label` to them
+help: add `:` after the label
+   |
+LL |     println!('hello: world');
+   |                    +
+
+error: expected `,`, found `'`
+  --> $DIR/lex-bad-str-literal-as-char-3.rs:6:26
+   |
+LL |     println!('hello world');
+   |                          ^ expected `,`
+
+error: aborting due to 3 previous errors
+

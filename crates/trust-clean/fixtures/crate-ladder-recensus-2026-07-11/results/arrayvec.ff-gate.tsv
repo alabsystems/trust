@@ -1,0 +1,42 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+<arrayvec::ArrayVec<T, CAP> as arrayvec_impl::ArrayVecImpl>::as_mut_ptr	SHAPE_GAP	false	false	false	false	false	false	false
+<arrayvec::ArrayVec<T, CAP> as arrayvec_impl::ArrayVecImpl>::as_ptr	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::len	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<arrayvec::ArrayVec<T, CAP> as arrayvec_impl::ArrayVecImpl>::len	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<arrayvec::ArrayVec<T, CAP> as arrayvec_impl::ArrayVecImpl>::set_len	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::as_mut_ptr	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec_impl::ArrayVecImpl::as_mut_slice	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::as_mut_slice	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::as_ptr	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec_impl::ArrayVecImpl::as_slice	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::as_slice	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::capacity	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec_impl::ArrayVecImpl::truncate	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec_impl::ArrayVecImpl::clear	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::clear	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::drain_range	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::extend_from_iter::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::extend_from_slice	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::get_unchecked_ptr	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::into_inner_unchecked	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::into_inner	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::is_empty	FULLY_FAITHFUL	true	true	true	true	true	false	true
+arrayvec::ArrayVec::<T, CAP>::is_full	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::new	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::new_const	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec_impl::ArrayVecImpl::pop	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::pop	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::pop_at	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::remaining_capacity	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::retain::process_one	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::set_len	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::spare_capacity_mut	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::swap_pop	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::take	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::truncate	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::ArrayVec::<T, CAP>::try_extend_from_slice	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::extend_panic	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec::raw_ptr_add	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec_impl::ArrayVecImpl::push_unchecked	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec_impl::ArrayVecImpl::try_push	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec_impl::ArrayVecImpl::push	SHAPE_GAP	false	false	false	false	false	false	false

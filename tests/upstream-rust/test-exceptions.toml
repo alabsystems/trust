@@ -1,0 +1,1393 @@
+# Per-test exception ledger for `trust-upstream-compat prove`.
+#
+# Release evidence may only accept a vanilla upstream Rust failure, skip, or
+# output diff when a matching active entry appears here. Keep entries narrow:
+# one test id, one suite/path/revision, one owner, one issue, and one expiry.
+
+schema_version = "0.1.0"
+
+# RETIRED 2026-07-23: `test-exc.crashes.135122.no-ice` removed. The exception was
+# already `status=resolved`, and its subject `tests/crashes/135122.rs` is DELETED
+# (replaced by tests/ui/implied-bounds/ice-implied-outlives-bounds-135122.rs, which
+# asserts the ordinary diagnostics Trust emits where upstream still ICEs at
+# `assertion failed: !ty.has_non_region_infer()` in implied_outlives_bounds).
+# Nothing remains for the waiver to match. The adopted-fix rationale is permanently
+# recorded in tests/upstream-rust/upstream-fixes.toml
+# (fix.trait_solver.implied_outlives_bounds_infer_ice_135122). Verified deleted +
+# replacement present + fix-record present before removal.
+
+[[exceptions]]
+id = "test-exc.lexer.str-as-char-4.prime-superset"
+test_id = "upstream.tests.ui.lexer.lex-bad-str-literal-as-char-4.rs"
+suite = "ui"
+path = "tests/ui/lexer/lex-bad-str-literal-as-char-4.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "intentional_divergence"
+status = "active"
+owner = "@trust-compiler"
+reason = "Post-state prime notation (two-language design D2/Q9) makes ident-adjacent quotes that are neither char literals nor lifetimes lex as prime tokens. The single-quoted string inside this UNEXPANDED macro body therefore lexes cleanly and the program compiles: an invalid-vanilla program admitted by the superset grammar, exactly like clause positions. Expanded uses still error at parse time."
+issue = "local:docs/design/2026-07-09-two-language-spec-surface.md#11-open-questions"
+reviewed_on = "2026-07-11"
+expires_on = "2026-10-09"
+allowed_patterns = [
+    "unused macro definition",
+    "compiled successfully where upstream expects unterminated character literal",
+]
+
+[[exceptions]]
+id = "test-exc.lexer.str-as-char-3.prime-superset"
+test_id = "upstream.tests.ui.lexer.lex-bad-str-literal-as-char-3.rs"
+suite = "ui"
+path = "tests/ui/lexer/lex-bad-str-literal-as-char-3.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "intentional_divergence"
+status = "active"
+owner = "@trust-compiler"
+reason = "Companion to lex-bad-str-literal-as-char-4: post-state prime notation (two-language design D2/Q9) lexes the ident-adjacent single quote in `println!('hello world')` as a prime token rather than an unterminated char literal, so Trust emits label/prime parse diagnostics across all three edition revisions instead of upstream's 'unterminated character literal' + 'unknown prefix `world`'. Same intentional superset-grammar divergence; the invalid-vanilla program is still rejected, only the diagnostic text differs."
+issue = "local:docs/design/2026-07-09-two-language-spec-surface.md#11-open-questions"
+reviewed_on = "2026-07-12"
+expires_on = "2026-10-09"
+allowed_patterns = [
+    "expected `while`, `for`, `loop` or `{` after a label",
+    "prime token diagnostics replace the upstream unterminated character literal error",
+]
+
+# 2026-07-24 category-blocker decomposition (PR rule: category-level blockers
+# are not a hiding place — break them into per-test entries first). The rows
+# below decompose the two divergence-audit.toml category blockers whose most
+# recent executed evidence names concrete tests: the 2026-07-12 executed
+# domination run (run_id exec-c30dc44143, HEAD c30dc4414365, artifact
+# reports/evidence-2026-07-11/execution/failures-extract.json) recorded
+# exactly 74 failed tests: 1 crashes row (135122, since retired via the
+# de-ICE process), 2 ui diagnostic-drift rows (the tests/ui/linking/macos-*
+# pair below), and 71 rustc-private/fulldeps rows (every tests/ui-fulldeps/**
+# failure below, all one root cause: the ui-fulldeps rustc-private sysroot is
+# assembled incoherently — dylib-only, missing librustc_driver, stale
+# artifact hashes — so `extern crate rustc_*` fails E0463/E0460; see
+# tests/trust-comprehensive/divergences.toml
+# #upstream.trust-compat.2026-05-07.stage-sysroot-skew). These waivers expire
+# 2026-08-21: the next strict stage2 executed run must confirm or retire each
+# row. No proof claim is made for waived tests.
+
+[[exceptions]]
+id = "test-exc.linking.macos-ignoring-duplicate.strict-exec-drift"
+test_id = "upstream.tests.ui.linking.macos-ignoring-duplicate.rs"
+suite = "ui"
+path = "tests/ui/linking/macos-ignoring-duplicate.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Recorded failing (diagnostic-drift) by the most recent executed domination run, 2026-07-12 exec-c30dc44143 (reports/evidence-2026-07-11/execution/failures-extract.json) on aarch64-apple-darwin — one of exactly two tests/ui failures in that run. The extract carries no per-test diff text, so the current drift is unclassified; a fresh strict stage2 executed run must reproduce and classify it (or retire this row) before 2026-08-21. Decomposed from divergence-audit category row upstream.blocker.ui-diagnostic-drift."
+issue = "local:reports/evidence-2026-07-11/execution/failures-extract.json"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+
+[[exceptions]]
+id = "test-exc.linking.macos-search-path.strict-exec-drift"
+test_id = "upstream.tests.ui.linking.macos-search-path.rs"
+suite = "ui"
+path = "tests/ui/linking/macos-search-path.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Recorded failing (diagnostic-drift) by the most recent executed domination run, 2026-07-12 exec-c30dc44143 (reports/evidence-2026-07-11/execution/failures-extract.json) on aarch64-apple-darwin — one of exactly two tests/ui failures in that run. The extract carries no per-test diff text, so the current drift is unclassified; a fresh strict stage2 executed run must reproduce and classify it (or retire this row) before 2026-08-21. Decomposed from divergence-audit category row upstream.blocker.ui-diagnostic-drift."
+issue = "local:reports/evidence-2026-07-11/execution/failures-extract.json"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.compiler-calls.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.compiler-calls.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/compiler-calls.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.contracts.trust-contract-cross-crate-metadata.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.contracts.trust-contract-cross-crate-metadata.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/contracts/trust-contract-cross-crate-metadata.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.deriving-global.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.deriving-global.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/deriving-global.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.deriving-hygiene.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.deriving-hygiene.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/deriving-hygiene.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.dropck-tarena-cycle-checked.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.dropck-tarena-cycle-checked.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/dropck-tarena-cycle-checked.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.dropck-tarena-unsound-drop.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.dropck-tarena-unsound-drop.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/dropck-tarena-unsound-drop.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.dropck_tarena_sound_drop.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.dropck_tarena_sound_drop.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/dropck_tarena_sound_drop.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.empty-struct-braces-derive.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.empty-struct-braces-derive.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/empty-struct-braces-derive.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.explain_highlighter.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.explain_highlighter.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/explain_highlighter.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.internal-lints.bad_opt_access.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.internal-lints.bad_opt_access.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/internal-lints/bad_opt_access.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.internal-lints.default_hash_types.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.internal-lints.default_hash_types.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/internal-lints/default_hash_types.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.internal-lints.direct-use-of-rustc-type-ir.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.internal-lints.direct-use-of-rustc-type-ir.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/internal-lints/direct-use-of-rustc-type-ir.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.internal-lints.find_attr.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.internal-lints.find_attr.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/internal-lints/find_attr.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.internal-lints.import-of-type-ir-inherent.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.internal-lints.import-of-type-ir-inherent.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/internal-lints/import-of-type-ir-inherent.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.internal-lints.import-of-type-ir-traits.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.internal-lints.import-of-type-ir-traits.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/internal-lints/import-of-type-ir-traits.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.internal-lints.lint_pass_impl_without_macro.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.internal-lints.lint_pass_impl_without_macro.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/internal-lints/lint_pass_impl_without_macro.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.internal-lints.non_glob_import_of_type_ir_inherent.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.internal-lints.non_glob_import_of_type_ir_inherent.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/internal-lints/non_glob_import_of_type_ir_inherent.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.internal-lints.qualified_ty_ty_ctxt.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.internal-lints.qualified_ty_ty_ctxt.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/internal-lints/qualified_ty_ty_ctxt.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.internal-lints.query_completeness.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.internal-lints.query_completeness.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/internal-lints/query_completeness.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.internal-lints.query_stability.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.internal-lints.query_stability.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/internal-lints/query_stability.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.internal-lints.rustc_pass_by_value.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.internal-lints.rustc_pass_by_value.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/internal-lints/rustc_pass_by_value.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.internal-lints.span_use_eq_ctxt.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.internal-lints.span_use_eq_ctxt.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/internal-lints/span_use_eq_ctxt.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.internal-lints.ty_tykind_usage.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.internal-lints.ty_tykind_usage.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/internal-lints/ty_tykind_usage.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.lexer.unicode-version.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.lexer.unicode-version.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/lexer/unicode-version.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.lint-pass-macros.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.lint-pass-macros.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/lint-pass-macros.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.missing-rustc-driver-error.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.missing-rustc-driver-error.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/missing-rustc-driver-error.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.mod_dir_path_canonicalized.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.mod_dir_path_canonicalized.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/mod_dir_path_canonicalized.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.obtain-borrowck.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.obtain-borrowck.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/obtain-borrowck.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.pathless-extern-unstable.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.pathless-extern-unstable.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/pathless-extern-unstable.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.polymorphic-drop-glue.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.polymorphic-drop-glue.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/polymorphic-drop-glue.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.pprust-expr-roundtrip.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.pprust-expr-roundtrip.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/pprust-expr-roundtrip.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.pprust-parenthesis-insertion.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.pprust-parenthesis-insertion.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/pprust-parenthesis-insertion.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.regions-mock-tcx.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.regions-mock-tcx.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/regions-mock-tcx.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.run-compiler-twice.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.run-compiler-twice.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/run-compiler-twice.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc-dev-remap.only-remap.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc-dev-remap.rs.only-remap"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc-dev-remap.rs#only-remap"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc-dev-remap.remap-unremap.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc-dev-remap.rs.remap-unremap"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc-dev-remap.rs#remap-unremap"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_encodable_hygiene.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_encodable_hygiene.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_encodable_hygiene.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_abi.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_abi.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_abi.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_allocation.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_allocation.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_allocation.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_assoc_items.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_assoc_items.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_assoc_items.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_attribute.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_attribute.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_attribute.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_binop.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_binop.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_binop.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_coroutine_body.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_coroutine_body.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_coroutine_body.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_crate_defs.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_crate_defs.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_crate_defs.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_def_parent.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_def_parent.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_def_parent.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_def_ty.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_def_ty.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_def_ty.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_defs.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_defs.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_defs.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_fmt_macro.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_fmt_macro.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_fmt_macro.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_fn_attrs.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_fn_attrs.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_fn_attrs.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_foreign.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_foreign.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_foreign.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_instance.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_instance.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_instance.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_intrinsics.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_intrinsics.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_intrinsics.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_item_kind.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_item_kind.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_item_kind.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_normalization.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_normalization.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_normalization.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_trait_queries.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_trait_queries.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_trait_queries.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_transform.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_transform.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_transform.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_ty_fold.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_ty_fold.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_ty_fold.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_variant.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_variant.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_variant.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.check_vtable.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.check_vtable.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/check_vtable.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.closure-generic-body.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.closure-generic-body.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/closure-generic-body.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.closure_body.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.closure_body.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/closure_body.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.compilation-result.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.compilation-result.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/compilation-result.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.crate-info.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.crate-info.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/crate-info.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.projections.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.projections.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/projections.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.smir_internal.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.smir_internal.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/smir_internal.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.smir_serde.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.smir_serde.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/smir_serde.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.rustc_public.smir_visitor.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.rustc_public.smir_visitor.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/rustc_public/smir_visitor.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.session-diagnostic.diagnostic-derive-doc-comment-field.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.session-diagnostic.diagnostic-derive-doc-comment-field.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/session-diagnostic/diagnostic-derive-doc-comment-field.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.session-diagnostic.diagnostic-derive-inline.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.session-diagnostic.diagnostic-derive-inline.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/session-diagnostic/diagnostic-derive-inline.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.session-diagnostic.subdiagnostic-derive-inline.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.session-diagnostic.subdiagnostic-derive-inline.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/session-diagnostic/subdiagnostic-derive-inline.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.ui-fulldeps.stable-hash-is-unstable.sysroot-skew"
+test_id = "upstream.tests.ui-fulldeps.stable-hash-is-unstable.rs"
+suite = "ui"
+path = "tests/ui-fulldeps/stable-hash-is-unstable.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Harness rustc-private sysroot skew, not a trustc compiler regression: recorded failing (rustc-private-or-fulldeps-drift) by the 2026-07-12 executed domination run exec-c30dc44143; the prepared ui-fulldeps rustc-private sysroot is assembled incoherently (dylib-only, missing librustc_driver, stale artifact hashes), so `extern crate rustc_*` fails E0463/E0460. Root cause and required fix tracked by the active backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew. Decomposed from divergence-audit category row upstream.blocker.stage-sysroot-skew; retire on a fresh green fulldeps lane."
+issue = "local:tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+reviewed_on = "2026-07-24"
+expires_on = "2026-08-21"
+allowed_patterns = [
+    "can't find crate for `rustc_",
+    "found possibly newer version of crate",
+]
+
+[[exceptions]]
+id = "test-exc.tait.65679-free-alias-mir-built-cycle"
+test_id = "upstream.tests.ui.type-alias-impl-trait.issue-65679-inst-opaque-ty-from-val-twice.rs"
+suite = "ui"
+path = "tests/ui/type-alias-impl-trait/issue-65679-inst-opaque-ty-from-val-twice.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "expected_fail"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust-introduced query cycle, NOT a diagnostic drift: this `//@ check-pass` test aborts with `error[E0391]: cycle detected when computing type of T::{opaque#0}`. Measured 2026-07-25 against stage2 33d600dc18 — vanilla rustc 1.99.0-nightly (14cae6813) compiles it clean, and the failure needs codegen (`--emit=metadata` alone still exits 0), so it is reached through `optimized_mir`, not borrowck. Cause: trust-thir-lower's differential runs from the `mir_built` hook, and `sig_shapes_coherent` -> `fat_shape` -> `cycle_safe_normalize` (crates/trust-thir-lower/src/lib.rs:16129) normalizes `fn() -> T` where `type T = impl Sized;` is a FREE ALIAS. A free alias carries HAS_TY_FREE_ALIAS, not HAS_TY_OPAQUE, so the `has_opaque_types()` guard that fixed the sibling RPIT half (gate (0.4) in differential.rs) does not see it and the normalize re-enters the in-flight `mir_built`. The obvious repair — widening that guard to `has_aliases()` — is DELIBERATELY NOT TAKEN: it also stops resolving concrete projections, which is the identity-vs-concrete asymmetry the wave-19 DST-coherence gate reads to catch a thin-vs-fat pointer flip, so it could admit a fat value into a thin record slot. That is a soundness change to a gate needing its own evidence, not a flag swap. Retire this row when that evidence exists; do not retire it by widening the guard."
+issue = "local:crates/trust-thir-lower/src/differential.rs#opaque-reveal-cycle-gate"
+reviewed_on = "2026-07-25"
+expires_on = "2026-09-25"
+allowed_patterns = [
+    "cycle detected when computing type of",
+]

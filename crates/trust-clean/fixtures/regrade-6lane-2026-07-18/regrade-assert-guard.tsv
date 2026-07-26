@@ -1,0 +1,8 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+bounded_double	FULLY_FAITHFUL	true	true	true	true	true	false	true
+bounded_sum	FULLY_FAITHFUL	true	true	true	true	true	false	true
+checked_id	FULLY_FAITHFUL	true	true	true	true	true	false	true
+either	SHAPE_GAP	false	false	false	false	false	false	false
+non_panic_helper	SAFETY_GAP	false	false	true	false	false	false	false
+unsafe_double	SAFETY_GAP	false	false	true	false	false	false	false
+weird_guard	SHAPE_GAP	false	false	false	false	false	false	false

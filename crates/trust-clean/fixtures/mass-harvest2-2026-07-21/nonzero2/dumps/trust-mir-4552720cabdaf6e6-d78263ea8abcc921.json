@@ -1,0 +1,482 @@
+{
+  "name": "lt",
+  "def_path": "<core::num::nonzero::NonZero<u8> as core::cmp::PartialOrd>::lt",
+  "span": {
+    "file": "core/src/num/nonzero.rs",
+    "line_start": 229,
+    "col_start": 4,
+    "line_end": 231,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "core::num::nonzero::NonZero",
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Adt": {
+                        "name": "core::num::niche_types::NonZeroU8Inner",
+                        "fields": [
+                          [
+                            "0",
+                            {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "core::num::nonzero::NonZero",
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Adt": {
+                        "name": "core::num::niche_types::NonZeroU8Inner",
+                        "fields": [
+                          [
+                            "0",
+                            {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null
+              }
+            }
+          }
+        },
+        "name": "other"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Adt": {
+            "name": "core::num::nonzero::NonZero",
+            "fields": [
+              [
+                "0",
+                {
+                  "Adt": {
+                    "name": "core::num::niche_types::NonZeroU8Inner",
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Adt": {
+            "name": "core::num::nonzero::NonZero",
+            "fields": [
+              [
+                "0",
+                {
+                  "Adt": {
+                    "name": "core::num::niche_types::NonZeroU8Inner",
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null
+          }
+        },
+        "name": "self"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 3
+          },
+          {
+            "StorageLive": 4
+          },
+          {
+            "StorageLive": 5
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "core/src/num/nonzero.rs",
+                "line_start": 230,
+                "col_start": 8,
+                "line_end": 230,
+                "col_end": 12
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Unsupported": {
+                  "kind": "CastKind::Transmute",
+                  "detail": "transmute to u8 requires layout compatibility and validity-invariant proof; refusing to model it as a value-preserving cast",
+                  "operands": [
+                    {
+                      "Copy": {
+                        "local": 5,
+                        "projections": []
+                      }
+                    }
+                  ]
+                }
+              },
+              "span": {
+                "file": "core/src/num/nonzero.rs",
+                "line_start": 486,
+                "col_start": 17,
+                "line_end": 486,
+                "col_end": 54
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "core/src/num/nonzero.rs",
+                "line_start": 230,
+                "col_start": 8,
+                "line_end": 230,
+                "col_end": 18
+              }
+            }
+          },
+          {
+            "StorageDead": 5
+          },
+          {
+            "StorageLive": 6
+          },
+          {
+            "StorageLive": 7
+          },
+          {
+            "StorageLive": 8
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "core/src/num/nonzero.rs",
+                "line_start": 230,
+                "col_start": 21,
+                "line_end": 230,
+                "col_end": 26
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Unsupported": {
+                  "kind": "CastKind::Transmute",
+                  "detail": "transmute to u8 requires layout compatibility and validity-invariant proof; refusing to model it as a value-preserving cast",
+                  "operands": [
+                    {
+                      "Copy": {
+                        "local": 8,
+                        "projections": []
+                      }
+                    }
+                  ]
+                }
+              },
+              "span": {
+                "file": "core/src/num/nonzero.rs",
+                "line_start": 486,
+                "col_start": 17,
+                "line_end": 486,
+                "col_end": 54
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 7,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "core/src/num/nonzero.rs",
+                "line_start": 230,
+                "col_start": 21,
+                "line_end": 230,
+                "col_end": 32
+              }
+            }
+          },
+          {
+            "StorageDead": 8
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<u8 as core::cmp::PartialOrd>::lt",
+            "args": [
+              {
+                "Move": {
+                  "local": 3,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 6,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "core/src/num/nonzero.rs",
+              "line_start": 230,
+              "col_start": 8,
+              "line_end": 230,
+              "col_end": 32
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageDead": 7
+          },
+          {
+            "StorageDead": 6
+          },
+          {
+            "StorageDead": 4
+          },
+          {
+            "StorageDead": 3
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": "Bool"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

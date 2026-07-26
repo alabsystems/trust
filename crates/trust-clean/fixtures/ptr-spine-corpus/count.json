@@ -1,0 +1,278 @@
+{
+  "name": "count",
+  "def_path": "arch::all::memchr::One::count",
+  "span": {
+    "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.8.2/src/arch/all/memchr.rs",
+    "line_start": 93,
+    "col_start": 4,
+    "line_end": 101,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "arch::all::memchr::One",
+                "fields": [
+                  [
+                    "s1",
+                    {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "v1",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "haystack"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": "start"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": "end"
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::slice::<impl [T]>::as_ptr",
+            "args": [
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.8.2/src/arch/all/memchr.rs",
+              "line_start": 97,
+              "col_start": 24,
+              "line_end": 97,
+              "col_end": 41
+            },
+            "atomic": null,
+            "is_foreign": false
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.8.2/src/arch/all/memchr.rs",
+                "line_start": 98,
+                "col_start": 32,
+                "line_end": 98,
+                "col_end": 46
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::ptr::const_ptr::<impl *const T>::add",
+            "args": [
+              {
+                "Copy": {
+                  "local": 3,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 5,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.8.2/src/arch/all/memchr.rs",
+              "line_start": 98,
+              "col_start": 22,
+              "line_end": 98,
+              "col_end": 47
+            },
+            "atomic": null,
+            "is_foreign": false
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "arch::all::memchr::One::count_raw",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 3,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 4,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.8.2/src/arch/all/memchr.rs",
+              "line_start": 99,
+              "col_start": 12,
+              "line_end": 99,
+              "col_end": 38
+            },
+            "atomic": null,
+            "is_foreign": false
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -1,0 +1,91 @@
+def_path	self_recursive	fold_verdict	detail
+<parser::CToken as std::cmp::Eq>::assert_fields_are_eq	false	param_shape_unsupported	ParamShapeUnsupported("Unit-returning traversal with 1 params (rung B models exactly one folded param + one accumulator)")
+<parser::ParseError as std::cmp::Eq>::assert_fields_are_eq	false	param_shape_unsupported	ParamShapeUnsupported("Unit-returning traversal with 1 params (rung B models exactly one folded param + one accumulator)")
+<parser::ParseError as std::error::Error>::source	false	non_int_return	NonIntReturn
+<parser::ParseError as std::fmt::Display>::fmt	false	non_int_return	NonIntReturn
+<parser::Token as std::cmp::Eq>::assert_fields_are_eq	false	param_shape_unsupported	ParamShapeUnsupported("Unit-returning traversal with 1 params (rung B models exactly one folded param + one accumulator)")
+<reduction::Order as std::cmp::Eq>::assert_fields_are_eq	false	param_shape_unsupported	ParamShapeUnsupported("Unit-returning traversal with 1 params (rung B models exactly one folded param + one accumulator)")
+<reduction::Order as std::fmt::Display>::fmt	false	non_int_return	NonIntReturn
+<term::Context as std::cmp::Eq>::assert_fields_are_eq	false	param_shape_unsupported	ParamShapeUnsupported("Unit-returning traversal with 1 params (rung B models exactly one folded param + one accumulator)")
+<term::Context as std::convert::From<&[S]>>::from	false	non_int_return	NonIntReturn
+<term::Context as std::convert::From<std::vec::Vec<std::string::String>>>::from	false	non_int_return	NonIntReturn
+<term::DisplayWithContext<'a> as std::fmt::Display>::fmt	false	non_int_return	NonIntReturn
+<term::Notation as std::cmp::Eq>::assert_fields_are_eq	false	param_shape_unsupported	ParamShapeUnsupported("Unit-returning traversal with 1 params (rung B models exactly one folded param + one accumulator)")
+<term::Term as std::cmp::Eq>::assert_fields_are_eq	false	param_shape_unsupported	ParamShapeUnsupported("Unit-returning traversal with 1 params (rung B models exactly one folded param + one accumulator)")
+<term::Term as std::fmt::Debug>::fmt	false	non_int_return	NonIntReturn
+<term::Term as std::fmt::Display>::fmt	false	non_int_return	NonIntReturn
+<term::TermError as std::cmp::Eq>::assert_fields_are_eq	false	param_shape_unsupported	ParamShapeUnsupported("Unit-returning traversal with 1 params (rung B models exactly one folded param + one accumulator)")
+<term::TermError as std::error::Error>::source	false	non_int_return	NonIntReturn
+<term::TermError as std::fmt::Display>::fmt	false	non_int_return	NonIntReturn
+parser::_convert_classic_tokens	true	non_int_return	NonIntReturn
+parser::_convert_classic_tokens::{closure#0}	false	non_int_return	NonIntReturn
+parser::_get_ast	true	non_int_return	NonIntReturn
+parser::convert_classic_tokens	false	non_int_return	NonIntReturn
+parser::fold_exprs	true	non_int_return	NonIntReturn
+parser::fold_terms	false	non_int_return	NonIntReturn
+parser::get_ast	false	non_int_return	NonIntReturn
+parser::parse	false	non_int_return	NonIntReturn
+parser::parse_with_context	false	non_int_return	NonIntReturn
+parser::tokenize_cla	false	non_int_return	NonIntReturn
+parser::tokenize_dbr	false	non_int_return	NonIntReturn
+reduction::<impl term::Term>::_apply	true	param_shape_unsupported	ParamShapeUnsupported("Unit-returning traversal with 3 params (rung B models exactly one folded param + one accumulator)")
+reduction::<impl term::Term>::apply	false	non_int_return	NonIntReturn
+reduction::<impl term::Term>::beta_app	true	param_shape_unsupported	ParamShapeUnsupported("Unit-returning traversal with 3 params (rung B models exactly one folded param + one accumulator)")
+reduction::<impl term::Term>::beta_cbn	true	param_shape_unsupported	ParamShapeUnsupported("Unit-returning traversal with 3 params (rung B models exactly one folded param + one accumulator)")
+reduction::<impl term::Term>::beta_cbv	true	param_shape_unsupported	ParamShapeUnsupported("Unit-returning traversal with 3 params (rung B models exactly one folded param + one accumulator)")
+reduction::<impl term::Term>::beta_hap	true	param_shape_unsupported	ParamShapeUnsupported("Unit-returning traversal with 3 params (rung B models exactly one folded param + one accumulator)")
+reduction::<impl term::Term>::beta_hno	true	param_shape_unsupported	ParamShapeUnsupported("Unit-returning traversal with 3 params (rung B models exactly one folded param + one accumulator)")
+reduction::<impl term::Term>::beta_hsp	true	param_shape_unsupported	ParamShapeUnsupported("Unit-returning traversal with 3 params (rung B models exactly one folded param + one accumulator)")
+reduction::<impl term::Term>::beta_nor	true	param_shape_unsupported	ParamShapeUnsupported("Unit-returning traversal with 3 params (rung B models exactly one folded param + one accumulator)")
+reduction::<impl term::Term>::eval	false	not_self_recursive	NotSelfRecursive
+reduction::<impl term::Term>::is_reducible	false	non_int_return	NonIntReturn
+reduction::<impl term::Term>::is_reducible::{closure#0}	false	non_int_return	NonIntReturn
+reduction::<impl term::Term>::reduce	false	non_int_return	NonIntReturn
+reduction::<impl term::Term>::update_free_variables	true	param_shape_unsupported	ParamShapeUnsupported("Unit-returning traversal with 3 params (rung B models exactly one folded param + one accumulator)")
+reduction::beta	false	non_int_return	NonIntReturn
+term::Context::contains	false	non_int_return	NonIntReturn
+term::Context::contains::{closure#0}	false	non_int_return	NonIntReturn
+term::Context::empty	false	non_int_return	NonIntReturn
+term::Context::is_empty	false	not_self_recursive	NotSelfRecursive
+term::Context::iter	false	non_int_return	NonIntReturn
+term::Context::iter::{closure#0}	false	non_int_return	NonIntReturn
+term::Context::len	false	not_self_recursive	NotSelfRecursive
+term::Context::new	false	non_int_return	NonIntReturn
+term::Context::new::{closure#0}	false	non_int_return	NonIntReturn
+term::Context::resolve_free_var	false	non_int_return	NonIntReturn
+term::Context::resolve_free_var::{closure#0}	false	non_int_return	NonIntReturn
+term::Term::has_free_variables	false	not_self_recursive	NotSelfRecursive
+term::Term::has_free_variables_helper	true	fold_shape_ok	sort=Bool
+term::Term::is_isomorphic_to	true	non_int_return	NonIntReturn
+term::Term::is_supercombinator	false	not_self_recursive	NotSelfRecursive
+term::Term::lhs	false	non_int_return	NonIntReturn
+term::Term::lhs_mut	false	non_int_return	NonIntReturn
+term::Term::lhs_ref	false	non_int_return	NonIntReturn
+term::Term::max_depth	true	foreign_value_in_arm	ForeignValueInArm("std::cmp::Ord::max")
+term::Term::max_free_index	false	not_self_recursive	NotSelfRecursive
+term::Term::max_free_index_helper	true	foreign_value_in_arm	ForeignValueInArm("core::num::<impl usize>::saturating_sub")
+term::Term::rhs	false	non_int_return	NonIntReturn
+term::Term::rhs_mut	false	non_int_return	NonIntReturn
+term::Term::rhs_ref	false	non_int_return	NonIntReturn
+term::Term::unabs	false	non_int_return	NonIntReturn
+term::Term::unabs_mut	false	non_int_return	NonIntReturn
+term::Term::unabs_ref	false	non_int_return	NonIntReturn
+term::Term::unapp	false	non_int_return	NonIntReturn
+term::Term::unapp_mut	false	non_int_return	NonIntReturn
+term::Term::unapp_ref	false	non_int_return	NonIntReturn
+term::Term::unvar	false	non_int_return	NonIntReturn
+term::Term::unvar_mut	false	non_int_return	NonIntReturn
+term::Term::unvar_ref	false	non_int_return	NonIntReturn
+term::Term::with_context	false	non_int_return	NonIntReturn
+term::abs	false	non_int_return	NonIntReturn
+term::app	false	non_int_return	NonIntReturn
+term::auto_generate_context	false	non_int_return	NonIntReturn
+term::auto_generate_context::{closure#0}	false	non_int_return	NonIntReturn
+term::base26_encode	false	non_int_return	NonIntReturn
+term::generate_binder_names	false	non_int_return	NonIntReturn
+term::generate_binder_names::{closure#0}	false	non_int_return	NonIntReturn
+term::generate_binder_names::{closure#1}	false	non_int_return	NonIntReturn
+term::parenthesize_if	false	non_int_return	NonIntReturn
+term::show_precedence_cla	true	non_int_return	NonIntReturn
+term::show_precedence_cla::{closure#0}	false	non_int_return	NonIntReturn
+term::show_precedence_dbr	true	non_int_return	NonIntReturn

@@ -1,0 +1,6 @@
+== fold-crate-intake summary: 90 functions, 18 direct-self-recursive, 1 fold_shape_ok
+   fold_shape_ok: 1
+   foreign_value_in_arm: 2
+   non_int_return: 64
+   not_self_recursive: 6
+   param_shape_unsupported: 17

@@ -1,0 +1,18 @@
+# Seed fixture for post-baseline upstream Rust fix accounting.
+
+schema = "trust.upstream-rust.upstream-fixes.v1"
+
+[[upstream_fix]]
+upstream_commit = "1111111111111111111111111111111111111111"
+upstream_range = "0123456789abcdef0123456789abcdef01234567..1111111111111111111111111111111111111111"
+upstream_pr = "https://github.com/rust-lang/rust/pull/999999"
+title = "fix fixture-only borrowck compatibility regression"
+paths_fingerprint = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+classification = "adopted"
+disposition = "rebase_baseline"
+tRust_commit = "2222222222222222222222222222222222222222"
+issue = "https://github.com/alabsystems/Trust/issues/2"
+reviewer = "@trust-release"
+reviewed_at = "2026-04-26"
+next_review_at = "2026-05-03"
+notes = "Seed entry: upstream regression test passes in vanilla mode."

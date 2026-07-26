@@ -1,0 +1,115 @@
+{
+  "name": "get",
+  "def_path": "core::num::nonzero::NonZero::<i32>::get",
+  "span": {
+    "file": "core/src/num/nonzero.rs",
+    "line_start": 467,
+    "col_start": 4,
+    "line_end": 487,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "core::num::nonzero::NonZero",
+            "fields": [
+              [
+                "0",
+                {
+                  "Adt": {
+                    "name": "core::num::niche_types::NonZeroI32Inner",
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Int": {
+                            "width": 32,
+                            "signed": true
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null
+          }
+        },
+        "name": "self"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Unsupported": {
+                  "kind": "CastKind::Transmute",
+                  "detail": "transmute to i32 requires layout compatibility and validity-invariant proof; refusing to model it as a value-preserving cast",
+                  "operands": [
+                    {
+                      "Copy": {
+                        "local": 1,
+                        "projections": []
+                      }
+                    }
+                  ]
+                }
+              },
+              "span": {
+                "file": "core/src/num/nonzero.rs",
+                "line_start": 486,
+                "col_start": 17,
+                "line_end": 486,
+                "col_end": 54
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

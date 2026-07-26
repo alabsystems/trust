@@ -1,0 +1,21 @@
+# tRust-added compiletest exception ledger.
+#
+# These are not upstream Rust exceptions. They are tRust-added compiletest
+# primary files that currently fail the exhaustive `trust-added-compiletest`
+# audit. Each active entry is excluded from the intended Rust-native
+# `trust-added-compiletest` proof command once ported, so the proof log can
+# distinguish "passed" from "known not yet passable" instead of making a false
+# all-green claim.
+#
+# Required metadata for every exception: path, kind, status, owner, issue,
+# reviewed_on, expires_on, and reason. Placeholder issues such as
+# `#trust-added-compiletest` are invalid; use a real tracker URL or a local
+# review-report anchor when GitHub issue filing is unavailable.
+
+schema_version = "0.2.0"
+
+
+# RETIRED 2026-07-02 (ui-parity campaign, reports/ui-vanilla-rootcause-2026-07-01.md):
+# 22 entries removed — their tests now pass the vanilla ui replay, either via real
+# fixes (annotations/source/snapshots aligned with actual compiler behavior) or via
+# honest `//@ known-bug: #N` conversion (auto-flips when the hole is closed).

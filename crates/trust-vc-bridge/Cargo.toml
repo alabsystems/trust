@@ -1,0 +1,47 @@
+# trust-vc-bridge: trustc integration boundary for trust-vc ownership verifier
+#
+# Exposes a fail-closed trust-verifier-api adapter for trust-vc. Direct
+# trust-vc-trust-engine wiring must use the committed first-party/ source
+# inputs; this crate must not depend on ad hoc build-directory clones.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-vc-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# trustc-owned path that lowers TrustContractBundle memory/ownership
+# obligations into trust-vc-trust-engine TrustMirMemoryProofUnit values once
+# trust-vc-trust-engine is admitted through committed source materialization.
+trust-build = [
+    "dep:trust-vc-core",
+    "dep:trust-vc-trust-engine",
+    "dep:trust-ir",
+    # Kernel replay for CleanCic proof authority: the import path re-validates
+    # native bundles, which requires in-process certificate recheck capability.
+    "trust-ir/clean-expr",
+    "trust-vc-trust-engine/proof-certificates",
+]
+
+[dependencies]
+trust-vc-core = { workspace = true, optional = true }
+trust-vc-trust-engine = { path = "../../first-party/trust-vc/crates/trust-vc-trust-engine", optional = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+# Trust (R1 corpus): depth-tolerant payload parsing (`json_depth::from_str_deep`).
+trust-types = { workspace = true }
+trust-ir = { workspace = true, optional = true }
+trust-verifier-api = { workspace = true }
+
+[dev-dependencies]
+trust-ir-bridge = { workspace = true }

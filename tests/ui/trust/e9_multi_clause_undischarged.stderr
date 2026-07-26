@@ -1,0 +1,71 @@
+note: Clean island kernel-checked: 1 declaration(s) registered (u64_ge_refl)
+  --> $DIR/e9_multi_clause_undischarged.rs:12:5
+   |
+LL | /     theorem u64_ge_refl : forall (x : UInt64),
+LL | |         Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
+LL | |         fun x => Nat.le.refl (UInt64.toNat x)
+   | |_____________________________________________^
+
+
+=== Trust Verification Report (e9_multi_clause_undischarged) ===
+
+note: Trust verification: 0 proved, 0 failed, 4 unknown, 0 timed out, 0 runtime-checked out of 4 obligation(s)
+  --> $DIR/e9_multi_clause_undischarged.rs:17:1
+   |
+LL | / pub fn two(x: u64) -> u64
+LL | |
+LL | |     ensures x >= x by u64_ge_refl
+LL | |     ensures x <= x
+LL | | { x }
+   | |_____^
+   |
+   = note: 4× [postcond] UNKNOWN (trust-full-verifier): native full verifier proof evidence was not accepted by the compiler's strict full-verification policy
+
+error: Trust strict verification failed for `two`: 6 obligation(s) were not fully verified
+  --> $DIR/e9_multi_clause_undischarged.rs:17:1
+   |
+LL | / pub fn two(x: u64) -> u64
+LL | |
+LL | |     ensures x >= x by u64_ge_refl
+LL | |     ensures x <= x
+LL | | { x }
+   | |_____^
+   |
+   = note: summary: 0 trusted, 0 certified, 0 failed, 4 unknown, 0 runtime-checked, 0 skipped out of 4
+   = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
+   = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
+   = note: native full verifier status: Inconclusive; requested=4, proved=4, failed=0, unknown=0, timed_out=0, unsupported=0, skipped=0, insufficient_strength=0
+   = note: native full verifier diagnostic: evidence_bundle_hash conflict for evidence trust-wp:native-pure:trust-contracts:two:obligation:two:postcondition:1: aggregate sha256:94516f4125b78288ad81d460a743fd4f28c5e4ad19b2ffb2d26d476ef652a8b5, evidence sha256:b706e33e9c0492fe9db275b6642c2d51e0d6d346dbae819c92394635a3ee2655
+   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:3d17966f5fe3c44e7bdadaf4eaade09e35f8c8845e9939df41708d10aba12cd1 requests=4
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[2] request_digest=sha256:9c956c23401e12384df3cc2a43cabecfec9e60d37f6b5b1ddef9b94323ecfcfc
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=1 proof_obligations=[3] request_digest=sha256:6eefb468ede3c45ebfbdd0ce11936c065d4838e26d85fda7c67186989493f888
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=2 proof_obligations=[4] request_digest=sha256:286833814684f787d37dad1730aa1b06b5c6cc3157215e3653d13875b7f13054
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-wp request_id=3 proof_obligations=[0,1] request_digest=sha256:079d11a039688e704da3c5dd8becdbcaf66df121b03c58493fe0aee7889da178
+   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-wp@0.1.0 obligations=2 elapsed_ms=$TIME worker_threads=unbounded
+   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@0.1.0+native-trust-ir-bundle obligations=3 elapsed_ms=$TIME worker_threads=unbounded
+   = note: native full verifier evidence `obligation:two:postcondition:0`: verified by trust_wp NativeTrustWpBundleVerifier aggregate VerifyBundleResult using typed `trust_wp.trust-formula.v1` claim payload and `trust_wp.native-pure-replay.v1` checked evidence
+   = note: native full verifier evidence `obligation:two:postcondition:0`: trust-wp proof result metadata: engine=trust-wp-core.native-pure-replay, checker=trust_wp.native-pure-replay.v1, claim_format=TrustFormulaV1, replay_steps=4, assumptions=0, assertions=1
+   = note: native full verifier evidence `obligation:two:postcondition:0`: trust-wp proof transport artifacts preserved: native_artifacts=4, aggregate_artifacts=2, aggregate_schema=trust-wp.verify-bundle-aggregate.v1
+   = note: native full verifier evidence `obligation:two:postcondition:1`: verified by trust_wp NativeTrustWpBundleVerifier aggregate VerifyBundleResult using typed `trust_wp.trust-formula.v1` claim payload and `trust_wp.native-pure-replay.v1` checked evidence
+   = note: native full verifier evidence `obligation:two:postcondition:1`: trust-wp proof result metadata: engine=trust-wp-core.native-pure-replay, checker=trust_wp.native-pure-replay.v1, claim_format=TrustFormulaV1, replay_steps=4, assumptions=0, assertions=1
+   = note: native full verifier evidence `obligation:two:postcondition:1`: trust-wp proof transport artifacts preserved: native_artifacts=4, aggregate_artifacts=2, aggregate_schema=trust-wp.verify-bundle-aggregate.v1
+   = note: native full verifier evidence `vc:two:postcondition:0`: constructed typed trust_mc ChcVc from trust-verifier-api data: obligation=trust_ir-native-trust_mc-request-0-proof-2, function=two, kind=Assertion, relations=1, clauses=1
+   = note: native full verifier evidence `vc:two:postcondition:0`: native trust_mc typed CHC/PDR full-verification runner selected PdrProof for obligation trust_ir-native-trust_mc-request-0-proof-2
+   = note: native full verifier evidence `vc:two:postcondition:0`: native trust_mc typed CHC/PDR full-verification runner proved obligation trust_ir-native-trust_mc-request-0-proof-2 with PdrInvariant: relations=1, clauses=1
+   = note: native full verifier evidence `vc:two:postcondition:1`: constructed typed trust_mc ChcVc from trust-verifier-api data: obligation=trust_ir-native-trust_mc-request-1-proof-3, function=two, kind=Assertion, relations=1, clauses=1
+   = note: native full verifier evidence `vc:two:postcondition:1`: native trust_mc typed CHC/PDR full-verification runner selected PdrProof for obligation trust_ir-native-trust_mc-request-1-proof-3
+   = note: native full verifier evidence `vc:two:postcondition:1`: native trust_mc typed CHC/PDR full-verification runner proved obligation trust_ir-native-trust_mc-request-1-proof-3 with PdrInvariant: relations=1, clauses=1
+   = note: native full verifier evidence `vc:two:trust_mc_default_function:0`: native trust_mc typed CHC/PDR proof transport accepted with public typed-CHC binding, structured proof status, proof strength, native id, and digest-backed replay/check artifacts
+   = note: native full verifier evidence `vc:two:trust_mc_default_function:0`: native typed CHC/PDR proof transport: schema=1, suite=trust_ir, backend=trust_mc::typed-chc-pdr::chc::trivial-safe, request_id=2, proof_id=Some(4), native_id=trust_ir-native-trust_mc-request-2-proof-4, status=Proved, strength=ChcValidity, solver_artifacts=1, replay_artifacts=1, check_artifacts=1
+   = note: native full verifier evidence `vc:two:trust_mc_default_function:0`: no Horn rule derives typed CHC query target `error`
+
+note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `two`, with a clean certification audit
+  --> $DIR/e9_multi_clause_undischarged.rs:19:23
+   |
+LL |     ensures x >= x by u64_ge_refl
+   |                       ^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+
+error: aborting due to 1 previous error
+

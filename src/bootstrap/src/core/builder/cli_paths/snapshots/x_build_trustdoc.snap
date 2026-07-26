@@ -1,0 +1,7 @@
+---
+source: src/core/builder/cli_paths/tests.rs
+expression: build trustdoc
+---
+[Build] tool::Rustdoc
+    targets: [x86_64-unknown-linux-gnu]
+    - Set({build::src/tools/trustdoc})

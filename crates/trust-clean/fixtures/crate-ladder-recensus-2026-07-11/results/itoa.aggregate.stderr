@@ -1,0 +1,9 @@
+aggregate: 17 of 17 requested targets found in dump dir
+  ⏱ DECLINED (per-function budget exceeded, fail-closed — not counted proven): <impl private::Sealed for i16>::write
+  ⏱ DECLINED (per-function budget exceeded, fail-closed — not counted proven): <impl private::Sealed for i32>::write
+  ⏱ DECLINED (per-function budget exceeded, fail-closed — not counted proven): <impl private::Sealed for i64>::write
+  ⏱ DECLINED (per-function budget exceeded, fail-closed — not counted proven): <impl private::Sealed for i8>::write
+  ⏱ DECLINED (per-function budget exceeded, fail-closed — not counted proven): <impl private::Sealed for u16>::write
+  ⏱ DECLINED (per-function budget exceeded, fail-closed — not counted proven): <impl private::Sealed for u32>::write
+  ⏱ DECLINED (per-function budget exceeded, fail-closed — not counted proven): <impl private::Sealed for u64>::write
+  ⏱ DECLINED (per-function budget exceeded, fail-closed — not counted proven): <impl private::Sealed for u8>::write

@@ -1,0 +1,28 @@
+error: legacy `kani::any()`; use the native harness `any()`
+  --> tests/ui/trust_legacy_nondet_sugar.rs:22:18
+   |
+LL |     let a: i32 = kani::any();
+   |                  ------^^^
+   |                  |
+   |                  help: use the native harness `any` directly
+   |
+   = note: `-D clippy::trust-legacy-spec-sugar` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::trust_legacy_spec_sugar)]`
+
+error: legacy `kani::assume()`; use the native harness `assume()`
+  --> tests/ui/trust_legacy_nondet_sugar.rs:24:5
+   |
+LL |     kani::assume(a > 0);
+   |     ------^^^^^^
+   |     |
+   |     help: use the native harness `assume` directly
+
+error: legacy `kani::any()`; use the native harness `any()`
+  --> tests/ui/trust_legacy_nondet_sugar.rs:31:5
+   |
+LL |     kani::any::<u32>()
+   |     ------^^^^^^^^^^
+   |     |
+   |     help: use the native harness `any` directly
+
+error: aborting due to 3 previous errors

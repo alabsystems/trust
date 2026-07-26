@@ -1,0 +1,46 @@
+# trust-wp: trustc integration boundary for trust-wp deductive verifier
+#
+# Exposes trust-wp's deductive verification as a library API callable from trust's
+# verification pass. The target contract architecture is
+# designs/2026-04-25-trust-contracts-first-class-target.md.
+#
+# Defines transitional standalone types (ContractSet, trust-wpResult,
+# LoopInvariant) and a trust-wpBackend trait. The CliBackend is a compatibility
+# bridge only; target trustc builds must pass TyCtxt + DefId + TrustContractBundle
+# to trust-wp in-process.
+#
+# Default builds do not depend on trust-wp-core; trust-build enables the native
+# trust-wp bridge explicitly.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-wp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[features]
+# trust #790: trust-build enables compilation against the trustc compiler tree.
+# Target behavior: verify_with_contracts accepts TyCtxt + DefId +
+# TrustContractBundle directly in-process. Subprocess mode is compatibility only.
+trust-build = ["dep:trust-wp-core", "dep:trust-wp-ay", "dep:trust-ir"]
+
+[dependencies]
+trust-types = { workspace = true }
+trust-verifier-api = { workspace = true }
+# trust: deadline-bounded child processes (own process group, group kill).
+trust-os = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+trust-wp-core = { workspace = true, optional = true }
+trust-wp-ay = { workspace = true, optional = true }
+trust-ir = { workspace = true, features = ["serde"], optional = true }

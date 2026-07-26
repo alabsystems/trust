@@ -1,0 +1,37 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+<i32 as std::cmp::Ord>::min	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<i64 as std::cmp::Ord>::min	FULLY_FAITHFUL	true	true	false	false	false	false	true
+core::num::<impl i32>::abs	SAFETY_GAP	false	false	true	false	false	false	false
+core::num::<impl i32>::div_euclid	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::is_negative	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::num::<impl i32>::is_positive	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::num::<impl i32>::rem_euclid	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::<impl i32>::signum	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::num::<impl i64>::abs	SAFETY_GAP	false	false	true	false	false	false	false
+core::num::<impl i64>::is_negative	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::num::<impl i64>::is_positive	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::num::<impl i64>::signum	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::num::<impl i8>::abs	SAFETY_GAP	false	false	true	false	false	false	false
+core::num::<impl i8>::is_negative	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::num::<impl i8>::is_positive	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::num::<impl i8>::signum	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::num::<impl u32>::is_power_of_two	SHAPE_GAP	false	false	false	false	false	false	false
+std::cmp::impls::<impl std::cmp::PartialOrd for i32>::lt	SHAPE_GAP	false	false	false	false	false	false	false
+std::cmp::impls::<impl std::cmp::PartialOrd for i64>::lt	SHAPE_GAP	false	false	false	false	false	false	false
+w_i32_abs	SHAPE_GAP	false	false	false	false	false	false	false
+w_i32_div_euclid_7	SHAPE_GAP	false	false	false	false	false	false	false
+w_i32_is_negative	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_i32_is_positive	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_i32_rem_euclid_7	SHAPE_GAP	false	false	false	false	false	false	false
+w_i32_signum	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_i64_abs	SHAPE_GAP	false	false	false	false	false	false	false
+w_i64_is_negative	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_i64_is_positive	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_i64_signum	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_i8_abs	SHAPE_GAP	false	false	false	false	false	false	false
+w_i8_is_negative	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_i8_is_positive	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_i8_signum	FULLY_FAITHFUL	true	true	true	true	true	false	true
+w_min_abs_i32	SHAPE_GAP	false	false	false	false	false	false	false
+w_min_abs_i64	SHAPE_GAP	false	false	false	false	false	false	false
+w_u32_is_power_of_two	SHAPE_GAP	false	false	false	false	false	false	false

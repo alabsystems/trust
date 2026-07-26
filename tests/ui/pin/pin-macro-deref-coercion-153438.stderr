@@ -1,0 +1,20 @@
+error[E0308]: mismatched types
+  --> $DIR/pin-macro-deref-coercion-153438.rs:37:29
+   |
+LL |     let _x: Pin<&mut u32> = pin!(Wrapper(42));
+   |                             ^^^^^^^^^^^^^^^^^
+   |                             |
+   |                             expected `u32`, found `Wrapper`
+   |                             arguments to this function are incorrect
+   |
+help: the return type of this call is `Wrapper` due to the type of the argument passed
+  --> $DIR/pin-macro-deref-coercion-153438.rs:37:29
+   |
+LL |     let _x: Pin<&mut u32> = pin!(Wrapper(42));
+   |                             ^^^^^^^^^^^^^^^^^ this argument influences the return type of `unreachable_pin_macro_type_constraint`
+note: function defined here
+  --> $SRC_DIR/core/src/pin.rs:LL:COL
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `trustc --explain E0308`.

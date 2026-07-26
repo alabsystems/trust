@@ -1,0 +1,853 @@
+{
+  "name": "main",
+  "def_path": "probe::main",
+  "span": {
+    "file": "probe.rs",
+    "line_start": 47,
+    "col_start": 0,
+    "line_end": 56,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "v"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 1
+          },
+          {
+            "StorageLive": 2
+          },
+          {
+            "StorageLive": 3
+          },
+          {
+            "StorageLive": 4
+          },
+          {
+            "StorageLive": 5
+          },
+          {
+            "StorageLive": 6
+          },
+          {
+            "StorageLive": 7
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "probe::cmp_family",
+            "args": [
+              {
+                "Constant": {
+                  "Int": 3
+                }
+              },
+              {
+                "Constant": {
+                  "Int": 4
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    5,
+                    8
+                  ]
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    6,
+                    8
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 7,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "probe.rs",
+              "line_start": 48,
+              "col_start": 12,
+              "line_end": 48,
+              "col_end": 34
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageLive": 8
+          },
+          {
+            "StorageLive": 9
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "probe::option_family",
+            "args": [
+              {
+                "Constant": "OpaqueConst"
+              },
+              {
+                "Constant": "OpaqueConst"
+              }
+            ],
+            "dest": {
+              "local": 9,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "probe.rs",
+              "line_start": 49,
+              "col_start": 10,
+              "line_end": 49,
+              "col_end": 41
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 9,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 32,
+                      "signed": true
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "probe.rs",
+                "line_start": 49,
+                "col_start": 10,
+                "line_end": 49,
+                "col_end": 48
+              }
+            }
+          },
+          {
+            "StorageDead": 9
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Move": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "probe.rs",
+                "line_start": 48,
+                "col_start": 12,
+                "line_end": 49,
+                "col_end": 48
+              }
+            }
+          },
+          {
+            "StorageDead": 8
+          },
+          {
+            "StorageDead": 7
+          },
+          {
+            "StorageLive": 10
+          },
+          {
+            "StorageLive": 11
+          },
+          {
+            "StorageLive": 13
+          },
+          {
+            "StorageLive": 14
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Int": 1
+                  }
+                }
+              },
+              "span": {
+                "file": "core/src/result.rs",
+                "line_start": 1594,
+                "col_start": 15,
+                "line_end": 1594,
+                "col_end": 16
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      2,
+                      32
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "core/src/result.rs",
+                "line_start": 1594,
+                "col_start": 15,
+                "line_end": 1594,
+                "col_end": 16
+              }
+            }
+          },
+          {
+            "StorageLive": 15
+          },
+          {
+            "StorageLive": 16
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 13,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "probe.rs",
+                "line_start": 26,
+                "col_start": 4,
+                "line_end": 26,
+                "col_end": 14
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Move": {
+                      "local": 16,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 1
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "probe.rs",
+                "line_start": 26,
+                "col_start": 4,
+                "line_end": 26,
+                "col_end": 27
+              }
+            }
+          },
+          {
+            "StorageDead": 16
+          },
+          {
+            "StorageLive": 17
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 14,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": true
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "probe.rs",
+                "line_start": 26,
+                "col_start": 30,
+                "line_end": 26,
+                "col_end": 40
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Move": {
+                      "local": 15,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 17,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "probe.rs",
+                "line_start": 26,
+                "col_start": 4,
+                "line_end": 26,
+                "col_end": 40
+              }
+            }
+          },
+          {
+            "StorageDead": 17
+          },
+          {
+            "StorageDead": 15
+          },
+          {
+            "StorageDead": 14
+          },
+          {
+            "StorageDead": 13
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 32,
+                      "signed": true
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "probe.rs",
+                "line_start": 50,
+                "col_start": 10,
+                "line_end": 50,
+                "col_end": 44
+              }
+            }
+          },
+          {
+            "StorageDead": 11
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Move": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 10,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "probe.rs",
+                "line_start": 48,
+                "col_start": 12,
+                "line_end": 50,
+                "col_end": 44
+              }
+            }
+          },
+          {
+            "StorageDead": 10
+          },
+          {
+            "StorageDead": 6
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Move": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 6
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "probe.rs",
+                "line_start": 48,
+                "col_start": 12,
+                "line_end": 51,
+                "col_end": 40
+              }
+            }
+          },
+          {
+            "StorageDead": 5
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Move": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 10
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "probe.rs",
+                "line_start": 48,
+                "col_start": 12,
+                "line_end": 52,
+                "col_end": 44
+              }
+            }
+          },
+          {
+            "StorageDead": 4
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Move": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 3
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "probe.rs",
+                "line_start": 48,
+                "col_start": 12,
+                "line_end": 53,
+                "col_end": 44
+              }
+            }
+          },
+          {
+            "StorageDead": 3
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Add",
+                  {
+                    "Move": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 3
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "probe.rs",
+                "line_start": 48,
+                "col_start": 12,
+                "line_end": 54,
+                "col_end": 37
+              }
+            }
+          },
+          {
+            "StorageDead": 2
+          },
+          {
+            "StorageLive": 12
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::intrinsics::black_box::<i32>",
+            "args": [
+              {
+                "Move": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 12,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "core/src/hint.rs",
+              "line_start": 491,
+              "col_start": 4,
+              "line_end": 491,
+              "col_end": 39
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "StorageDead": 12
+          },
+          {
+            "StorageDead": 1
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 0,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

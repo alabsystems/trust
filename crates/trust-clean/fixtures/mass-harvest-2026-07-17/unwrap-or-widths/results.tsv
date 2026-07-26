@@ -1,0 +1,38 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+std::option::Option::<i32>::unwrap_or	FULLY_FAITHFUL	true	true	false	false	false	false	true
+meth_unwrap_or_i32	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::option::Option::<u64>::unwrap_or	FULLY_FAITHFUL	true	true	false	false	false	false	true
+meth_unwrap_or_u64	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::option::Option::<usize>::unwrap_or	FULLY_FAITHFUL	true	true	false	false	false	false	true
+meth_unwrap_or_usize	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::option::Option::<i128>::unwrap_or	FULLY_FAITHFUL	true	true	false	false	false	false	true
+opt_unwrap_or_i128	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::option::Option::<i16>::unwrap_or	FULLY_FAITHFUL	true	true	false	false	false	false	true
+opt_unwrap_or_i16	FULLY_FAITHFUL	true	true	true	true	true	false	true
+opt_unwrap_or_i32	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::option::Option::<i64>::unwrap_or	FULLY_FAITHFUL	true	true	false	false	false	false	true
+opt_unwrap_or_i64	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::option::Option::<i8>::unwrap_or	FULLY_FAITHFUL	true	true	false	false	false	false	true
+opt_unwrap_or_i8	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::option::Option::<isize>::unwrap_or	FULLY_FAITHFUL	true	true	false	false	false	false	true
+opt_unwrap_or_isize	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::option::Option::<u128>::unwrap_or	FULLY_FAITHFUL	true	true	false	false	false	false	true
+opt_unwrap_or_u128	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::option::Option::<u16>::unwrap_or	FULLY_FAITHFUL	true	true	false	false	false	false	true
+opt_unwrap_or_u16	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::option::Option::<u32>::unwrap_or	FULLY_FAITHFUL	true	true	false	false	false	false	true
+opt_unwrap_or_u32	FULLY_FAITHFUL	true	true	true	true	true	false	true
+opt_unwrap_or_u64	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::option::Option::<u8>::unwrap_or	FULLY_FAITHFUL	true	true	false	false	false	false	true
+opt_unwrap_or_u8	FULLY_FAITHFUL	true	true	true	true	true	false	true
+opt_unwrap_or_usize	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::result::Result::<i128, u8>::unwrap_or	FULLY_FAITHFUL	true	true	false	false	false	false	true
+res_unwrap_or_i128	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::result::Result::<i32, u8>::unwrap_or	FULLY_FAITHFUL	true	true	false	false	false	false	true
+res_unwrap_or_i32	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::result::Result::<i8, u8>::unwrap_or	FULLY_FAITHFUL	true	true	false	false	false	false	true
+res_unwrap_or_i8	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::result::Result::<u64, u8>::unwrap_or	FULLY_FAITHFUL	true	true	false	false	false	false	true
+res_unwrap_or_u64	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::result::Result::<usize, u8>::unwrap_or	FULLY_FAITHFUL	true	true	false	false	false	false	true
+res_unwrap_or_usize	FULLY_FAITHFUL	true	true	true	true	true	false	true

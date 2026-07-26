@@ -1,0 +1,258 @@
+{
+  "name": "pick_established",
+  "def_path": "pick_established",
+  "span": {
+    "file": "SOURCE.rs",
+    "line_start": 1,
+    "col_start": 0,
+    "line_end": 3,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "c"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "a"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "b"
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 0
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "SOURCE.rs",
+                "line_start": 1,
+                "col_start": 0,
+                "line_end": 1,
+                "col_end": 1
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "SOURCE.rs",
+              "line_start": 1,
+              "col_start": 0,
+              "line_end": 1,
+              "col_end": 1
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "helper_req",
+            "args": [
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "SOURCE.rs",
+              "line_start": 1,
+              "col_start": 0,
+              "line_end": 1,
+              "col_end": 1
+            },
+            "atomic": null,
+            "is_foreign": false
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "helper_req",
+            "args": [
+              {
+                "Copy": {
+                  "local": 3,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "SOURCE.rs",
+              "line_start": 1,
+              "col_start": 0,
+              "line_end": 1,
+              "col_end": 1
+            },
+            "atomic": null,
+            "is_foreign": false
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 3,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Requires",
+      "span": {
+        "file": "SOURCE.rs",
+        "line_start": 1,
+        "col_start": 0,
+        "line_end": 1,
+        "col_end": 1
+      },
+      "body": "__trust_lowered_compiler_contract__:(a) < (1000)"
+    },
+    {
+      "kind": "Requires",
+      "span": {
+        "file": "SOURCE.rs",
+        "line_start": 1,
+        "col_start": 0,
+        "line_end": 1,
+        "col_end": 1
+      },
+      "body": "__trust_lowered_compiler_contract__:(b) < (1000)"
+    }
+  ],
+  "preconditions": [
+    {
+      "Lt": [
+        {
+          "Var": [
+            "a",
+            "Int"
+          ]
+        },
+        {
+          "Int": 1000
+        }
+      ]
+    },
+    {
+      "Lt": [
+        {
+          "Var": [
+            "b",
+            "Int"
+          ]
+        },
+        {
+          "Int": 1000
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [
+      "(a) < (1000)",
+      "(b) < (1000)"
+    ],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -1,0 +1,283 @@
+{
+  "name": "max",
+  "def_path": "<num::nonzero::NonZero<T> as cmp::Ord>::max",
+  "span": {
+    "file": "library/core/src/num/nonzero.rs",
+    "line_start": 263,
+    "col_start": 4,
+    "line_end": 266,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Adt": {
+            "name": "num::nonzero::NonZero",
+            "fields": [
+              [
+                "0",
+                {
+                  "Unsupported": {
+                    "kind": "TyKind::Alias",
+                    "detail": "alias still has generic parameters (pre-monomorphization)"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "num::nonzero::NonZero",
+            "fields": [
+              [
+                "0",
+                {
+                  "Unsupported": {
+                    "kind": "TyKind::Alias",
+                    "detail": "alias still has generic parameters (pre-monomorphization)"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "num::nonzero::NonZero",
+            "fields": [
+              [
+                "0",
+                {
+                  "Unsupported": {
+                    "kind": "TyKind::Alias",
+                    "detail": "alias still has generic parameters (pre-monomorphization)"
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null
+          }
+        },
+        "name": "other"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Unsupported": {
+            "kind": "TyKind::Param",
+            "detail": "generic parameter T/#0 needs monomorphization"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Unsupported": {
+            "kind": "TyKind::Param",
+            "detail": "generic parameter T/#0 needs monomorphization"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Unsupported": {
+            "kind": "TyKind::Param",
+            "detail": "generic parameter T/#0 needs monomorphization"
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "num::nonzero::NonZero::<T>::get",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "library/core/src/num/nonzero.rs",
+              "line_start": 265,
+              "col_start": 37,
+              "line_end": 265,
+              "col_end": 47
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "num::nonzero::NonZero::<T>::get",
+            "args": [
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 5,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "library/core/src/num/nonzero.rs",
+              "line_start": 265,
+              "col_start": 52,
+              "line_end": 265,
+              "col_end": 63
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<T as cmp::Ord>::max",
+            "args": [
+              {
+                "Move": {
+                  "local": 4,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 5,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "library/core/src/num/nonzero.rs",
+              "line_start": 265,
+              "col_start": 37,
+              "line_end": 265,
+              "col_end": 64
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "num::nonzero::NonZero::<T>::new_unchecked",
+            "args": [
+              {
+                "Move": {
+                  "local": 3,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "library/core/src/num/nonzero.rs",
+              "line_start": 265,
+              "col_start": 17,
+              "line_end": 265,
+              "col_end": 65
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": true
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Adt": {
+        "name": "num::nonzero::NonZero",
+        "fields": [
+          [
+            "0",
+            {
+              "Unsupported": {
+                "kind": "TyKind::Alias",
+                "detail": "alias still has generic parameters (pre-monomorphization)"
+              }
+            }
+          ]
+        ],
+        "variants": [],
+        "disc_index_safe": false,
+        "faithful_enum_repr": null
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

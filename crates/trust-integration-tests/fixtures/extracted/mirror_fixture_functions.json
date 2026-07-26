@@ -1,0 +1,585 @@
+{
+  "mirror": {
+    "name": "mirror",
+    "def_path": "clean_kernel::mirror",
+    "span": {
+      "file": "mirror_fixture.rs",
+      "line_start": 33,
+      "col_start": 0,
+      "line_end": 41,
+      "col_end": 1
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": {
+            "Datatype": {
+              "name": "clean_kernel::level::Level",
+              "variants": [
+                [
+                  "Zero",
+                  []
+                ],
+                [
+                  "Succ",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::level::Level",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ]
+              ]
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 1,
+          "ty": {
+            "Ref": {
+              "mutable": false,
+              "inner": {
+                "Datatype": {
+                  "name": "clean_kernel::level::Level",
+                  "variants": [
+                    [
+                      "Zero",
+                      []
+                    ],
+                    [
+                      "Succ",
+                      [
+                        [
+                          "0",
+                          {
+                            "Datatype": {
+                              "name": "clean_kernel::level::Level",
+                              "variants": []
+                            }
+                          }
+                        ]
+                      ]
+                    ]
+                  ]
+                }
+              }
+            }
+          },
+          "name": "l"
+        },
+        {
+          "index": 2,
+          "ty": {
+            "Int": {
+              "width": 64,
+              "signed": true
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 3,
+          "ty": {
+            "Ref": {
+              "mutable": false,
+              "inner": {
+                "RawPtr": {
+                  "mutable": false,
+                  "pointee": {
+                    "Datatype": {
+                      "name": "clean_kernel::level::Level",
+                      "variants": [
+                        [
+                          "Zero",
+                          []
+                        ],
+                        [
+                          "Succ",
+                          [
+                            [
+                              "0",
+                              {
+                                "Datatype": {
+                                  "name": "clean_kernel::level::Level",
+                                  "variants": []
+                                }
+                              }
+                            ]
+                          ]
+                        ]
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "name": "p"
+        },
+        {
+          "index": 4,
+          "ty": {
+            "Datatype": {
+              "name": "clean_kernel::level::Level",
+              "variants": [
+                [
+                  "Zero",
+                  []
+                ],
+                [
+                  "Succ",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::level::Level",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ]
+              ]
+            }
+          },
+          "name": "m"
+        },
+        {
+          "index": 5,
+          "ty": {
+            "Ref": {
+              "mutable": false,
+              "inner": {
+                "Datatype": {
+                  "name": "clean_kernel::level::Level",
+                  "variants": [
+                    [
+                      "Zero",
+                      []
+                    ],
+                    [
+                      "Succ",
+                      [
+                        [
+                          "0",
+                          {
+                            "Datatype": {
+                              "name": "clean_kernel::level::Level",
+                              "variants": []
+                            }
+                          }
+                        ]
+                      ]
+                    ]
+                  ]
+                }
+              }
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 6,
+          "ty": {
+            "RawPtr": {
+              "mutable": false,
+              "pointee": {
+                "Datatype": {
+                  "name": "clean_kernel::level::Level",
+                  "variants": [
+                    [
+                      "Zero",
+                      []
+                    ],
+                    [
+                      "Succ",
+                      [
+                        [
+                          "0",
+                          {
+                            "Datatype": {
+                              "name": "clean_kernel::level::Level",
+                              "variants": []
+                            }
+                          }
+                        ]
+                      ]
+                    ]
+                  ]
+                }
+              }
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 7,
+          "ty": {
+            "RawPtr": {
+              "mutable": false,
+              "pointee": {
+                "Datatype": {
+                  "name": "clean_kernel::level::Level",
+                  "variants": [
+                    [
+                      "Zero",
+                      []
+                    ],
+                    [
+                      "Succ",
+                      [
+                        [
+                          "0",
+                          {
+                            "Datatype": {
+                              "name": "clean_kernel::level::Level",
+                              "variants": []
+                            }
+                          }
+                        ]
+                      ]
+                    ]
+                  ]
+                }
+              }
+            }
+          },
+          "name": null
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 2,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Discriminant": {
+                    "local": 1,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                },
+                "span": {
+                  "file": "mirror_fixture.rs",
+                  "line_start": 34,
+                  "col_start": 10,
+                  "line_end": 34,
+                  "col_end": 11
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "SwitchInt": {
+              "discr": {
+                "Move": {
+                  "local": 2,
+                  "projections": []
+                }
+              },
+              "targets": [
+                [
+                  0,
+                  3
+                ],
+                [
+                  1,
+                  2
+                ]
+              ],
+              "otherwise": 1,
+              "exhaustive_enum_unreachable": true,
+              "span": {
+                "file": "mirror_fixture.rs",
+                "line_start": 34,
+                "col_start": 4,
+                "line_end": 34,
+                "col_end": 11
+              }
+            }
+          }
+        },
+        {
+          "id": 1,
+          "stmts": [],
+          "terminator": "Unreachable"
+        },
+        {
+          "id": 2,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 7,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Use": {
+                    "Copy": {
+                      "local": 1,
+                      "projections": [
+                        "Deref",
+                        {
+                          "Downcast": 1
+                        },
+                        {
+                          "Field": 0
+                        }
+                      ]
+                    }
+                  }
+                },
+                "span": {
+                  "file": "mirror_fixture.rs",
+                  "line_start": 37,
+                  "col_start": 36,
+                  "line_end": 37,
+                  "col_end": 40
+                }
+              }
+            },
+            {
+              "Assign": {
+                "place": {
+                  "local": 5,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Ref": {
+                    "mutable": false,
+                    "place": {
+                      "local": 7,
+                      "projections": [
+                        "Deref"
+                      ]
+                    }
+                  }
+                },
+                "span": {
+                  "file": "mirror_fixture.rs",
+                  "line_start": 37,
+                  "col_start": 36,
+                  "line_end": 37,
+                  "col_end": 40
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Call": {
+              "func": "clean_kernel::mirror",
+              "args": [
+                {
+                  "Move": {
+                    "local": 5,
+                    "projections": []
+                  }
+                }
+              ],
+              "dest": {
+                "local": 4,
+                "projections": []
+              },
+              "target": 4,
+              "span": {
+                "file": "mirror_fixture.rs",
+                "line_start": 37,
+                "col_start": 20,
+                "line_end": 37,
+                "col_end": 43
+              },
+              "atomic": null,
+              "is_foreign": false,
+              "is_unsafe_sig": false
+            }
+          }
+        },
+        {
+          "id": 3,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 0,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "clean_kernel::level::Level",
+                        "variant": 0,
+                        "active_field": null
+                      }
+                    },
+                    []
+                  ]
+                },
+                "span": {
+                  "file": "mirror_fixture.rs",
+                  "line_start": 35,
+                  "col_start": 23,
+                  "line_end": 35,
+                  "col_end": 34
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Goto": 5
+          }
+        },
+        {
+          "id": 4,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 6,
+                  "projections": []
+                },
+                "rvalue": {
+                  "AddressOf": [
+                    false,
+                    {
+                      "local": 4,
+                      "projections": []
+                    }
+                  ]
+                },
+                "span": {
+                  "file": "mirror_fixture.rs",
+                  "line_start": 38,
+                  "col_start": 24,
+                  "line_end": 38,
+                  "col_end": 26
+                }
+              }
+            },
+            {
+              "Assign": {
+                "place": {
+                  "local": 0,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "clean_kernel::level::Level",
+                        "variant": 1,
+                        "active_field": null
+                      }
+                    },
+                    [
+                      {
+                        "Copy": {
+                          "local": 6,
+                          "projections": []
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "mirror_fixture.rs",
+                  "line_start": 38,
+                  "col_start": 12,
+                  "line_end": 38,
+                  "col_end": 27
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "Goto": 5
+          }
+        },
+        {
+          "id": 5,
+          "stmts": [],
+          "terminator": "Return"
+        }
+      ],
+      "arg_count": 1,
+      "return_ty": {
+        "Datatype": {
+          "name": "clean_kernel::level::Level",
+          "variants": [
+            [
+              "Zero",
+              []
+            ],
+            [
+              "Succ",
+              [
+                [
+                  "0",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::level::Level",
+                      "variants": []
+                    }
+                  }
+                ]
+              ]
+            ]
+          ]
+        }
+      }
+    },
+    "contracts": [],
+    "preconditions": [
+      {
+        "Or": [
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_2",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 0
+              }
+            ]
+          },
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_2",
+                  "Int"
+                ]
+              },
+              {
+                "Int": 1
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  }
+}

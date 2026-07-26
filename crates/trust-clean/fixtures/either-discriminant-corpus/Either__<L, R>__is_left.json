@@ -1,0 +1,243 @@
+{
+  "name": "is_left",
+  "def_path": "Either::<L, R>::is_left",
+  "span": {
+    "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.15.0/src/lib.rs",
+    "line_start": 175,
+    "col_start": 4,
+    "line_end": 180,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "Either",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ],
+                  [
+                    "__v0_0",
+                    {
+                      "Unsupported": {
+                        "kind": "TyKind::Param",
+                        "detail": "generic parameter L/#0 needs monomorphization"
+                      }
+                    }
+                  ],
+                  [
+                    "__v1_0",
+                    {
+                      "Unsupported": {
+                        "kind": "TyKind::Param",
+                        "detail": "generic parameter R/#1 needs monomorphization"
+                      }
+                    }
+                  ]
+                ]
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 1,
+                  "projections": [
+                    "Deref"
+                  ]
+                }
+              },
+              "span": {
+                "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.15.0/src/lib.rs",
+                "line_start": 176,
+                "col_start": 14,
+                "line_end": 176,
+                "col_end": 18
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 2,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                3
+              ],
+              [
+                1,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.15.0/src/lib.rs",
+              "line_start": 176,
+              "col_start": 8,
+              "line_end": 176,
+              "col_end": 18
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": false
+                  }
+                }
+              },
+              "span": {
+                "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.15.0/src/lib.rs",
+                "line_start": 178,
+                "col_start": 24,
+                "line_end": 178,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 4
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.15.0/src/lib.rs",
+                "line_start": 177,
+                "col_start": 23,
+                "line_end": 177,
+                "col_end": 27
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 4
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Bool"
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

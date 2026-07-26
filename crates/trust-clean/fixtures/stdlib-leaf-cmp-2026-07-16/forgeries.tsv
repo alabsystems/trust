@@ -1,0 +1,7 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful	total	inhabited	type_grounded_not_inhabited	not_grounded	kernel_rejected	safety_obligations	safety_discharged	census_fully_faithful	via_trustir	mirsem_fallback	declined	expr_fold_decline
+C1_dangling_local	SHAPE_GAP	false	false	false	false	false	false	false	1	0	0	0	0	0	0	0	0	0	0	-
+C2_type_lie_bool_from_add	SHAPE_GAP	false	false	false	false	false	false	false	1	0	0	0	0	0	0	0	0	0	0	-
+C3_div_by_zero	SHAPE_GAP	false	false	false	false	false	false	false	1	1	0	0	0	2	1	0	0	0	0	-
+C4_opaque_call	SHAPE_GAP	false	false	false	false	false	false	false	1	1	0	0	0	0	0	0	0	0	0	-
+C5_unchecked_overflow_add	SAFETY_GAP	false	false	true	false	false	false	false	1	1	0	0	0	1	0	0	0	0	0	-
+C6_valid_select_control	FULLY_FAITHFUL	true	true	true	true	true	false	true	1	1	0	0	0	0	0	1	1	0	0	-

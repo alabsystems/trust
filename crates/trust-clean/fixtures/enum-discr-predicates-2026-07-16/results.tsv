@@ -1,0 +1,10 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+std::cmp::Ordering::is_eq	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::cmp::Ordering::is_gt	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::cmp::Ordering::is_le	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::cmp::Ordering::is_lt	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::cmp::Ordering::is_ne	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::ops::ControlFlow::<i32, i32>::is_break	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::ops::ControlFlow::<i32, i32>::is_continue	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::task::Poll::<i32>::is_pending	FULLY_FAITHFUL	false	false	true	true	true	false	true
+std::task::Poll::<i32>::is_ready	FULLY_FAITHFUL	false	false	true	true	true	false	true

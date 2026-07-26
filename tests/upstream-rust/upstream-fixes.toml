@@ -1,0 +1,409 @@
+# Production-shaped upstream-fix ledger for upstream Rust compatibility accounting.
+#
+# Drift audit performed 2026-04-28 against rust-lang/rust HEAD:
+#   baseline/tracked start: 0d4eb09831046687ccd28e8a570735e90f22004c
+#   first reviewed slice:   03c609abb6638f9d7f49f34326d4137d07f5cd61
+#   reviewed through:       37d85e592f9ae5f20f7d9a9f99785246fa7298da
+#   first slice size:       3037 commits
+#   first compatibility set: 1771 commits touching tests/, compiler/, library/,
+#                            src/tools/, src/bootstrap/, src/doc/, or src/llvm-project/
+#   first tests/ drift:     638 added, 1466 modified, 247 renamed, 97 deleted
+#   second slice size:      86 commits
+#   second tests/ drift:    1 added, 17 modified
+#
+# Drift audit extended 2026-04-30 against rust-lang/rust HEAD:
+#   previous reviewed:      37d85e592f9ae5f20f7d9a9f99785246fa7298da
+#   remote HEAD evidence:   git ls-remote https://github.com/rust-lang/rust.git HEAD
+#                            -> a021a7796f66600f46013d6c8d1dfc9e8d7f4a92
+#   reviewed through:       a021a7796f66600f46013d6c8d1dfc9e8d7f4a92
+#   third slice size:       80 commits
+#   third compatibility set: 72 commits touching tests/, compiler/, library/,
+#                            src/tools/, src/bootstrap/, src/doc/, or src/llvm-project/
+#   third tests/ drift:     14 added, 48 modified, 1 renamed, 6 deleted
+#   third tracked drift:    45 added, 263 modified, 8 renamed, 6 deleted
+#
+# The entries below are not waivers. They are the high-signal upstream commits
+# from the audited range that are likely to require tRust test imports, test
+# harness support, or compiler/tool updates before the latest upstream suite can
+# reach 100% compatibility.
+
+# Drift audit closed out 2026-07-09 by the rust-1.99 content migration
+# (branch migrate/rust-2026-07):
+#   previous reviewed:      a021a7796f66600f46013d6c8d1dfc9e8d7f4a92
+#   adopted through:        5e91de65d75d3c849c643f5079509b9e5985a5c0 (upstream/main)
+#   adoption mode:          wholesale content port (compiler/, library/, src/,
+#                           tests/ aligned by 3-way merge against 0d4eb098),
+#                           NOT a per-commit review — the 6,265-commit slice
+#                           between the two revisions is included by
+#                           construction. All 34 [[fixes]] entries below were
+#                           mechanically verified as ancestors of the adopted
+#                           revision (2026-07-08 audit), so every tracked fix
+#                           is present.
+schema_version = "0.1.0"
+tracked_until_revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+
+[[fixes]]
+id = "fix.compiletest.skip_filecheck_directive"
+baseline_entry_id = "toolchain.compiletest-run-make"
+title = "compiletest promotes skip-filecheck to a normal directive"
+upstream_reference = "https://github.com/rust-lang/rust/commit/eb6eed4ba7287aa525273d8b4a385d4d02872504"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-22"
+landed_in_revision = "rust-lang/rust:eb6eed4ba7287aa525273d8b4a385d4d02872504"
+
+[[fixes]]
+id = "fix.compiletest.skip_filecheck_codegen"
+baseline_entry_id = "toolchain.compiletest-run-make"
+title = "codegen and assembly suites honor skip-filecheck"
+upstream_reference = "https://github.com/rust-lang/rust/commit/1e8cd1f7a68bf17b0b8cda356562968e4145a215"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-22"
+landed_in_revision = "rust-lang/rust:1e8cd1f7a68bf17b0b8cda356562968e4145a215"
+
+# Companion commits in this directive migration:
+# 72abf370bba999fe6c2021343366b19d5be05241 renamed cfail/cpass to bfail/bpass.
+# 793c646b7b637cbfd3344541b5bb904cbde15d77 and
+# 0ea8958c029fcd28f7fe368418477cd934c7841f migrated bfail/build-pass to bpass.
+# 87ec57f3a1e2be28221e563a88b90459847e637c forbids *-pass incremental directives.
+[[fixes]]
+id = "fix.compiletest.incremental_revision_directives"
+baseline_entry_id = "toolchain.compiletest-run-make"
+title = "incremental revisions add cpass and migrate pass directive spelling"
+upstream_reference = "https://github.com/rust-lang/rust/commit/edbb86264d0953cc9bba5a5cace01e94cf45baf2"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-22"
+landed_in_revision = "rust-lang/rust:edbb86264d0953cc9bba5a5cace01e94cf45baf2"
+
+[[fixes]]
+id = "fix.compiletest.remove_should_ice"
+baseline_entry_id = "toolchain.compiletest-run-make"
+title = "compiletest removes the should-ice directive"
+upstream_reference = "https://github.com/rust-lang/rust/commit/975402e3293abb5790279513e15024b01c9de408"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-17"
+landed_in_revision = "rust-lang/rust:975402e3293abb5790279513e15024b01c9de408"
+
+[[fixes]]
+id = "fix.compiletest.unpretty_unstable_options"
+baseline_entry_id = "toolchain.compiletest-run-make"
+title = "compiletest passes -Zunstable-options for unpretty and no-codegen paths"
+upstream_reference = "https://github.com/rust-lang/rust/commit/85633125c7616d00e3c3a33eb356e26540b8a438"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-08"
+landed_in_revision = "rust-lang/rust:85633125c7616d00e3c3a33eb356e26540b8a438"
+
+[[fixes]]
+id = "fix.compiletest.compare_out_by_lines_diff"
+baseline_entry_id = "toolchain.compiletest-run-make"
+title = "compiletest emits a dedicated compare-out-by-lines diff"
+upstream_reference = "https://github.com/rust-lang/rust/commit/459be3e7b120d9e7df5db5e3ba173a83c6454887"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-20"
+landed_in_revision = "rust-lang/rust:459be3e7b120d9e7df5db5e3ba173a83c6454887"
+
+[[fixes]]
+id = "fix.diagnostics.verbose_span_suggestions"
+baseline_entry_id = "toolchain.rustc"
+title = "diagnostics make span_suggestions always verbose"
+upstream_reference = "https://github.com/rust-lang/rust/commit/b849e10d380004fd44cb12f35d8be456e29f2baf"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-15"
+landed_in_revision = "rust-lang/rust:b849e10d380004fd44cb12f35d8be456e29f2baf"
+
+[[fixes]]
+id = "fix.diagnostics.on_unknown_item_attribute"
+baseline_entry_id = "toolchain.rustc"
+title = "diagnostic attributes add on_unknown_item handling"
+upstream_reference = "https://github.com/rust-lang/rust/commit/6e5fc9075cf6e70f4a211e42d5670fa723457660"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-10"
+landed_in_revision = "rust-lang/rust:6e5fc9075cf6e70f4a211e42d5670fa723457660"
+
+[[fixes]]
+id = "fix.symbol_names.rustc_dump_symbol_name"
+baseline_entry_id = "toolchain.rustc"
+title = "rustc_symbol_name test attribute is renamed to rustc_dump_symbol_name"
+upstream_reference = "https://github.com/rust-lang/rust/commit/cb4a7f4f19758e70de20dd0591a9fe0b6965d096"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-10"
+landed_in_revision = "rust-lang/rust:cb4a7f4f19758e70de20dd0591a9fe0b6965d096"
+
+[[fixes]]
+id = "fix.codegen.llvm_22_1_4"
+baseline_entry_id = "toolchain.rustc"
+title = "LLVM submodule advances to 22.1.4"
+upstream_reference = "https://github.com/rust-lang/rust/commit/cf8a60c20df5bbb5eb93f64e82fa91b2948a034f"
+status = "landed"
+local_action = "track_only"
+landed_on = "2026-04-28"
+landed_in_revision = "rust-lang/rust:cf8a60c20df5bbb5eb93f64e82fa91b2948a034f"
+
+[[fixes]]
+id = "fix.codegen.c_variadic_va_list_next_arg"
+baseline_entry_id = "toolchain.standard-library"
+title = "c-variadic VaList API is renamed from arg to next_arg"
+upstream_reference = "https://github.com/rust-lang/rust/commit/84cd23b3c8d9acf5fd882558cacac1181faaef10"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-22"
+landed_in_revision = "rust-lang/rust:84cd23b3c8d9acf5fd882558cacac1181faaef10"
+
+[[fixes]]
+id = "fix.rustdoc.percent_encoded_fragments"
+baseline_entry_id = "toolchain.rustdoc"
+title = "rustdoc percent-encodes URL fragments"
+upstream_reference = "https://github.com/rust-lang/rust/commit/a9d7027f3986fba29cc329c2cf5038d9c21b7583"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-15"
+landed_in_revision = "rust-lang/rust:a9d7027f3986fba29cc329c2cf5038d9c21b7583"
+
+[[fixes]]
+id = "fix.libtest.exact_filter_binary_search"
+baseline_entry_id = "toolchain.test-harness"
+title = "libtest changes exact filtering to binary search"
+upstream_reference = "https://github.com/rust-lang/rust/commit/bbb9e3bb4a40f82e39a0d30b34fcaa5f8c2d1c6c"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-05"
+landed_in_revision = "rust-lang/rust:bbb9e3bb4a40f82e39a0d30b34fcaa5f8c2d1c6c"
+
+[[fixes]]
+id = "fix.cargo.submodule_2026_04_24"
+baseline_entry_id = "toolchain.cargo"
+title = "Cargo submodule advances in the latest upstream test range"
+upstream_reference = "https://github.com/rust-lang/rust/commit/d439d07af224ce3e1ae837972f580ce0afd60f0e"
+status = "landed"
+local_action = "rebase_baseline"
+landed_on = "2026-04-24"
+landed_in_revision = "rust-lang/rust:d439d07af224ce3e1ae837972f580ce0afd60f0e"
+
+[[fixes]]
+id = "fix.symbol_names.v0_mangling_default"
+baseline_entry_id = "toolchain.rustc"
+title = "stable rustc switches to v0 symbol mangling by default"
+upstream_reference = "https://github.com/rust-lang/rust/commit/a4c0bf5edae"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-28"
+landed_in_revision = "rust-lang/rust:a4c0bf5edae"
+
+[[fixes]]
+id = "fix.diagnostics.let_else_irrefutable"
+baseline_entry_id = "toolchain.rustc"
+title = "irrefutable let-else warnings gain new output and suggestions"
+upstream_reference = "https://github.com/rust-lang/rust/commit/8591f0f230c"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-28"
+landed_in_revision = "rust-lang/rust:8591f0f230c"
+
+[[fixes]]
+id = "fix.compiletest.incremental_runner_overhaul"
+baseline_entry_id = "toolchain.compiletest-run-make"
+title = "compiletest overhauls incremental revision execution"
+upstream_reference = "https://github.com/rust-lang/rust/commit/da0fe8db677"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-28"
+landed_in_revision = "rust-lang/rust:da0fe8db677"
+
+[[fixes]]
+id = "fix.compiletest.needs_asm_mnemonic"
+baseline_entry_id = "toolchain.compiletest-run-make"
+title = "compiletest adds needs-asm-mnemonic for backend mnemonic filtering"
+upstream_reference = "https://github.com/rust-lang/rust/commit/2a8e588c904"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-28"
+landed_in_revision = "rust-lang/rust:2a8e588c904"
+
+[[fixes]]
+id = "fix.codegen.boollike_argument_niche"
+baseline_entry_id = "toolchain.rustc"
+title = "codegen narrows the 155473 argument ABI exclusion to one-byte bool-like values"
+upstream_reference = "https://github.com/rust-lang/rust/commit/569ad998644"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-28"
+landed_in_revision = "rust-lang/rust:569ad998644"
+
+[[fixes]]
+id = "fix.const_eval.const_closure_hkl"
+baseline_entry_id = "toolchain.rustc"
+title = "const closure higher-ranked lifetime handling gains a regression test and fix"
+upstream_reference = "https://github.com/rust-lang/rust/commit/b465c5642b4"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-28"
+landed_in_revision = "rust-lang/rust:b465c5642b4"
+
+[[fixes]]
+id = "fix.rustdoc.doc_cfg_extern_items"
+baseline_entry_id = "toolchain.rustdoc"
+title = "rustdoc fixes doc_cfg rendering for extern items"
+upstream_reference = "https://github.com/rust-lang/rust/commit/36138dc0b8bd20a99ea1fc91651002f5f58b07d2"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-29"
+landed_in_revision = "rust-lang/rust:36138dc0b8bd20a99ea1fc91651002f5f58b07d2"
+
+[[fixes]]
+id = "fix.diagnostics.fnmut_closure_arg_suggestion"
+baseline_entry_id = "toolchain.rustc"
+title = "borrowck avoids misleading return-type notes for foreign Fn callees"
+upstream_reference = "https://github.com/rust-lang/rust/commit/4de0d24c3f817a6443719c4fc990e8c8d1a284d1"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-27"
+landed_in_revision = "rust-lang/rust:4de0d24c3f817a6443719c4fc990e8c8d1a284d1"
+
+[[fixes]]
+id = "fix.compiletest.needs_asm_mnemonic_ret"
+baseline_entry_id = "toolchain.compiletest-run-make"
+title = "codegen tests expand needs-asm-mnemonic ret filtering"
+upstream_reference = "https://github.com/rust-lang/rust/commit/44b9251b181150f7e36f561abd944c2bd167e183"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-27"
+landed_in_revision = "rust-lang/rust:44b9251b181150f7e36f561abd944c2bd167e183"
+
+[[fixes]]
+id = "fix.bootstrap.out_dir_remap"
+baseline_entry_id = "toolchain.bootstrap-x.py"
+title = "bootstrap remaps OUT_DIR paths to remove build-script path leakage"
+upstream_reference = "https://github.com/rust-lang/rust/commit/e743a4db62336027dcc1f1a755f4ca35f56b67df"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-28"
+landed_in_revision = "rust-lang/rust:e743a4db62336027dcc1f1a755f4ca35f56b67df"
+
+[[fixes]]
+id = "fix.codegen.wasm32_wali_trust_cg2_target"
+baseline_entry_id = "toolchain.rustc"
+title = "wasm32-wali target spec updates for LLVM 22"
+upstream_reference = "https://github.com/rust-lang/rust/commit/8b3f6dbd9fc5da7f3a5b21314d4fbf5b1757337c"
+status = "landed"
+local_action = "track_only"
+landed_on = "2026-04-28"
+landed_in_revision = "rust-lang/rust:8b3f6dbd9fc5da7f3a5b21314d4fbf5b1757337c"
+
+[[fixes]]
+id = "fix.codegen.dlltool_whitespace_paths"
+baseline_entry_id = "toolchain.rustc"
+title = "raw-dylib dlltool path quoting and whitespace coverage change"
+upstream_reference = "https://github.com/rust-lang/rust/commit/91783dd17f423613a17d5a3870d1c02832ecfc8a"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-29"
+landed_in_revision = "rust-lang/rust:91783dd17f423613a17d5a3870d1c02832ecfc8a"
+
+[[fixes]]
+id = "fix.diagnostics.host_effect_bounds"
+baseline_entry_id = "toolchain.rustc"
+title = "HostEffect trait-bound diagnostics gain new suggestions"
+upstream_reference = "https://github.com/rust-lang/rust/commit/61e876fe760a983a3d172e812ec1be1b60453cd4"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-27"
+landed_in_revision = "rust-lang/rust:61e876fe760a983a3d172e812ec1be1b60453cd4"
+
+[[fixes]]
+id = "fix.const_eval.c_variadic_ub_check"
+baseline_entry_id = "toolchain.standard-library"
+title = "c-variadic const eval adds more precise VaList UB checks"
+upstream_reference = "https://github.com/rust-lang/rust/commit/c560774cf35e52fc140048edacaa9a9bc10f624e"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-26"
+landed_in_revision = "rust-lang/rust:c560774cf35e52fc140048edacaa9a9bc10f624e"
+
+[[fixes]]
+id = "fix.codegen.archive_format_error"
+baseline_entry_id = "toolchain.rustc"
+title = "archive format errors report diagnostics instead of ICEs"
+upstream_reference = "https://github.com/rust-lang/rust/commit/b784a1ca79d9f683cd96369637993068de678a3a"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-29"
+landed_in_revision = "rust-lang/rust:b784a1ca79d9f683cd96369637993068de678a3a"
+
+[[fixes]]
+id = "fix.codegen.nvptx_drop_old_arch"
+baseline_entry_id = "toolchain.rustc"
+title = "NVPTX drops old hardware and ISA support"
+upstream_reference = "https://github.com/rust-lang/rust/commit/a2d23cec5f108a1cb69e77ec2fe310f19ab56da8"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-02-01"
+landed_in_revision = "rust-lang/rust:a2d23cec5f108a1cb69e77ec2fe310f19ab56da8"
+
+[[fixes]]
+id = "fix.miri.tree_borrows_implicit_writes"
+baseline_entry_id = "toolchain.miri"
+title = "Miri Tree Borrows adds implicit-write tracking and tests"
+upstream_reference = "https://github.com/rust-lang/rust/commit/d0440d3a6a78e08427513f25c202b18ee0677dff"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-29"
+landed_in_revision = "rust-lang/rust:d0440d3a6a78e08427513f25c202b18ee0677dff"
+
+[[fixes]]
+id = "fix.codegen.simd_reduce_minmax_float_removed"
+baseline_entry_id = "toolchain.rustc"
+title = "simd_reduce_min and simd_reduce_max remove float support"
+upstream_reference = "https://github.com/rust-lang/rust/commit/ad7ddbc08ec744d969f8110bb2cd5e7bd8d66aa8"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-12"
+landed_in_revision = "rust-lang/rust:ad7ddbc08ec744d969f8110bb2cd5e7bd8d66aa8"
+
+[[fixes]]
+id = "fix.parser.attribute_stage_cleanup"
+baseline_entry_id = "toolchain.rustc"
+title = "attribute parsing removes Stage-based emission plumbing"
+upstream_reference = "https://github.com/rust-lang/rust/commit/0424cc16731e6141a18077f8ccde77ba148d9649"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-29"
+landed_in_revision = "rust-lang/rust:0424cc16731e6141a18077f8ccde77ba148d9649"
+
+[[fixes]]
+id = "fix.trait_solver.placeholder_canonicalization"
+baseline_entry_id = "toolchain.rustc"
+title = "trait solver canonicalizes input free regions as placeholders"
+upstream_reference = "https://github.com/rust-lang/rust/commit/f2ae894662cdb8532879955d309154588323274c"
+status = "landed"
+local_action = "port_fix"
+landed_on = "2026-04-28"
+landed_in_revision = "rust-lang/rust:f2ae894662cdb8532879955d309154588323274c"
+
+# Trust-ahead-of-upstream divergence adopted as a fix (2026-07-12), not an
+# upstream commit: rust-lang/rust#135122 still ICEs at the tracked revision
+# (`assertion failed: !ty.has_non_region_infer()` in implied_outlives_bounds
+# during impl-item comparison; upstream keeps it in the known-bug corpus as
+# tests/crashes/135122.rs, labeled fixed-by-next-solver, issue open). Trust
+# emits ordinary diagnostics (E0046/E0207/E0191/E0277) instead of crashing,
+# observed in domination run exec-c30dc44143. Per the upstream-sanctioned
+# process for a crashes test that stops ICEing, the crashes entry is deleted
+# locally and replaced by the blessed regression test
+# tests/ui/implied-bounds/ice-implied-outlives-bounds-135122.rs. The matching
+# waiver test-exc.crashes.135122.no-ice in test-exceptions.toml is resolved
+# (local_action = drop_exception). status = "proposed" because the upstream
+# fix path (next-generation trait solver) has not landed as default upstream.
+[[fixes]]
+id = "fix.trait_solver.implied_outlives_bounds_infer_ice_135122"
+baseline_entry_id = "toolchain.rustc"
+title = "implied-outlives-bounds infer-var ICE (crashes/135122) emits ordinary diagnostics under Trust"
+upstream_reference = "https://github.com/rust-lang/rust/issues/135122"
+status = "proposed"
+local_action = "drop_exception"

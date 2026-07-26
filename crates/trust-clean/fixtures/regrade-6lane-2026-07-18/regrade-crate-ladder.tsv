@@ -1,0 +1,539 @@
+corpus	def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+arrayvec	<arrayvec::ArrayVec<T, CAP> as arrayvec_impl::ArrayVecImpl>::as_mut_ptr	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	<arrayvec::ArrayVec<T, CAP> as arrayvec_impl::ArrayVecImpl>::as_ptr	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::len	FULLY_FAITHFUL	true	true	true	true	true	false	true
+arrayvec	<arrayvec::ArrayVec<T, CAP> as arrayvec_impl::ArrayVecImpl>::len	FULLY_FAITHFUL	true	true	true	true	true	false	true
+arrayvec	<arrayvec::ArrayVec<T, CAP> as arrayvec_impl::ArrayVecImpl>::set_len	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::as_mut_ptr	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec_impl::ArrayVecImpl::as_mut_slice	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::as_mut_slice	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::as_ptr	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec_impl::ArrayVecImpl::as_slice	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::as_slice	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::capacity	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec_impl::ArrayVecImpl::truncate	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec_impl::ArrayVecImpl::clear	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::clear	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::drain_range	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::extend_from_iter::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::extend_from_slice	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::get_unchecked_ptr	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::into_inner_unchecked	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::into_inner	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::is_empty	FULLY_FAITHFUL	true	true	true	true	true	false	true
+arrayvec	arrayvec::ArrayVec::<T, CAP>::is_full	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::new	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::new_const	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec_impl::ArrayVecImpl::pop	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::pop	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::pop_at	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::remaining_capacity	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::retain::process_one	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::set_len	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::spare_capacity_mut	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::swap_pop	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::take	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::truncate	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::ArrayVec::<T, CAP>::try_extend_from_slice	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::extend_panic	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec::raw_ptr_add	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec_impl::ArrayVecImpl::push_unchecked	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec_impl::ArrayVecImpl::try_push	SHAPE_GAP	false	false	false	false	false	false	false
+arrayvec	arrayvec_impl::ArrayVecImpl::push	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::read_u128	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::read_u128_into	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::read_u16	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::read_u16_into	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::read_u32	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::read_u32_into	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::read_u64	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::read_u64_into	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::read_uint	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::read_uint128	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::write_u128	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::write_u128_into	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::write_u16	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::write_u16_into	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::write_u32	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::write_u32_into	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::write_u64	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::write_u64_into	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::write_uint	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<BigEndian as ByteOrder>::write_uint128	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::read_u128	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::read_u128_into	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::read_u16	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::read_u16_into	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::read_u32	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::read_u32_into	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::read_u64	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::read_u64_into	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::read_uint	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::read_uint128	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::write_u128	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::write_u128_into	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::write_u16	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::write_u16_into	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::write_u32	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::write_u32_into	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::write_u64	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::write_u64_into	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::write_uint	SHAPE_GAP	false	false	false	false	false	false	false
+byteorder	<LittleEndian as ByteOrder>::write_uint128	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::clone::Clone>::clone_from	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::cmp::Ord>::cmp	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::cmp::PartialEq>::eq	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::cmp::PartialOrd>::partial_cmp	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::convert::AsMut<Target>>::as_mut	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::convert::AsMut<[Target]>>::as_mut	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::convert::AsMut<str>>::as_mut	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::convert::AsRef<Target>>::as_ref	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::convert::AsRef<[Target]>>::as_ref	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::convert::AsRef<str>>::as_ref	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::fmt::Debug>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::fmt::Display>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::fmt::Write>::write_char	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::fmt::Write>::write_fmt	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::fmt::Write>::write_str	SHAPE_GAP	false	false	false	false	false	false	false
+either	Either::<L, R>::as_pin_mut	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::future::Future>::poll	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::hash::Hash>::hash	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::ops::Deref>::deref	SHAPE_GAP	false	false	false	false	false	false	false
+either	<Either<L, R> as core::ops::DerefMut>::deref_mut	SHAPE_GAP	false	false	false	false	false	false	false
+either	<iterator::IterEither<L, R> as core::clone::Clone>::clone	SHAPE_GAP	false	false	false	false	false	false	false
+either	<iterator::IterEither<L, R> as core::fmt::Debug>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+either	<iterator::IterEither<L, R> as core::iter::DoubleEndedIterator>::next_back	SHAPE_GAP	false	false	false	false	false	false	false
+either	<iterator::IterEither<L, R> as core::iter::DoubleEndedIterator>::nth_back	SHAPE_GAP	false	false	false	false	false	false	false
+either	<iterator::IterEither<L, R> as core::iter::ExactSizeIterator>::len	SHAPE_GAP	false	false	false	false	false	false	false
+either	<iterator::IterEither<L, R> as core::iter::Iterator>::next	SHAPE_GAP	false	false	false	false	false	false	false
+either	<iterator::IterEither<L, R> as core::iter::Iterator>::nth	SHAPE_GAP	false	false	false	false	false	false	false
+either	<iterator::IterEither<L, R> as core::iter::Iterator>::size_hint	SHAPE_GAP	false	false	false	false	false	false	false
+either	Either::<L, R>::as_mut	SHAPE_GAP	false	false	false	false	false	false	false
+either	Either::<L, R>::as_pin_ref	SHAPE_GAP	false	false	false	false	false	false	false
+either	Either::<L, R>::as_ref	SHAPE_GAP	false	false	false	false	false	false	false
+either	iterator::IterEither::<L, R>::new	SHAPE_GAP	false	false	false	false	false	false	false
+either	Either::<L, R>::factor_iter	SHAPE_GAP	false	false	false	false	false	false	false
+either	Either::<L, R>::factor_iter_mut	SHAPE_GAP	false	false	false	false	false	false	false
+either	Either::<L, R>::is_left	FULLY_FAITHFUL	false	false	true	true	true	false	true
+either	Either::<L, R>::is_right	FULLY_FAITHFUL	true	true	true	true	true	false	true
+either	Either::<L, R>::iter	SHAPE_GAP	false	false	false	false	false	false	false
+either	Either::<L, R>::iter_mut	SHAPE_GAP	false	false	false	false	false	false	false
+either	Either::<core::option::Option<L>, core::option::Option<R>>::factor_none	SHAPE_GAP	false	false	false	false	false	false	false
+either	Either::<core::result::Result<L, E>, core::result::Result<R, E>>::factor_err	SHAPE_GAP	false	false	false	false	false	false	false
+either	Either::<core::result::Result<T, L>, core::result::Result<T, R>>::factor_ok	SHAPE_GAP	false	false	false	false	false	false	false
+either	iterator::<impl core::iter::DoubleEndedIterator for Either<L, R>>::next_back	SHAPE_GAP	false	false	false	false	false	false	false
+either	iterator::<impl core::iter::DoubleEndedIterator for Either<L, R>>::nth_back	SHAPE_GAP	false	false	false	false	false	false	false
+either	iterator::<impl core::iter::ExactSizeIterator for Either<L, R>>::len	SHAPE_GAP	false	false	false	false	false	false	false
+either	iterator::<impl core::iter::Iterator for Either<L, R>>::next	SHAPE_GAP	false	false	false	false	false	false	false
+either	iterator::<impl core::iter::Iterator for Either<L, R>>::nth	SHAPE_GAP	false	false	false	false	false	false	false
+either	iterator::<impl core::iter::Iterator for Either<L, R>>::size_hint	SHAPE_GAP	false	false	false	false	false	false	false
+itoa	Buffer::new	SHAPE_GAP	false	false	false	false	false	false	false
+itoa	<Buffer as core::clone::Clone>::clone	SHAPE_GAP	false	false	false	false	false	false	false
+itoa	<Buffer as core::default::Default>::default	SHAPE_GAP	false	false	false	false	false	false	false
+itoa	udiv128::u128_mulhi	SHAPE_GAP	false	false	false	false	false	false	false
+itoa	udiv128::udivmod_1e19	SHAPE_GAP	false	false	false	false	false	false	false
+itoa	<impl private::Sealed for i128>::write	SHAPE_GAP	false	false	false	false	false	false	false
+itoa	<impl private::Sealed for i16>::write	SHAPE_GAP	false	false	false	false	false	false	false
+itoa	<impl private::Sealed for i32>::write	SHAPE_GAP	false	false	false	false	false	false	false
+itoa	<impl private::Sealed for i64>::write	SHAPE_GAP	false	false	false	false	false	false	false
+itoa	<impl private::Sealed for i8>::write	SHAPE_GAP	false	false	false	false	false	false	false
+itoa	<impl private::Sealed for isize>::write	SHAPE_GAP	false	false	false	false	false	false	false
+itoa	<impl private::Sealed for u128>::write	SHAPE_GAP	false	false	false	false	false	false	false
+itoa	<impl private::Sealed for u16>::write	SHAPE_GAP	false	false	false	false	false	false	false
+itoa	<impl private::Sealed for u32>::write	SHAPE_GAP	false	false	false	false	false	false	false
+itoa	<impl private::Sealed for u64>::write	SHAPE_GAP	false	false	false	false	false	false	false
+itoa	<impl private::Sealed for u8>::write	SHAPE_GAP	false	false	false	false	false	false	false
+itoa	<impl private::Sealed for usize>::write	SHAPE_GAP	false	false	false	false	false	false	false
+memchr	arch::all::memchr::One::confirm	FULLY_FAITHFUL	true	true	false	false	false	false	true
+memchr	arch::all::memchr::One::count_raw	SAFETY_GAP	false	false	true	false	false	false	false
+memchr	arch::all::memchr::One::count	SHAPE_GAP	false	false	false	false	false	false	false
+memchr	arch::all::memchr::One::find	SHAPE_GAP	false	false	false	false	false	false	false
+memchr	arch::all::memchr::One::has_needle	SHAPE_GAP	false	false	false	false	false	false	false
+memchr	arch::all::memchr::One::find_raw	SHAPE_GAP	false	false	false	false	false	false	false
+memchr	arch::all::memchr::One::find::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+memchr	arch::all::memchr::One::find_raw::{closure#0}	FULLY_FAITHFUL	true	true	true	true	true	false	true
+memchr	arch::all::memchr::One::iter	SHAPE_GAP	false	false	false	false	false	false	false
+memchr	arch::all::memchr::One::new	SHAPE_GAP	false	false	false	false	false	false	false
+memchr	arch::all::memchr::One::rfind	SHAPE_GAP	false	false	false	false	false	false	false
+memchr	arch::all::memchr::One::rfind_raw	SHAPE_GAP	false	false	false	false	false	false	false
+memchr	arch::all::memchr::One::rfind::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+memchr	arch::all::memchr::One::rfind_raw::{closure#0}	FULLY_FAITHFUL	true	true	true	true	true	false	true
+ascii_utils	<char as Check>::is_control	FULLY_FAITHFUL	false	false	true	true	true	false	true
+ascii_utils	<char as Check>::is_digit	FULLY_FAITHFUL	true	true	true	true	true	false	true
+ascii_utils	<char as Check>::is_extended	FULLY_FAITHFUL	false	false	true	true	true	false	true
+ascii_utils	<char as Check>::is_letter	FULLY_FAITHFUL	true	true	true	true	true	false	true
+ascii_utils	<char as Check>::is_lower	FULLY_FAITHFUL	true	true	true	true	true	false	true
+ascii_utils	<char as Check>::is_printable	FULLY_FAITHFUL	false	false	true	true	true	false	true
+ascii_utils	<char as Check>::is_space	FULLY_FAITHFUL	true	true	true	true	true	false	true
+ascii_utils	<char as Check>::is_upper	FULLY_FAITHFUL	true	true	true	true	true	false	true
+ascii_utils	<char as Check>::is_us_ascii	FULLY_FAITHFUL	false	false	true	true	true	false	true
+ascii_utils	<errors::AsciiError as std::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+ascii_utils	<errors::AsciiError as std::cmp::PartialEq>::eq	SHAPE_GAP	false	false	false	false	false	false	false
+ascii_utils	<errors::AsciiError as std::error::Error>::cause	SHAPE_GAP	false	false	false	false	false	false	false
+ascii_utils	<errors::AsciiError as std::error::Error>::description	SHAPE_GAP	false	false	false	false	false	false	false
+ascii_utils	<errors::AsciiError as std::fmt::Debug>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+ascii_utils	<errors::AsciiError as std::fmt::Display>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+ascii_utils	<u8 as Check>::is_control	FULLY_FAITHFUL	true	true	true	true	true	false	true
+ascii_utils	<u8 as Check>::is_digit	FULLY_FAITHFUL	true	true	true	true	true	false	true
+ascii_utils	<u8 as Check>::is_extended	FULLY_FAITHFUL	true	true	true	true	true	false	true
+ascii_utils	<u8 as Check>::is_letter	FULLY_FAITHFUL	true	true	true	true	true	false	true
+ascii_utils	<u8 as Check>::is_lower	FULLY_FAITHFUL	true	true	true	true	true	false	true
+ascii_utils	<u8 as Check>::is_printable	FULLY_FAITHFUL	true	true	true	true	true	false	true
+ascii_utils	<u8 as Check>::is_space	FULLY_FAITHFUL	true	true	true	true	true	false	true
+ascii_utils	<u8 as Check>::is_upper	FULLY_FAITHFUL	true	true	true	true	true	false	true
+ascii_utils	<u8 as Check>::is_us_ascii	FULLY_FAITHFUL	true	true	true	true	true	false	true
+ascii_utils	check_ascii_printable	SHAPE_GAP	false	false	false	false	false	false	false
+bit_field	<[T] as BitArray<T>>::bit_length	SHAPE_GAP	false	false	false	false	false	false	false
+bit_field	<[T] as BitArray<T>>::get_bit	SHAPE_GAP	false	false	false	false	false	false	false
+bit_field	<[T] as BitArray<T>>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+bit_field	<i128 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+bit_field	<i128 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+bit_field	<i16 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+bit_field	<i16 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+bit_field	<i32 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+bit_field	<i32 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+bit_field	<i64 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+bit_field	<i64 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+bit_field	<i8 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+bit_field	<i8 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+bit_field	<isize as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+bit_field	<isize as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+bit_field	<u128 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+bit_field	<u128 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+bit_field	<u16 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+bit_field	<u16 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+bit_field	<u32 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+bit_field	<u32 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+bit_field	<u64 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+bit_field	<u64 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+bit_field	<u8 as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+bit_field	<u8 as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+bit_field	<usize as BitField>::get_bit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+bit_field	<usize as BitField>::set_bit	SHAPE_GAP	false	false	false	false	false	false	false
+bit_field	to_regular_range	SHAPE_GAP	false	false	false	false	false	false	false
+cast	<Error as core::clone::Clone>::clone	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	<Error as core::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+cast	<Error as core::cmp::PartialEq>::eq	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	<Error as core::fmt::Debug>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+cast	Error::description_helper	SHAPE_GAP	false	false	false	false	false	false	false
+cast	<Error as core::fmt::Display>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+cast	<f32 as From<f64>>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f32> for f32>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<f32> for f64>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f32> for i16>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f32> for i32>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f32> for i64>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f32> for i8>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f32> for isize>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f32> for u16>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f32> for u32>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f32> for u64>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f32> for u8>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f32> for usize>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f64> for f64>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<f64> for i16>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f64> for i32>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f64> for i64>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f64> for i8>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f64> for isize>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f64> for u16>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f64> for u32>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f64> for u64>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f64> for u8>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<f64> for usize>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<i16> for f32>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<i16> for f64>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<i16> for i16>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<i16> for i32>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<i16> for i64>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<i16> for i8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i16> for isize>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<i16> for u16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i16> for u32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i16> for u64>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i16> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i16> for usize>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i32> for f32>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<i32> for f64>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<i32> for i16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i32> for i32>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<i32> for i64>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<i32> for i8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i32> for isize>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<i32> for u16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i32> for u32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i32> for u64>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i32> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i32> for usize>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i64> for f32>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<i64> for f64>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<i64> for i16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i64> for i32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i64> for i64>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<i64> for i8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i64> for isize>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<i64> for u16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i64> for u32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i64> for u64>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i64> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i64> for usize>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i8> for f32>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<i8> for f64>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<i8> for i16>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<i8> for i32>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<i8> for i64>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<i8> for i8>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<i8> for isize>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<i8> for u16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i8> for u32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i8> for u64>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i8> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<i8> for usize>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<isize> for f32>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<isize> for f64>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<isize> for i16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<isize> for i32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<isize> for i64>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<isize> for i8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<isize> for isize>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<isize> for u16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<isize> for u32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<isize> for u64>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<isize> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<isize> for usize>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<u16> for f32>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<u16> for f64>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<u16> for i16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<u16> for i32>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u16> for i64>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u16> for i8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<u16> for isize>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u16> for u16>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u16> for u32>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u16> for u64>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u16> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<u16> for usize>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u32> for f32>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<u32> for f64>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<u32> for i16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<u32> for i32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<u32> for i64>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u32> for i8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<u32> for isize>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u32> for u16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<u32> for u32>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u32> for u64>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u32> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<u32> for usize>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u64> for f32>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<u64> for f64>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<u64> for i16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<u64> for i32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<u64> for i64>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<u64> for i8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<u64> for isize>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<u64> for u16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<u64> for u32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<u64> for u64>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u64> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<u64> for usize>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u8> for f32>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<u8> for f64>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<u8> for i16>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u8> for i32>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u8> for i64>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u8> for i8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<u8> for isize>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u8> for u16>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u8> for u32>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u8> for u64>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u8> for u8>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<u8> for usize>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<usize> for f32>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<usize> for f64>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_64::<impl From<usize> for i16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<usize> for i32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<usize> for i64>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<usize> for i8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<usize> for isize>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<usize> for u16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<usize> for u32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<usize> for u64>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_64::<impl From<usize> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_64::<impl From<usize> for usize>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_x128::<impl From<f32> for i128>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_x128::<impl From<f32> for u128>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_x128::<impl From<f64> for i128>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_x128::<impl From<f64> for u128>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_x128::<impl From<i128> for f32>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_x128::<impl From<i128> for f64>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_x128::<impl From<i128> for i128>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_x128::<impl From<i128> for i16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<i128> for i32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<i128> for i64>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<i128> for i8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<i128> for isize>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<i128> for u128>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<i128> for u16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<i128> for u32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<i128> for u64>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<i128> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<i128> for usize>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<i16> for i128>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_x128::<impl From<i16> for u128>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<i32> for i128>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_x128::<impl From<i32> for u128>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<i64> for i128>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_x128::<impl From<i64> for u128>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<i8> for i128>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_x128::<impl From<i8> for u128>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<isize> for i128>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_x128::<impl From<isize> for u128>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<u128> for f32>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_x128::<impl From<u128> for f64>::cast	SHAPE_GAP	false	false	false	false	false	false	false
+cast	_x128::<impl From<u128> for i128>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<u128> for i16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<u128> for i32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<u128> for i64>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<u128> for i8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<u128> for isize>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<u128> for u128>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_x128::<impl From<u128> for u16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<u128> for u32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<u128> for u64>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<u128> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<u128> for usize>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+cast	_x128::<impl From<u16> for i128>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_x128::<impl From<u16> for u128>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_x128::<impl From<u32> for i128>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_x128::<impl From<u32> for u128>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_x128::<impl From<u64> for i128>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_x128::<impl From<u64> for u128>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_x128::<impl From<u8> for i128>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_x128::<impl From<u8> for u128>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_x128::<impl From<usize> for i128>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+cast	_x128::<impl From<usize> for u128>::cast	FULLY_FAITHFUL	true	true	true	true	true	false	true
+nonmax	NonMaxU8::get	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxI128 as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxI16 as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxI32 as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxI64 as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxIsize as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU128 as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU16 as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU32 as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU64 as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU8 as core::clone::Clone>::clone	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU8 as core::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU8 as core::cmp::Ord>::cmp	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU8 as core::cmp::PartialEq>::eq	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU8 as core::cmp::PartialOrd>::partial_cmp	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	NonMaxU8::new	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU8 as core::convert::TryFrom<u8>>::try_from	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	NonMaxU8::new_unchecked	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU8 as core::default::Default>::default	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU8 as core::fmt::Binary>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU8 as core::fmt::Debug>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU8 as core::fmt::Display>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU8 as core::fmt::LowerHex>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU8 as core::fmt::Octal>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU8 as core::fmt::UpperHex>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU8 as core::hash::Hash>::hash	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU8 as core::ops::BitAnd<u8>>::bitand	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU8 as core::ops::BitAnd>::bitand	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU8 as core::ops::BitAndAssign<u8>>::bitand_assign	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU8 as core::ops::BitAndAssign>::bitand_assign	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxU8 as core::str::FromStr>::from_str	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<NonMaxUsize as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<impl core::convert::From<NonMaxU8> for u8>::from	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<impl core::ops::BitAnd<NonMaxU8> for u8>::bitand	SHAPE_GAP	false	false	false	false	false	false	false
+nonmax	<impl core::ops::BitAndAssign<NonMaxU8> for u8>::bitand_assign	SHAPE_GAP	false	false	false	false	false	false	false
+leaf-call	arrayvec::ArrayVec::<T, CAP>::len	FULLY_FAITHFUL	true	true	true	true	true	false	true
+leaf-call	<arrayvec::ArrayVec<T, CAP> as arrayvec_impl::ArrayVecImpl>::len	FULLY_FAITHFUL	true	true	true	true	true	false	true
+leaf-call	arrayvec::ArrayVec::<T, CAP>::is_empty	FULLY_FAITHFUL	true	true	true	true	true	false	true
+either-disc	Either::<L, R>::is_left	FULLY_FAITHFUL	false	false	true	true	true	false	true
+either-disc	Either::<L, R>::is_right	FULLY_FAITHFUL	true	true	true	true	true	false	true
+adt-return	_64::<impl From<i16> for u16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+adt-return	_64::<impl From<i32> for u32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+adt-return	_64::<impl From<i64> for u64>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+adt-return	_64::<impl From<i8> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+adt-return	_64::<impl From<u16> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+adt-return	_64::<impl From<u32> for i8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+adt-return	_64::<impl From<u64> for i32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+adt-return	_x128::<impl From<i128> for u128>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+adt-return	_x128::<impl From<u128> for i32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+adt-return	_x128::<impl From<u128> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_64::<impl From<i16> for i8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_64::<impl From<i16> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_64::<impl From<i32> for i16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_64::<impl From<i32> for i8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_64::<impl From<i32> for u16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_64::<impl From<i32> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_64::<impl From<i64> for i16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_64::<impl From<i64> for i32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_64::<impl From<i64> for i8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_64::<impl From<i64> for u16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_64::<impl From<i64> for u32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_64::<impl From<i64> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_64::<impl From<isize> for i16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_64::<impl From<isize> for i32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_64::<impl From<isize> for i8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_64::<impl From<isize> for u16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_64::<impl From<isize> for u32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_64::<impl From<isize> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_x128::<impl From<i128> for i16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_x128::<impl From<i128> for i32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_x128::<impl From<i128> for i64>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_x128::<impl From<i128> for i8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_x128::<impl From<i128> for isize>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_x128::<impl From<i128> for u16>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_x128::<impl From<i128> for u32>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_x128::<impl From<i128> for u64>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_x128::<impl From<i128> for u8>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+from-signed	_x128::<impl From<i128> for usize>::cast	FULLY_FAITHFUL	true	true	false	false	false	false	true
+container	Stack::len	FULLY_FAITHFUL	true	true	true	true	true	false	true
+container	Stack::at_least	FULLY_FAITHFUL	true	true	true	true	true	false	true
+container	Stack::capacity	FULLY_FAITHFUL	true	true	true	true	true	false	true
+container	Stack::double_len	SAFETY_GAP	false	false	true	false	false	false	false
+container	Stack::has_len	FULLY_FAITHFUL	true	true	true	true	true	false	true
+container	Stack::is_empty	FULLY_FAITHFUL	true	true	true	true	true	false	true
+container	Stack::is_full	FULLY_FAITHFUL	true	true	true	true	true	false	true
+container	Stack::remaining	SAFETY_GAP	false	false	true	false	false	false	false
+loop-leaf	arch::all::memchr::One::count_raw	FULLY_FAITHFUL	false	false	true	false	false	true	true
+ptr-spine	arch::all::memchr::One::count_raw	FULLY_FAITHFUL	false	false	true	false	false	true	true
+ptr-spine	arch::all::memchr::One::count	FULLY_FAITHFUL	true	true	true	true	true	false	true
+lift-demo	arch::all::memchr::One::count_raw	FULLY_FAITHFUL	false	false	true	false	false	true	true
+lift-demo	<arch::all::memchr::OneIter<'a, 'h> as core::iter::Iterator>::count::{closure#0}	FULLY_FAITHFUL	true	true	true	true	true	false	true
+structural-fold	all_leaves_pos	FULLY_FAITHFUL	true	true	false	false	false	false	true
+structural-fold	bad_acc_alias	SHAPE_GAP	false	false	false	false	false	false	false
+structural-fold	sink	SHAPE_GAP	false	false	false	false	false	false	false
+structural-fold	bad_acc_escape	SHAPE_GAP	false	false	false	false	false	false	false
+structural-fold	bad_acc_read	SHAPE_GAP	false	false	false	false	false	false	false
+structural-fold	pick	FULLY_FAITHFUL	true	true	true	true	true	false	true
+structural-fold	bad_nonsub	SHAPE_GAP	false	false	false	false	false	false	false
+structural-fold	bad_rebuilt	SHAPE_GAP	false	false	false	false	false	false	false
+structural-fold	bad_self	SHAPE_GAP	false	false	false	false	false	false	false
+structural-fold	collect_leaves	FULLY_FAITHFUL	true	true	false	false	false	false	true
+structural-fold	first_leaf	FULLY_FAITHFUL	true	true	false	false	false	false	true
+structural-fold	has_leaf_zero	FULLY_FAITHFUL	true	true	false	false	false	false	true
+structural-fold	size	SHAPE_GAP	false	false	false	false	false	false	false
+structural-fold	sum	SHAPE_GAP	false	false	false	false	false	false	false
+structural-fold	tag_xor	FULLY_FAITHFUL	true	true	false	false	false	false	true
+structural-fold	xor_all	FULLY_FAITHFUL	true	true	false	false	false	false	true
+multi-eq	char::methods::<impl char>::is_ascii_whitespace	FULLY_FAITHFUL	true	true	false	false	false	false	true
+multi-eq	num::<impl u8>::is_ascii_whitespace	FULLY_FAITHFUL	true	true	false	false	false	false	true
+level-fold	expr::stack_safe	SHAPE_GAP	false	false	false	false	false	false	false
+level-fold	level::Level::collect_params_impl	SHAPE_GAP	false	false	false	false	false	false	false
+level-fold	level::Level::has_params	FULLY_FAITHFUL	true	true	false	false	false	false	true
+level-fold	level::Level::has_params_impl	FULLY_FAITHFUL	true	true	false	false	false	false	true
+level-fold	level::Level::has_params::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level-fold	level::Level::has_params_impl::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level-fold	level::Level::has_params_impl::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+level-fold	level::Level::has_params_impl::{closure#2}	SHAPE_GAP	false	false	false	false	false	false	false
+level-fold	level::Level::is_nonzero	FULLY_FAITHFUL	true	true	false	false	false	false	true
+level-fold	level::Level::is_zero	FULLY_FAITHFUL	true	true	false	false	false	false	true
+level-fold	level::Level::substitute_map	SHAPE_GAP	false	false	false	false	false	false	false
+level-fold	level::Level::substitute_map_impl_opt	SHAPE_GAP	false	false	false	false	false	false	false
+level-fold	level::Level::substitute_map_impl	SHAPE_GAP	false	false	false	false	false	false	false
+level-fold	level::Level::substitute_slice_impl_opt	SHAPE_GAP	false	false	false	false	false	false	false

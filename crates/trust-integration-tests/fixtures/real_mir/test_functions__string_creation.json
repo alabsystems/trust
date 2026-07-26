@@ -1,0 +1,298 @@
+{
+  "name": "string_creation",
+  "def_path": "test_functions::string_creation",
+  "span": {
+    "file": "test_functions.rs",
+    "line_start": 89,
+    "col_start": 1,
+    "line_end": 92,
+    "col_end": 2
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "alloc::string::String",
+            "fields": []
+          }
+        },
+        "name": "s"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "alloc::string::String",
+                "fields": []
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 2
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Constant": {
+                      "Uint": [
+                        20480,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Ref": {
+                      "mutable": false,
+                      "inner": {
+                        "Slice": {
+                          "elem": {
+                            "Int": {
+                              "width": 8,
+                              "signed": false
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "test_functions.rs",
+                "line_start": 90,
+                "col_start": 13,
+                "line_end": 90,
+                "col_end": 34
+              }
+            }
+          },
+          {
+            "StorageLive": 1
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::string::String::from",
+            "args": [
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 1,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "test_functions.rs",
+              "line_start": 90,
+              "col_start": 13,
+              "line_end": 90,
+              "col_end": 34
+            },
+            "atomic": null
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageLive": 3
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "test_functions.rs",
+                "line_start": 91,
+                "col_start": 5,
+                "line_end": 91,
+                "col_end": 12
+              }
+            }
+          },
+          {
+            "StorageLive": 4
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::string::String::len",
+            "args": [
+              {
+                "Copy": {
+                  "local": 3,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "test_functions.rs",
+              "line_start": 91,
+              "col_start": 5,
+              "line_end": 91,
+              "col_end": 12
+            },
+            "atomic": null
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "test_functions.rs",
+                "line_start": 91,
+                "col_start": 5,
+                "line_end": 91,
+                "col_end": 12
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 1,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "test_functions.rs",
+              "line_start": 91,
+              "col_start": 5,
+              "line_end": 91,
+              "col_end": 12
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "StorageDead": 4
+          },
+          {
+            "StorageDead": 3
+          },
+          {
+            "StorageDead": 2
+          },
+          {
+            "StorageDead": 1
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 0,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

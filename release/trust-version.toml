@@ -1,0 +1,33 @@
+# Trust product version — the one authoritative statement of what this
+# toolchain calls itself. `src/version` carries the same number for the
+# compiler's own `-V` output; `targo trust version` reads this file.
+#
+# Trust versions are `major.minor.dev` (Andrew's constellation scheme):
+#   major  the top-level line
+#   minor  the release counter — a public release is always X.Y.0
+#   dev    the internal iteration counter — 0 is public, > 0 is internal-only
+#
+# The channel is DERIVED from the dev counter, never authored, so a version and
+# its channel cannot disagree. There are no `-preview` / `-rc` suffixes: the dev
+# counter already says "not public".
+schema_version = "trust.version-source.v2"
+product = "Trust"
+toolchain_alias = "trust"
+trust_product_version = "0.1.0"
+release_report_schema = "trust.release-report.v1"
+
+# The upstream revision Trust last merged. This is a record for compatibility
+# work, NOT an authority: nothing derives Trust's version, channel, or any gate
+# or proof claim from it. Keep it in step with
+# `tests/upstream-rust/baseline.toml#upstream.revision` — the compatibility
+# ledger diffs against exactly this revision.
+[rust_alignment]
+rustc_version = "1.99.0"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+merged_on = "2026-07-08"
+
+[schemas]
+version = "trust.version.v3"
+release_report = "trust.release-report.v1"
+verifier_api = "trust.verifier-api.v1"
+verifier_run_manifest = "trust.verifier-run-manifest.v1"

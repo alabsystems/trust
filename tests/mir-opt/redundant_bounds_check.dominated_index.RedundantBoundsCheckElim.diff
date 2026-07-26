@@ -1,0 +1,47 @@
+- // MIR for `dominated_index` before RedundantBoundsCheckElim
++ // MIR for `dominated_index` after RedundantBoundsCheckElim
+  
+  fn dominated_index(_1: &[i32], _2: usize) -> (i32, i32) {
+      debug x => _1;
+      debug i => _2;
+      let mut _0: (i32, i32);
+      let mut _3: i32;
+      let _4: usize;
+      let mut _5: usize;
+      let mut _6: bool;
+      let mut _7: i32;
+      let _8: usize;
+      let mut _9: usize;
+      let mut _10: bool;
+  
+      bb0: {
+          StorageLive(_3);
+          StorageLive(_4);
+          _4 = copy _2;
+          _5 = PtrMetadata(copy _1);
+          _6 = Lt(copy _2, copy _5);
+          assert(copy _6, "index out of bounds: the length is {} but the index is {}", copy _5, copy _2) -> [success: bb1, unwind continue];
+      }
+  
+      bb1: {
+          _3 = copy (*_1)[_2];
+          StorageLive(_7);
+          StorageLive(_8);
+          _8 = copy _2;
+          _9 = copy _5;
+          _10 = copy _6;
+-         assert(copy _6, "index out of bounds: the length is {} but the index is {}", copy _5, copy _2) -> [success: bb2, unwind continue];
++         goto -> bb2;
+      }
+  
+      bb2: {
+          _7 = copy _3;
+          _0 = (copy _3, copy _3);
+          StorageDead(_7);
+          StorageDead(_3);
+          StorageDead(_8);
+          StorageDead(_4);
+          return;
+      }
+  }
+  

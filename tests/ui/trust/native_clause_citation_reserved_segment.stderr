@@ -1,0 +1,8 @@
+error: expected a name segment after `.` in the contract clause citation
+  --> $DIR/native_clause_citation_reserved_segment.rs:6:28
+   |
+LL |     ensures result == x by Lemma.fn
+   |                            ^^^^^^
+
+error: aborting due to 1 previous error
+

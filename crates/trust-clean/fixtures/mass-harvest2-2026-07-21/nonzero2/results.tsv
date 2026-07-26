@@ -1,0 +1,30 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+<core::num::nonzero::NonZero<i32> as core::cmp::PartialOrd>::lt	SHAPE_GAP	false	false	false	false	false	false	false
+<core::num::nonzero::NonZero<u8> as core::cmp::Ord>::cmp	SHAPE_GAP	false	false	false	false	false	false	false
+<core::num::nonzero::NonZero<u8> as core::cmp::PartialOrd>::lt	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::nonzero::NonZero::<i32>::get	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::nonzero::NonZero::<i32>::new	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::nonzero::NonZero::<u16>::get	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::nonzero::NonZero::<u16>::new	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::nonzero::NonZero::<u32>::get	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::nonzero::NonZero::<u8>::get	SHAPE_GAP	false	false	false	false	false	false	false
+core::num::nonzero::NonZero::<u8>::new	SHAPE_GAP	false	false	false	false	false	false	false
+core::option::Option::<core::num::nonzero::NonZero<i32>>::unwrap_or	SHAPE_GAP	false	false	false	false	false	false	false
+core::option::Option::<core::num::nonzero::NonZero<u16>>::unwrap_or	SHAPE_GAP	false	false	false	false	false	false	false
+core::option::Option::<core::num::nonzero::NonZero<u8>>::unwrap_or	SHAPE_GAP	false	false	false	false	false	false	false
+main::nz_i32_count_ones	SHAPE_GAP	false	false	false	false	false	false	false
+main::nz_i32_get	SHAPE_GAP	false	false	false	false	false	false	false
+main::nz_i32_leading_zeros	SHAPE_GAP	false	false	false	false	false	false	false
+main::nz_i32_lt	SHAPE_GAP	false	false	false	false	false	false	false
+main::nz_i32_new	SHAPE_GAP	false	false	false	false	false	false	false
+main::nz_i32_trailing_zeros	SHAPE_GAP	false	false	false	false	false	false	false
+main::nz_u16_count_ones	SHAPE_GAP	false	false	false	false	false	false	false
+main::nz_u16_get	SHAPE_GAP	false	false	false	false	false	false	false
+main::nz_u16_new	SHAPE_GAP	false	false	false	false	false	false	false
+main::nz_u8_cmp	SHAPE_GAP	false	false	false	false	false	false	false
+main::nz_u8_count_ones	SHAPE_GAP	false	false	false	false	false	false	false
+main::nz_u8_get	SHAPE_GAP	false	false	false	false	false	false	false
+main::nz_u8_leading_zeros	SHAPE_GAP	false	false	false	false	false	false	false
+main::nz_u8_lt	SHAPE_GAP	false	false	false	false	false	false	false
+main::nz_u8_new	SHAPE_GAP	false	false	false	false	false	false	false
+main::nz_u8_trailing_zeros	SHAPE_GAP	false	false	false	false	false	false	false

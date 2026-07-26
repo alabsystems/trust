@@ -1,0 +1,16 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+add_g	FULLY_FAITHFUL	true	true	true	true	true	false	true
+crate::bump	FULLY_FAITHFUL	true	true	true	true	true	false	true
+crate::checked	SAFETY_GAP	true	false	false	false	false	false	false
+crate::clamp_hi	FULLY_FAITHFUL	true	true	true	true	true	false	true
+crate::id	FULLY_FAITHFUL	true	true	true	true	true	false	true
+crate::pos	FULLY_FAITHFUL	true	true	true	true	true	false	true
+dec	FULLY_FAITHFUL	true	true	true	true	true	false	true
+div	FULLY_FAITHFUL	true	true	true	true	true	false	true
+double_b	SHAPE_GAP	false	false	false	false	false	false	false
+get	FULLY_FAITHFUL	true	true	true	true	true	false	true
+inc	FULLY_FAITHFUL	true	true	true	true	true	false	true
+rem	FULLY_FAITHFUL	true	true	true	true	true	false	true
+sub	FULLY_FAITHFUL	true	true	true	true	true	false	true
+wmul	SHAPE_GAP	false	false	false	false	false	false	false
+wmul64	SHAPE_GAP	false	false	false	false	false	false	false

@@ -1,0 +1,422 @@
+{
+  "name": "unwrap",
+  "def_path": "std::result::Result::<i32, u8>::unwrap",
+  "span": {
+    "file": "core/src/result.rs",
+    "line_start": 1225,
+    "col_start": 4,
+    "line_end": 1233,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "t"
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "std::result::Result",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v0_0",
+                {
+                  "Int": {
+                    "width": 32,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Ok",
+                "discriminant": 0,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 32,
+                        "signed": true
+                      }
+                    }
+                  ]
+                ]
+              },
+              {
+                "name": "Err",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "e"
+      },
+      {
+        "index": 4,
+        "ty": "Never",
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Dynamic": {
+                "trait_name": "std::fmt::Debug"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "core/src/result.rs",
+                "line_start": 1229,
+                "col_start": 14,
+                "line_end": 1229,
+                "col_end": 18
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 2,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                3
+              ],
+              [
+                1,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "core/src/result.rs",
+              "line_start": 1229,
+              "col_start": 8,
+              "line_end": 1229,
+              "col_end": 18
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "StorageLive": 3
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "core/src/result.rs",
+                "line_start": 1231,
+                "col_start": 16,
+                "line_end": 1231,
+                "col_end": 17
+              }
+            }
+          },
+          {
+            "StorageLive": 5
+          },
+          {
+            "StorageLive": 6
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 3,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "core/src/result.rs",
+                "line_start": 1231,
+                "col_start": 83,
+                "line_end": 1231,
+                "col_end": 85
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": "OpaqueConst"
+                }
+              },
+              "span": {
+                "file": "core/src/result.rs",
+                "line_start": 1231,
+                "col_start": 83,
+                "line_end": 1231,
+                "col_end": 85
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Opaque": {
+            "kind": "Call::std::result::unwrap_failed::UnsupportedUnwind(Cleanup(bb4))",
+            "targets": [
+              4
+            ],
+            "span": {
+              "file": "core/src/result.rs",
+              "line_start": 1231,
+              "col_start": 22,
+              "line_end": 1231,
+              "col_end": 86
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Downcast": 0
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "core/src/result.rs",
+                "line_start": 1230,
+                "col_start": 15,
+                "line_end": 1230,
+                "col_end": 16
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 5,
+            "span": {
+              "file": "core/src/result.rs",
+              "line_start": 1231,
+              "col_start": 85,
+              "line_end": 1231,
+              "col_end": 86
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [],
+        "terminator": "Resume"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

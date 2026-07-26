@@ -1,0 +1,37 @@
+# trust-certify: in-process Certified-tier bridge (de Bruijn criterion)
+#
+# Drives clean-auto's in-process ay backend to reconstruct a real solver
+# UNSAT into a kernel-CHECKED CIC proof term, then maps it to a trust-ir
+# `ProofEvidence::CleanCic`. The SMT solver is OUTSIDE the trusted base: the
+# clean CIC kernel (`TypeChecker::check_type`, infer_only=false) re-checks the
+# proof term. Fail-closed: anything we cannot kernel-certify returns `None`
+# (the caller records `Trusted`, never a false `Certified`).
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-certify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+trust-types = { workspace = true }
+trust-ir = { workspace = true, features = ["serde"] }
+trust-ir-build = { workspace = true }
+clean-kernel = { workspace = true }
+clean-auto = { workspace = true }
+clean-verify = { workspace = true }
+clean-parser = { workspace = true }
+clean-elab = { workspace = true }
+# Trust: E9 citation unification — clause elaboration + the honesty meter.
+trust-cert-meter = { workspace = true }
+trust-spec-elab = { workspace = true }
+bincode = { workspace = true }
+sha2 = { workspace = true }
+serde_json = { workspace = true }

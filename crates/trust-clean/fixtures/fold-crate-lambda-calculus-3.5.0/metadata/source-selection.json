@@ -1,0 +1,24 @@
+{
+  "archive": {
+    "sha256": "168030aef659e9a35ba517952982bb0212fda53d531837e3f18c399f9d28dba8",
+    "url": "https://static.crates.io/crates/lambda_calculus/lambda_calculus-3.5.0.crate"
+  },
+  "crate": "lambda_calculus",
+  "selection": {
+    "dependencies": 0,
+    "edition": "2024",
+    "features": [
+      "encoding"
+    ],
+    "kind": "published-crates-io-tarball-verbatim-source",
+    "version": "3.5.0"
+  },
+  "source_tree": {
+    "bytes": 234120,
+    "file_count": 46,
+    "manifest_encoding": "canonical-json-file-rows-v1",
+    "manifest_sha256": "fd3c1be3aef2286bd867181136d9ce7574edf3ccc67fa5f0ab754fb836045a04",
+    "vcs_commit": "1ab0dc1525deff02b1b062881cb3f1d710d685d0"
+  },
+  "schema": "trust.published-crate-source-selection.v1"
+}

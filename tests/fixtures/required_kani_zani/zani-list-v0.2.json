@@ -1,0 +1,49 @@
+{
+  "zani-version": "0.0.0-test",
+  "file-version": "0.2",
+  "standard-harnesses": {
+    "proofs/lib.rs": [
+      "check_standard"
+    ]
+  },
+  "contract-harnesses": {
+    "proofs/lib.rs": [
+      "check_contract"
+    ]
+  },
+  "proof-obligations": [
+    {
+      "proof-item-id": "zani:kani-proof:proof_fixture:check_standard",
+      "crate": "proof_fixture",
+      "harness": "check_standard",
+      "role": "Harness",
+      "source-form": "KaniProofAttribute",
+      "target": null,
+      "file": "proofs/lib.rs",
+      "start-line": 2,
+      "end-line": 3,
+      "engine": "zani",
+      "required-by-full-verify": true
+    },
+    {
+      "proof-item-id": "zani:kani-proof-for-contract:proof_fixture:check_contract",
+      "crate": "proof_fixture",
+      "harness": "check_contract",
+      "role": "ContractHarness",
+      "source-form": "KaniProofForContractAttribute",
+      "target": "target_fn",
+      "file": "proofs/lib.rs",
+      "start-line": 5,
+      "end-line": 6,
+      "engine": "zani",
+      "required-by-full-verify": true
+    }
+  ],
+  "contracts": [],
+  "totals": {
+    "standard-harnesses": 1,
+    "contract-harnesses": 1,
+    "proof-obligations": 2,
+    "functions-under-contract": 0
+  }
+}

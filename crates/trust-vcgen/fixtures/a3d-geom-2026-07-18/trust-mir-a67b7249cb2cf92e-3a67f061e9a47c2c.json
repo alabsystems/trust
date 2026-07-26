@@ -1,0 +1,661 @@
+{
+  "name": "diagonal",
+  "def_path": "Aabb::diagonal",
+  "span": {
+    "file": "crates/a3d-geom/src/lib.rs",
+    "line_start": 289,
+    "col_start": 4,
+    "line_end": 291,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Float": {
+            "width": 64
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "Aabb",
+                "fields": [
+                  [
+                    "min",
+                    {
+                      "Adt": {
+                        "name": "Vec3",
+                        "fields": [
+                          [
+                            "x",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ],
+                          [
+                            "y",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ],
+                          [
+                            "z",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ],
+                  [
+                    "max",
+                    {
+                      "Adt": {
+                        "name": "Vec3",
+                        "fields": [
+                          [
+                            "x",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ],
+                          [
+                            "y",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ],
+                          [
+                            "z",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Closure": {
+            "name": "Aabb::diagonal::{closure#0}",
+            "upvars": [
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Adt": {
+                      "name": "Aabb",
+                      "fields": [
+                        [
+                          "min",
+                          {
+                            "Adt": {
+                              "name": "Vec3",
+                              "fields": [
+                                [
+                                  "x",
+                                  {
+                                    "Float": {
+                                      "width": 64
+                                    }
+                                  }
+                                ],
+                                [
+                                  "y",
+                                  {
+                                    "Float": {
+                                      "width": 64
+                                    }
+                                  }
+                                ],
+                                [
+                                  "z",
+                                  {
+                                    "Float": {
+                                      "width": 64
+                                    }
+                                  }
+                                ]
+                              ],
+                              "variants": [],
+                              "disc_index_safe": false
+                            }
+                          }
+                        ],
+                        [
+                          "max",
+                          {
+                            "Adt": {
+                              "name": "Vec3",
+                              "fields": [
+                                [
+                                  "x",
+                                  {
+                                    "Float": {
+                                      "width": 64
+                                    }
+                                  }
+                                ],
+                                [
+                                  "y",
+                                  {
+                                    "Float": {
+                                      "width": 64
+                                    }
+                                  }
+                                ],
+                                [
+                                  "z",
+                                  {
+                                    "Float": {
+                                      "width": 64
+                                    }
+                                  }
+                                ]
+                              ],
+                              "variants": [],
+                              "disc_index_safe": false
+                            }
+                          }
+                        ]
+                      ],
+                      "variants": [],
+                      "disc_index_safe": false
+                    }
+                  }
+                }
+              }
+            ],
+            "call": {
+              "kind": "Fn",
+              "params": [],
+              "ret": "Bool"
+            }
+          }
+        },
+        "name": "__requires_checker"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "Vec3",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "Aabb::extent",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 290,
+              "col_start": 8,
+              "line_end": 290,
+              "col_end": 21
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "Vec3::length",
+            "args": [
+              {
+                "Move": {
+                  "local": 3,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 290,
+              "col_start": 8,
+              "line_end": 290,
+              "col_end": 30
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Float": {
+        "width": 64
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Requires",
+      "span": {
+        "file": "crates/a3d-geom/src/lib.rs",
+        "line_start": 285,
+        "col_start": 8,
+        "line_end": 288,
+        "col_end": 58
+      },
+      "body": "__trust_lowered_compiler_contract__:(((((((((((((*self).0.0) <= (1.0e149)) && (((*self).0.0) >= (-(1.0e149)))) && (((*self).0.1) <= (1.0e149))) && (((*self).0.1) >= (-(1.0e149)))) && (((*self).0.2) <= (1.0e149))) && (((*self).0.2) >= (-(1.0e149)))) && (((*self).1.0) <= (1.0e149))) && (((*self).1.0) >= (-(1.0e149)))) && (((*self).1.1) <= (1.0e149))) && (((*self).1.1) >= (-(1.0e149)))) && (((*self).1.2) <= (1.0e149))) && (((*self).1.2) >= (-(1.0e149)))"
+    }
+  ],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "And": [
+            {
+              "And": [
+                {
+                  "And": [
+                    {
+                      "And": [
+                        {
+                          "And": [
+                            {
+                              "And": [
+                                {
+                                  "And": [
+                                    {
+                                      "And": [
+                                        {
+                                          "And": [
+                                            {
+                                              "And": [
+                                                {
+                                                  "Le": [
+                                                    {
+                                                      "Var": [
+                                                        "self*.0.0",
+                                                        {
+                                                          "Float": {
+                                                            "eb": 11,
+                                                            "sb": 53
+                                                          }
+                                                        }
+                                                      ]
+                                                    },
+                                                    {
+                                                      "FpConst": {
+                                                        "bits": 6836262289665382271,
+                                                        "eb": 11,
+                                                        "sb": 53
+                                                      }
+                                                    }
+                                                  ]
+                                                },
+                                                {
+                                                  "Ge": [
+                                                    {
+                                                      "Var": [
+                                                        "self*.0.0",
+                                                        {
+                                                          "Float": {
+                                                            "eb": 11,
+                                                            "sb": 53
+                                                          }
+                                                        }
+                                                      ]
+                                                    },
+                                                    {
+                                                      "FpConst": {
+                                                        "bits": 16059634326520158079,
+                                                        "eb": 11,
+                                                        "sb": 53
+                                                      }
+                                                    }
+                                                  ]
+                                                }
+                                              ]
+                                            },
+                                            {
+                                              "Le": [
+                                                {
+                                                  "Var": [
+                                                    "self*.0.1",
+                                                    {
+                                                      "Float": {
+                                                        "eb": 11,
+                                                        "sb": 53
+                                                      }
+                                                    }
+                                                  ]
+                                                },
+                                                {
+                                                  "FpConst": {
+                                                    "bits": 6836262289665382271,
+                                                    "eb": 11,
+                                                    "sb": 53
+                                                  }
+                                                }
+                                              ]
+                                            }
+                                          ]
+                                        },
+                                        {
+                                          "Ge": [
+                                            {
+                                              "Var": [
+                                                "self*.0.1",
+                                                {
+                                                  "Float": {
+                                                    "eb": 11,
+                                                    "sb": 53
+                                                  }
+                                                }
+                                              ]
+                                            },
+                                            {
+                                              "FpConst": {
+                                                "bits": 16059634326520158079,
+                                                "eb": 11,
+                                                "sb": 53
+                                              }
+                                            }
+                                          ]
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "Le": [
+                                        {
+                                          "Var": [
+                                            "self*.0.2",
+                                            {
+                                              "Float": {
+                                                "eb": 11,
+                                                "sb": 53
+                                              }
+                                            }
+                                          ]
+                                        },
+                                        {
+                                          "FpConst": {
+                                            "bits": 6836262289665382271,
+                                            "eb": 11,
+                                            "sb": 53
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                },
+                                {
+                                  "Ge": [
+                                    {
+                                      "Var": [
+                                        "self*.0.2",
+                                        {
+                                          "Float": {
+                                            "eb": 11,
+                                            "sb": 53
+                                          }
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "FpConst": {
+                                        "bits": 16059634326520158079,
+                                        "eb": 11,
+                                        "sb": 53
+                                      }
+                                    }
+                                  ]
+                                }
+                              ]
+                            },
+                            {
+                              "Le": [
+                                {
+                                  "Var": [
+                                    "self*.1.0",
+                                    {
+                                      "Float": {
+                                        "eb": 11,
+                                        "sb": 53
+                                      }
+                                    }
+                                  ]
+                                },
+                                {
+                                  "FpConst": {
+                                    "bits": 6836262289665382271,
+                                    "eb": 11,
+                                    "sb": 53
+                                  }
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        {
+                          "Ge": [
+                            {
+                              "Var": [
+                                "self*.1.0",
+                                {
+                                  "Float": {
+                                    "eb": 11,
+                                    "sb": 53
+                                  }
+                                }
+                              ]
+                            },
+                            {
+                              "FpConst": {
+                                "bits": 16059634326520158079,
+                                "eb": 11,
+                                "sb": 53
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "Le": [
+                        {
+                          "Var": [
+                            "self*.1.1",
+                            {
+                              "Float": {
+                                "eb": 11,
+                                "sb": 53
+                              }
+                            }
+                          ]
+                        },
+                        {
+                          "FpConst": {
+                            "bits": 6836262289665382271,
+                            "eb": 11,
+                            "sb": 53
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "Ge": [
+                    {
+                      "Var": [
+                        "self*.1.1",
+                        {
+                          "Float": {
+                            "eb": 11,
+                            "sb": 53
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "FpConst": {
+                        "bits": 16059634326520158079,
+                        "eb": 11,
+                        "sb": 53
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "Le": [
+                {
+                  "Var": [
+                    "self*.1.2",
+                    {
+                      "Float": {
+                        "eb": 11,
+                        "sb": 53
+                      }
+                    }
+                  ]
+                },
+                {
+                  "FpConst": {
+                    "bits": 6836262289665382271,
+                    "eb": 11,
+                    "sb": 53
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Ge": [
+            {
+              "Var": [
+                "self*.1.2",
+                {
+                  "Float": {
+                    "eb": 11,
+                    "sb": 53
+                  }
+                }
+              ]
+            },
+            {
+              "FpConst": {
+                "bits": 16059634326520158079,
+                "eb": 11,
+                "sb": 53
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [
+      "(((((((((((((*self).0.0) <= (1.0e149)) && (((*self).0.0) >= (-(1.0e149)))) && (((*self).0.1) <= (1.0e149))) && (((*self).0.1) >= (-(1.0e149)))) && (((*self).0.2) <= (1.0e149))) && (((*self).0.2) >= (-(1.0e149)))) && (((*self).1.0) <= (1.0e149))) && (((*self).1.0) >= (-(1.0e149)))) && (((*self).1.1) <= (1.0e149))) && (((*self).1.1) >= (-(1.0e149)))) && (((*self).1.2) <= (1.0e149))) && (((*self).1.2) >= (-(1.0e149)))"
+    ],
+    "ensures": [],
+    "invariants": []
+  }
+}

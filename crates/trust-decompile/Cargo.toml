@@ -1,0 +1,37 @@
+# trust-decompile: Minimal binary decompiler API
+#
+# Owns the public decompile_binary(bytes, options) surface and artifact schema.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-decompile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["elf"]
+elf = ["trust-lift/elf"]
+macho = ["trust-lift/macho"]
+trust-cg = ["dep:trust-cg-bridge"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+trust-lift = { workspace = true }
+trust-binary-parse = { workspace = true }
+trust-types = { workspace = true }
+trust-cg-bridge = { workspace = true, optional = true }
+trust-ir = { workspace = true }
+trust-ir-bridge = { workspace = true }
+trust-wasm-bridge = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

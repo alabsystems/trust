@@ -1,0 +1,302 @@
+{
+  "canonical_binary_provenance": {
+    "records": [
+      {
+        "artifact_digest_identity": {
+          "root_artifact_digest": {
+            "algorithm": "sha256",
+            "value": "5ac94af2cef7831025beb0939d1a429708821c7515a166089508bee931aeb336"
+          },
+          "selected_image": {
+            "file_offset": 0,
+            "file_size": 984,
+            "sha256": "5ac94af2cef7831025beb0939d1a429708821c7515a166089508bee931aeb336"
+          }
+        },
+        "origin": {
+          "binary_path": "fixtures/real-debug/line-table.elf",
+          "encoding": 2425393296,
+          "function_entry": 4194320,
+          "instruction_address": 4194320,
+          "instruction_bytes": [
+            144,
+            144,
+            144,
+            144
+          ],
+          "instruction_size": 4,
+          "source": {
+            "col_end": 8,
+            "col_start": 7,
+            "file": "src/real_debug.rs",
+            "line_end": 12,
+            "line_start": 12
+          }
+        },
+        "proof_evidence": {
+          "checked_certificate_sha256": "0000000000000000000000000000000000000000000000006bb8a02285e78efa",
+          "production_checker_evidence_sha256": "000000000000000000000000000000000000000000000000832410ded4e7bacb",
+          "replay_transcript_digest": "0000000000000000000000000000000000000000000000003c63a7285a6d2cff",
+          "solver_dispatch_id": "real-debug-source-provenance:vc0",
+          "source_backpropagation_gate_sha256": "0000000000000000000000000000000000000000000000001b356097c260b0da"
+        },
+        "provenance_status": "checked_exact",
+        "record_digest": "1d3e95e2bd253ecbf7384a559b2e9c6fa3118962102c8081003746cb12cd2a99",
+        "source_status": "exact"
+      },
+      {
+        "artifact_digest_identity": {
+          "root_artifact_digest": {
+            "algorithm": "sha256",
+            "value": "5ac94af2cef7831025beb0939d1a429708821c7515a166089508bee931aeb336"
+          },
+          "selected_image": {
+            "file_offset": 0,
+            "file_size": 984,
+            "sha256": "5ac94af2cef7831025beb0939d1a429708821c7515a166089508bee931aeb336"
+          }
+        },
+        "origin": {
+          "binary_path": "fixtures/real-debug/line-table.elf",
+          "encoding": 2425393296,
+          "function_entry": 4194320,
+          "instruction_address": 4194324,
+          "instruction_bytes": [
+            144,
+            144,
+            144,
+            144
+          ],
+          "instruction_size": 4,
+          "source": {
+            "col_end": 6,
+            "col_start": 5,
+            "file": "src/real_debug.rs",
+            "line_end": 13,
+            "line_start": 13
+          }
+        },
+        "proof_evidence": {
+          "checked_certificate_sha256": "0000000000000000000000000000000000000000000000006bb8a12285e790ad",
+          "production_checker_evidence_sha256": "000000000000000000000000000000000000000000000000eebf848a25f6356a",
+          "replay_transcript_digest": "0000000000000000000000000000000000000000000000009ea1965bc6e191c2",
+          "solver_dispatch_id": "real-debug-source-provenance:vc1",
+          "source_backpropagation_gate_sha256": "0000000000000000000000000000000000000000000000001b356097c260b0da"
+        },
+        "provenance_status": "checked_exact",
+        "record_digest": "c63d02d1cf88ea9cb1cefd7be244a0397e5c3d5804cd3566aeef6db0cff2d3b0",
+        "source_status": "exact"
+      }
+    ]
+  },
+  "kind": "binary_source_provenance",
+  "reconstruction": {
+    "assumptions": [],
+    "diagnostics": [],
+    "outputs": [
+      {
+        "artifact_path": null,
+        "assumptions": [],
+        "diagnostics": [],
+        "preserved_symbolic_formulas": [],
+        "target": "TrustIr",
+        "target_validation_blockers": [],
+        "text": null,
+        "trust_level": "ProofGrade",
+        "validated_rust": null,
+        "validation": "Validated",
+        "validation_records": []
+      }
+    ],
+    "target": "TrustIr",
+    "trust_level": "ProofGrade",
+    "validated_rust": null,
+    "validation": "Validated"
+  },
+  "schema_version": "trust-report.binary-source-provenance-artifact.v1",
+  "source_backpropagation_gate": {
+    "accepted_reconstruction_validation": true,
+    "accepted_target_validation": true,
+    "blockers": [],
+    "checked_certificate_identity": true,
+    "exact_replay_identity": true,
+    "exact_source_provenance": true,
+    "replay_grade_artifact_identity": true,
+    "schema_version": "trust-proof-cert.source-backpropagation-gate.v1",
+    "source_backpropagation_allowed": true,
+    "source_backpropagation_gate_sha256": "0000000000000000000000000000000000000000000000001b356097c260b0da",
+    "source_provenance": {
+      "ambiguous_mapping_count": 0,
+      "diagnostics": [
+        "exact DWARF source provenance recovered for 2 binary address(es)"
+      ],
+      "exact_mapping_count": 2,
+      "source_backpropagation_allowed": true,
+      "status": "exact"
+    }
+  },
+  "source_backpropagation_gate_sha256": "0000000000000000000000000000000000000000000000001b356097c260b0da",
+  "source_provenance": {
+    "ambiguous_mapping_count": 0,
+    "diagnostics": [
+      "exact DWARF source provenance recovered for 2 binary address(es)"
+    ],
+    "exact_mapping_count": 2,
+    "source_backpropagation_allowed": true,
+    "status": "exact"
+  },
+  "source_provenance_artifact_digest": "sha256:114c76d339e08f93f8a782eee0db5960512cd120ff0a1baeead51a215f9b92ae",
+  "verification": {
+    "assumptions": [],
+    "claims": [],
+    "failed": 0,
+    "proof_certificate": {
+      "Checked": {
+        "checker": "ay-cert-check@2026.04;production_checker_evidence_sha256=000000000000000000000000000000000000000000000000832410ded4e7bacb",
+        "format": "lfsc",
+        "sha256": "0000000000000000000000000000000000000000000000006bb8a02285e78efa"
+      }
+    },
+    "proved": 2,
+    "rejected": 0,
+    "replay": "Replayed",
+    "solver_dispatch": [
+      {
+        "assumptions": [],
+        "backend": null,
+        "binary_artifact_digest_identity": {
+          "root_artifact_digest": {
+            "algorithm": "sha256",
+            "value": "5ac94af2cef7831025beb0939d1a429708821c7515a166089508bee931aeb336"
+          },
+          "selected_image": {
+            "file_offset": 0,
+            "file_size": 984,
+            "sha256": "5ac94af2cef7831025beb0939d1a429708821c7515a166089508bee931aeb336"
+          }
+        },
+        "certificate": {
+          "Checked": {
+            "checker": "ay-cert-check@2026.04;production_checker_evidence_sha256=000000000000000000000000000000000000000000000000832410ded4e7bacb",
+            "format": "lfsc",
+            "sha256": "0000000000000000000000000000000000000000000000006bb8a02285e78efa"
+          }
+        },
+        "diagnostics": [
+          "checked proof-cert readback row accepted for proof-grade release; source_backpropagation_gate_sha256=0000000000000000000000000000000000000000000000001b356097c260b0da",
+          "exact_replay_transcript_artifact_digest=accepted:sha256=0000000000000000000000000000000000000000000000003c63a7285a6d2cff"
+        ],
+        "elapsed_ms": null,
+        "function": "main",
+        "id": "real-debug-source-provenance:vc0",
+        "origin": {
+          "binary_path": "fixtures/real-debug/line-table.elf",
+          "encoding": 2425393296,
+          "function_entry": 4194320,
+          "instruction_address": 4194320,
+          "instruction_bytes": [
+            144,
+            144,
+            144,
+            144
+          ],
+          "instruction_size": 4,
+          "source": {
+            "col_end": 8,
+            "col_start": 7,
+            "file": "src/real_debug.rs",
+            "line_end": 12,
+            "line_start": 12
+          }
+        },
+        "query_semantics": "SatIsCounterexample",
+        "replay": "Replayed",
+        "result": null,
+        "solver": "ay",
+        "status": "Unsat",
+        "timeout_evidence": {
+          "backend_timeout_ms": null,
+          "planned_timeout_ms": 250,
+          "release_blocker": null,
+          "status": "PolicyRecorded"
+        },
+        "timeout_ms": null,
+        "vc": null,
+        "vc_kind": null
+      },
+      {
+        "assumptions": [],
+        "backend": null,
+        "binary_artifact_digest_identity": {
+          "root_artifact_digest": {
+            "algorithm": "sha256",
+            "value": "5ac94af2cef7831025beb0939d1a429708821c7515a166089508bee931aeb336"
+          },
+          "selected_image": {
+            "file_offset": 0,
+            "file_size": 984,
+            "sha256": "5ac94af2cef7831025beb0939d1a429708821c7515a166089508bee931aeb336"
+          }
+        },
+        "certificate": {
+          "Checked": {
+            "checker": "ay-cert-check@2026.04;production_checker_evidence_sha256=000000000000000000000000000000000000000000000000eebf848a25f6356a",
+            "format": "lfsc",
+            "sha256": "0000000000000000000000000000000000000000000000006bb8a12285e790ad"
+          }
+        },
+        "diagnostics": [
+          "checked proof-cert readback row accepted for proof-grade release; source_backpropagation_gate_sha256=0000000000000000000000000000000000000000000000001b356097c260b0da",
+          "exact_replay_transcript_artifact_digest=accepted:sha256=0000000000000000000000000000000000000000000000009ea1965bc6e191c2"
+        ],
+        "elapsed_ms": null,
+        "function": "main",
+        "id": "real-debug-source-provenance:vc1",
+        "origin": {
+          "binary_path": "fixtures/real-debug/line-table.elf",
+          "encoding": 2425393296,
+          "function_entry": 4194320,
+          "instruction_address": 4194324,
+          "instruction_bytes": [
+            144,
+            144,
+            144,
+            144
+          ],
+          "instruction_size": 4,
+          "source": {
+            "col_end": 6,
+            "col_start": 5,
+            "file": "src/real_debug.rs",
+            "line_end": 13,
+            "line_start": 13
+          }
+        },
+        "query_semantics": "SatIsCounterexample",
+        "replay": "Replayed",
+        "result": null,
+        "solver": "ay",
+        "status": "Unsat",
+        "timeout_evidence": {
+          "backend_timeout_ms": null,
+          "planned_timeout_ms": 250,
+          "release_blocker": null,
+          "status": "PolicyRecorded"
+        },
+        "timeout_ms": null,
+        "vc": null,
+        "vc_kind": null
+      }
+    ],
+    "status": "Proved",
+    "timeout": 0,
+    "total_vcs": 2,
+    "trust_level": "ProofGrade",
+    "unknown": 0,
+    "unsupported": 0,
+    "unsupported_ledger": {
+      "records": []
+    },
+    "witnesses": []
+  }
+}

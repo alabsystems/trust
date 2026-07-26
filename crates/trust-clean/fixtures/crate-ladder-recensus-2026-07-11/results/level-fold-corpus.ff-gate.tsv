@@ -1,0 +1,15 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+expr::stack_safe	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::collect_params_impl	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::has_params	FULLY_FAITHFUL	true	true	false	false	false	false	true
+level::Level::has_params_impl	FULLY_FAITHFUL	true	true	false	false	false	false	true
+level::Level::has_params::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::has_params_impl::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::has_params_impl::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::has_params_impl::{closure#2}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_nonzero	FULLY_FAITHFUL	true	true	false	false	false	false	true
+level::Level::is_zero	FULLY_FAITHFUL	true	true	false	false	false	false	true
+level::Level::substitute_map	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_map_impl_opt	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_map_impl	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_slice_impl_opt	SHAPE_GAP	false	false	false	false	false	false	false

@@ -1,0 +1,74 @@
+# S-ts — the frozen erasable-TypeScript corpus slice for the TrustTS differential lane.
+#
+# Each path below is a small, import-free, console.log-observable, ERASABLE TypeScript
+# program under tests/ts-corpus/ (paths are corpus-relative). Node (>=24, native
+# type-strip) and Bun run these `.ts` files natively in the module goal; the TrustTS
+# head (trust-ts-strip -> trust-js-interp) is judged against them by
+# `trust-js-differential ts-calibrate`. The bar is ZERO wrong traces: a covered trace
+# must equal Node or Bun; a sound NoCoverage (strip refusal or interp gap) is always safe.
+#
+# This is a plain committed list (payload-embedded). `list_sha256` hashes the sorted
+# path list; `content_sha256` hashes the sorted-path concatenation of file bytes. Any
+# add/remove/edit changes a hash -> drift is detectable.
+#
+# Author: Andrew Yates
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+schema_version = "0.1.0"
+id = "ts.s-ts.2026-07-23-v1"
+
+[corpus]
+dir = "tests/ts-corpus"
+
+[manifest]
+count = 45
+list_sha256 = "eea4803fed0cd22563fc94089273d908ae4c61c295214ca50db3b6711f0f4a9a"
+content_sha256 = "57e9d5a0ea342886ac2c1a2d703ef0ff2a4ddb5b876dc4bf15b2e596bcd965d7"
+paths = [
+    "abstract_class.ts",
+    "arithmetic.ts",
+    "array_ops.ts",
+    "as_cast.ts",
+    "class_access_modifiers.ts",
+    "closures.ts",
+    "const_enum_alt.ts",
+    "control_flow_types.ts",
+    "declare_stmts.ts",
+    "generic_arrow.ts",
+    "generic_class.ts",
+    "generic_constraint.ts",
+    "generics.ts",
+    "getters_setters.ts",
+    "import_type.ts",
+    "index_signature.ts",
+    "inheritance.ts",
+    "interfaces.ts",
+    "json_roundtrip.ts",
+    "nested_generics.ts",
+    "non_null.ts",
+    "object_methods.ts",
+    "optional_params.ts",
+    "overloads.ts",
+    "recursion.ts",
+    "satisfies.ts",
+    "sorting.ts",
+    "spread_rest.ts",
+    "static_methods.ts",
+    "string_builder.ts",
+    "string_ops.ts",
+    "switch_stmt.ts",
+    "template_and_casts.ts",
+    "ternary_logic.ts",
+    "this_param.ts",
+    "type_aliases.ts",
+    "type_only_specifiers.ts",
+    "typed_arrows.ts",
+    "typed_destructuring.ts",
+    "typed_map.ts",
+    "typed_params_returns.ts",
+    "typed_set.ts",
+    "typed_tuple_ops.ts",
+    "typed_vars.ts",
+    "union_intersection.ts",
+]
+

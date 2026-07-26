@@ -1,0 +1,70 @@
+Trust
+Copyright 2026 Andrew Yates
+
+Dual-licensed under Apache-2.0 OR MIT, at your option; the full texts live in
+LICENSE-APACHE and LICENSE-MIT at the root of this repository.
+
+Trust is built on rust-lang/rust, which is Copyright (c) The Rust Project
+Contributors under those same two licenses. COPYRIGHT and REUSE.toml record
+which files carry which lineage.
+
+The following third-party software is bundled with or required by Trust, and is
+reproduced here to satisfy its respective license terms:
+
+---
+
+PyJWT (with cryptography extra)
+  License: MIT
+  Home: https://github.com/jpadilla/pyjwt
+
+cryptography (transitive via PyJWT[crypto])
+  License: Apache-2.0 OR BSD-3-Clause
+  Home: https://github.com/pyca/cryptography
+
+requests
+  License: Apache-2.0
+  Home: https://github.com/psf/requests
+
+---
+
+Test and development dependencies (not included in production):
+
+pytest
+  License: MIT
+  Home: https://github.com/pytest-dev/pytest
+
+pytest-cov
+  License: MIT
+  Home: https://github.com/pytest-dev/pytest-cov
+
+pytest-xdist
+  License: MIT
+  Home: https://github.com/pytest-dev/pytest-xdist
+
+pytest-timeout
+  License: MIT
+  Home: https://github.com/pytest-dev/pytest-timeout
+
+hypothesis
+  License: MPL-2.0
+  Home: https://github.com/HypothesisWorks/hypothesis
+
+coverage
+  License: Apache-2.0
+  Home: https://github.com/nedbat/coveragepy
+
+PyYAML
+  License: MIT
+  Home: https://github.com/yaml/pyyaml
+
+pre-commit
+  License: MIT
+  Home: https://github.com/pre-commit/pre-commit
+
+playwright
+  License: Apache-2.0
+  Home: https://github.com/microsoft/playwright-python
+
+openai
+  License: Apache-2.0
+  Home: https://github.com/openai/openai-python

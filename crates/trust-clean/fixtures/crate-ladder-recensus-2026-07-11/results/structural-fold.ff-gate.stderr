@@ -1,0 +1,18 @@
+
+=== FF-gate cluster summary (16 functions) ===
+  FULLY_FAITHFUL   7
+  SHAPE_GAP        9
+
+=== SHAPE_GAP functions (recognizer declines on both lanes) ===
+  bad_acc_alias  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  sink  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  bad_acc_escape  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  bad_acc_read  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  bad_nonsub  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  bad_rebuilt  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  bad_self  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  size  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  sum  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+
+=== SAFETY_GAP functions (shape recognized, safety/discharge open) ===
+       83.27 real        80.08 user         0.30 sys

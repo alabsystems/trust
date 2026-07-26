@@ -1,0 +1,24 @@
+# trust-semantics: clean-kernel definitions for Trust's safety predicates.
+#
+# Stage 1 of PROOF_OF_PERFECTION.md: replace opaque `const_str` placeholders for
+# safety predicates (e.g. RustVIR.noOverflow) with REAL clean-kernel Definitions
+# the kernel understands, and emit the matching violation Formula in the exact
+# shape trust-vcgen's range.rs builds. Fail-closed: overflow_safety_env returns
+# None if the kernel rejects the definition.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-semantics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+trust-types = { workspace = true }
+clean-kernel = { workspace = true }

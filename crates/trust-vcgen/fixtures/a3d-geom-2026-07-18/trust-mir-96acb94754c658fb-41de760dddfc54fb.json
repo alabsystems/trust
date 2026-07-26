@@ -1,0 +1,217 @@
+{
+  "name": "eq",
+  "def_path": "<Aabb as std::cmp::PartialEq>::eq",
+  "span": {
+    "file": "crates/a3d-geom/src/lib.rs",
+    "line_start": 224,
+    "col_start": 29,
+    "line_end": 224,
+    "col_end": 38
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "Aabb",
+                "fields": [
+                  [
+                    "min",
+                    {
+                      "Adt": {
+                        "name": "Vec3",
+                        "fields": [
+                          [
+                            "x",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ],
+                          [
+                            "y",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ],
+                          [
+                            "z",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ],
+                  [
+                    "max",
+                    {
+                      "Adt": {
+                        "name": "Vec3",
+                        "fields": [
+                          [
+                            "x",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ],
+                          [
+                            "y",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ],
+                          [
+                            "z",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "Aabb",
+                "fields": [
+                  [
+                    "min",
+                    {
+                      "Adt": {
+                        "name": "Vec3",
+                        "fields": [
+                          [
+                            "x",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ],
+                          [
+                            "y",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ],
+                          [
+                            "z",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ],
+                  [
+                    "max",
+                    {
+                      "Adt": {
+                        "name": "Vec3",
+                        "fields": [
+                          [
+                            "x",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ],
+                          [
+                            "y",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ],
+                          [
+                            "z",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          }
+        },
+        "name": "other"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": "Bool"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

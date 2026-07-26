@@ -1,0 +1,2 @@
+aggregate: 28 of 28 requested targets found in dump dir
+  ⏱ DECLINED (per-function budget exceeded, fail-closed — not counted proven): to_regular_range

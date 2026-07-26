@@ -1,0 +1,11 @@
+
+=== FF-gate cluster summary (8 functions) ===
+  FULLY_FAITHFUL   6
+  SAFETY_GAP       2
+
+=== SHAPE_GAP functions (recognizer declines on both lanes) ===
+
+=== SAFETY_GAP functions (shape recognized, safety/discharge open) ===
+  Stack::double_len  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, via_mirsem_straight_line_shape: true, via_mirsem_loop_shape: false, via_mirsem_shape: true, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  Stack::remaining  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, via_mirsem_straight_line_shape: true, via_mirsem_loop_shape: false, via_mirsem_shape: true, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+       34.26 real        34.07 user         0.05 sys

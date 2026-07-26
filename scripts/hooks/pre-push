@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# Trust pre-push gate. Install with `scripts/install-git-hooks.sh`.
+#
+# Trust has no CI, so this is the only thing between a drift class and `origin`.
+# It is therefore scoped to what can run in under a minute on any checkout —
+# three lanes, none needing a stage2 build:
+#
+#   fast.pr-gate         toolchain/flag drift + stage0 seed cadence + ledger
+#                        expirations (scripts/pr_gate.sh)
+#   fast.pin-coherence   every submodule at its recorded pin
+#   fast.bridge-pin      the vendored Lean semantics match the trust-ir pin
+#
+# The bridge REPLAY (every bridged arm still carries its kernel-checked
+# agreement theorem) is deliberately NOT here: it kernel-checks 185 modules and
+# takes ~142s, and a pre-push gate that slow is one everyone learns to skip with
+# --no-verify. It runs in the slower `bridge.replay` lane instead. The two are
+# genuinely different questions — fast.bridge-pin proves the artifacts BELONG to
+# the pin, and an artifact set can match its pin while a theorem inside it has
+# stopped checking, which is exactly what happened on 2026-07-25.
+#
+# Those are the gate ids the `fast` profile of
+# tests/run_trust_comprehensive_harness.sh uses, deliberately: one id per lane
+# means one quarantine row governs the lane wherever it runs.
+#
+# QUARANTINE, not bypass. A lane that is known-red gets a row in
+# `tests/trust-comprehensive/divergences.toml` with an owner, a reason, and an
+# `expires_on`. While that row is active the lane reports QUARANTINED and the
+# push proceeds — and the moment the lane goes GREEN with the row still active,
+# this hook FAILS and tells you to delete the row. A quarantine therefore cannot
+# outlive the problem it documents, and `scripts/check_ledger_expirations.py`
+# (inside pr_gate) fails once it expires. There is no environment variable that
+# turns a lane off; the escape hatch is `git push --no-verify`, which is git's
+# and is visible in the reflog.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0 OR MIT
+set -uo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "pre-push: not inside a git worktree" >&2
+  exit 1
+}
+cd "$REPO_ROOT"
+
+PYTHON_BIN=""
+for candidate in python3.14 python3.13 python3.12 python3.11 python3 python; do
+  if command -v "$candidate" >/dev/null 2>&1; then PYTHON_BIN="$candidate"; break; fi
+done
+if [ -z "$PYTHON_BIN" ]; then
+  echo "pre-push: no python3 on PATH; cannot read the quarantine ledger" >&2
+  exit 2
+fi
+
+LEDGER="tests/trust-comprehensive/divergences.toml"
+
+# Prints the active, unexpired quarantine reason for a gate id, or nothing.
+# Exits nonzero when the ledger itself is unreadable, which fails the push:
+# an unreadable quarantine ledger means no lane's status can be trusted.
+quarantine_for() {
+  "$PYTHON_BIN" - "$LEDGER" "$1" <<'PY'
+import sys
+from datetime import date, datetime, timezone
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        print("no TOML parser available (need Python 3.11+ or tomli)", file=sys.stderr)
+        raise SystemExit(2)
+
+ledger, gate_id = Path(sys.argv[1]), sys.argv[2]
+try:
+    rows = tomllib.loads(ledger.read_text(encoding="utf-8")).get("divergences", [])
+except Exception as exc:
+    print(f"unreadable quarantine ledger {ledger}: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+
+today = datetime.now(timezone.utc).date()
+for row in rows:
+    if not isinstance(row, dict) or row.get("gate_id") != gate_id:
+        continue
+    if str(row.get("status", "")).lower() != "active":
+        continue
+    expires = row.get("expires_on")
+    if isinstance(expires, str):
+        expires = date.fromisoformat(expires)
+    if not isinstance(expires, date) or expires < today:
+        continue
+    print(f"{row.get('id')} :: expires {expires} :: {row.get('required_action', '')}")
+    break
+PY
+}
+
+FAILED=0
+run_lane() {
+  local gate_id="$1"
+  shift
+  local quarantine
+  if ! quarantine="$(quarantine_for "$gate_id")"; then
+    echo "pre-push: cannot read $LEDGER — refusing to judge any lane" >&2
+    exit 2
+  fi
+
+  echo
+  echo "=== $gate_id ==="
+  if "$@"; then
+    if [ -n "$quarantine" ]; then
+      echo "FAIL: $gate_id is GREEN but still quarantined."
+      echo "      Delete the row and push again: $quarantine"
+      FAILED=1
+    else
+      echo "PASS: $gate_id"
+    fi
+    return
+  fi
+
+  if [ -n "$quarantine" ]; then
+    echo "QUARANTINED: $gate_id is red under an active, unexpired ledger row."
+    echo "             $quarantine"
+    return
+  fi
+  echo "FAIL: $gate_id"
+  FAILED=1
+}
+
+echo "Trust pre-push gate (no stage2 build required)"
+
+run_lane fast.pr-gate bash scripts/pr_gate.sh
+run_lane fast.pin-coherence bash scripts/check_pin_coherence.sh
+run_lane fast.bridge-pin bash scripts/check_bridge_pin.sh --check
+
+echo
+if [ "$FAILED" -eq 0 ]; then
+  echo "PRE-PUSH: GREEN"
+  exit 0
+fi
+echo "PRE-PUSH: RED — fix the lanes above, or quarantine one with an owned,"
+echo "expiring row in $LEDGER. \`git push --no-verify\` skips this hook and"
+echo "leaves no record of why."
+exit 1

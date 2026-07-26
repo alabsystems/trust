@@ -1,0 +1,328 @@
+{
+  "name": "{closure#0}",
+  "def_path": "std::rt::lang_start::<()>::{closure#0}",
+  "span": {
+    "file": "std/src/rt.rs",
+    "line_start": 206,
+    "col_start": 9,
+    "line_end": 206,
+    "col_end": 92
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Closure": {
+                "name": "std::rt::lang_start::{closure#0}",
+                "upvars": [
+                  {
+                    "FnPtr": {
+                      "sig": {
+                        "params": [],
+                        "ret": "Unit"
+                      }
+                    }
+                  }
+                ],
+                "call": {
+                  "kind": "Fn",
+                  "params": [],
+                  "ret": {
+                    "Int": {
+                      "width": 32,
+                      "signed": true
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "std::process::ExitCode",
+            "fields": [
+              [
+                "0",
+                {
+                  "Adt": {
+                    "name": "std::sys::process::unix::common::ExitCode",
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 3,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "FnPtr": {
+            "sig": {
+              "params": [],
+              "ret": "Unit"
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 2
+          },
+          {
+            "StorageLive": 3
+          },
+          {
+            "StorageLive": 4
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "std/src/rt.rs",
+                "line_start": 206,
+                "col_start": 69,
+                "line_end": 206,
+                "col_end": 73
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>",
+            "args": [
+              {
+                "Move": {
+                  "local": 4,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "std/src/rt.rs",
+              "line_start": 206,
+              "col_start": 17,
+              "line_end": 206,
+              "col_end": 74
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageDead": 4
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<() as std::process::Termination>::report",
+            "args": [
+              {
+                "Move": {
+                  "local": 3,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "std/src/rt.rs",
+              "line_start": 206,
+              "col_start": 17,
+              "line_end": 206,
+              "col_end": 83
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "StorageDead": 3
+          },
+          {
+            "StorageLive": 5
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": [
+                      {
+                        "Field": 0
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "std/src/sys/process/unix/common.rs",
+                "line_start": 592,
+                "col_start": 8,
+                "line_end": 592,
+                "col_end": 14
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Move": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 32,
+                      "signed": true
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "std/src/sys/process/unix/common.rs",
+                "line_start": 592,
+                "col_start": 8,
+                "line_end": 592,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "StorageDead": 5
+          },
+          {
+            "StorageDead": 2
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

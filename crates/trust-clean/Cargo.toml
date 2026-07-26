@@ -1,0 +1,68 @@
+# trust-clean: Certificate pipeline for clean proof verification
+#
+# Bridges trust verification conditions to clean proof certificates.
+# Provides canonical VC serialization, fingerprinting, and certificate
+# generation/verification stubs for the clean kernel integration.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-clean"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+trust-types = { workspace = true }
+# Trust (perf): parallelize the edge-free corpus proof loop in `prove_dump_dir`.
+rayon = { workspace = true }
+# §6 driver: count the FULL obligation set (safety VCs + postconditions) per
+# function so `targo trust prove` reports honest scope, not just user contracts.
+trust-vcgen = { workspace = true }
+# Step 6SI (SYNTHESIZED loop invariants): consume trust-strengthen's abstract-domain
+# invariant inference (`InvariantInferrer`) to PROPOSE a non-trivial loop invariant
+# (e.g. the interval lower bound `0 ≤ i`) that the clean kernel then CHECKS for
+# preservation. Synthesis proposes; the kernel verifies (fail-closed).
+trust-strengthen = { workspace = true }
+trust-proof-cert = { workspace = true }
+# Goal item 4 (whole-program POC): consume the universal IR's composition data
+# model — `FunctionSummary{requires,ensures,proved,params}`, per-`Call`
+# `ProofContext{assumes,establishes}`, `ProofEvidence::InheritedFromCallee`, and
+# the `Certified`/`CleanCic` tier — so the 2-function compositional proof is
+# trust-ir-keyed (whole_program.rs), parallel to the per-function re-anchor.
+trust-ir = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+clean-kernel = { workspace = true }
+# Lean↔Clean bridge gate (trustir_bridge.rs): clean-olean machine-imports the
+# VENDORED trust-ir .olean semantics (fixtures/trustir-oleans +
+# vendor/lean-core-oleans) into a clean-kernel Environment; clean-parser +
+# clean-elab elaborate the agreement theorems against the imported constants
+# (the thin check seam is ported from first-party/clean/crates/clean/src/check.rs
+# — depending on the `clean` facade crate would drag in clean-cli/tokio/server).
+# Trust: explicit path (not `{ workspace = true }`) is REQUIRED for `x.py dist`
+# generate-copyright. clean-olean is the one clean crate reached ONLY through the
+# single cross-workspace path targo-trust -> trust-clean, and `cargo vendor`
+# cannot resolve a `workspace = true` inheritance across that boundary (it fails
+# with "dependency.clean-olean was not found in workspace.dependencies", even
+# though it is in crates/Cargo.toml [workspace.dependencies]). The other clean
+# deps resolve via additional in-graph paths, so only this one needs pinning.
+clean-olean = { path = "../../first-party/clean/crates/clean-olean" }
+clean-parser = { workspace = true }
+clean-elab = { workspace = true }
+# MANIFEST.toml parsing for the vendored-olean provenance gate (fail-closed on
+# sha mismatch / trust-ir pin drift).
+toml = { workspace = true }
+sha2 = { workspace = true }
+
+[features]
+clean-integration = []
+
+[dev-dependencies]

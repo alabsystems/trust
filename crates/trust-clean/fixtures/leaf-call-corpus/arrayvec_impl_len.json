@@ -1,0 +1,112 @@
+{
+  "name": "len",
+  "def_path": "<arrayvec::ArrayVec<T, CAP> as arrayvec_impl::ArrayVecImpl>::len",
+  "span": {
+    "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/arrayvec-0.7.7/src/arrayvec.rs",
+    "line_start": 749,
+    "col_start": 4,
+    "line_end": 749,
+    "col_end": 41
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "arrayvec::ArrayVec",
+                "fields": [
+                  [
+                    "len",
+                    {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "xs",
+                    {
+                      "Unsupported": {
+                        "kind": "TyKind::Array",
+                        "detail": "array length CAP/#1 is not a concrete target usize"
+                      }
+                    }
+                  ]
+                ]
+              }
+            }
+          }
+        },
+        "name": "self"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "arrayvec::ArrayVec::<T, CAP>::len",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/arrayvec-0.7.7/src/arrayvec.rs",
+              "line_start": 749,
+              "col_start": 29,
+              "line_end": 749,
+              "col_end": 39
+            },
+            "atomic": null,
+            "is_foreign": false
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

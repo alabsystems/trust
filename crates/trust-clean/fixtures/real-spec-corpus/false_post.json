@@ -1,0 +1,175 @@
+{
+  "name": "false_post",
+  "def_path": "false_post",
+  "span": {
+    "file": "SOURCE.rs",
+    "line_start": 133,
+    "col_start": 0,
+    "line_end": 135,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "std::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Closure": {
+                    "name": "false_post::{closure#0}",
+                    "upvars": [
+                      {
+                        "Int": {
+                          "width": 32,
+                          "signed": true
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "name": "__ensures_checker"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "std::option::Option",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "SOURCE.rs",
+                "line_start": 132,
+                "col_start": 0,
+                "line_end": 132,
+                "col_end": 54
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "SOURCE.rs",
+                "line_start": 132,
+                "col_start": 0,
+                "line_end": 132,
+                "col_end": 54
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "SOURCE.rs",
+        "line_start": 132,
+        "col_start": 0,
+        "line_end": 132,
+        "col_end": 54
+      },
+      "body": "__trust_lowered_compiler_contract__:(result) > (x)"
+    }
+  ],
+  "preconditions": [],
+  "postconditions": [
+    {
+      "Gt": [
+        {
+          "Var": [
+            "_0",
+            "Int"
+          ]
+        },
+        {
+          "Var": [
+            "x",
+            "Int"
+          ]
+        }
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [],
+    "ensures": [
+      "(result) > (x)"
+    ],
+    "invariants": []
+  }
+}

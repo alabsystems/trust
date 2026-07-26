@@ -1,0 +1,100 @@
+{
+  "name": "assert_fields_are_eq",
+  "def_path": "<reduction::Order as std::cmp::Eq>::assert_fields_are_eq",
+  "span": {
+    "file": "<dump-root>/reduction.rs",
+    "line_start": 17,
+    "col_start": 27,
+    "line_end": 17,
+    "col_end": 29
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "reduction::Order",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "NOR",
+                    "discriminant": 0,
+                    "fields": []
+                  },
+                  {
+                    "name": "CBN",
+                    "discriminant": 1,
+                    "fields": []
+                  },
+                  {
+                    "name": "HSP",
+                    "discriminant": 2,
+                    "fields": []
+                  },
+                  {
+                    "name": "HNO",
+                    "discriminant": 3,
+                    "fields": []
+                  },
+                  {
+                    "name": "APP",
+                    "discriminant": 4,
+                    "fields": []
+                  },
+                  {
+                    "name": "CBV",
+                    "discriminant": 5,
+                    "fields": []
+                  },
+                  {
+                    "name": "HAP",
+                    "discriminant": 6,
+                    "fields": []
+                  }
+                ],
+                "disc_index_safe": true
+              }
+            }
+          }
+        },
+        "name": "self"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

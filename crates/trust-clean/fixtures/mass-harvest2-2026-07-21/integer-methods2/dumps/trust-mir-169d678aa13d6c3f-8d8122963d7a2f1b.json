@@ -1,0 +1,63 @@
+{
+  "name": "runtime",
+  "def_path": "core::ub_checks::check_language_ub::runtime",
+  "span": {
+    "file": "corelib/library/core/src/intrinsics/mod.rs",
+    "line_start": 2445,
+    "col_start": 8,
+    "line_end": 2447,
+    "col_end": 9
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "Not",
+                  {
+                    "Constant": {
+                      "Bool": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "corelib/library/core/src/intrinsics/mod.rs",
+                "line_start": 2445,
+                "col_start": 8,
+                "line_end": 2445,
+                "col_end": 63
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 0,
+    "return_ty": "Bool"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

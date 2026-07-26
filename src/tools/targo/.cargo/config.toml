@@ -1,0 +1,8 @@
+# Trust: Snapbox's fallback source-root heuristic selects the outermost ancestor
+# with a Cargo.toml. Upstream Cargo is its own repository root, so the heuristic
+# is correct there; vendored inside Trust it resolves fixtures from Trust's root
+# instead of Targo's. Cargo resolves this empty, relative value to the nested
+# workspace root before rustc expands Snapbox's source-path macros, covering both
+# the main testsuite and member-crate tests.
+[env]
+CARGO_RUSTC_CURRENT_DIR = { value = "", relative = true }

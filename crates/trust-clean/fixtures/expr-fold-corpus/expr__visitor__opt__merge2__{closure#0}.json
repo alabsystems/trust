@@ -1,0 +1,888 @@
+{
+  "name": "{closure#0}",
+  "def_path": "expr::visitor::opt::merge2::{closure#0}",
+  "span": {
+    "file": "src/expr/visitor_opt.rs",
+    "line_start": 30,
+    "col_start": 30,
+    "line_end": 30,
+    "col_end": 46
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Adt": {
+            "name": "std::sync::Arc",
+            "fields": [
+              [
+                "ptr",
+                {
+                  "Adt": {
+                    "name": "std::ptr::NonNull",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Adt": {
+                                "name": "smallvec::alloc::sync::ArcInner",
+                                "fields": [
+                                  [
+                                    "strong",
+                                    {
+                                      "Adt": {
+                                        "name": "std::sync::atomic::Atomic",
+                                        "fields": [
+                                          [
+                                            "v",
+                                            {
+                                              "Adt": {
+                                                "name": "std::cell::UnsafeCell",
+                                                "fields": [
+                                                  [
+                                                    "value",
+                                                    {
+                                                      "Adt": {
+                                                        "name": "std::sync::atomic::private::Align8",
+                                                        "fields": [
+                                                          [
+                                                            "0",
+                                                            {
+                                                              "Int": {
+                                                                "width": 64,
+                                                                "signed": false
+                                                              }
+                                                            }
+                                                          ]
+                                                        ],
+                                                        "variants": [],
+                                                        "disc_index_safe": false
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "weak",
+                                    {
+                                      "Adt": {
+                                        "name": "std::sync::atomic::Atomic",
+                                        "fields": [
+                                          [
+                                            "v",
+                                            {
+                                              "Adt": {
+                                                "name": "std::cell::UnsafeCell",
+                                                "fields": [
+                                                  [
+                                                    "value",
+                                                    {
+                                                      "Adt": {
+                                                        "name": "std::sync::atomic::private::Align8",
+                                                        "fields": [
+                                                          [
+                                                            "0",
+                                                            {
+                                                              "Int": {
+                                                                "width": 64,
+                                                                "signed": false
+                                                              }
+                                                            }
+                                                          ]
+                                                        ],
+                                                        "variants": [],
+                                                        "disc_index_safe": false
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "data",
+                                    {
+                                      "Adt": {
+                                        "name": "expr::Expr",
+                                        "fields": [
+                                          [
+                                            "kind",
+                                            {
+                                              "Datatype": {
+                                                "name": "expr::kind::ExprKind",
+                                                "variants": []
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "meta",
+                                            {
+                                              "Adt": {
+                                                "name": "expr::meta::ExprMeta",
+                                                "fields": [
+                                                  [
+                                                    "0",
+                                                    {
+                                                      "Int": {
+                                                        "width": 64,
+                                                        "signed": false
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ],
+              [
+                "phantom",
+                {
+                  "Adt": {
+                    "name": "std::marker::PhantomData",
+                    "fields": [],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ],
+              [
+                "alloc",
+                {
+                  "Adt": {
+                    "name": "std::alloc::Global",
+                    "fields": [],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Closure": {
+            "name": "expr::visitor::opt::merge2::{closure#0}",
+            "upvars": [
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Adt": {
+                      "name": "std::sync::Arc",
+                      "fields": [
+                        [
+                          "ptr",
+                          {
+                            "Adt": {
+                              "name": "std::ptr::NonNull",
+                              "fields": [
+                                [
+                                  "pointer",
+                                  {
+                                    "RawPtr": {
+                                      "mutable": false,
+                                      "pointee": {
+                                        "Adt": {
+                                          "name": "smallvec::alloc::sync::ArcInner",
+                                          "fields": [
+                                            [
+                                              "strong",
+                                              {
+                                                "Adt": {
+                                                  "name": "std::sync::atomic::Atomic",
+                                                  "fields": [
+                                                    [
+                                                      "v",
+                                                      {
+                                                        "Adt": {
+                                                          "name": "std::cell::UnsafeCell",
+                                                          "fields": [
+                                                            [
+                                                              "value",
+                                                              {
+                                                                "Adt": {
+                                                                  "name": "std::sync::atomic::private::Align8",
+                                                                  "fields": [
+                                                                    [
+                                                                      "0",
+                                                                      {
+                                                                        "Int": {
+                                                                          "width": 64,
+                                                                          "signed": false
+                                                                        }
+                                                                      }
+                                                                    ]
+                                                                  ],
+                                                                  "variants": [],
+                                                                  "disc_index_safe": false
+                                                                }
+                                                              }
+                                                            ]
+                                                          ],
+                                                          "variants": [],
+                                                          "disc_index_safe": false
+                                                        }
+                                                      }
+                                                    ]
+                                                  ],
+                                                  "variants": [],
+                                                  "disc_index_safe": false
+                                                }
+                                              }
+                                            ],
+                                            [
+                                              "weak",
+                                              {
+                                                "Adt": {
+                                                  "name": "std::sync::atomic::Atomic",
+                                                  "fields": [
+                                                    [
+                                                      "v",
+                                                      {
+                                                        "Adt": {
+                                                          "name": "std::cell::UnsafeCell",
+                                                          "fields": [
+                                                            [
+                                                              "value",
+                                                              {
+                                                                "Adt": {
+                                                                  "name": "std::sync::atomic::private::Align8",
+                                                                  "fields": [
+                                                                    [
+                                                                      "0",
+                                                                      {
+                                                                        "Int": {
+                                                                          "width": 64,
+                                                                          "signed": false
+                                                                        }
+                                                                      }
+                                                                    ]
+                                                                  ],
+                                                                  "variants": [],
+                                                                  "disc_index_safe": false
+                                                                }
+                                                              }
+                                                            ]
+                                                          ],
+                                                          "variants": [],
+                                                          "disc_index_safe": false
+                                                        }
+                                                      }
+                                                    ]
+                                                  ],
+                                                  "variants": [],
+                                                  "disc_index_safe": false
+                                                }
+                                              }
+                                            ],
+                                            [
+                                              "data",
+                                              {
+                                                "Adt": {
+                                                  "name": "expr::Expr",
+                                                  "fields": [
+                                                    [
+                                                      "kind",
+                                                      {
+                                                        "Datatype": {
+                                                          "name": "expr::kind::ExprKind",
+                                                          "variants": []
+                                                        }
+                                                      }
+                                                    ],
+                                                    [
+                                                      "meta",
+                                                      {
+                                                        "Adt": {
+                                                          "name": "expr::meta::ExprMeta",
+                                                          "fields": [
+                                                            [
+                                                              "0",
+                                                              {
+                                                                "Int": {
+                                                                  "width": 64,
+                                                                  "signed": false
+                                                                }
+                                                              }
+                                                            ]
+                                                          ],
+                                                          "variants": [],
+                                                          "disc_index_safe": false
+                                                        }
+                                                      }
+                                                    ]
+                                                  ],
+                                                  "variants": [],
+                                                  "disc_index_safe": false
+                                                }
+                                              }
+                                            ]
+                                          ],
+                                          "variants": [],
+                                          "disc_index_safe": false
+                                        }
+                                      }
+                                    }
+                                  }
+                                ]
+                              ],
+                              "variants": [],
+                              "disc_index_safe": false
+                            }
+                          }
+                        ],
+                        [
+                          "phantom",
+                          {
+                            "Adt": {
+                              "name": "std::marker::PhantomData",
+                              "fields": [],
+                              "variants": [],
+                              "disc_index_safe": false
+                            }
+                          }
+                        ],
+                        [
+                          "alloc",
+                          {
+                            "Adt": {
+                              "name": "std::alloc::Global",
+                              "fields": [],
+                              "variants": [],
+                              "disc_index_safe": false
+                            }
+                          }
+                        ]
+                      ],
+                      "variants": [],
+                      "disc_index_safe": false
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "std::sync::Arc",
+                "fields": [
+                  [
+                    "ptr",
+                    {
+                      "Adt": {
+                        "name": "std::ptr::NonNull",
+                        "fields": [
+                          [
+                            "pointer",
+                            {
+                              "RawPtr": {
+                                "mutable": false,
+                                "pointee": {
+                                  "Adt": {
+                                    "name": "smallvec::alloc::sync::ArcInner",
+                                    "fields": [
+                                      [
+                                        "strong",
+                                        {
+                                          "Adt": {
+                                            "name": "std::sync::atomic::Atomic",
+                                            "fields": [
+                                              [
+                                                "v",
+                                                {
+                                                  "Adt": {
+                                                    "name": "std::cell::UnsafeCell",
+                                                    "fields": [
+                                                      [
+                                                        "value",
+                                                        {
+                                                          "Adt": {
+                                                            "name": "std::sync::atomic::private::Align8",
+                                                            "fields": [
+                                                              [
+                                                                "0",
+                                                                {
+                                                                  "Int": {
+                                                                    "width": 64,
+                                                                    "signed": false
+                                                                  }
+                                                                }
+                                                              ]
+                                                            ],
+                                                            "variants": [],
+                                                            "disc_index_safe": false
+                                                          }
+                                                        }
+                                                      ]
+                                                    ],
+                                                    "variants": [],
+                                                    "disc_index_safe": false
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      ],
+                                      [
+                                        "weak",
+                                        {
+                                          "Adt": {
+                                            "name": "std::sync::atomic::Atomic",
+                                            "fields": [
+                                              [
+                                                "v",
+                                                {
+                                                  "Adt": {
+                                                    "name": "std::cell::UnsafeCell",
+                                                    "fields": [
+                                                      [
+                                                        "value",
+                                                        {
+                                                          "Adt": {
+                                                            "name": "std::sync::atomic::private::Align8",
+                                                            "fields": [
+                                                              [
+                                                                "0",
+                                                                {
+                                                                  "Int": {
+                                                                    "width": 64,
+                                                                    "signed": false
+                                                                  }
+                                                                }
+                                                              ]
+                                                            ],
+                                                            "variants": [],
+                                                            "disc_index_safe": false
+                                                          }
+                                                        }
+                                                      ]
+                                                    ],
+                                                    "variants": [],
+                                                    "disc_index_safe": false
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      ],
+                                      [
+                                        "data",
+                                        {
+                                          "Adt": {
+                                            "name": "expr::Expr",
+                                            "fields": [
+                                              [
+                                                "kind",
+                                                {
+                                                  "Datatype": {
+                                                    "name": "expr::kind::ExprKind",
+                                                    "variants": []
+                                                  }
+                                                }
+                                              ],
+                                              [
+                                                "meta",
+                                                {
+                                                  "Adt": {
+                                                    "name": "expr::meta::ExprMeta",
+                                                    "fields": [
+                                                      [
+                                                        "0",
+                                                        {
+                                                          "Int": {
+                                                            "width": 64,
+                                                            "signed": false
+                                                          }
+                                                        }
+                                                      ]
+                                                    ],
+                                                    "variants": [],
+                                                    "disc_index_safe": false
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ],
+                  [
+                    "phantom",
+                    {
+                      "Adt": {
+                        "name": "std::marker::PhantomData",
+                        "fields": [],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ],
+                  [
+                    "alloc",
+                    {
+                      "Adt": {
+                        "name": "std::alloc::Global",
+                        "fields": [],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "src/expr/visitor_opt.rs",
+                "line_start": 30,
+                "col_start": 33,
+                "line_end": 30,
+                "col_end": 38
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "std::clone::Clone::clone",
+            "args": [
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "src/expr/visitor_opt.rs",
+              "line_start": 30,
+              "col_start": 33,
+              "line_end": 30,
+              "col_end": 46
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Adt": {
+        "name": "std::sync::Arc",
+        "fields": [
+          [
+            "ptr",
+            {
+              "Adt": {
+                "name": "std::ptr::NonNull",
+                "fields": [
+                  [
+                    "pointer",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Adt": {
+                            "name": "smallvec::alloc::sync::ArcInner",
+                            "fields": [
+                              [
+                                "strong",
+                                {
+                                  "Adt": {
+                                    "name": "std::sync::atomic::Atomic",
+                                    "fields": [
+                                      [
+                                        "v",
+                                        {
+                                          "Adt": {
+                                            "name": "std::cell::UnsafeCell",
+                                            "fields": [
+                                              [
+                                                "value",
+                                                {
+                                                  "Adt": {
+                                                    "name": "std::sync::atomic::private::Align8",
+                                                    "fields": [
+                                                      [
+                                                        "0",
+                                                        {
+                                                          "Int": {
+                                                            "width": 64,
+                                                            "signed": false
+                                                          }
+                                                        }
+                                                      ]
+                                                    ],
+                                                    "variants": [],
+                                                    "disc_index_safe": false
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              ],
+                              [
+                                "weak",
+                                {
+                                  "Adt": {
+                                    "name": "std::sync::atomic::Atomic",
+                                    "fields": [
+                                      [
+                                        "v",
+                                        {
+                                          "Adt": {
+                                            "name": "std::cell::UnsafeCell",
+                                            "fields": [
+                                              [
+                                                "value",
+                                                {
+                                                  "Adt": {
+                                                    "name": "std::sync::atomic::private::Align8",
+                                                    "fields": [
+                                                      [
+                                                        "0",
+                                                        {
+                                                          "Int": {
+                                                            "width": 64,
+                                                            "signed": false
+                                                          }
+                                                        }
+                                                      ]
+                                                    ],
+                                                    "variants": [],
+                                                    "disc_index_safe": false
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              ],
+                              [
+                                "data",
+                                {
+                                  "Adt": {
+                                    "name": "expr::Expr",
+                                    "fields": [
+                                      [
+                                        "kind",
+                                        {
+                                          "Datatype": {
+                                            "name": "expr::kind::ExprKind",
+                                            "variants": []
+                                          }
+                                        }
+                                      ],
+                                      [
+                                        "meta",
+                                        {
+                                          "Adt": {
+                                            "name": "expr::meta::ExprMeta",
+                                            "fields": [
+                                              [
+                                                "0",
+                                                {
+                                                  "Int": {
+                                                    "width": 64,
+                                                    "signed": false
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          ],
+          [
+            "phantom",
+            {
+              "Adt": {
+                "name": "std::marker::PhantomData",
+                "fields": [],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          ],
+          [
+            "alloc",
+            {
+              "Adt": {
+                "name": "std::alloc::Global",
+                "fields": [],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          ]
+        ],
+        "variants": [],
+        "disc_index_safe": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

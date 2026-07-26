@@ -1,0 +1,14 @@
+error: unused variable: `x`
+  --> $DIR/native_contract_liveness.rs:26:5
+   |
+LL |     x: u32,
+   |     ^ help: if this is intentional, prefix it with an underscore: `_x`
+   |
+note: the lint level is defined here
+  --> $DIR/native_contract_liveness.rs:14:29
+   |
+LL | #![deny(unused_assignments, unused_variables)]
+   |                             ^^^^^^^^^^^^^^^^
+
+error: aborting due to 1 previous error
+

@@ -1,0 +1,12 @@
+kind	sha256	def_path_json	file
+controls	2c6e8d9b11dae301144cf56872de15732f89421359ff796d1b9672556e4bae77	"ctl_min_i32"	ctl_min_i32.json
+controls	4591f6018f6802c8f9eb6732dacf6f3cfa6892889b1e1c744bdf73594eac2ba3	"ctl_max_u8"	ctl_max_u8.json
+controls	62174e01dc4803ea761377fff4c08b77a48f5e0864a4fddb9d8d6e2f9d7e4113	"ctl_max_i32"	ctl_max_i32.json
+controls	7dba584761831a9dc9cff1f0699aff9a9279104015829613faaf8fea125725c4	"ctl_clamp_i32"	ctl_clamp_i32.json
+controls	86e03c7bd55a312936c769710a516a4001d31a3bf2d17c61b44dad6cf831f307	"ctl_min_u8"	ctl_min_u8.json
+dumps	093c916d99c9d0903571eabe934b1752f7ad0ff10f03acf109df805b47466e98	"<u8 as core::cmp::Ord>::min"	u8_as_core_cmp_Ord_min.json
+dumps	17927fe669cb4771a7ba622a2c2bf350528f64a43ee51409b957992c47b7bd31	"core::cmp::max::<i32>"	core_cmp_max_i32.json
+dumps	3630a2b1ef64337862833264f07d6c699bcd874ffdba7303ee57f918182d5507	"<i32 as core::cmp::Ord>::max"	i32_as_core_cmp_Ord_max.json
+dumps	af66a8d8c9c3dc0a230b66e54bd53a61b17ae4e37f2c6686de2db51f27388631	"core::cmp::min::<i32>"	core_cmp_min_i32.json
+dumps	b0eb1bb304a2e6009cd6c28ec6e7b9b9ff196020d37325f2a32b9af0862e26c5	"<i32 as core::cmp::Ord>::min"	i32_as_core_cmp_Ord_min.json
+dumps	cf942371eb10561b706b4f31006d16e19575f8fa278a9acd2b5a4f580f36ec4d	"<u8 as core::cmp::Ord>::max"	u8_as_core_cmp_Ord_max.json

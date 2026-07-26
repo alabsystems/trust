@@ -1,0 +1,18 @@
+{
+  "schema": "dpub.public-engine-package.v1",
+  "name": "sunder",
+  "role": "deductive-engine",
+  "package_name": "sunder",
+  "package_version": "1.0.0",
+  "package_coordinate": "dpub://trust-engines/sunder@1.0.0",
+  "source_repo": "https://github.com/alabsystems/sunder",
+  "source_ref_kind": "commit",
+  "source_rev": "1111111111111111111111111111111111111111",
+  "verifier_api": "trust-verifier-api@1.0.0",
+  "capability_set": ["deductive-proof", "vc-discharge"],
+  "package_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "admission_hash": "sha256:2111111111111111111111111111111111111111111111111111111111111111",
+  "admission_signature_algorithm": "dpub-ed25519-v1",
+  "admission_signature_keyid": "dpub-bot@andrewyates",
+  "admission_signature": "signature-value-sunder-abcdefghijklmnopqrstuvwxyz"
+}

@@ -1,0 +1,192 @@
+{
+  "canonical_binary_provenance": {
+    "records": [
+      {
+        "artifact_digest_identity": {
+          "root_artifact_digest": {
+            "algorithm": "sha256",
+            "value": "000000000000000000000000000000000000000000000000aefe5a1e579a9dab"
+          },
+          "selected_image": {
+            "file_offset": 0,
+            "file_size": 16,
+            "sha256": "000000000000000000000000000000000000000000000000aefe5a1e579a9dab"
+          }
+        },
+        "origin": {
+          "binary_path": "fixtures/tiny",
+          "encoding": 2425393296,
+          "function_entry": 4198400,
+          "instruction_address": 4198416,
+          "instruction_bytes": [
+            144,
+            144,
+            144,
+            144
+          ],
+          "instruction_size": 4,
+          "source": {
+            "col_end": 17,
+            "col_start": 5,
+            "file": "src/recovered.rs",
+            "line_end": 3,
+            "line_start": 3
+          }
+        },
+        "proof_evidence": {
+          "checked_certificate_sha256": "0000000000000000000000000000000000000000000000008f9b6e6f14bd13f7",
+          "production_checker_evidence_sha256": "00000000000000000000000000000000000000000000000097c33ab9d1583308",
+          "replay_transcript_digest": "0000000000000000000000000000000000000000000000008fd6f96526c0583c",
+          "solver_dispatch_id": "source-provenance:vc0",
+          "source_backpropagation_gate_sha256": "000000000000000000000000000000000000000000000000477c2d3d79cd109f"
+        },
+        "provenance_status": "checked_exact",
+        "record_digest": "3fb5eedbd368648459a2d6958f9feea5a27180870a9bba6f225a2ba1c69a0ea2",
+        "source_status": "exact"
+      }
+    ]
+  },
+  "kind": "binary_source_provenance",
+  "reconstruction": {
+    "assumptions": [],
+    "diagnostics": [],
+    "outputs": [
+      {
+        "artifact_path": null,
+        "assumptions": [],
+        "diagnostics": [],
+        "preserved_symbolic_formulas": [],
+        "target": "TrustIr",
+        "target_validation_blockers": [],
+        "text": null,
+        "trust_level": "ProofGrade",
+        "validated_rust": null,
+        "validation": "Validated",
+        "validation_records": []
+      }
+    ],
+    "target": "TrustIr",
+    "trust_level": "ProofGrade",
+    "validated_rust": null,
+    "validation": "Validated"
+  },
+  "schema_version": "trust-report.binary-source-provenance-artifact.v1",
+  "source_backpropagation_gate": {
+    "accepted_reconstruction_validation": true,
+    "accepted_target_validation": true,
+    "blockers": [],
+    "checked_certificate_identity": true,
+    "exact_replay_identity": true,
+    "exact_source_provenance": true,
+    "replay_grade_artifact_identity": true,
+    "schema_version": "trust-proof-cert.source-backpropagation-gate.v1",
+    "source_backpropagation_allowed": true,
+    "source_backpropagation_gate_sha256": "000000000000000000000000000000000000000000000000477c2d3d79cd109f",
+    "source_provenance": {
+      "ambiguous_mapping_count": 0,
+      "diagnostics": [],
+      "exact_mapping_count": 1,
+      "source_backpropagation_allowed": true,
+      "status": "exact"
+    }
+  },
+  "source_backpropagation_gate_sha256": "000000000000000000000000000000000000000000000000477c2d3d79cd109f",
+  "source_provenance": {
+    "ambiguous_mapping_count": 0,
+    "diagnostics": [],
+    "exact_mapping_count": 1,
+    "source_backpropagation_allowed": true,
+    "status": "exact"
+  },
+  "source_provenance_artifact_digest": "sha256:dd22021d711e10381918baaf1e1ee141cdb71d6cb2c23b8d3868b79c78598618",
+  "verification": {
+    "assumptions": [],
+    "claims": [],
+    "failed": 0,
+    "proof_certificate": {
+      "Checked": {
+        "checker": "ay-cert-check@2026.04;production_checker_evidence_sha256=00000000000000000000000000000000000000000000000097c33ab9d1583308",
+        "format": "lfsc",
+        "sha256": "0000000000000000000000000000000000000000000000008f9b6e6f14bd13f7"
+      }
+    },
+    "proved": 1,
+    "rejected": 0,
+    "replay": "Replayed",
+    "solver_dispatch": [
+      {
+        "assumptions": [],
+        "backend": null,
+        "binary_artifact_digest_identity": {
+          "root_artifact_digest": {
+            "algorithm": "sha256",
+            "value": "000000000000000000000000000000000000000000000000aefe5a1e579a9dab"
+          },
+          "selected_image": {
+            "file_offset": 0,
+            "file_size": 16,
+            "sha256": "000000000000000000000000000000000000000000000000aefe5a1e579a9dab"
+          }
+        },
+        "certificate": {
+          "Checked": {
+            "checker": "ay-cert-check@2026.04;production_checker_evidence_sha256=00000000000000000000000000000000000000000000000097c33ab9d1583308",
+            "format": "lfsc",
+            "sha256": "0000000000000000000000000000000000000000000000008f9b6e6f14bd13f7"
+          }
+        },
+        "diagnostics": [
+          "checked proof-cert readback row accepted for proof-grade release; source_backpropagation_gate_sha256=000000000000000000000000000000000000000000000000477c2d3d79cd109f",
+          "exact_replay_transcript_artifact_digest=accepted:sha256=0000000000000000000000000000000000000000000000008fd6f96526c0583c"
+        ],
+        "elapsed_ms": null,
+        "function": "main",
+        "id": "source-provenance:vc0",
+        "origin": {
+          "binary_path": "fixtures/tiny",
+          "encoding": 2425393296,
+          "function_entry": 4198400,
+          "instruction_address": 4198416,
+          "instruction_bytes": [
+            144,
+            144,
+            144,
+            144
+          ],
+          "instruction_size": 4,
+          "source": {
+            "col_end": 17,
+            "col_start": 5,
+            "file": "src/recovered.rs",
+            "line_end": 3,
+            "line_start": 3
+          }
+        },
+        "query_semantics": "SatIsCounterexample",
+        "replay": "Replayed",
+        "result": null,
+        "solver": "ay",
+        "status": "Unsat",
+        "timeout_evidence": {
+          "backend_timeout_ms": null,
+          "planned_timeout_ms": 250,
+          "release_blocker": null,
+          "status": "PolicyRecorded"
+        },
+        "timeout_ms": null,
+        "vc": null,
+        "vc_kind": null
+      }
+    ],
+    "status": "Proved",
+    "timeout": 0,
+    "total_vcs": 1,
+    "trust_level": "ProofGrade",
+    "unknown": 0,
+    "unsupported": 0,
+    "unsupported_ledger": {
+      "records": []
+    },
+    "witnesses": []
+  }
+}

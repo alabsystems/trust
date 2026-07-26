@@ -1,0 +1,203 @@
+{
+  "schema_version": 1,
+  "source_id": "Trust::compiler::trust_vc_trust_ir_adapter::increment_old_result_cfg",
+  "proof_policy": "evidence_only",
+  "metadata": {
+    "trust.vc.snapshot": "e2832d239d80d0b600e6e259d44d5ff173b79fec",
+    "trust.fixture.path": "crates/trust-vc-bridge/fixtures/trust_ir_adapter/trust_increment_contract_cfg_trust_ir_adapter_golden.json",
+    "trust.issue.refs": "#2789,#2790",
+    "trust.pipeline": "compiler-trust-contract-bundle+trust_ir",
+    "trust.producer": "Trust",
+    "trust.verifier_api.schema_version": "trust.verifier-api.v1"
+  },
+  "units": [
+    {
+      "unit_id": "trust_vc_fixture::increment_checked",
+      "display_name": "trust_vc_fixture::increment_checked (trust_vc_fixture)",
+      "native_context": {
+        "function_signature": {
+          "name": "trust_vc_fixture::increment_checked",
+          "params": [
+            {
+              "name": "cfg_edge_entry_return",
+              "sort": {
+                "kind": "bool"
+              }
+            },
+            {
+              "name": "x",
+              "sort": {
+                "kind": "math_int"
+              }
+            }
+          ],
+          "return_sort": {
+            "kind": "math_int"
+          }
+        },
+        "contract_frame": {
+          "return_value": {
+            "name": "result",
+            "sort": {
+              "kind": "math_int"
+            }
+          },
+          "old_values": [
+            {
+              "source": "x",
+              "snapshot": {
+                "name": "old_x",
+                "sort": {
+                  "kind": "math_int"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "obligations": [
+        {
+          "id": "requires.x_nonnegative",
+          "kind": "requires",
+          "predicate": {
+            "kind": "expr",
+            "expr": {
+              "kind": "compare",
+              "op": "ge",
+              "left": {
+                "kind": "variable",
+                "name": "x",
+                "sort": {
+                  "kind": "math_int"
+                }
+              },
+              "right": {
+                "kind": "int_literal",
+                "value": "0",
+                "sort": {
+                  "kind": "math_int"
+                }
+              }
+            }
+          },
+          "lineage": {
+            "source": "trust_types_contract",
+            "producer": "Trust trust-mir-extract",
+            "stage": "trust-types",
+            "rule": "requires-clause",
+            "input_digest": "sha256:f0c43e5ea4f230a9fd2cf84f2165c2ad12f4e9be06c50c9d7991052fcb369620"
+          },
+          "span": {
+            "file": "crates/trust-vc-bridge/fixtures/trust_vc_increment.rs",
+            "line_start": 3,
+            "column_start": 5,
+            "line_end": 3,
+            "column_end": 21
+          }
+        },
+        {
+          "id": "ensures.old_result_reflexive",
+          "kind": "ensures",
+          "predicate": {
+            "kind": "expr",
+            "expr": {
+              "kind": "logic",
+              "op": "and",
+              "left": {
+                "kind": "compare",
+                "op": "eq",
+                "left": {
+                  "kind": "old",
+                  "source": "x",
+                  "snapshot": "old_x",
+                  "sort": {
+                    "kind": "math_int"
+                  }
+                },
+                "right": {
+                  "kind": "old",
+                  "source": "x",
+                  "snapshot": "old_x",
+                  "sort": {
+                    "kind": "math_int"
+                  }
+                }
+              },
+              "right": {
+                "kind": "compare",
+                "op": "eq",
+                "left": {
+                  "kind": "variable",
+                  "name": "result",
+                  "sort": {
+                    "kind": "math_int"
+                  }
+                },
+                "right": {
+                  "kind": "variable",
+                  "name": "result",
+                  "sort": {
+                    "kind": "math_int"
+                  }
+                }
+              }
+            }
+          },
+          "lineage": {
+            "source": "trust_types_contract",
+            "producer": "Trust trust-mir-extract",
+            "stage": "trust-types",
+            "rule": "ensures-clause",
+            "input_digest": "sha256:3fb5bbe7bb491f8b021927dbcbc7f8f1408df66ee4e81a35532790150f3784d8"
+          },
+          "span": {
+            "file": "crates/trust-vc-bridge/fixtures/trust_vc_increment.rs",
+            "line_start": 4,
+            "column_start": 5,
+            "line_end": 4,
+            "column_end": 29
+          }
+        },
+        {
+          "id": "trust_ir.cfg.entry_to_return",
+          "kind": "translation_validation",
+          "predicate": {
+            "kind": "expr",
+            "expr": {
+              "kind": "compare",
+              "op": "eq",
+              "left": {
+                "kind": "variable",
+                "name": "cfg_edge_entry_return",
+                "sort": {
+                  "kind": "bool"
+                }
+              },
+              "right": {
+                "kind": "variable",
+                "name": "cfg_edge_entry_return",
+                "sort": {
+                  "kind": "bool"
+                }
+              }
+            }
+          },
+          "lineage": {
+            "source": "trust_ir_lowering",
+            "producer": "Trust trust-mir-extract",
+            "stage": "trust_ir-lowering",
+            "rule": "typed-cfg-proof",
+            "input_digest": "sha256:f955cae3be913a9d527e96d1997c6d83f47d3998c54248a9130b2d210a26d880"
+          },
+          "span": {
+            "file": "trust_ir:trust_vc_fixture::increment_checked",
+            "line_start": 1,
+            "column_start": 1,
+            "line_end": 1,
+            "column_end": 8
+          }
+        }
+      ]
+    }
+  ]
+}

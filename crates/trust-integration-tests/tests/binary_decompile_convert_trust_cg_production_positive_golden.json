@@ -1,0 +1,1410 @@
+{
+  "convert_trust_cg": {
+    "blocks": 1,
+    "checked_certificate_readback": {
+      "checked_certificates": 0,
+      "loader_status": "not_requested",
+      "normalized_solver_proof_exports": 0,
+      "production_positive_golden_inventory": {
+        "missing_artifacts": [],
+        "required": false,
+        "status": "not_required",
+        "target": "trust-cg"
+      },
+      "proof_grade_release_accepted": false,
+      "raw_solver_proof_bytes_sufficient": false,
+      "status": "blocked"
+    },
+    "conversion_gate": {
+      "accepted": false,
+      "blocker_count": 44,
+      "proof_grade_artifact": false,
+      "source_backpropagation_gate": {
+        "accepted": false,
+        "binary_verification_evidence": "missing",
+        "blocker_identities": [
+          {
+            "code": "exact-source-provenance-missing",
+            "evidence_required": [
+              "exact_binary_source_provenance"
+            ],
+            "feature": "exact-source-provenance",
+            "stage": "targo-trust::binary-source-backprop"
+          },
+          {
+            "code": "proof-grade-binary-verification-missing",
+            "evidence_required": [
+              "proof_grade_binary_verification",
+              "checked_certificate_identity",
+              "replay_grade_binary_artifact_identity"
+            ],
+            "feature": "proof-grade-binary-verification",
+            "stage": "targo-trust::binary-source-backprop"
+          },
+          {
+            "code": "accepted-reconstruction-target-validation-missing",
+            "evidence_required": [
+              "accepted_reconstruction",
+              "target_semantic_validation"
+            ],
+            "feature": "reconstruction-target-validation",
+            "stage": "targo-trust::binary-source-backprop"
+          },
+          {
+            "code": "checked-certificate-source-backpropagation-gate-missing",
+            "evidence_required": [
+              "checked_certificate_source_backpropagation_gate"
+            ],
+            "feature": "checked-certificate-source-backpropagation-gate",
+            "stage": "targo-trust::binary-source-backprop"
+          }
+        ],
+        "checked_certificate_source_backpropagation_gate": "missing",
+        "reconstruction_evidence": "partial",
+        "source_provenance": "missing",
+        "status": "rejected"
+      },
+      "status": "rejected",
+      "target": "trust-cg",
+      "validation": "inspectable_rejected",
+      "validation_blocker_count": 42
+    },
+    "failures": 0,
+    "function": {
+      "blocks": 1,
+      "entry": "0x400000",
+      "instruction_provenance": [
+        {
+          "address": "0x400000",
+          "bytes": [
+            72,
+            139,
+            7
+          ],
+          "encoding": 137,
+          "size": 3,
+          "source_file": "binary:0x400000"
+        },
+        {
+          "address": "0x400003",
+          "bytes": [
+            195
+          ],
+          "encoding": 195,
+          "size": 1,
+          "source_file": "binary:0x400003"
+        }
+      ],
+      "instructions": 2,
+      "memory_facts": 2,
+      "name": "trust_fixture_x86_load",
+      "statements": 4,
+      "unsupported": 5
+    },
+    "functions_decompiled": 1,
+    "instructions": 2,
+    "memory_facts": 2,
+    "output_content_sha256": "e9010cdc249e4857c8413deae8011b845f1cbc76803e33d315be1054ccb05daf",
+    "output_kind": "trust_cg_text",
+    "output_trust_level": "rejected",
+    "output_validation": "inspectable_rejected",
+    "positive_release_gate_scaffold": {
+      "accepted": false,
+      "prerequisites": {
+        "checked_cert_readback_identity": {
+          "accepted": false,
+          "accepted_certificate_rows": 0,
+          "binary_artifact_digest_identity_rows": 0,
+          "checked_certificates": 0,
+          "loader_status": "not_requested",
+          "manifest_identity_rows": 0,
+          "normalized_solver_proof_exports": 0,
+          "readback_record_count": 0,
+          "release_blocker_present": true,
+          "source_backpropagation_gate_identity_rows": 0
+        },
+        "empty_unsupported_ledger": {
+          "accepted": false,
+          "artifact_unsupported_records": 6,
+          "convert_unsupported": 6,
+          "decompile_unsupported": 6,
+          "release_blocker_present": true
+        },
+        "replay_attestation": {
+          "accepted": false,
+          "accepted_replay_digest_identity_rows": 0,
+          "accepted_target_proof_replay_records": 0,
+          "raw_solver_proof_bytes_sufficient": false,
+          "replayed_readback_records": 0,
+          "target_consumer_blocker_present": true
+        },
+        "source_backprop_handoff": {
+          "accepted": false,
+          "binary_verification_evidence": "missing",
+          "blocker_codes": [
+            "exact-source-provenance-missing",
+            "proof-grade-binary-verification-missing",
+            "accepted-reconstruction-target-validation-missing",
+            "checked-certificate-source-backpropagation-gate-missing"
+          ],
+          "checked_certificate_source_backpropagation_gate": "missing",
+          "gate_status": "rejected",
+          "reconstruction_evidence": "partial",
+          "source_provenance": "missing"
+        },
+        "target_proof_consumer_binding": {
+          "accepted": false,
+          "all_inputs_consumed": false,
+          "available": false,
+          "binding_sha256": null,
+          "blocker_count": 0,
+          "digest_matches_binding": false,
+          "digest_source": "missing",
+          "input_count": 0,
+          "target_output_sha256": null
+        },
+        "target_refinement_consumer": {
+          "accepted": false,
+          "blocker_codes": [
+            "target-semantics-not-consumed",
+            "symbolic-formula-not-consumed-by-target-semantics",
+            "symbolic-formula-not-consumed-by-target-semantics",
+            "symbolic-formula-not-consumed-by-target-semantics",
+            "symbolic-formula-not-consumed-by-target-semantics",
+            "missing-checked-proof-certificate",
+            "missing-proof-replay-metadata"
+          ],
+          "missing_refinement_metadata": true,
+          "record_kinds": [
+            "target_semantics",
+            "symbolic_formula",
+            "symbolic_formula",
+            "symbolic_formula",
+            "symbolic_formula",
+            "checked_certificate",
+            "proof_replay"
+          ],
+          "target_consumer_status": "rejected",
+          "target_semantics_consumed": false
+        }
+      },
+      "release_blocker_codes": [
+        "checked-certificate-evidence-blocked",
+        "checked-certificate-evidence-blocked",
+        "checked-certificate-evidence-blocked",
+        "checked-certificate-missing",
+        "proof-evidence-missing",
+        "checked-certificate-evidence-blocked",
+        "checked-certificate-evidence-blocked",
+        "proof-evidence-missing",
+        "checked-certificate-evidence-blocked",
+        "checked-certificate-evidence-blocked",
+        "checked-certificate-evidence-blocked",
+        "checked-certificate-evidence-blocked",
+        "checked-certificate-evidence-blocked",
+        "checked-certificate-evidence-blocked",
+        "checked-certificate-evidence-blocked",
+        "checked-certificate-missing",
+        "checked-certificate-evidence-blocked",
+        "checked-certificate-evidence-blocked",
+        "checked-certificate-evidence-blocked",
+        "checked-certificate-evidence-blocked",
+        "checked-certificate-evidence-blocked",
+        "checked-certificate-missing",
+        "checked-certificate-evidence-blocked",
+        "proof-evidence-missing",
+        "checked-certificate-evidence-blocked",
+        "checked-certificate-evidence-blocked",
+        "proof-evidence-missing",
+        "checked-certificate-evidence-blocked",
+        "proof-evidence-missing",
+        "proof-grade-artifact-missing",
+        "convert-checked-certificate-loader-missing",
+        "proof-grade-artifact-missing",
+        "translation-validation-missing",
+        "proof-grade-release-gate-blocked",
+        "target-semantic-validation-missing",
+        "target-refinement-consumer-missing",
+        "checked-certificate-missing",
+        "proof-grade-release-gate-blocked",
+        "proof-grade-release-gate-blocked",
+        "proof-grade-release-gate-blocked",
+        "target-semantic-validation-missing",
+        "target-refinement-consumer-missing",
+        "proof-grade-release-gate-blocked",
+        "proof-grade-release-gate-blocked",
+        "unsupported-ledger-nonempty",
+        "unsupported-ledger-nonempty",
+        "symbolic-formula-preservation-not-consumed",
+        "target-semantic-validation-missing",
+        "target-semantic-validation-missing",
+        "target-semantic-validation-missing",
+        "target-semantic-validation-missing",
+        "target-semantic-validation-missing",
+        "target-semantic-validation-missing",
+        "target-semantic-validation-missing",
+        "proof-grade-release-gate-blocked",
+        "proof-grade-release-gate-blocked",
+        "proof-grade-release-gate-blocked",
+        "proof-grade-release-gate-blocked",
+        "proof-grade-release-gate-blocked",
+        "unsupported-ledger-nonempty",
+        "symbolic-formula-preservation-not-consumed",
+        "exact-machine-replay-missing",
+        "proof-grade-release-gate-blocked",
+        "symbolic-formula-preservation-not-consumed",
+        "unsupported-ledger-nonempty"
+      ],
+      "requires_all_real_evidence": true,
+      "status": "rejected",
+      "target": "trust-cg"
+    },
+    "preserved_symbolic_formulas": [
+      {
+        "block": 0,
+        "formula_kind": "BvOr",
+        "formula_sha256": "bc17612ef43ff231ca4d214752addb3bbecca8f55c2b5040d611eda770e2c40c",
+        "function": "trust_fixture_x86_load",
+        "location": "use",
+        "statement_index": 0,
+        "target": "TrustCg"
+      },
+      {
+        "block": 0,
+        "formula_kind": "BvAdd",
+        "formula_sha256": "4d809a1dc7f91c06315f9c88dae0cc32fe546d86e16a979738751d3d91680767",
+        "function": "trust_fixture_x86_load",
+        "location": "use",
+        "statement_index": 1,
+        "target": "TrustCg"
+      },
+      {
+        "block": 0,
+        "formula_kind": "BvAdd",
+        "formula_sha256": "258a073909219353112a39a92354df646f91afcea1b9147e4c56e4f802fb92d6",
+        "function": "trust_fixture_x86_load",
+        "location": "use",
+        "statement_index": 2,
+        "target": "TrustCg"
+      },
+      {
+        "block": 0,
+        "formula_kind": "BvOr",
+        "formula_sha256": "030ec594b7f818fc346169890ccf56b539e0d15867dba3cf6185cf17ea755c2b",
+        "function": "trust_fixture_x86_load",
+        "location": "use",
+        "statement_index": 3,
+        "target": "TrustCg"
+      }
+    ],
+    "proof_grade_release_blocker_codes": [
+      "checked-certificate-evidence-blocked",
+      "checked-certificate-evidence-blocked",
+      "checked-certificate-evidence-blocked",
+      "checked-certificate-missing",
+      "proof-evidence-missing",
+      "checked-certificate-evidence-blocked",
+      "checked-certificate-evidence-blocked",
+      "proof-evidence-missing",
+      "checked-certificate-evidence-blocked",
+      "checked-certificate-evidence-blocked",
+      "checked-certificate-evidence-blocked",
+      "checked-certificate-evidence-blocked",
+      "checked-certificate-evidence-blocked",
+      "checked-certificate-evidence-blocked",
+      "checked-certificate-evidence-blocked",
+      "checked-certificate-missing",
+      "checked-certificate-evidence-blocked",
+      "checked-certificate-evidence-blocked",
+      "checked-certificate-evidence-blocked",
+      "checked-certificate-evidence-blocked",
+      "checked-certificate-evidence-blocked",
+      "checked-certificate-missing",
+      "checked-certificate-evidence-blocked",
+      "proof-evidence-missing",
+      "checked-certificate-evidence-blocked",
+      "checked-certificate-evidence-blocked",
+      "proof-evidence-missing",
+      "checked-certificate-evidence-blocked",
+      "proof-evidence-missing",
+      "proof-grade-artifact-missing",
+      "convert-checked-certificate-loader-missing",
+      "proof-grade-artifact-missing",
+      "translation-validation-missing",
+      "proof-grade-release-gate-blocked",
+      "target-semantic-validation-missing",
+      "target-refinement-consumer-missing",
+      "checked-certificate-missing",
+      "proof-grade-release-gate-blocked",
+      "proof-grade-release-gate-blocked",
+      "proof-grade-release-gate-blocked",
+      "target-semantic-validation-missing",
+      "target-refinement-consumer-missing",
+      "proof-grade-release-gate-blocked",
+      "proof-grade-release-gate-blocked",
+      "unsupported-ledger-nonempty",
+      "unsupported-ledger-nonempty",
+      "symbolic-formula-preservation-not-consumed",
+      "target-semantic-validation-missing",
+      "target-semantic-validation-missing",
+      "target-semantic-validation-missing",
+      "target-semantic-validation-missing",
+      "target-semantic-validation-missing",
+      "target-semantic-validation-missing",
+      "target-semantic-validation-missing",
+      "proof-grade-release-gate-blocked",
+      "proof-grade-release-gate-blocked",
+      "proof-grade-release-gate-blocked",
+      "proof-grade-release-gate-blocked",
+      "proof-grade-release-gate-blocked",
+      "unsupported-ledger-nonempty",
+      "symbolic-formula-preservation-not-consumed",
+      "exact-machine-replay-missing",
+      "proof-grade-release-gate-blocked",
+      "symbolic-formula-preservation-not-consumed",
+      "unsupported-ledger-nonempty"
+    ],
+    "proof_grade_release_blocker_identities": [
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "unsupported-trust_cg-subset",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "missing-target-semantic-validation",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "missing-refinement-metadata",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-missing",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "missing-checked-proof-certificate",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "proof-evidence-missing",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "missing-binary-proof-obligation",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "missing-target-semantic-validation",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "missing-refinement-metadata",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "proof-evidence-missing",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "missing-binary-proof-obligation",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "binary-provenance-not-consumed-by-target-semantics",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "unsupported-ledger-not-consumed-by-target-semantics",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "unsupported-ledger-not-eliminated",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "target-semantics-not-consumed",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "bounded-empty-slice-target-not-empty",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "bounded-empty-slice-nontrivial-formula",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "bounded-empty-slice-non-noop-provenance",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-missing",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "bounded-empty-slice-missing-checked-certificate",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "bounded-empty-slice-missing-exact-replay",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "bounded-empty-slice-unsupported-ledger-not-eliminated",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "non-empty-scalar-trust_cg-target-consumer-unavailable",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "non-empty-scalar-canonical-source-shape-validation-missing",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "missing-scalar-formula-target-op-binding",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-missing",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "non-empty-scalar-checked-certificate-identity-missing",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "non-empty-scalar-replay-artifact-identity-missing",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "proof-evidence-missing",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "non-empty-scalar-proof-metadata-identity-mismatch",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "non-empty-scalar-unsupported-ledger-not-eliminated",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "symbolic-formula-not-consumed-by-target-semantics",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "proof-evidence-missing",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "missing-proof-replay-metadata",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "checked-certificate-evidence-blocked",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "TrustCg validation blocker",
+        "stage": "trust-decompile::target-validation"
+      },
+      {
+        "code": "proof-evidence-missing",
+        "evidence_required": [
+          "formula-specific-checked-certificate",
+          "formula-specific-replay"
+        ],
+        "feature": "symbolic-formula-proof-semantics",
+        "stage": "trust-cg-bridge::target-validation"
+      },
+      {
+        "code": "proof-grade-artifact-missing",
+        "evidence_required": [
+          "proof_grade_conversion_artifact"
+        ],
+        "feature": "proof-grade-conversion-output",
+        "stage": "targo-trust::convert-gate"
+      },
+      {
+        "code": "convert-checked-certificate-loader-missing",
+        "evidence_required": [
+          "checked_certificate_artifact",
+          "convert_checked_certificate_loader"
+        ],
+        "feature": "checked-certificate-loader",
+        "stage": "targo-trust::convert-loader"
+      },
+      {
+        "code": "proof-grade-artifact-missing",
+        "evidence_required": [
+          "proof_grade_conversion_artifact"
+        ],
+        "feature": "proof-grade-conversion-output",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "translation-validation-missing",
+        "evidence_required": [
+          "translation_validation"
+        ],
+        "feature": "translation-validation",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "proof-grade-release-gate-blocked",
+        "evidence_required": [
+          "proof_grade_release_gate_acceptance"
+        ],
+        "feature": "proof-grade-release-gate",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "target-semantic-validation-missing",
+        "evidence_required": [
+          "target_semantic_validation"
+        ],
+        "feature": "target-semantic-validation",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "target-refinement-consumer-missing",
+        "evidence_required": [
+          "target_refinement_metadata",
+          "target_semantic_validation"
+        ],
+        "feature": "target-refinement-consumer",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "checked-certificate-missing",
+        "evidence_required": [
+          "normalized_solver_proof_export",
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "feature": "checked-certificate-loader",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "proof-grade-release-gate-blocked",
+        "evidence_required": [
+          "proof_grade_release_gate_acceptance"
+        ],
+        "feature": "proof-grade-release-gate",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "proof-grade-release-gate-blocked",
+        "evidence_required": [
+          "proof_grade_release_gate_acceptance"
+        ],
+        "feature": "proof-grade-release-gate",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "proof-grade-release-gate-blocked",
+        "evidence_required": [
+          "proof_grade_release_gate_acceptance"
+        ],
+        "feature": "proof-grade-release-gate",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "target-semantic-validation-missing",
+        "evidence_required": [
+          "target_semantic_validation"
+        ],
+        "feature": "target-semantic-validation",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "target-refinement-consumer-missing",
+        "evidence_required": [
+          "target_refinement_metadata",
+          "target_semantic_validation"
+        ],
+        "feature": "target-refinement-consumer",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "proof-grade-release-gate-blocked",
+        "evidence_required": [
+          "proof_grade_release_gate_acceptance"
+        ],
+        "feature": "proof-grade-release-gate",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "proof-grade-release-gate-blocked",
+        "evidence_required": [
+          "proof_grade_release_gate_acceptance"
+        ],
+        "feature": "proof-grade-release-gate",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "unsupported-ledger-nonempty",
+        "evidence_required": [
+          "empty_unsupported_ledger"
+        ],
+        "feature": "unsupported-ledger",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "unsupported-ledger-nonempty",
+        "evidence_required": [
+          "empty_unsupported_ledger"
+        ],
+        "feature": "unsupported-ledger",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "symbolic-formula-preservation-not-consumed",
+        "evidence_required": [
+          "preserved_symbolic_formula",
+          "target_semantic_validation"
+        ],
+        "feature": "symbolic-formula-preservation",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "target-semantic-validation-missing",
+        "evidence_required": [
+          "target_semantic_validation"
+        ],
+        "feature": "target-semantic-validation",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "target-semantic-validation-missing",
+        "evidence_required": [
+          "target_semantic_validation"
+        ],
+        "feature": "target-semantic-validation",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "target-semantic-validation-missing",
+        "evidence_required": [
+          "target_semantic_validation"
+        ],
+        "feature": "target-semantic-validation",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "target-semantic-validation-missing",
+        "evidence_required": [
+          "target_semantic_validation"
+        ],
+        "feature": "target-semantic-validation",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "target-semantic-validation-missing",
+        "evidence_required": [
+          "target_semantic_validation"
+        ],
+        "feature": "target-semantic-validation",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "target-semantic-validation-missing",
+        "evidence_required": [
+          "target_semantic_validation"
+        ],
+        "feature": "target-semantic-validation",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "target-semantic-validation-missing",
+        "evidence_required": [
+          "target_semantic_validation"
+        ],
+        "feature": "target-semantic-validation",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "proof-grade-release-gate-blocked",
+        "evidence_required": [
+          "proof_grade_release_gate_acceptance"
+        ],
+        "feature": "proof-grade-release-gate",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "proof-grade-release-gate-blocked",
+        "evidence_required": [
+          "proof_grade_release_gate_acceptance"
+        ],
+        "feature": "proof-grade-release-gate",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "proof-grade-release-gate-blocked",
+        "evidence_required": [
+          "proof_grade_release_gate_acceptance"
+        ],
+        "feature": "proof-grade-release-gate",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "proof-grade-release-gate-blocked",
+        "evidence_required": [
+          "proof_grade_release_gate_acceptance"
+        ],
+        "feature": "proof-grade-release-gate",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "proof-grade-release-gate-blocked",
+        "evidence_required": [
+          "proof_grade_release_gate_acceptance"
+        ],
+        "feature": "proof-grade-release-gate",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "unsupported-ledger-nonempty",
+        "evidence_required": [
+          "empty_unsupported_ledger"
+        ],
+        "feature": "unsupported-ledger",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "symbolic-formula-preservation-not-consumed",
+        "evidence_required": [
+          "preserved_symbolic_formula",
+          "target_semantic_validation"
+        ],
+        "feature": "symbolic-formula-preservation",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "exact-machine-replay-missing",
+        "evidence_required": [
+          "machine_replay_transcript"
+        ],
+        "feature": "exact-machine-replay",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "proof-grade-release-gate-blocked",
+        "evidence_required": [
+          "proof_grade_release_gate_acceptance"
+        ],
+        "feature": "proof-grade-release-gate",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "symbolic-formula-preservation-not-consumed",
+        "evidence_required": [
+          "preserved_symbolic_formula",
+          "target_semantic_validation"
+        ],
+        "feature": "symbolic-formula-preservation",
+        "stage": "targo-trust::convert-release-gate"
+      },
+      {
+        "code": "unsupported-ledger-nonempty",
+        "evidence_required": [
+          "empty_unsupported_ledger"
+        ],
+        "feature": "unsupported-ledger",
+        "stage": "targo-trust::convert-release-gate"
+      }
+    ],
+    "statements": 4,
+    "status": "incomplete",
+    "strict": false,
+    "target_proof_consumer_evidence": {
+      "binding": {
+        "all_inputs_consumed": false,
+        "available": false,
+        "binding_sha256": null,
+        "blocker_count": 0,
+        "digest_matches_binding": false,
+        "digest_source": "missing",
+        "input_count": 0,
+        "status": "missing",
+        "target_output_sha256": null
+      },
+      "blocker_codes": [
+        "target-semantics-not-consumed",
+        "symbolic-formula-not-consumed-by-target-semantics",
+        "symbolic-formula-not-consumed-by-target-semantics",
+        "symbolic-formula-not-consumed-by-target-semantics",
+        "symbolic-formula-not-consumed-by-target-semantics",
+        "missing-checked-proof-certificate",
+        "missing-proof-replay-metadata"
+      ],
+      "record_identities": [
+        {
+          "accepted": false,
+          "identifier": "trust_cg-lir",
+          "kind": "target_semantics"
+        },
+        {
+          "accepted": false,
+          "identifier": "trust_fixture_x86_load::bb0::stmt0::use",
+          "kind": "symbolic_formula"
+        },
+        {
+          "accepted": false,
+          "identifier": "trust_fixture_x86_load::bb0::stmt1::use",
+          "kind": "symbolic_formula"
+        },
+        {
+          "accepted": false,
+          "identifier": "trust_fixture_x86_load::bb0::stmt2::use",
+          "kind": "symbolic_formula"
+        },
+        {
+          "accepted": false,
+          "identifier": "trust_fixture_x86_load::bb0::stmt3::use",
+          "kind": "symbolic_formula"
+        },
+        {
+          "accepted": false,
+          "identifier": "missing",
+          "kind": "checked_certificate"
+        },
+        {
+          "accepted": false,
+          "identifier": "missing",
+          "kind": "proof_replay"
+        }
+      ],
+      "record_kinds": [
+        "target_semantics",
+        "symbolic_formula",
+        "symbolic_formula",
+        "symbolic_formula",
+        "symbolic_formula",
+        "checked_certificate",
+        "proof_replay"
+      ],
+      "status": "rejected",
+      "target": "trust-cg",
+      "target_semantics_consumed": false
+    },
+    "target_validation_blocker_features": [
+      "unsupported-trust_cg-subset",
+      "missing-target-semantic-validation",
+      "missing-refinement-metadata",
+      "missing-checked-proof-certificate",
+      "missing-binary-proof-obligation",
+      "non-exact source provenance: unavailable",
+      "non-recovered debug type provenance: unavailable",
+      "missing-target-semantic-validation",
+      "missing-checked-proof-certificate",
+      "missing-refinement-metadata",
+      "missing-binary-proof-obligation",
+      "binary-provenance-not-consumed-by-target-semantics",
+      "unsupported-ledger-not-consumed-by-target-semantics",
+      "unsupported-ledger-not-eliminated",
+      "target-semantics-not-consumed",
+      "bounded-empty-slice-target-not-empty",
+      "bounded-empty-slice-nontrivial-formula",
+      "bounded-empty-slice-non-noop-provenance",
+      "bounded-empty-slice-missing-checked-certificate",
+      "bounded-empty-slice-missing-exact-replay",
+      "bounded-empty-slice-unsupported-ledger-not-eliminated",
+      "non-empty-scalar-trust_cg-target-consumer-unavailable",
+      "non-empty-scalar-canonical-source-shape-validation-missing",
+      "missing-scalar-formula-target-op-binding",
+      "non-empty-scalar-checked-certificate-identity-missing",
+      "non-empty-scalar-replay-artifact-identity-missing",
+      "non-empty-scalar-proof-metadata-identity-mismatch",
+      "non-empty-scalar-unsupported-ledger-not-eliminated",
+      "symbolic-formula-not-consumed-by-target-semantics",
+      "binary-provenance-not-consumed-by-target-semantics",
+      "missing-checked-proof-certificate",
+      "missing-proof-replay-metadata",
+      "unsupported-ledger-not-consumed-by-target-semantics",
+      "unsupported-ledger-not-eliminated",
+      "missing-refinement-metadata",
+      "missing-binary-proof-obligation",
+      "TrustCg validation blocker",
+      "symbolic-formula-proof-semantics",
+      "symbolic-formula-proof-semantics",
+      "symbolic-formula-proof-semantics",
+      "symbolic-formula-proof-semantics"
+    ],
+    "unsupported": 6
+  },
+  "decompile_trust_ir": {
+    "artifact": {
+      "lifted_body": {
+        "block_count": 1,
+        "block_stmt_kinds": [
+          [
+            "Assign",
+            "Assign",
+            "Assign",
+            "Assign"
+          ]
+        ],
+        "block_terminators": [
+          "Return"
+        ],
+        "def_path": "binary::trust_fixture_x86_load",
+        "local_count": 24,
+        "local_names": [
+          "_lifted_result",
+          "RAX",
+          "RCX",
+          "RDX",
+          "RBX",
+          "RSP",
+          "RBP",
+          "RSI",
+          "RDI",
+          "R8",
+          "R9",
+          "R10",
+          "R11",
+          "R12",
+          "R13",
+          "R14",
+          "R15",
+          "SP",
+          "PC",
+          "CF",
+          "ZF",
+          "SF",
+          "OF",
+          "MEM"
+        ]
+      },
+      "memory_accesses": [
+        {
+          "address_formula_kind": "Var",
+          "address_formula_sha256": "f5a1742ece39349734c911c1e74822cc0cfa40e6a29fdf22b4f1c685aa030d40",
+          "base_object": null,
+          "endianness": "Little",
+          "instruction_address": "0x400000",
+          "kind": "Read",
+          "provenance": null,
+          "region": "Unknown",
+          "width_bytes": 8
+        },
+        {
+          "address_formula_kind": "Var",
+          "address_formula_sha256": "b43318574c4fe9ce89b8d1b669bbe18bf4aec00a76869fe7ccca475ba8379590",
+          "base_object": "SP",
+          "endianness": "Little",
+          "instruction_address": "0x400003",
+          "kind": "Read",
+          "provenance": "stack-relative address rooted at SP",
+          "region": "Stack",
+          "width_bytes": 8
+        }
+      ],
+      "metadata": {
+        "architecture": "x86-64",
+        "byte_len": 576,
+        "entry_point": 4194304,
+        "format": "Elf",
+        "image_kind": "Unknown",
+        "root_artifact_digest": {
+          "algorithm": "sha256",
+          "value": "251757e36749c41d81a42feb4764e9ed80c354990f9de66858a498e549524000"
+        },
+        "segments": [
+          {
+            "file_offset": 0,
+            "file_size": 576,
+            "name": "PT_LOAD[0]",
+            "permissions": {
+              "execute": true,
+              "read": true,
+              "write": false
+            },
+            "virtual_range": {
+              "end": 4194880,
+              "start": 4194304
+            }
+          }
+        ],
+        "selected_image": {
+          "file_offset": 0,
+          "file_size": 576,
+          "sha256": "251757e36749c41d81a42feb4764e9ed80c354990f9de66858a498e549524000"
+        },
+        "symbols": [
+          {
+            "address": 4194304,
+            "kind": "Function",
+            "name": "trust_fixture_x86_load",
+            "size": 4
+          }
+        ]
+      },
+      "module_summary": {
+        "block_body_lengths": [
+          [
+            9
+          ]
+        ],
+        "block_counts": [
+          1
+        ],
+        "func_type_count": 1,
+        "function_count": 1
+      },
+      "signature": {
+        "assumptions": [
+          "calling convention selected from target architecture",
+          "return register is ABI default metadata",
+          "argument register reads are observations, not proof assumptions"
+        ],
+        "calling_convention": "SystemV",
+        "parameters": [
+          "RDI"
+        ],
+        "returns": [
+          "RAX"
+        ]
+      },
+      "source_provenance_status": "unavailable",
+      "trust_level": "Partial",
+      "unsupported_records": [
+        {
+          "architecture": "x86_64",
+          "feature": "x86_64 scalar/data instruction outside exact empty-ledger release slice; opcode Mov; operands=X0, Base { base: Register { kind: Gpr, index: 7, width: 64 } }; typed proof blocker: operand-width normalization, flag side effects, memory addressing/provenance, and replay witnesses are not part of the narrow no-data empty-ledger claim",
+          "instruction_address": "0x400000",
+          "stage": "trust-lift::semantic-lift"
+        },
+        {
+          "architecture": "x86_64",
+          "feature": "x86_64 ABI return boundary outside exact empty-ledger release slice; operands=unavailable; typed proof blocker: return-target stack read, canonical frame/stack restoration, red-zone/unwind constraints, and saved-return-address security witnesses are not proof-consumed; security/ABI VCs remain blockers",
+          "instruction_address": "0x400003",
+          "stage": "trust-lift::semantic-lift"
+        },
+        {
+          "architecture": "x86-64",
+          "feature": "unclassified memory region",
+          "instruction_address": "0x400000",
+          "stage": "trust-lift::memory-provenance"
+        },
+        {
+          "architecture": "x86-64",
+          "feature": "non-exact source provenance: unavailable",
+          "instruction_address": "0x400000",
+          "stage": "trust-lift::source-provenance"
+        },
+        {
+          "architecture": "x86-64",
+          "feature": "non-recovered debug type provenance: unavailable",
+          "instruction_address": "0x400000",
+          "stage": "trust-lift::type-provenance"
+        },
+        {
+          "architecture": "x86-64",
+          "feature": "parser artifact identity is not proof-grade bindable: missing loader build-id/UUID/timestamp identity for certificate/replay binding",
+          "instruction_address": null,
+          "stage": "trust-binary-parse::artifact-identity"
+        }
+      ],
+      "verification": {
+        "assumptions": [],
+        "claims": [],
+        "failed": 0,
+        "proof_certificate": "NotRequested",
+        "proved": 0,
+        "rejected": 0,
+        "replay": "NotAttempted",
+        "solver_dispatch": [],
+        "status": "NotRun",
+        "timeout": 0,
+        "total_vcs": 0,
+        "trust_level": "Partial",
+        "unknown": 0,
+        "unsupported": 0,
+        "unsupported_ledger": {
+          "records": []
+        },
+        "witnesses": []
+      }
+    },
+    "artifact_gate": {
+      "accepted": false,
+      "proof_grade_artifact": false,
+      "source_backpropagation_gate": {
+        "accepted": false,
+        "binary_verification_evidence": "missing",
+        "blocker_identities": [
+          {
+            "code": "exact-source-provenance-missing",
+            "evidence_required": [
+              "exact_binary_source_provenance"
+            ],
+            "feature": "exact-source-provenance",
+            "stage": "targo-trust::binary-source-backprop"
+          },
+          {
+            "code": "proof-grade-binary-verification-missing",
+            "evidence_required": [
+              "proof_grade_binary_verification",
+              "checked_certificate_identity",
+              "replay_grade_binary_artifact_identity"
+            ],
+            "feature": "proof-grade-binary-verification",
+            "stage": "targo-trust::binary-source-backprop"
+          },
+          {
+            "code": "accepted-reconstruction-target-validation-missing",
+            "evidence_required": [
+              "accepted_reconstruction",
+              "target_semantic_validation"
+            ],
+            "feature": "reconstruction-target-validation",
+            "stage": "targo-trust::binary-source-backprop"
+          },
+          {
+            "code": "checked-certificate-source-backpropagation-gate-missing",
+            "evidence_required": [
+              "checked_certificate_source_backpropagation_gate"
+            ],
+            "feature": "checked-certificate-source-backpropagation-gate",
+            "stage": "targo-trust::binary-source-backprop"
+          }
+        ],
+        "checked_certificate_source_backpropagation_gate": "missing",
+        "reconstruction_evidence": "partial",
+        "source_provenance": "missing",
+        "status": "rejected"
+      },
+      "status": "rejected"
+    },
+    "blocks": 1,
+    "failures": 0,
+    "function": {
+      "blocks": 1,
+      "entry": "0x400000",
+      "instruction_provenance": [
+        {
+          "address": "0x400000",
+          "bytes": [
+            72,
+            139,
+            7
+          ],
+          "encoding": 137,
+          "size": 3,
+          "source_file": "binary:0x400000"
+        },
+        {
+          "address": "0x400003",
+          "bytes": [
+            195
+          ],
+          "encoding": 195,
+          "size": 1,
+          "source_file": "binary:0x400003"
+        }
+      ],
+      "instructions": 2,
+      "memory_facts": 2,
+      "name": "trust_fixture_x86_load",
+      "statements": 4,
+      "unsupported": 5
+    },
+    "functions_decompiled": 1,
+    "instructions": 2,
+    "memory_facts": 2,
+    "output_content_sha256": "c848664036b0a01e1fff0b8605d52d1c2351f4c9fce23b70a01e4a6a4603fd0a",
+    "output_kind": "trust_ir_json",
+    "output_trust_level": "partial",
+    "output_validation": "lifted_trust_ir_partial",
+    "preserved_symbolic_formulas": [
+      {
+        "block": 0,
+        "formula_kind": "BvOr",
+        "formula_sha256": "bc17612ef43ff231ca4d214752addb3bbecca8f55c2b5040d611eda770e2c40c",
+        "function": "trust_fixture_x86_load",
+        "location": "statement.assign",
+        "statement_index": 0,
+        "target": "TrustIr"
+      },
+      {
+        "block": 0,
+        "formula_kind": "BvAdd",
+        "formula_sha256": "4d809a1dc7f91c06315f9c88dae0cc32fe546d86e16a979738751d3d91680767",
+        "function": "trust_fixture_x86_load",
+        "location": "statement.assign",
+        "statement_index": 1,
+        "target": "TrustIr"
+      },
+      {
+        "block": 0,
+        "formula_kind": "BvAdd",
+        "formula_sha256": "258a073909219353112a39a92354df646f91afcea1b9147e4c56e4f802fb92d6",
+        "function": "trust_fixture_x86_load",
+        "location": "statement.assign",
+        "statement_index": 2,
+        "target": "TrustIr"
+      },
+      {
+        "block": 0,
+        "formula_kind": "BvOr",
+        "formula_sha256": "030ec594b7f818fc346169890ccf56b539e0d15867dba3cf6185cf17ea755c2b",
+        "function": "trust_fixture_x86_load",
+        "location": "statement.assign",
+        "statement_index": 3,
+        "target": "TrustIr"
+      }
+    ],
+    "statements": 4,
+    "status": "incomplete",
+    "strict": false,
+    "unsupported": 6
+  },
+  "fixture": {
+    "architecture": "x86-64",
+    "byte_len": 576,
+    "entry": "0x400000",
+    "format": "ELF",
+    "sha256": "251757e36749c41d81a42feb4764e9ed80c354990f9de66858a498e549524000",
+    "symbol": "trust_fixture_x86_load"
+  },
+  "fixture_family": "production_positive_x86_64_load_decompile_convert_trust_cg"
+}

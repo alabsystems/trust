@@ -1,0 +1,7 @@
+0a9b8c3a2f7b80447703e5cdc224d059465a90fb9203e0ab4b0182af17494cac  library/core/src/cmp.rs
+563ec3e777f8444c3b45c103913d36a3baa8af45b2f40b2c7ed2b0136e6ecf76  library/core/src/num/nonzero.rs
+1ec959677c0dbdacf4706f56a4aaf9978a69607dcac5e360d7761be70cc538df  library/core/src/num/imp/int_log10.rs
+6a96705ce386ef7c95bf426acbe3fa9b279dc65da56e83a72e59f4991bbe0cad  library/core/src/lib.rs
+b640ef6f5e4c378737bc00e66c204990a6f6f9c1edd9d0e45dfdde7c323abf7e  crates/trust-clean/fixtures/stdlib-leaf-cmp-2026-07-16/SOURCE/Cargo.toml
+8b7a2bd6caa0e85b099467418b9118cdfc99de373da98fea96c03e635ea4c73c  crates/trust-clean/fixtures/stdlib-leaf-cmp-2026-07-16/SOURCE/src/lib.rs
+dd49f6c50b07c7731d7f40bfd30a4ff3fe75c1eea82ecf7209473c0c6dc4e67a  crates/trust-clean/fixtures/stdlib-leaf-cmp-2026-07-16/int_log10-workaround.diff

@@ -1,0 +1,13 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful	kernel_rejected	safety_obligations	safety_discharged	via_trustir	mirsem_fallback	declined
+forgery::F1_fake_ctlz_defpath	SHAPE_GAP	false	false	false	false	false	false	false	0	1	0	0	0	0
+forgery::F2_nontotal_ctlz_nonzero	SHAPE_GAP	false	false	false	false	false	false	false	0	1	0	0	0	0
+forgery::F3_wrong_arity_ctlz	SHAPE_GAP	false	false	false	false	false	false	false	0	1	0	0	0	0
+forgery::F4_foreign_ctlz	SHAPE_GAP	false	false	false	false	false	false	false	0	2	0	0	0	0
+forgery::F5_unmodeled_intrinsic_transmute	SHAPE_GAP	false	false	false	false	false	false	false	0	1	0	0	0	0
+forgery::F6_valid_control_leading_zeros	FULLY_FAITHFUL	false	false	true	true	true	false	true	0	1	0	0	1	0
+forgery::G1_wrong_callee_evil	SHAPE_GAP	false	false	false	false	false	false	false	0	0	0	0	0	0
+forgery::G2_wrong_method_trailing_zeros	SHAPE_GAP	false	false	false	false	false	false	false	0	0	0	0	0	0
+forgery::G3_sideeffect_preop_binaryop	SHAPE_GAP	false	false	false	false	false	false	false	0	1	0	0	0	0
+forgery::G4_preop_unmodeled_value	SHAPE_GAP	false	false	false	false	false	false	false	0	0	0	0	0	0
+forgery::G5_multiwrite_preop_temp	SHAPE_GAP	false	false	false	false	false	false	false	0	0	0	0	0	0
+forgery::G6_valid_control_count_zeros	FULLY_FAITHFUL	false	false	true	true	true	false	true	0	0	0	0	1	0

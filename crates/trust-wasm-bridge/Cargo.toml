@@ -1,0 +1,28 @@
+# trust-wasm-bridge: Conservative Wasm text conversion for binary-derived TrustIr
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-wasm-bridge"
+description = "Fail-closed Wasm text bridge for a tiny trust-types subset"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+trust-ir = { workspace = true, features = ["fmt", "parser"] }
+trust-ir-bridge = { workspace = true }
+trust-types = { workspace = true }
+# The real binary-wasm front door lowers trust-ir -> .wasm via the trust-cg
+# backend (no default features — wasm emission needs none of the native paths).
+trust-cg-codegen = { path = "../../first-party/trust-cg/crates/trust-cg-codegen", default-features = false }
+
+[dev-dependencies]
+trust-ir-build = { workspace = true }

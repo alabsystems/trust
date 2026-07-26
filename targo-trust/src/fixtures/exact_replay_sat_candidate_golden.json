@@ -1,0 +1,62 @@
+{
+  "exact_replay_provenance_json": {
+    "origin": {
+      "binary_path": "fixtures/tiny.bin",
+      "encoding": 144,
+      "function_entry": 4198400,
+      "instruction_address": 4198416,
+      "instruction_bytes": [
+        144
+      ],
+      "instruction_size": 1
+    }
+  },
+  "failed_sat_candidate_with_exact_original_bytes": {
+    "detail": "machine_replay_confirmed: lifted trace replay matched, but no replay expectation was supplied for confirmation; machine-code replay confirmed matching instruction provenance",
+    "replay_status": "replayed",
+    "status": "failed"
+  },
+  "failed_sat_candidate_with_missing_original_bytes": {
+    "detail": "needs_machine_replay: original instruction bytes missing for trace address 0x401010; cannot replay",
+    "replay_status": "not_attempted",
+    "status": "failed"
+  },
+  "failed_sat_candidate_with_original_byte_length_mismatch": {
+    "detail": "needs_machine_replay: original instruction byte length mismatch for trace address 0x401010: instruction_size=3 but 1 byte(s) were captured; cannot replay",
+    "replay_status": "not_attempted",
+    "status": "failed"
+  },
+  "failed_sat_candidate_with_mismatched_original_bytes": {
+    "detail": "machine_replay_spurious: machine-code replay rejected mismatched original instruction bytes",
+    "replay_status": "spurious",
+    "status": "failed"
+  },
+  "mismatched_original_bytes_proof_grade_gate": {
+    "accepted": false,
+    "missing_machine_replay": 1,
+    "rejections": [
+      "final trust level is `partial`; proof-grade requires `proof_grade`",
+      "required binary VCs are not all proved: 0/1 proved, 1 unproved, 1 non-proof solver result(s)",
+      "checked proof certificates missing: 0/1 checked, 1 missing",
+      "replay semantics missing: 0/1 satisfied (0 exact-byte replayed, 0 checked UNSAT certificate-only), 1 missing",
+      "raw solver proof bytes are not sufficient for proof-grade; checked proof certificates are required"
+    ],
+    "replay_semantics_satisfied": false,
+    "replayed_vcs": 0
+  },
+  "missing_memory_effect_witness_binding_proof_grade_gate": {
+    "accepted": false,
+    "exact_replay_slice_attested_vcs": 0,
+    "missing_machine_replay": 1,
+    "rejections": [
+      "final trust level is `partial`; proof-grade requires `proof_grade`",
+      "required binary VCs are not all proved: 0/1 proved, 1 unproved, 1 non-proof solver result(s)",
+      "checked proof certificates missing: 0/1 checked, 1 missing",
+      "replay semantics missing: 0/1 satisfied (1 machine replayed, 0 selected-image byte/segment attested, 0 checked UNSAT certificate-only), 1 missing",
+      "exact replay selected-image byte/segment attestation accepted 0/1 replayed VC(s); proof-grade replay requires selected-image bytes and executable segment byte-range attestation: dispatch vc-sat-missing-memory-effect-witness: missing exact replay normalized witness binding: memory/effect attestation; dispatch vc-sat-missing-memory-effect-witness: exact replay normalized witness loaded-image identity rejected: missing or unreadable loaded-image bytes for exact replay transcript: fixtures/tiny.bin: No such file or directory (os error 2)",
+      "raw solver proof bytes are not sufficient for proof-grade; checked proof certificates are required"
+    ],
+    "replay_semantics_satisfied": false,
+    "replayed_vcs": 1
+  }
+}

@@ -1,0 +1,8 @@
+error: expected `.` or the end of the contract clause citation
+  --> $DIR/native_clause_citation_missing_dot.rs:6:34
+   |
+LL |     ensures result == x by Lemma part
+   |                                  ^^^^
+
+error: aborting due to 1 previous error
+

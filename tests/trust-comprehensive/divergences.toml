@@ -1,0 +1,156 @@
+# Command-level divergence ledger for tests/run_trust_comprehensive_harness.sh.
+#
+# This ledger is intentionally empty by default. The full upstream Rust corpus
+# uses tests/upstream-rust/test-exceptions.toml for per-test exceptions, and the
+# Trust-added compiletest corpus uses tests/trust-added/compiletest-exceptions.toml.
+#
+# A row here documents that a top-level harness gate is known to diverge. It
+# does not make the comprehensive replacement verdict pass; documented
+# divergences are still reported as blockers unless the caller is doing local
+# triage outside release evidence.
+
+schema_version = "0.1.0"
+
+# Example shape:
+#
+# [[divergences]]
+# id = "divergence.example"
+# gate_id = "upstream.porting"
+# status = "active"
+# owner = "@trust-release"
+# reason = "Short, falsifiable reason."
+# issue = "https://example.invalid/trust/issues/123"
+# reviewed_on = "2026-05-06"
+# expires_on = "2026-06-06"
+# allowed_exit_codes = [1]
+# allowed_patterns = ["specific failure text required in the gate log"]
+
+[[divergences]]
+id = "upstream.trust-compat.2026-05-07.ui-diagnostic-drift"
+gate_id = "upstream.trust-compat"
+status = "accepted_narrow_divergence"
+owner = "@trust-release"
+reason = "RESOLVED to an explicit porter model: the tests/ui vanilla lane is GREEN (21159 passed / 0 failed / 606 ignored, exit 0). Trust's deliberate branding and prose are represented directly in the reviewed in-tree tests/ui expectations; structural/non-branding deviations remain enumerated in tests/upstream-rust/patches.toml. Compiletest only normalizes platform/path classes that the porter does not encode. The in-tree expectation set is therefore an audited Trust adapter, not a pristine upstream mirror."
+issue = "local:reports/trust-comprehensive/upstream.trust-compat"
+reviewed_on = "2026-07-11"
+expires_on = "2026-10-01"
+note = "2026-07-11 policy reconciliation: porter commit 9d808e84011 moved branded explain hints, ICE notes, and Trust documentation prose into the in-tree UI expectations and removed TRUST_WORDING_NORMALIZATIONS from compiletest. The large expectation rewrite is intentional adapter data, not blind bless output. The upstream Rust baseline remains recoverable from its recorded import commit; Trust release evidence reviews the adapter diff plus patches.toml rather than claiming byte-for-byte-pristine upstream expectations."
+allowed_exit_codes = [0]
+allowed_patterns = [
+    "test result: ok. 21159 passed; 0 failed; 606 ignored; 0 measured; 0 filtered out",
+]
+classification = "diagnostic_drift"
+compatibility_status = "accepted_narrow_divergence"
+required_action = "Keep the lane green and auditable: a new Trust diagnostic rewrite must include the compiler change and its narrowly matching adapter expectation; structural/non-branding divergence must also update patches.toml. Never run a broad unreviewed bless or hide branded differences in compiletest normalization."
+
+[[divergences]]
+id = "upstream.trust-compat.2026-05-07.crash-status-drift"
+gate_id = "upstream.trust-compat"
+status = "resolved"
+owner = "@trust-release"
+reason = "Resolved by retiring the sole recorded crash-status divergence through the upstream de-ICE process."
+issue = "local:reports/trust-comprehensive/upstream.trust-compat#crashes"
+reviewed_on = "2026-07-23"
+note = "2026-07-23 review: commit e7aaf75872 deleted the sole recorded reproducer, tests/crashes/135122.rs, replaced it with the blessed tests/ui/implied-bounds/ice-implied-outlives-bounds-135122.rs non-ICE regression, marked the exact per-test exception resolved, and recorded the adopted fix in tests/upstream-rust/upstream-fixes.toml. The 2026-07-11 evidence inventory identified exactly one crash-status-drift row and it was 135122, so no category-level crash divergence remains."
+allowed_exit_codes = [0]
+allowed_patterns = [
+    "ice-implied-outlives-bounds-135122",
+]
+classification = "crash_status_drift"
+compatibility_status = "resolved"
+required_action = "None; retain the blessed non-ICE UI regression and adopted-fix record."
+
+[[divergences]]
+id = "upstream.trust-compat.2026-05-07.codegen-filecheck-drift"
+gate_id = "upstream.trust-compat"
+status = "resolved"
+owner = "@trust-release"
+reason = "Resolved by implementing and directly testing both recorded codegen reproducers."
+issue = "local:reports/trust-comprehensive/upstream.trust-compat#codegen"
+reviewed_on = "2026-07-23"
+note = "2026-07-23 review: commit c2c4747b8b implemented the i386 SysV 3/5/6/7-byte small-struct register-return ABI and enabled x86-c-struct-return.rs. The supposedly missing foreign-unwind implementation was also already present in rustc_codegen_ssa: foreign-ABI detection emits a volatile frame anchor, an intermediate foreign_unwind_pad landing pad, and a volatile reload before the real cleanup. Commit 863f86b2e8 corrected that regression's FileCheck line to the emitted two-line invoke. A fresh exact stage2 codegen run on cb246323ca passed all three revisions across the two tests, so no recorded category-level codegen drift remains."
+allowed_exit_codes = [0]
+allowed_patterns = [
+    "foreign-unwind-register-preservation.rs",
+    "x86-c-struct-return.rs",
+]
+classification = "codegen_output_drift"
+compatibility_status = "resolved"
+required_action = "None; retain both focused codegen regressions."
+
+[[divergences]]
+id = "upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+gate_id = "upstream.trust-compat"
+status = "active"
+owner = "@trust-release"
+reason = "The strict stage2 upstream-compat lane contains stage/sysroot skew in the rustc_private preparation used by ui-fulldeps + rustc_private tool tests. Treat as harness/bootstrap skew unless reproduced as public Trust behavior."
+issue = "local:reports/trust-comprehensive/upstream.trust-compat#sysroot"
+reviewed_on = "2026-07-11"
+expires_on = "2026-10-01"
+note = "2026-07-11 re-review on the rust-1.99 release-evidence run (reports/upstream-rust/2026-07-11-rust199-evidence-a0129195797): the prepared rustc-private-sysroot (build/host/rustc-private-sysroots/ui-fulldeps-*) is assembled INCOHERENTLY — dylib-only, missing librustc_driver, carrying stale artifact hashes that skew against the stage2 compiler — so `extern crate rustc_*` fails E0463 ('can't find crate') / E0460 ('found possibly newer version') across all 71 ui-fulldeps tests plus the rustdoc/parser rustc_private tool builds. This is a HARNESS/bootstrap gap in prepare_rustc_private_sysroot (a fragile Trust-modified bootstrap area per CLAUDE.md), NOT a trustc compiler regression and NOT introduced by the 1.99 migration (this row pre-dates it; no full-proof domination run has ever produced a green fulldeps lane). trustc compiles these tests correctly given a coherent -Ldependency set (verified: force-feeding the exact rustc_macros dylib via --extern advances resolution to the next crate). required_action stands: assemble a coherent stage2-compatible rustc_private sysroot for the fulldeps invocation."
+allowed_exit_codes = [1]
+allowed_patterns = [
+    "found possibly newer version of crate",
+    "can't find crate for `rustc_",
+]
+classification = "stage_sysroot_skew"
+compatibility_status = "harness_blocker"
+required_action = "Make the upstream test invocation use a coherent stage2 Trust sysroot without environment side paths."
+
+[[divergences]]
+id = "upstream.trust-compat.2026-05-07.rustdoc-linkcheck-drift"
+gate_id = "upstream.trust-compat"
+status = "active"
+owner = "@trust-release"
+reason = "The strict stage2 upstream-compat lane still contains rustdoc output and linkcheck drift. This is a release blocker unless each output change is a reviewed Trust-owned documentation/name change."
+issue = "local:reports/trust-comprehensive/upstream.trust-compat#rustdoc"
+reviewed_on = "2026-07-23"
+expires_on = "2026-08-06"
+note = "2026-07-23 review: changes since the prior review include branded expectation adoption, parser-island support, check-cfg hygiene, and the ENV_MUTATION lint, but no rustdoc/linkcheck root-cause fix, reviewed complete wording-patch set, or full strict stage2 rustdoc pass. The divergence therefore remains a release blocker pending fresh evidence; this short renewal is not acceptance."
+allowed_exit_codes = [1]
+allowed_patterns = [
+    "broken link",
+    "Some tests failed in compiletest suite=rustdoc-ui",
+]
+classification = "rustdoc_output_drift"
+compatibility_status = "blocker"
+required_action = "Fix rustdoc/linkcheck behavior or convert reviewed Trust-owned wording changes into deterministic patch-manifest rows."
+
+[[divergences]]
+id = "upstream.trust-compat.2026-05-07.run-make-trust-defaults"
+gate_id = "upstream.trust-compat"
+status = "active"
+owner = "@trust-release"
+reason = "The strict stage2 upstream-compat lane still contains run-make failures around Trust naming and default verification behavior. Trust naming may require expected-output patches; verification leakage into vanilla upstream compatibility is a blocker."
+issue = "local:reports/trust-comprehensive/upstream.trust-compat#run-make"
+reviewed_on = "2026-07-23"
+expires_on = "2026-08-06"
+note = "2026-07-23 review: the run-make tree and compiler launch/default surfaces changed substantially after the prior review. The focused certified-monitor run-make gate is green, but that is not a vanilla-mode full run-make compatibility pass and cannot establish that verification/default behavior never leaks into inherited tests. The category remains a release blocker pending the full strict stage2 lane; this short renewal is not acceptance."
+allowed_exit_codes = [1]
+allowed_patterns = [
+    "tests/run-make/const-trait-stable-toolchain",
+    "RUSTC_BOOTSTRAP",
+    "-Ztrust-verify=off",
+]
+classification = "run_make_default_behavior"
+compatibility_status = "blocker"
+required_action = "Keep vanilla upstream compatibility on no-verification semantics and patch only reviewed Trust-owned output naming."
+
+[[divergences]]
+id = "verify.precision.2026-07-08.call-havoc-guard-severing"
+gate_id = "verify.precision"
+status = "active"
+owner = "@trust-release"
+reason = "SOUNDNESS FIX (callee-write false-accept sweep): a guard read of a pointee (`*r`, `s.v` behind &mut) no longer transfers across ANY Call/Drop/Opaque terminator — the conservative havoc severs guard-to-use fact flow when a call/drop sits between a pointee guard and its arithmetic use, flipping previously-PROVING safe idioms to REFUTE: println!/logging between guard and use, unrelated calls with disjoint arguments, &self getters inside &mut-self methods, provably-disjoint-&mut-arg calls (probes or1_println, or1_unrelated, or2_disjoint, or2_unrelated, or3_self, or3_self_getter, or4_println, or5_div, or7_vec). ACCEPTED per the sacred invariant: the same havoc closes a CONFIRMED silent false-accept (guard `*r < 1000`, callee writes `*r = u32::MAX`, use `*r + 1` verified '1 proved' yet panicking at runtime) plus its method/nested/field/mem-replace/mem-swap/Drop-glue variants. The snapshot idiom (`let n = *r;` before the call) remains a zero-cost sound rewrite and PROVES (or6_snapshot control). SCOPE NARROWED (per-argument havoc refinement, same day): calls whose arguments are ALL constants or copies of pure pointer-free values — and whose function contains no raw-pointer laundering site — no longer sever the guard (or1_unrelated, or2_unrelated, or5_div restored CLEAN). Still severed pending the deeper lanes: pointer-carrying args incl. fmt closures (or1/or4_println), place-level disjoint &mut args (or2_disjoint, or7_vec), and &self getters inside &mut-self methods (or3_self, or3_self_getter)."
+issue = "local:task#14-callee-write-false-accept"
+reviewed_on = "2026-07-08"
+expires_on = "2026-10-08"
+allowed_exit_codes = [1]
+allowed_patterns = [
+    "overflow:add",
+    "overflow:sub",
+]
+classification = "precision_regression_from_soundness_fix"
+compatibility_status = "accepted_narrow_divergence"
+required_action = "Precision follow-ups scheduled BEHIND the soundness fix, never as a rollback: (a) per-argument reachability refinement (skip havocing pointees no call argument can reach — sound under &mut noalias), (b) arg-pointee non-mutation callee summaries in modular.rs (currently dest-only), (c) wire the snapshot rewrite into trust-backprop so the flywheel auto-repairs regressed sites."
+

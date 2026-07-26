@@ -1,0 +1,49 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+<Either<L, R> as core::clone::Clone>::clone_from	SHAPE_GAP	false	false	false	false	false	false	false
+<Either<L, R> as core::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+<Either<L, R> as core::cmp::Ord>::cmp	SHAPE_GAP	false	false	false	false	false	false	false
+<Either<L, R> as core::cmp::PartialEq>::eq	SHAPE_GAP	false	false	false	false	false	false	false
+<Either<L, R> as core::cmp::PartialOrd>::partial_cmp	SHAPE_GAP	false	false	false	false	false	false	false
+<Either<L, R> as core::convert::AsMut<Target>>::as_mut	SHAPE_GAP	false	false	false	false	false	false	false
+<Either<L, R> as core::convert::AsMut<[Target]>>::as_mut	SHAPE_GAP	false	false	false	false	false	false	false
+<Either<L, R> as core::convert::AsMut<str>>::as_mut	SHAPE_GAP	false	false	false	false	false	false	false
+<Either<L, R> as core::convert::AsRef<Target>>::as_ref	SHAPE_GAP	false	false	false	false	false	false	false
+<Either<L, R> as core::convert::AsRef<[Target]>>::as_ref	SHAPE_GAP	false	false	false	false	false	false	false
+<Either<L, R> as core::convert::AsRef<str>>::as_ref	SHAPE_GAP	false	false	false	false	false	false	false
+<Either<L, R> as core::fmt::Debug>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<Either<L, R> as core::fmt::Display>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<Either<L, R> as core::fmt::Write>::write_char	SHAPE_GAP	false	false	false	false	false	false	false
+<Either<L, R> as core::fmt::Write>::write_fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<Either<L, R> as core::fmt::Write>::write_str	SHAPE_GAP	false	false	false	false	false	false	false
+Either::<L, R>::as_pin_mut	SHAPE_GAP	false	false	false	false	false	false	false
+<Either<L, R> as core::future::Future>::poll	SHAPE_GAP	false	false	false	false	false	false	false
+<Either<L, R> as core::hash::Hash>::hash	SHAPE_GAP	false	false	false	false	false	false	false
+<Either<L, R> as core::ops::Deref>::deref	SHAPE_GAP	false	false	false	false	false	false	false
+<Either<L, R> as core::ops::DerefMut>::deref_mut	SHAPE_GAP	false	false	false	false	false	false	false
+<iterator::IterEither<L, R> as core::clone::Clone>::clone	SHAPE_GAP	false	false	false	false	false	false	false
+<iterator::IterEither<L, R> as core::fmt::Debug>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<iterator::IterEither<L, R> as core::iter::DoubleEndedIterator>::next_back	SHAPE_GAP	false	false	false	false	false	false	false
+<iterator::IterEither<L, R> as core::iter::DoubleEndedIterator>::nth_back	SHAPE_GAP	false	false	false	false	false	false	false
+<iterator::IterEither<L, R> as core::iter::ExactSizeIterator>::len	SHAPE_GAP	false	false	false	false	false	false	false
+<iterator::IterEither<L, R> as core::iter::Iterator>::next	SHAPE_GAP	false	false	false	false	false	false	false
+<iterator::IterEither<L, R> as core::iter::Iterator>::nth	SHAPE_GAP	false	false	false	false	false	false	false
+<iterator::IterEither<L, R> as core::iter::Iterator>::size_hint	SHAPE_GAP	false	false	false	false	false	false	false
+Either::<L, R>::as_mut	SHAPE_GAP	false	false	false	false	false	false	false
+Either::<L, R>::as_pin_ref	SHAPE_GAP	false	false	false	false	false	false	false
+Either::<L, R>::as_ref	SHAPE_GAP	false	false	false	false	false	false	false
+iterator::IterEither::<L, R>::new	SHAPE_GAP	false	false	false	false	false	false	false
+Either::<L, R>::factor_iter	SHAPE_GAP	false	false	false	false	false	false	false
+Either::<L, R>::factor_iter_mut	SHAPE_GAP	false	false	false	false	false	false	false
+Either::<L, R>::is_left	FULLY_FAITHFUL	false	false	true	true	true	false	true
+Either::<L, R>::is_right	FULLY_FAITHFUL	true	true	true	true	true	false	true
+Either::<L, R>::iter	SHAPE_GAP	false	false	false	false	false	false	false
+Either::<L, R>::iter_mut	SHAPE_GAP	false	false	false	false	false	false	false
+Either::<core::option::Option<L>, core::option::Option<R>>::factor_none	SHAPE_GAP	false	false	false	false	false	false	false
+Either::<core::result::Result<L, E>, core::result::Result<R, E>>::factor_err	SHAPE_GAP	false	false	false	false	false	false	false
+Either::<core::result::Result<T, L>, core::result::Result<T, R>>::factor_ok	SHAPE_GAP	false	false	false	false	false	false	false
+iterator::<impl core::iter::DoubleEndedIterator for Either<L, R>>::next_back	SHAPE_GAP	false	false	false	false	false	false	false
+iterator::<impl core::iter::DoubleEndedIterator for Either<L, R>>::nth_back	SHAPE_GAP	false	false	false	false	false	false	false
+iterator::<impl core::iter::ExactSizeIterator for Either<L, R>>::len	SHAPE_GAP	false	false	false	false	false	false	false
+iterator::<impl core::iter::Iterator for Either<L, R>>::next	SHAPE_GAP	false	false	false	false	false	false	false
+iterator::<impl core::iter::Iterator for Either<L, R>>::nth	SHAPE_GAP	false	false	false	false	false	false	false
+iterator::<impl core::iter::Iterator for Either<L, R>>::size_hint	SHAPE_GAP	false	false	false	false	false	false	false

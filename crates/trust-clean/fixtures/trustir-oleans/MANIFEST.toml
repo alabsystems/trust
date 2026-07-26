@@ -1,0 +1,49 @@
+schema = "trust.trust-clean.trustir-oleans.manifest.v1"
+
+[provenance]
+trustir_commit = "86685a9241702f9dabb1a544d5710784663a479e"
+# The first-party/clean revision these bytes are staged against — the olean
+# reader that decodes them and the kernel that admits the decoded declarations
+# both live there, so a clean pin bump changes what "the bridge replays" means
+# just as surely as a trust-ir bump changes what it replays. Kept equal to the
+# indexed gitlink by scripts/check_bridge_pin.sh; the replay itself is
+# validated by crates/trust-clean/tests/lean_clean_bridge.rs.
+clean_commit = "c580183ed5a1dfc65c0d5192699477b7788d095f"
+lean_toolchain = "leanprover/lean4:v4.8.0"
+lean_version = "Lean (version 4.8.0, aarch64-unknown-linux-gnu, commit df668f00e6c0, Release)"
+root_module = "TrustIr.Semantics.Arith"
+source_subdir = "lean/trust_ir-semantics"
+build_command = "lake build (unmodified sources at trustir_commit; toolchain pinned by lean-toolchain)"
+built_on = "2026-07-26"
+# Minimal module closure of root_module: computed by loading the root with
+# clean-olean load_module_with_deps and vendoring exactly the visited TrustIr
+# modules. Regenerate + audit with scripts/regen-trustir-oleans.sh.
+
+[files]
+"TrustIr/Basic.olean" = "fb2c7329d9b267beb0ac5c644219f8f081b3bed07c8b500625db333c5376ab72"
+"TrustIr/BinOp.olean" = "19b3b7acd987decdc1d6db5748adc79c73489c562bfc48e4156af8c695d8f6a4"
+"TrustIr/CastOp.olean" = "f75ed89e6a4a1ed5b03bd76211e68508ed2355ba3a8c6f998312dcb2090f6d1b"
+"TrustIr/CmpOp.olean" = "da175f910e79a2b723f408c2e8e165a5cc084dad790d5ee9e1276a38b1f4eae6"
+"TrustIr/Constant.olean" = "231a487402c32058b235a899e15b48b3b16ec2ddd2eb4b189acbce7ad150b886"
+"TrustIr/DialectInst.olean" = "b0991bc04f9c4e080fc7e7addbe3fb3574201642f2c6b32d93f8937b315a0161"
+"TrustIr/Inst.olean" = "515722a12f5c146c3498b11331606a6397b505d6b2a051cb5022a41d01c7268f"
+"TrustIr/Ordering.olean" = "bc4a8c0fb6ec6422832c311451d5f30c6f974805ee4084f427c8ba96d9c879cc"
+"TrustIr/Semantics/ARC.olean" = "7f922f733d740d58dcc9ece4e73651da1bcd07b56dfe3e498e8a812a9f682221"
+"TrustIr/Semantics/Aggregate.olean" = "1a2c94f11fba152d632ef821ca17a0be0185365e60a7591e70376592be2d9be1"
+"TrustIr/Semantics/Arith.olean" = "3af59e40d9d0f1c8856cc74ab6dbb052b1502fb913c33c854eb057be34ce5306"
+"TrustIr/Semantics/Atomic.olean" = "6d0799ab1507651b3ee07be3c540fe04d74652495b3bb54a87644ea0ffbfc640"
+"TrustIr/Semantics/Borrow.olean" = "e6e7a41330bc1f35a5351b69f71ede26382e32663e6200ca77b99685094e299c"
+"TrustIr/Semantics/Call.olean" = "1d603d6430e4a4a9af071032406683aa98649f1e2f9f5287c0be854f2b161ddb"
+"TrustIr/Semantics/Cast.olean" = "9caeb5c93fc89c8526e96ac2a06bc9b624fe08a505cd60b92087369b26954108"
+"TrustIr/Semantics/Compare.olean" = "4c7281999d1d657e95b4daf8d2b97eed8945113f569fa0c5bddfad2efa3de37b"
+"TrustIr/Semantics/Control.olean" = "0de630cd4ff7e363b9d9800657b05da93a8d438646521aeec950cb8173369b4e"
+"TrustIr/Semantics/Coroutine.olean" = "4463e40908804a567287b4b9fc76d403fae80dee00bc9505aaeb5c2b6434919b"
+"TrustIr/Semantics/Eval.olean" = "2d8be0e8c0483a2a8f6cc34e41bba2f8bb9a0f6221eca705b6f2f0d3c4241030"
+"TrustIr/Semantics/Frame.olean" = "d85e4c69617f2a2e18c46cad1dd0e395dcc59748509ad926cedcfcaa421c9744"
+"TrustIr/Semantics/Memory.olean" = "b4618cfc0dbd7be7794a03b00a970b4df56da7718adb084b934dd12db504a9f8"
+"TrustIr/Semantics/Monad.olean" = "21132f8b9eb699a243ad9d36c7f827c3d4c72f5e5542518444dab9ec39322c5d"
+"TrustIr/Semantics/Step.olean" = "4c22403d02218f22aa263876c7d408edcad509c5599e11a9ee66f1f6a4de78a2"
+"TrustIr/State/MachineState.olean" = "60e0163e986df1554d5cb12d767eb284ef9d6d146c58c8e9e97ce0a6a50d1f3a"
+"TrustIr/State/Memory.olean" = "6e03dcb206b67863adaffb305ac3d8310baf35fb4c5653f06ede4b2c1aad62be"
+"TrustIr/State/Permission.olean" = "482e2db117ff8093d8fc57f18eedd2403ec1657fe5688f92fe536f896e656f38"
+"TrustIr/State/ValueMap.olean" = "28d90b0031014848a0f72a659ffe5519cf17efbafdc92542ecb121966b9c50a7"

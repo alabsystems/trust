@@ -1,0 +1,18 @@
+error: Clean island declaration `arith_debt` uses `trustedArith`; strict islands reject all trust debt
+  --> $DIR/clean_island_no_verify_trusted.rs:9:5
+   |
+LL |     theorem arith_debt : True := trustedArith
+   |     ^^^^^^^
+   |
+   = note: the island was parsed by the Clean parser and checked by the Clean CIC kernel during this build (two-language design E10)
+
+error: Clean island declaration `ay_debt` uses `trustedAy`; strict islands reject all trust debt
+  --> $DIR/clean_island_no_verify_trusted.rs:10:5
+   |
+LL |     theorem ay_debt : True := trustedAy
+   |     ^^^^^^^
+   |
+   = note: the island was parsed by the Clean parser and checked by the Clean CIC kernel during this build (two-language design E10)
+
+error: aborting due to 2 previous errors
+

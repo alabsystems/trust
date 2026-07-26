@@ -1,0 +1,27 @@
+[submodule "first-party/ay"]
+	path = first-party/ay
+	url = https://github.com/alabsystems/ay.git
+[submodule "first-party/clean"]
+	path = first-party/clean
+	url = https://github.com/alabsystems/clean.git
+[submodule "first-party/trust-cg"]
+	path = first-party/trust-cg
+	url = https://github.com/alabsystems/trust-cg.git
+[submodule "first-party/trust-ir"]
+	path = first-party/trust-ir
+	url = https://github.com/alabsystems/trust-ir.git
+[submodule "first-party/trust-mc"]
+	path = first-party/trust-mc
+	url = https://github.com/alabsystems/trust-mc.git
+[submodule "first-party/trust-vc"]
+	path = first-party/trust-vc
+	url = https://github.com/alabsystems/trust-vc.git
+[submodule "first-party/trust-wp"]
+	path = first-party/trust-wp
+	url = https://github.com/alabsystems/trust-wp.git
+[submodule "first-party/ty"]
+	path = first-party/ty
+	url = https://github.com/alabsystems/ty.git
+[submodule "first-party/ny"]
+	path = first-party/ny
+	url = https://github.com/alabsystems/ny.git

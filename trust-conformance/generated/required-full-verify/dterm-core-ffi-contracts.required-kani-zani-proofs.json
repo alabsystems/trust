@@ -1,0 +1,95 @@
+{
+  "generated_from_inventory": {
+    "ecosystem": "dterm",
+    "inventory_date": "2026-04-27",
+    "inventory_path": "trust-conformance/proof-item-migration-inventory/dterm-20260427.json",
+    "issue_refs": [
+      "#1117",
+      "#1108",
+      "#1095",
+      "#1043"
+    ],
+    "schema": "trust.proof-item-migration-inventory.v1",
+    "source_commit": "070b3484655985e03f41820a3a235c5d520de7b4"
+  },
+  "generation_policy": {
+    "bounded_legacy_imports_remain_rejected_as_full_proof": true,
+    "count_only_slices_are_not_materialized": true,
+    "fail_closed_on_missing_roots": true
+  },
+  "schema": "trust.required-kani-zani-proofs.v1",
+  "scopes": [
+    {
+      "engine": "kani",
+      "execution_mode": "bounded_regression",
+      "id": "dterm.core_ffi.contracts",
+      "import_status": "draft only; source tree is not vendored in tRust",
+      "manifest_path": "trust-conformance/external/dterm/crates/dterm-core-ffi/Cargo.toml",
+      "native_target": {
+        "accepted_evidence_requires": "hash-addressed Zani CHC/PDR transcript",
+        "kind": "contract_proof_fn",
+        "mode": "required_full_verify",
+        "source": "native_proof_fn"
+      },
+      "required_features": [
+        "kani-contracts"
+      ],
+      "required_proof_items": [
+        {
+          "bounded_depth": "unspecified",
+          "engine": "zani",
+          "file": "trust-conformance/external/dterm/crates/dterm-core-ffi/src/grid/kani_proofs.rs",
+          "harness": "dterm_is_box_drawing_character_contract",
+          "kind": "contract_harness",
+          "mode": "bounded_regression",
+          "must_execute_full_verify": true,
+          "proof_item_id": "proof:dterm.core_ffi.contracts:dterm_is_box_drawing_character_contract",
+          "source": "kani_proof_for_contract_attribute",
+          "target": "dterm_is_box_drawing_character"
+        },
+        {
+          "bounded_depth": "unwind:32",
+          "engine": "zani",
+          "file": "trust-conformance/external/dterm/crates/dterm-core-ffi/src/vi_mode/kani_proofs.rs",
+          "harness": "dterm_terminal_vi_mode_set_mark_v2_contract",
+          "kind": "contract_harness",
+          "mode": "bounded_regression",
+          "must_execute_full_verify": true,
+          "proof_item_id": "proof:dterm.core_ffi.contracts:dterm_terminal_vi_mode_set_mark_v2_contract",
+          "source": "kani_proof_for_contract_attribute",
+          "target": "dterm_terminal_vi_mode_set_mark_v2"
+        },
+        {
+          "bounded_depth": "unwind:32",
+          "engine": "zani",
+          "file": "trust-conformance/external/dterm/crates/dterm-core-ffi/src/vi_mode/kani_proofs.rs",
+          "harness": "dterm_terminal_vi_mode_inline_search_v2_contract",
+          "kind": "contract_harness",
+          "mode": "bounded_regression",
+          "must_execute_full_verify": true,
+          "proof_item_id": "proof:dterm.core_ffi.contracts:dterm_terminal_vi_mode_inline_search_v2_contract",
+          "source": "kani_proof_for_contract_attribute",
+          "target": "dterm_terminal_vi_mode_inline_search_v2"
+        }
+      ],
+      "required_rust_flags": [
+        "-Z function-contracts"
+      ],
+      "root": "trust-conformance/external/dterm/crates/dterm-core-ffi/src",
+      "runner": [
+        "{targo}",
+        "kani",
+        "--manifest-path",
+        "{manifest_path}",
+        "--features",
+        "kani-contracts",
+        "-Z",
+        "function-contracts",
+        "--harness",
+        "{harness}"
+      ],
+      "runner_host": "trust-stage2",
+      "source_prefix": "trust-conformance/external/dterm"
+    }
+  ]
+}

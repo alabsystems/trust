@@ -1,0 +1,135 @@
+{
+  "checked_certificate_production": {
+    "already_checked_certificates": 0,
+    "blocker_records": [
+      {
+        "code": "checker-selection-missing",
+        "detail": "no production checked-certificate checker was selected; pass --checked-cert-checker <path>",
+        "evidence_required": [
+          "production_checker"
+        ],
+        "stage": "checked-certificate-production"
+      },
+      {
+        "code": "normalized-proof-export-missing",
+        "detail": "solver dispatch has no normalized solver proof export bound to the canonical VC digest",
+        "dispatch_id": "export-run:vc0",
+        "evidence_required": [
+          "normalized_solver_proof_export"
+        ],
+        "stage": "checked-certificate-production"
+      },
+      {
+        "code": "checked-certificate-missing",
+        "detail": "solver dispatch has no independently checked certificate artifact",
+        "dispatch_id": "export-run:vc0",
+        "evidence_required": [
+          "checker_success",
+          "checked_certificate_artifact"
+        ],
+        "stage": "checked-certificate-production"
+      }
+    ],
+    "blockers": [
+      "no production checked-certificate checker was selected; pass --checked-cert-checker <path>",
+      "solver dispatch evidence contains no normalized proof exports for checked-certificate production",
+      "structural proof metadata and raw solver proof bytes cannot be promoted to checked certificates without a selected production checker"
+    ],
+    "canonical_binding_candidates": 1,
+    "candidate_dispatches": 1,
+    "certificate_check_records": [
+      {
+        "binary_artifact_digest_identity": {
+          "root_artifact_digest": {
+            "algorithm": "sha256",
+            "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          },
+          "selected_image": {
+            "file_offset": 0,
+            "file_size": 64,
+            "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          }
+        },
+        "blocker_codes": [
+          "normalized-proof-export-missing",
+          "checked-certificate-missing"
+        ],
+        "certificate_status": "unavailable",
+        "diagnostic": "certificate check did not run because no normalized solver proof export exists",
+        "dispatch_id": "export-run:vc0",
+        "function": "main",
+        "replay_digest_identity": {
+          "binary_artifact_digest_identity": {
+            "root_artifact_digest": {
+              "algorithm": "sha256",
+              "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            },
+            "selected_image": {
+              "file_offset": 0,
+              "file_size": 64,
+              "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            }
+          },
+          "blockers": [
+            "checked certificate replay was not completed",
+            "checked certificate replay transcript digest is missing"
+          ],
+          "replay": "not_attempted",
+          "status": "rejected"
+        },
+        "status": "not_run"
+      }
+    ],
+    "checker_selection": "absent",
+    "diagnostics": [],
+    "export_dir": "target/checked-certs",
+    "exported_artifacts": 0,
+    "proof_export_candidates": 0,
+    "proof_export_records": [
+      {
+        "backend": "ay-lrat",
+        "blocker_codes": [
+          "normalized-proof-export-missing",
+          "checked-certificate-missing"
+        ],
+        "canonical_binding": true,
+        "dispatch_id": "export-run:vc0",
+        "function": "main",
+        "origin_sha256": "521407299a145e754eb7ae53f5b7699be62e462ba526664fa2783f564846b2f6",
+        "solver": "ay-incremental",
+        "status": "missing",
+        "vc_sha256": "d2515b3f23c3a1f4796b4586cc98ca0d1c836d9257f36e563ca18364b1ae5b89"
+      }
+    ],
+    "raw_solver_proof_byte_dispatches": 0,
+    "rejected_dispatches": 1,
+    "requested": true,
+    "source_backpropagation_gate": {
+      "accepted_reconstruction_validation": false,
+      "accepted_target_validation": false,
+      "blockers": [
+        "source_backpropagation_gate_not_evaluated"
+      ],
+      "checked_certificate_identity": false,
+      "exact_replay_identity": false,
+      "exact_source_provenance": false,
+      "replay_grade_artifact_identity": false,
+      "schema_version": "checked-binary-certificate-source-backpropagation-gate.v1",
+      "source_backpropagation_allowed": false,
+      "source_provenance": {
+        "ambiguous_mapping_count": 0,
+        "diagnostics": [],
+        "exact_mapping_count": 0,
+        "source_backpropagation_allowed": false,
+        "status": "unavailable"
+      }
+    },
+    "status": "blocked"
+  },
+  "proof_grade_gate": {
+    "accepted": false,
+    "checked_certificate_blocked": true,
+    "status": "rejected"
+  },
+  "verify_binary_should_fail": true
+}

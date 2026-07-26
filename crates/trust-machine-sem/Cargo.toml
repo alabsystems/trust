@@ -1,0 +1,30 @@
+# trust-machine-sem: ISA semantics formalization
+#
+# Maps decoded instructions to their logical effects on machine state.
+# Used by translation validation to verify compiled output matches source
+# semantics.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-machine-sem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Pure data layer over trust-types; trust-machine-sem never uses the `Discharge`
+# `?`-sugar, so it must not transitively re-enable trust-types' nightly
+# `try-sugar` feature. default-features = false keeps trust-machine-sem (and its
+# production consumers trust-lift -> trust-vcgen, hence `clean`) buildable on the
+# stable release channel. See trust-vcgen/Cargo.toml for the rationale.
+trust-types = { path = "../trust-types", default-features = false }
+trust-disasm = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]

@@ -1,0 +1,13 @@
+fn sum_to_n(n: u32) -> u32
+requires n <= 4
+ensures result == n * (n + 1) / 2
+{
+    let mut i = 0;
+    let mut acc = 0;
+    invariant acc == i * (i + 1) / 2;
+    while i < n {
+        i = i + 1;
+        acc = acc + i;
+    }
+    acc
+}

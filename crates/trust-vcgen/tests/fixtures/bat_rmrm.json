@@ -1,0 +1,674 @@
+{
+  "name": "rmrm",
+  "def_path": "rmrm",
+  "span": {
+    "file": "<dump-root>/bat.rs",
+    "line_start": 4,
+    "col_start": 0,
+    "line_end": 4,
+    "col_end": 85
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "std::vec::Vec",
+                "fields": [
+                  [
+                    "buf",
+                    {
+                      "Adt": {
+                        "name": "alloc::raw_vec::RawVec",
+                        "fields": [
+                          [
+                            "inner",
+                            {
+                              "Adt": {
+                                "name": "alloc::raw_vec::RawVecInner",
+                                "fields": [
+                                  [
+                                    "ptr",
+                                    {
+                                      "Adt": {
+                                        "name": "std::ptr::Unique",
+                                        "fields": [
+                                          [
+                                            "pointer",
+                                            {
+                                              "Adt": {
+                                                "name": "std::ptr::NonNull",
+                                                "fields": [
+                                                  [
+                                                    "pointer",
+                                                    {
+                                                      "RawPtr": {
+                                                        "mutable": false,
+                                                        "pointee": {
+                                                          "Int": {
+                                                            "width": 8,
+                                                            "signed": false
+                                                          }
+                                                        }
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "_marker",
+                                            {
+                                              "Adt": {
+                                                "name": "std::marker::PhantomData",
+                                                "fields": [],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "cap",
+                                    {
+                                      "Adt": {
+                                        "name": "core::num::niche_types::UsizeNoHighBit",
+                                        "fields": [
+                                          [
+                                            "0",
+                                            {
+                                              "Int": {
+                                                "width": 64,
+                                                "signed": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "alloc",
+                                    {
+                                      "Adt": {
+                                        "name": "std::alloc::Global",
+                                        "fields": [],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ],
+                          [
+                            "_marker",
+                            {
+                              "Adt": {
+                                "name": "std::marker::PhantomData",
+                                "fields": [],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ],
+                  [
+                    "len",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          }
+        },
+        "name": "v"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "n"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "std::vec::Vec",
+                "fields": [
+                  [
+                    "buf",
+                    {
+                      "Adt": {
+                        "name": "alloc::raw_vec::RawVec",
+                        "fields": [
+                          [
+                            "inner",
+                            {
+                              "Adt": {
+                                "name": "alloc::raw_vec::RawVecInner",
+                                "fields": [
+                                  [
+                                    "ptr",
+                                    {
+                                      "Adt": {
+                                        "name": "std::ptr::Unique",
+                                        "fields": [
+                                          [
+                                            "pointer",
+                                            {
+                                              "Adt": {
+                                                "name": "std::ptr::NonNull",
+                                                "fields": [
+                                                  [
+                                                    "pointer",
+                                                    {
+                                                      "RawPtr": {
+                                                        "mutable": false,
+                                                        "pointee": {
+                                                          "Int": {
+                                                            "width": 8,
+                                                            "signed": false
+                                                          }
+                                                        }
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "_marker",
+                                            {
+                                              "Adt": {
+                                                "name": "std::marker::PhantomData",
+                                                "fields": [],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "cap",
+                                    {
+                                      "Adt": {
+                                        "name": "core::num::niche_types::UsizeNoHighBit",
+                                        "fields": [
+                                          [
+                                            "0",
+                                            {
+                                              "Int": {
+                                                "width": 64,
+                                                "signed": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "alloc",
+                                    {
+                                      "Adt": {
+                                        "name": "std::alloc::Global",
+                                        "fields": [],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ],
+                          [
+                            "_marker",
+                            {
+                              "Adt": {
+                                "name": "std::marker::PhantomData",
+                                "fields": [],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ],
+                  [
+                    "len",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/bat.rs",
+                "line_start": 4,
+                "col_start": 36,
+                "line_end": 4,
+                "col_end": 37
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "std::vec::Vec::<T, A>::len",
+            "args": [
+              {
+                "Move": {
+                  "local": 3,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "<dump-root>/bat.rs",
+              "line_start": 4,
+              "col_start": 36,
+              "line_end": 4,
+              "col_end": 43
+            },
+            "atomic": null,
+            "is_foreign": false
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/bat.rs",
+                "line_start": 4,
+                "col_start": 48,
+                "line_end": 4,
+                "col_end": 51
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                5
+              ]
+            ],
+            "otherwise": 2,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "<dump-root>/bat.rs",
+              "line_start": 4,
+              "col_start": 48,
+              "line_end": 4,
+              "col_end": 51
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "std::vec::Vec::<T, A>::remove",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    0,
+                    64
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 5,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "<dump-root>/bat.rs",
+              "line_start": 4,
+              "col_start": 54,
+              "line_end": 4,
+              "col_end": 65
+            },
+            "atomic": null,
+            "is_foreign": false
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Sub",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/bat.rs",
+                "line_start": 4,
+                "col_start": 76,
+                "line_end": 4,
+                "col_end": 79
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 8,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Sub"
+            },
+            "target": 4,
+            "span": {
+              "file": "<dump-root>/bat.rs",
+              "line_start": 4,
+              "col_start": 76,
+              "line_end": 4,
+              "col_end": 79
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 8,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/bat.rs",
+                "line_start": 4,
+                "col_start": 76,
+                "line_end": 4,
+                "col_end": 79
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "std::vec::Vec::<T, A>::remove",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 7,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 6,
+              "projections": []
+            },
+            "target": 5,
+            "span": {
+              "file": "<dump-root>/bat.rs",
+              "line_start": 4,
+              "col_start": 67,
+              "line_end": 4,
+              "col_end": 80
+            },
+            "atomic": null,
+            "is_foreign": false
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

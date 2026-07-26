@@ -1,0 +1,49 @@
+error: static of uninhabited type
+  --> $DIR/uninhabited-static-reject.rs:11:1
+   |
+LL | static VOID: Void = VOID;
+   | ^^^^^^^^^^^^^^^^^
+   |
+   = note: uninhabited statics cannot be initialized, and any access would be an immediate error
+   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+   = note: for more information, see issue #74840 <https://github.com/rust-lang/rust/issues/74840>
+note: the lint level is defined here
+  --> $DIR/uninhabited-static-reject.rs:6:9
+   |
+LL | #![deny(uninhabited_static)]
+   |         ^^^^^^^^^^^^^^^^^^
+
+error[E0507]: cannot move out of static item `VOID`
+  --> $DIR/uninhabited-static-reject.rs:11:21
+   |
+LL | static VOID: Void = VOID;
+   |                     ^^^^ move occurs because `VOID` has type `Void`, which does not implement the `Copy` trait
+   |
+note: if `Void` implemented `Clone`, you could clone the value
+  --> $DIR/uninhabited-static-reject.rs:8:1
+   |
+LL | enum Void {}
+   | ^^^^^^^^^ consider implementing `Clone` for this type
+...
+LL | static VOID: Void = VOID;
+   |                     ---- you could clone this value
+
+error: aborting due to 2 previous errors
+
+For more information about this error, try `trustc --explain E0507`.
+Future incompatibility report: Future breakage diagnostic:
+error: static of uninhabited type
+  --> $DIR/uninhabited-static-reject.rs:11:1
+   |
+LL | static VOID: Void = VOID;
+   | ^^^^^^^^^^^^^^^^^
+   |
+   = note: uninhabited statics cannot be initialized, and any access would be an immediate error
+   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+   = note: for more information, see issue #74840 <https://github.com/rust-lang/rust/issues/74840>
+note: the lint level is defined here
+  --> $DIR/uninhabited-static-reject.rs:6:9
+   |
+LL | #![deny(uninhabited_static)]
+   |         ^^^^^^^^^^^^^^^^^^
+

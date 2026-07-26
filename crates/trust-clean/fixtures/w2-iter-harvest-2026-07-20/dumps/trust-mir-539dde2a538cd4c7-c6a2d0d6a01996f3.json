@@ -1,0 +1,2047 @@
+{
+  "name": "precondition_check",
+  "def_path": "std::ptr::const_ptr::<impl *const T>::offset_from_unsigned::precondition_check",
+  "span": {
+    "file": "core/src/ub_checks.rs",
+    "line_start": 68,
+    "col_start": 12,
+    "line_end": 75,
+    "col_end": 13
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": "this"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": "Unit"
+          }
+        },
+        "name": "origin"
+      },
+      {
+        "index": 3,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 5,
+        "ty": "Never",
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Adt": {
+            "name": "std::fmt::Arguments",
+            "fields": [
+              [
+                "template",
+                {
+                  "Adt": {
+                    "name": "std::ptr::NonNull",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ],
+              [
+                "args",
+                {
+                  "Adt": {
+                    "name": "std::ptr::NonNull",
+                    "fields": [
+                      [
+                        "pointer",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Adt": {
+                                "name": "core::fmt::rt::Argument",
+                                "fields": [
+                                  [
+                                    "ty",
+                                    {
+                                      "Adt": {
+                                        "name": "core::fmt::rt::ArgumentType",
+                                        "fields": [
+                                          [
+                                            "__tag",
+                                            {
+                                              "Int": {
+                                                "width": 64,
+                                                "signed": true
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "__v0_value",
+                                            {
+                                              "Adt": {
+                                                "name": "std::ptr::NonNull",
+                                                "fields": [
+                                                  [
+                                                    "pointer",
+                                                    {
+                                                      "RawPtr": {
+                                                        "mutable": false,
+                                                        "pointee": "Unit"
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "__v0_formatter",
+                                            {
+                                              "FnPtr": {
+                                                "sig": {
+                                                  "params": [
+                                                    {
+                                                      "Adt": {
+                                                        "name": "std::ptr::NonNull",
+                                                        "fields": [
+                                                          [
+                                                            "pointer",
+                                                            {
+                                                              "RawPtr": {
+                                                                "mutable": false,
+                                                                "pointee": "Unit"
+                                                              }
+                                                            }
+                                                          ]
+                                                        ],
+                                                        "variants": [],
+                                                        "disc_index_safe": false
+                                                      }
+                                                    },
+                                                    {
+                                                      "Ref": {
+                                                        "mutable": true,
+                                                        "inner": {
+                                                          "Adt": {
+                                                            "name": "std::fmt::Formatter",
+                                                            "fields": [
+                                                              [
+                                                                "options",
+                                                                {
+                                                                  "Adt": {
+                                                                    "name": "std::fmt::FormattingOptions",
+                                                                    "fields": [
+                                                                      [
+                                                                        "flags",
+                                                                        {
+                                                                          "Int": {
+                                                                            "width": 32,
+                                                                            "signed": false
+                                                                          }
+                                                                        }
+                                                                      ],
+                                                                      [
+                                                                        "width",
+                                                                        {
+                                                                          "Int": {
+                                                                            "width": 16,
+                                                                            "signed": false
+                                                                          }
+                                                                        }
+                                                                      ],
+                                                                      [
+                                                                        "precision",
+                                                                        {
+                                                                          "Int": {
+                                                                            "width": 16,
+                                                                            "signed": false
+                                                                          }
+                                                                        }
+                                                                      ]
+                                                                    ],
+                                                                    "variants": [],
+                                                                    "disc_index_safe": false
+                                                                  }
+                                                                }
+                                                              ],
+                                                              [
+                                                                "buf",
+                                                                {
+                                                                  "Ref": {
+                                                                    "mutable": true,
+                                                                    "inner": {
+                                                                      "Dynamic": {
+                                                                        "trait_name": "std::fmt::Write"
+                                                                      }
+                                                                    }
+                                                                  }
+                                                                }
+                                                              ]
+                                                            ],
+                                                            "variants": [],
+                                                            "disc_index_safe": false
+                                                          }
+                                                        }
+                                                      }
+                                                    }
+                                                  ],
+                                                  "ret": {
+                                                    "Adt": {
+                                                      "name": "std::result::Result",
+                                                      "fields": [
+                                                        [
+                                                          "__tag",
+                                                          {
+                                                            "Int": {
+                                                              "width": 64,
+                                                              "signed": true
+                                                            }
+                                                          }
+                                                        ],
+                                                        [
+                                                          "__v0_0",
+                                                          "Unit"
+                                                        ],
+                                                        [
+                                                          "__v1_0",
+                                                          {
+                                                            "Adt": {
+                                                              "name": "std::fmt::Error",
+                                                              "fields": [],
+                                                              "variants": [],
+                                                              "disc_index_safe": false
+                                                            }
+                                                          }
+                                                        ]
+                                                      ],
+                                                      "variants": [
+                                                        {
+                                                          "name": "Ok",
+                                                          "discriminant": 0,
+                                                          "fields": [
+                                                            [
+                                                              "0",
+                                                              "Unit"
+                                                            ]
+                                                          ]
+                                                        },
+                                                        {
+                                                          "name": "Err",
+                                                          "discriminant": 1,
+                                                          "fields": [
+                                                            [
+                                                              "0",
+                                                              {
+                                                                "Adt": {
+                                                                  "name": "std::fmt::Error",
+                                                                  "fields": [],
+                                                                  "variants": [],
+                                                                  "disc_index_safe": false
+                                                                }
+                                                              }
+                                                            ]
+                                                          ]
+                                                        }
+                                                      ],
+                                                      "disc_index_safe": true
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "__v0__lifetime",
+                                            {
+                                              "Adt": {
+                                                "name": "std::marker::PhantomData",
+                                                "fields": [],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "__v1_0",
+                                            {
+                                              "Int": {
+                                                "width": 16,
+                                                "signed": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [
+                                          {
+                                            "name": "Placeholder",
+                                            "discriminant": 0,
+                                            "fields": [
+                                              [
+                                                "value",
+                                                {
+                                                  "Adt": {
+                                                    "name": "std::ptr::NonNull",
+                                                    "fields": [
+                                                      [
+                                                        "pointer",
+                                                        {
+                                                          "RawPtr": {
+                                                            "mutable": false,
+                                                            "pointee": "Unit"
+                                                          }
+                                                        }
+                                                      ]
+                                                    ],
+                                                    "variants": [],
+                                                    "disc_index_safe": false
+                                                  }
+                                                }
+                                              ],
+                                              [
+                                                "formatter",
+                                                {
+                                                  "FnPtr": {
+                                                    "sig": {
+                                                      "params": [
+                                                        {
+                                                          "Adt": {
+                                                            "name": "std::ptr::NonNull",
+                                                            "fields": [
+                                                              [
+                                                                "pointer",
+                                                                {
+                                                                  "RawPtr": {
+                                                                    "mutable": false,
+                                                                    "pointee": "Unit"
+                                                                  }
+                                                                }
+                                                              ]
+                                                            ],
+                                                            "variants": [],
+                                                            "disc_index_safe": false
+                                                          }
+                                                        },
+                                                        {
+                                                          "Ref": {
+                                                            "mutable": true,
+                                                            "inner": {
+                                                              "Adt": {
+                                                                "name": "std::fmt::Formatter",
+                                                                "fields": [
+                                                                  [
+                                                                    "options",
+                                                                    {
+                                                                      "Adt": {
+                                                                        "name": "std::fmt::FormattingOptions",
+                                                                        "fields": [
+                                                                          [
+                                                                            "flags",
+                                                                            {
+                                                                              "Int": {
+                                                                                "width": 32,
+                                                                                "signed": false
+                                                                              }
+                                                                            }
+                                                                          ],
+                                                                          [
+                                                                            "width",
+                                                                            {
+                                                                              "Int": {
+                                                                                "width": 16,
+                                                                                "signed": false
+                                                                              }
+                                                                            }
+                                                                          ],
+                                                                          [
+                                                                            "precision",
+                                                                            {
+                                                                              "Int": {
+                                                                                "width": 16,
+                                                                                "signed": false
+                                                                              }
+                                                                            }
+                                                                          ]
+                                                                        ],
+                                                                        "variants": [],
+                                                                        "disc_index_safe": false
+                                                                      }
+                                                                    }
+                                                                  ],
+                                                                  [
+                                                                    "buf",
+                                                                    {
+                                                                      "Ref": {
+                                                                        "mutable": true,
+                                                                        "inner": {
+                                                                          "Dynamic": {
+                                                                            "trait_name": "std::fmt::Write"
+                                                                          }
+                                                                        }
+                                                                      }
+                                                                    }
+                                                                  ]
+                                                                ],
+                                                                "variants": [],
+                                                                "disc_index_safe": false
+                                                              }
+                                                            }
+                                                          }
+                                                        }
+                                                      ],
+                                                      "ret": {
+                                                        "Adt": {
+                                                          "name": "std::result::Result",
+                                                          "fields": [
+                                                            [
+                                                              "__tag",
+                                                              {
+                                                                "Int": {
+                                                                  "width": 64,
+                                                                  "signed": true
+                                                                }
+                                                              }
+                                                            ],
+                                                            [
+                                                              "__v0_0",
+                                                              "Unit"
+                                                            ],
+                                                            [
+                                                              "__v1_0",
+                                                              {
+                                                                "Adt": {
+                                                                  "name": "std::fmt::Error",
+                                                                  "fields": [],
+                                                                  "variants": [],
+                                                                  "disc_index_safe": false
+                                                                }
+                                                              }
+                                                            ]
+                                                          ],
+                                                          "variants": [
+                                                            {
+                                                              "name": "Ok",
+                                                              "discriminant": 0,
+                                                              "fields": [
+                                                                [
+                                                                  "0",
+                                                                  "Unit"
+                                                                ]
+                                                              ]
+                                                            },
+                                                            {
+                                                              "name": "Err",
+                                                              "discriminant": 1,
+                                                              "fields": [
+                                                                [
+                                                                  "0",
+                                                                  {
+                                                                    "Adt": {
+                                                                      "name": "std::fmt::Error",
+                                                                      "fields": [],
+                                                                      "variants": [],
+                                                                      "disc_index_safe": false
+                                                                    }
+                                                                  }
+                                                                ]
+                                                              ]
+                                                            }
+                                                          ],
+                                                          "disc_index_safe": true
+                                                        }
+                                                      }
+                                                    }
+                                                  }
+                                                }
+                                              ],
+                                              [
+                                                "_lifetime",
+                                                {
+                                                  "Adt": {
+                                                    "name": "std::marker::PhantomData",
+                                                    "fields": [],
+                                                    "variants": [],
+                                                    "disc_index_safe": false
+                                                  }
+                                                }
+                                              ]
+                                            ]
+                                          },
+                                          {
+                                            "name": "Count",
+                                            "discriminant": 1,
+                                            "fields": [
+                                              [
+                                                "0",
+                                                {
+                                                  "Int": {
+                                                    "width": 16,
+                                                    "signed": false
+                                                  }
+                                                }
+                                              ]
+                                            ]
+                                          }
+                                        ],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Adt": {
+            "name": "std::ptr::NonNull",
+            "fields": [
+              [
+                "pointer",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Adt": {
+            "name": "std::ptr::NonNull",
+            "fields": [
+              [
+                "pointer",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Adt": {
+                        "name": "core::fmt::rt::Argument",
+                        "fields": [
+                          [
+                            "ty",
+                            {
+                              "Adt": {
+                                "name": "core::fmt::rt::ArgumentType",
+                                "fields": [
+                                  [
+                                    "__tag",
+                                    {
+                                      "Int": {
+                                        "width": 64,
+                                        "signed": true
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "__v0_value",
+                                    {
+                                      "Adt": {
+                                        "name": "std::ptr::NonNull",
+                                        "fields": [
+                                          [
+                                            "pointer",
+                                            {
+                                              "RawPtr": {
+                                                "mutable": false,
+                                                "pointee": "Unit"
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "__v0_formatter",
+                                    {
+                                      "FnPtr": {
+                                        "sig": {
+                                          "params": [
+                                            {
+                                              "Adt": {
+                                                "name": "std::ptr::NonNull",
+                                                "fields": [
+                                                  [
+                                                    "pointer",
+                                                    {
+                                                      "RawPtr": {
+                                                        "mutable": false,
+                                                        "pointee": "Unit"
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            },
+                                            {
+                                              "Ref": {
+                                                "mutable": true,
+                                                "inner": {
+                                                  "Adt": {
+                                                    "name": "std::fmt::Formatter",
+                                                    "fields": [
+                                                      [
+                                                        "options",
+                                                        {
+                                                          "Adt": {
+                                                            "name": "std::fmt::FormattingOptions",
+                                                            "fields": [
+                                                              [
+                                                                "flags",
+                                                                {
+                                                                  "Int": {
+                                                                    "width": 32,
+                                                                    "signed": false
+                                                                  }
+                                                                }
+                                                              ],
+                                                              [
+                                                                "width",
+                                                                {
+                                                                  "Int": {
+                                                                    "width": 16,
+                                                                    "signed": false
+                                                                  }
+                                                                }
+                                                              ],
+                                                              [
+                                                                "precision",
+                                                                {
+                                                                  "Int": {
+                                                                    "width": 16,
+                                                                    "signed": false
+                                                                  }
+                                                                }
+                                                              ]
+                                                            ],
+                                                            "variants": [],
+                                                            "disc_index_safe": false
+                                                          }
+                                                        }
+                                                      ],
+                                                      [
+                                                        "buf",
+                                                        {
+                                                          "Ref": {
+                                                            "mutable": true,
+                                                            "inner": {
+                                                              "Dynamic": {
+                                                                "trait_name": "std::fmt::Write"
+                                                              }
+                                                            }
+                                                          }
+                                                        }
+                                                      ]
+                                                    ],
+                                                    "variants": [],
+                                                    "disc_index_safe": false
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          ],
+                                          "ret": {
+                                            "Adt": {
+                                              "name": "std::result::Result",
+                                              "fields": [
+                                                [
+                                                  "__tag",
+                                                  {
+                                                    "Int": {
+                                                      "width": 64,
+                                                      "signed": true
+                                                    }
+                                                  }
+                                                ],
+                                                [
+                                                  "__v0_0",
+                                                  "Unit"
+                                                ],
+                                                [
+                                                  "__v1_0",
+                                                  {
+                                                    "Adt": {
+                                                      "name": "std::fmt::Error",
+                                                      "fields": [],
+                                                      "variants": [],
+                                                      "disc_index_safe": false
+                                                    }
+                                                  }
+                                                ]
+                                              ],
+                                              "variants": [
+                                                {
+                                                  "name": "Ok",
+                                                  "discriminant": 0,
+                                                  "fields": [
+                                                    [
+                                                      "0",
+                                                      "Unit"
+                                                    ]
+                                                  ]
+                                                },
+                                                {
+                                                  "name": "Err",
+                                                  "discriminant": 1,
+                                                  "fields": [
+                                                    [
+                                                      "0",
+                                                      {
+                                                        "Adt": {
+                                                          "name": "std::fmt::Error",
+                                                          "fields": [],
+                                                          "variants": [],
+                                                          "disc_index_safe": false
+                                                        }
+                                                      }
+                                                    ]
+                                                  ]
+                                                }
+                                              ],
+                                              "disc_index_safe": true
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "__v0__lifetime",
+                                    {
+                                      "Adt": {
+                                        "name": "std::marker::PhantomData",
+                                        "fields": [],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "__v1_0",
+                                    {
+                                      "Int": {
+                                        "width": 16,
+                                        "signed": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [
+                                  {
+                                    "name": "Placeholder",
+                                    "discriminant": 0,
+                                    "fields": [
+                                      [
+                                        "value",
+                                        {
+                                          "Adt": {
+                                            "name": "std::ptr::NonNull",
+                                            "fields": [
+                                              [
+                                                "pointer",
+                                                {
+                                                  "RawPtr": {
+                                                    "mutable": false,
+                                                    "pointee": "Unit"
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      ],
+                                      [
+                                        "formatter",
+                                        {
+                                          "FnPtr": {
+                                            "sig": {
+                                              "params": [
+                                                {
+                                                  "Adt": {
+                                                    "name": "std::ptr::NonNull",
+                                                    "fields": [
+                                                      [
+                                                        "pointer",
+                                                        {
+                                                          "RawPtr": {
+                                                            "mutable": false,
+                                                            "pointee": "Unit"
+                                                          }
+                                                        }
+                                                      ]
+                                                    ],
+                                                    "variants": [],
+                                                    "disc_index_safe": false
+                                                  }
+                                                },
+                                                {
+                                                  "Ref": {
+                                                    "mutable": true,
+                                                    "inner": {
+                                                      "Adt": {
+                                                        "name": "std::fmt::Formatter",
+                                                        "fields": [
+                                                          [
+                                                            "options",
+                                                            {
+                                                              "Adt": {
+                                                                "name": "std::fmt::FormattingOptions",
+                                                                "fields": [
+                                                                  [
+                                                                    "flags",
+                                                                    {
+                                                                      "Int": {
+                                                                        "width": 32,
+                                                                        "signed": false
+                                                                      }
+                                                                    }
+                                                                  ],
+                                                                  [
+                                                                    "width",
+                                                                    {
+                                                                      "Int": {
+                                                                        "width": 16,
+                                                                        "signed": false
+                                                                      }
+                                                                    }
+                                                                  ],
+                                                                  [
+                                                                    "precision",
+                                                                    {
+                                                                      "Int": {
+                                                                        "width": 16,
+                                                                        "signed": false
+                                                                      }
+                                                                    }
+                                                                  ]
+                                                                ],
+                                                                "variants": [],
+                                                                "disc_index_safe": false
+                                                              }
+                                                            }
+                                                          ],
+                                                          [
+                                                            "buf",
+                                                            {
+                                                              "Ref": {
+                                                                "mutable": true,
+                                                                "inner": {
+                                                                  "Dynamic": {
+                                                                    "trait_name": "std::fmt::Write"
+                                                                  }
+                                                                }
+                                                              }
+                                                            }
+                                                          ]
+                                                        ],
+                                                        "variants": [],
+                                                        "disc_index_safe": false
+                                                      }
+                                                    }
+                                                  }
+                                                }
+                                              ],
+                                              "ret": {
+                                                "Adt": {
+                                                  "name": "std::result::Result",
+                                                  "fields": [
+                                                    [
+                                                      "__tag",
+                                                      {
+                                                        "Int": {
+                                                          "width": 64,
+                                                          "signed": true
+                                                        }
+                                                      }
+                                                    ],
+                                                    [
+                                                      "__v0_0",
+                                                      "Unit"
+                                                    ],
+                                                    [
+                                                      "__v1_0",
+                                                      {
+                                                        "Adt": {
+                                                          "name": "std::fmt::Error",
+                                                          "fields": [],
+                                                          "variants": [],
+                                                          "disc_index_safe": false
+                                                        }
+                                                      }
+                                                    ]
+                                                  ],
+                                                  "variants": [
+                                                    {
+                                                      "name": "Ok",
+                                                      "discriminant": 0,
+                                                      "fields": [
+                                                        [
+                                                          "0",
+                                                          "Unit"
+                                                        ]
+                                                      ]
+                                                    },
+                                                    {
+                                                      "name": "Err",
+                                                      "discriminant": 1,
+                                                      "fields": [
+                                                        [
+                                                          "0",
+                                                          {
+                                                            "Adt": {
+                                                              "name": "std::fmt::Error",
+                                                              "fields": [],
+                                                              "variants": [],
+                                                              "disc_index_safe": false
+                                                            }
+                                                          }
+                                                        ]
+                                                      ]
+                                                    }
+                                                  ],
+                                                  "disc_index_safe": true
+                                                }
+                                              }
+                                            }
+                                          }
+                                        }
+                                      ],
+                                      [
+                                        "_lifetime",
+                                        {
+                                          "Adt": {
+                                            "name": "std::marker::PhantomData",
+                                            "fields": [],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      ]
+                                    ]
+                                  },
+                                  {
+                                    "name": "Count",
+                                    "discriminant": 1,
+                                    "fields": [
+                                      [
+                                        "0",
+                                        {
+                                          "Int": {
+                                            "width": 16,
+                                            "signed": false
+                                          }
+                                        }
+                                      ]
+                                    ]
+                                  }
+                                ],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Slice": {
+                "elem": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 3
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ge",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/ptr/const_ptr.rs",
+                "line_start": 717,
+                "col_start": 20,
+                "line_end": 717,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 3,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "core/src/ptr/const_ptr.rs",
+              "line_start": 728,
+              "col_start": 17,
+              "line_end": 728,
+              "col_end": 45
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageDead": 3
+          }
+        ],
+        "terminator": "Return"
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Str": {
+                      "bytes": [
+                        117,
+                        110,
+                        115,
+                        97,
+                        102,
+                        101,
+                        32,
+                        112,
+                        114,
+                        101,
+                        99,
+                        111,
+                        110,
+                        100,
+                        105,
+                        116,
+                        105,
+                        111,
+                        110,
+                        40,
+                        115,
+                        41,
+                        32,
+                        118,
+                        105,
+                        111,
+                        108,
+                        97,
+                        116,
+                        101,
+                        100,
+                        58,
+                        32,
+                        112,
+                        116,
+                        114,
+                        58,
+                        58,
+                        111,
+                        102,
+                        102,
+                        115,
+                        101,
+                        116,
+                        95,
+                        102,
+                        114,
+                        111,
+                        109,
+                        95,
+                        117,
+                        110,
+                        115,
+                        105,
+                        103,
+                        110,
+                        101,
+                        100,
+                        32,
+                        114,
+                        101,
+                        113,
+                        117,
+                        105,
+                        114,
+                        101,
+                        115,
+                        32,
+                        96,
+                        115,
+                        101,
+                        108,
+                        102,
+                        32,
+                        62,
+                        61,
+                        32,
+                        111,
+                        114,
+                        105,
+                        103,
+                        105,
+                        110,
+                        96,
+                        10,
+                        10,
+                        84,
+                        104,
+                        105,
+                        115,
+                        32,
+                        105,
+                        110,
+                        100,
+                        105,
+                        99,
+                        97,
+                        116,
+                        101,
+                        115,
+                        32,
+                        97,
+                        32,
+                        98,
+                        117,
+                        103,
+                        32,
+                        105,
+                        110,
+                        32,
+                        116,
+                        104,
+                        101,
+                        32,
+                        112,
+                        114,
+                        111,
+                        103,
+                        114,
+                        97,
+                        109,
+                        46,
+                        32,
+                        84,
+                        104,
+                        105,
+                        115,
+                        32,
+                        85,
+                        110,
+                        100,
+                        101,
+                        102,
+                        105,
+                        110,
+                        101,
+                        100,
+                        32,
+                        66,
+                        101,
+                        104,
+                        97,
+                        118,
+                        105,
+                        111,
+                        114,
+                        32,
+                        99,
+                        104,
+                        101,
+                        99,
+                        107,
+                        32,
+                        105,
+                        115,
+                        32,
+                        111,
+                        112,
+                        116,
+                        105,
+                        111,
+                        110,
+                        97,
+                        108,
+                        44,
+                        32,
+                        97,
+                        110,
+                        100,
+                        32,
+                        99,
+                        97,
+                        110,
+                        110,
+                        111,
+                        116,
+                        32,
+                        98,
+                        101,
+                        32,
+                        114,
+                        101,
+                        108,
+                        105,
+                        101,
+                        100,
+                        32,
+                        111,
+                        110,
+                        32,
+                        102,
+                        111,
+                        114,
+                        32,
+                        115,
+                        97,
+                        102,
+                        101,
+                        116,
+                        121,
+                        46
+                      ]
+                    }
+                  }
+                }
+              },
+              "span": {
+                "file": "core/src/ub_checks.rs",
+                "line_start": 70,
+                "col_start": 30,
+                "line_end": 72,
+                "col_end": 104
+              }
+            }
+          },
+          {
+            "StorageLive": 6
+          },
+          {
+            "StorageLive": 7
+          },
+          {
+            "StorageLive": 8
+          },
+          {
+            "StorageLive": 13
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "AddressOf": [
+                  false,
+                  {
+                    "local": 4,
+                    "projections": [
+                      "Deref"
+                    ]
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/str/mod.rs",
+                "line_start": 590,
+                "col_start": 8,
+                "line_end": 590,
+                "col_end": 12
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 13,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "RawPtr": {
+                      "mutable": false,
+                      "pointee": {
+                        "Int": {
+                          "width": 8,
+                          "signed": false
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/str/mod.rs",
+                "line_start": 590,
+                "col_start": 8,
+                "line_end": 590,
+                "col_end": 39
+              }
+            }
+          },
+          {
+            "StorageDead": 13
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Adt": {
+                      "name": "std::ptr::NonNull",
+                      "fields": [
+                        [
+                          "pointer",
+                          {
+                            "RawPtr": {
+                              "mutable": false,
+                              "pointee": {
+                                "Int": {
+                                  "width": 8,
+                                  "signed": false
+                                }
+                              }
+                            }
+                          }
+                        ]
+                      ],
+                      "variants": [],
+                      "disc_index_safe": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/fmt/mod.rs",
+                "line_start": 819,
+                "col_start": 26,
+                "line_end": 819,
+                "col_end": 52
+              }
+            }
+          },
+          {
+            "StorageDead": 8
+          },
+          {
+            "StorageLive": 9
+          },
+          {
+            "StorageLive": 10
+          },
+          {
+            "StorageLive": 11
+          },
+          {
+            "StorageLive": 12
+          },
+          {
+            "StorageLive": 14
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Constant": {
+                      "Str": {
+                        "bytes": [
+                          117,
+                          110,
+                          115,
+                          97,
+                          102,
+                          101,
+                          32,
+                          112,
+                          114,
+                          101,
+                          99,
+                          111,
+                          110,
+                          100,
+                          105,
+                          116,
+                          105,
+                          111,
+                          110,
+                          40,
+                          115,
+                          41,
+                          32,
+                          118,
+                          105,
+                          111,
+                          108,
+                          97,
+                          116,
+                          101,
+                          100,
+                          58,
+                          32,
+                          112,
+                          116,
+                          114,
+                          58,
+                          58,
+                          111,
+                          102,
+                          102,
+                          115,
+                          101,
+                          116,
+                          95,
+                          102,
+                          114,
+                          111,
+                          109,
+                          95,
+                          117,
+                          110,
+                          115,
+                          105,
+                          103,
+                          110,
+                          101,
+                          100,
+                          32,
+                          114,
+                          101,
+                          113,
+                          117,
+                          105,
+                          114,
+                          101,
+                          115,
+                          32,
+                          96,
+                          115,
+                          101,
+                          108,
+                          102,
+                          32,
+                          62,
+                          61,
+                          32,
+                          111,
+                          114,
+                          105,
+                          103,
+                          105,
+                          110,
+                          96,
+                          10,
+                          10,
+                          84,
+                          104,
+                          105,
+                          115,
+                          32,
+                          105,
+                          110,
+                          100,
+                          105,
+                          99,
+                          97,
+                          116,
+                          101,
+                          115,
+                          32,
+                          97,
+                          32,
+                          98,
+                          117,
+                          103,
+                          32,
+                          105,
+                          110,
+                          32,
+                          116,
+                          104,
+                          101,
+                          32,
+                          112,
+                          114,
+                          111,
+                          103,
+                          114,
+                          97,
+                          109,
+                          46,
+                          32,
+                          84,
+                          104,
+                          105,
+                          115,
+                          32,
+                          85,
+                          110,
+                          100,
+                          101,
+                          102,
+                          105,
+                          110,
+                          101,
+                          100,
+                          32,
+                          66,
+                          101,
+                          104,
+                          97,
+                          118,
+                          105,
+                          111,
+                          114,
+                          32,
+                          99,
+                          104,
+                          101,
+                          99,
+                          107,
+                          32,
+                          105,
+                          115,
+                          32,
+                          111,
+                          112,
+                          116,
+                          105,
+                          111,
+                          110,
+                          97,
+                          108,
+                          44,
+                          32,
+                          97,
+                          110,
+                          100,
+                          32,
+                          99,
+                          97,
+                          110,
+                          110,
+                          111,
+                          116,
+                          32,
+                          98,
+                          101,
+                          32,
+                          114,
+                          101,
+                          108,
+                          105,
+                          101,
+                          100,
+                          32,
+                          111,
+                          110,
+                          32,
+                          102,
+                          111,
+                          114,
+                          32,
+                          115,
+                          97,
+                          102,
+                          101,
+                          116,
+                          121,
+                          46
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "Ref": {
+                      "mutable": false,
+                      "inner": {
+                        "Slice": {
+                          "elem": {
+                            "Int": {
+                              "width": 8,
+                              "signed": false
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/str/mod.rs",
+                "line_start": 515,
+                "col_start": 17,
+                "line_end": 515,
+                "col_end": 37
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "PtrMetadata",
+                  {
+                    "Copy": {
+                      "local": 14,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/str/mod.rs",
+                "line_start": 155,
+                "col_start": 8,
+                "line_end": 155,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "StorageDead": 14
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Shl",
+                  {
+                    "Move": {
+                      "local": 12,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 1
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/fmt/mod.rs",
+                "line_start": 820,
+                "col_start": 37,
+                "line_end": 820,
+                "col_end": 49
+              }
+            }
+          },
+          {
+            "StorageDead": 12
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitOr",
+                  {
+                    "Move": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "core/src/fmt/mod.rs",
+                "line_start": 820,
+                "col_start": 37,
+                "line_end": 820,
+                "col_end": 53
+              }
+            }
+          },
+          {
+            "StorageDead": 11
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Unsupported": {
+                  "kind": "CastKind::Transmute",
+                  "detail": "transmute to std::ptr::NonNull<core::fmt::rt::Argument<'{erased}>> requires layout compatibility and validity-invariant proof; refusing to model it as a value-preserving cast",
+                  "operands": [
+                    {
+                      "Move": {
+                        "local": 10,
+                        "projections": []
+                      }
+                    }
+                  ]
+                }
+              },
+              "span": {
+                "file": "core/src/fmt/mod.rs",
+                "line_start": 820,
+                "col_start": 22,
+                "line_end": 820,
+                "col_end": 54
+              }
+            }
+          },
+          {
+            "StorageDead": 10
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "std::fmt::Arguments",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 7,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 9,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "core/src/fmt/mod.rs",
+                "line_start": 818,
+                "col_start": 12,
+                "line_end": 821,
+                "col_end": 13
+              }
+            }
+          },
+          {
+            "StorageDead": 9
+          },
+          {
+            "StorageDead": 7
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::panicking::panic_nounwind_fmt",
+            "args": [
+              {
+                "Move": {
+                  "local": 6,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Bool": false
+                }
+              }
+            ],
+            "dest": {
+              "local": 5,
+              "projections": []
+            },
+            "target": null,
+            "span": {
+              "file": "core/src/ub_checks.rs",
+              "line_start": 73,
+              "col_start": 20,
+              "line_end": 73,
+              "col_end": 103
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

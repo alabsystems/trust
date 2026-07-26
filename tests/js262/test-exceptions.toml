@@ -1,0 +1,98 @@
+# Per-test exception ledger for the js262 calibration gate.
+# Clones the discipline of tests/upstream-rust/test-exceptions.toml
+# (docs/design/2026-07-20-trustjs-m0-scope.md, D5).
+#
+# Every exception row is an EXPIRING, reviewed waiver for one test in one
+# suite. Mandatory fields per entry:
+#   id           unique ledger id ("js262.<area>.<slug>")
+#   test_id      stable test identity ("<suite>::<path>")
+#   suite        the suite the test belongs to (e.g. "js262.s0")
+#   path         corpus-relative test path ("test/...js")
+#   kind         exception kind (e.g. "trace_divergence", "harness_limit",
+#                "engine_timeout")
+#   status       "active" | "retired"
+#   owner        who signed off
+#   reason       why the waiver exists (specific, not "flaky")
+#   issue        tracking issue link
+#   reviewed_on  YYYY-MM-DD of the last review
+#   expires_on   YYYY-MM-DD hard expiry
+#
+# Fail-closed expiry rule: the gate validates against
+# TRUST_JS262_VALIDATION_DATE (env, YYYY-MM-DD; default = today). Any entry
+# with status = "active" and expires_on <= the validation date makes the gate
+# exit 1. There is no grace period and no auto-renewal: an expired waiver is
+# re-reviewed and re-dated, or the underlying failure is fixed.
+#
+# Category-level blanket waivers are not permitted — break them into
+# per-test entries. `projection_too_strong` divergences may NOT be waived
+# here at all; they are harness bugs (see divergence-audit.toml).
+#
+# Author: Andrew Yates
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+schema_version = "0.1.0"
+[[exceptions]]
+id = "js262-rgi-emoji-node-timeout"
+test_id = "built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji"
+suite = "js262"
+path = "test/built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji.js"
+kind = "engine_timeout"
+status = "active"
+owner = "ayates"
+reason = "Node v24.5.0 (V8) takes >5 minutes to build the RGI_Emoji `v`-flag string-property character class (measured 2026-07-21, >300s vs Bun <2s); the run is excepted rather than raising the global timeout past any useful bound"
+issue = "tests/js262/dashboard.md#harness-errors"
+reviewed_on = "2026-07-21"
+expires_on = "2026-10-19"
+
+
+[[exceptions]]
+id = "js262-check-abort--using-invalid-objectbindingpattern-after-bindingidentifier"
+test_id = "language/statements/using/syntax/using-invalid-objectbindingpattern-after-bindingidentifier"
+suite = "js262"
+path = "test/language/statements/using/syntax/using-invalid-objectbindingpattern-after-bindingidentifier.js"
+kind = "harness_limit"
+status = "active"
+owner = "ayates"
+reason = "node --check (v24.5.0) aborts with a C++ fatal error (std::string node::G...) instead of reporting the mandated SyntaxError on this invalid `using` destructuring form; the parse-verdict oracle cannot classify a crashed oracle. trust-js-parse rejects per spec (corpus negative:parse confirms)"
+issue = "tests/js262/dashboard.md#parse-verdict-oracle-errors"
+reviewed_on = "2026-07-21"
+expires_on = "2026-10-19"
+
+[[exceptions]]
+id = "js262-check-abort--using-invalid-arraybindingpattern-after-bindingidentifier"
+test_id = "language/statements/using/syntax/using-invalid-arraybindingpattern-after-bindingidentifier"
+suite = "js262"
+path = "test/language/statements/using/syntax/using-invalid-arraybindingpattern-after-bindingidentifier.js"
+kind = "harness_limit"
+status = "active"
+owner = "ayates"
+reason = "node --check (v24.5.0) aborts with a C++ fatal error (std::string node::G...) instead of reporting the mandated SyntaxError on this invalid `using` destructuring form; the parse-verdict oracle cannot classify a crashed oracle. trust-js-parse rejects per spec (corpus negative:parse confirms)"
+issue = "tests/js262/dashboard.md#parse-verdict-oracle-errors"
+reviewed_on = "2026-07-21"
+expires_on = "2026-10-19"
+
+[[exceptions]]
+id = "js262-check-abort--await-using-invalid-objectbindingpattern-after-bindingidentifier"
+test_id = "language/statements/await-using/syntax/await-using-invalid-objectbindingpattern-after-bindingidentifier"
+suite = "js262"
+path = "test/language/statements/await-using/syntax/await-using-invalid-objectbindingpattern-after-bindingidentifier.js"
+kind = "harness_limit"
+status = "active"
+owner = "ayates"
+reason = "node --check (v24.5.0) aborts with a C++ fatal error (std::string node::G...) instead of reporting the mandated SyntaxError on this invalid `using` destructuring form; the parse-verdict oracle cannot classify a crashed oracle. trust-js-parse rejects per spec (corpus negative:parse confirms)"
+issue = "tests/js262/dashboard.md#parse-verdict-oracle-errors"
+reviewed_on = "2026-07-21"
+expires_on = "2026-10-19"
+
+[[exceptions]]
+id = "js262-check-abort--await-using-invalid-arraybindingpattern-after-bindingidentifier"
+test_id = "language/statements/await-using/syntax/await-using-invalid-arraybindingpattern-after-bindingidentifier"
+suite = "js262"
+path = "test/language/statements/await-using/syntax/await-using-invalid-arraybindingpattern-after-bindingidentifier.js"
+kind = "harness_limit"
+status = "active"
+owner = "ayates"
+reason = "node --check (v24.5.0) aborts with a C++ fatal error (std::string node::G...) instead of reporting the mandated SyntaxError on this invalid `using` destructuring form; the parse-verdict oracle cannot classify a crashed oracle. trust-js-parse rejects per spec (corpus negative:parse confirms)"
+issue = "tests/js262/dashboard.md#parse-verdict-oracle-errors"
+reviewed_on = "2026-07-21"
+expires_on = "2026-10-19"

@@ -1,0 +1,11 @@
+error: Clean island source order is ambiguous because island spans are equal or overlap
+  --> $DIR/clean-island-collapsed-order.rs:12:1
+   |
+LL | emit_collapsed_clean_islands!();
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: stateful Clean checking requires one unambiguous authored order; macro-collapsed spans are rejected rather than ordered by DefId or HIR inventory order
+   = note: this error originates in the macro `emit_collapsed_clean_islands` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: aborting due to 1 previous error
+

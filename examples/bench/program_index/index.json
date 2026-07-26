@@ -1,0 +1,1887 @@
+{
+  "schema": "trust.compile-verify-program-index.v1",
+  "version": 2,
+  "description": "Single-file compile/verify benchmark corpus for upstream rustc, tRust noverify, explicit tRust LLVM, tRust verification, and experimental trust-cg slots.",
+  "slot_model": {
+    "upstream-rustc": {
+      "mode": "compile",
+      "fallback_binary": "rustc",
+      "flawed_program_policy": "compile_success",
+      "notes": "Rust baseline compile/codegen slot. Flawed programs are expected to compile because the bugs are semantic proof obligations."
+    },
+    "trust-noverify": {
+      "mode": "compile",
+      "fallback_binary": "trustc",
+      "flawed_program_policy": "compile_success",
+      "notes": "Trust compiler with -Z trust-verify=off. This is the verifier-disabled compile/codegen comparison slot."
+    },
+    "llvm": {
+      "mode": "compile",
+      "fallback_binary": "trustc",
+      "flawed_program_policy": "compile_success",
+      "notes": "Trust compiler with -Z trust-verify=off and -Z codegen-backend=llvm. This forces the production LLVM backend for explicit LLVM-vs-trust-cg parity comparisons."
+    },
+    "trust-verify": {
+      "mode": "verify",
+      "fallback_binary": "trustc",
+      "flawed_program_policy": "verification_failure",
+      "notes": "Trust compiler with native verification JSON transport. Good programs should prove; flawed programs should emit failed obligations."
+    },
+    "trust-cg": {
+      "mode": "compile",
+      "fallback_binary": "trustc",
+      "flawed_program_policy": "compile_success",
+      "notes": "Trust compiler with -Z trust-verify=off and -Z codegen-backend=trust_cg. trust-cg is experimental and report-only by default."
+    }
+  },
+  "trust_cg_exception_model": {
+    "schema": "trust.compile-verify-program-index.trust_cg-exceptions.v1",
+    "default_mode": "report",
+    "enforce_mode": "fail",
+    "classes": [
+      {
+        "id": "missing_backend",
+        "meaning": "The selected Trust sysroot has no rustc_codegen_trust_cg backend or the selected compiler rejects the trust-cg backend flag.",
+        "report_mode_outcome": "excepted",
+        "enforce_mode_outcome": "failed"
+      },
+      {
+        "id": "pipeline_emit_failure",
+        "meaning": "trust-cg was selected, but lowering, verification, optimization, register allocation, or object emission failed before producing an object.",
+        "report_mode_outcome": "excepted",
+        "enforce_mode_outcome": "failed"
+      },
+      {
+        "id": "link_or_runtime_surface",
+        "meaning": "trust-cg reached native linkage/runtime machinery that the compile-only benchmark does not execute by default.",
+        "report_mode_outcome": "excepted",
+        "enforce_mode_outcome": "failed"
+      },
+      {
+        "id": "unknown_trust_cg_failure",
+        "meaning": "trust-cg failed for a reason that was not recognized by the runner classifier.",
+        "report_mode_outcome": "excepted",
+        "enforce_mode_outcome": "failed"
+      }
+    ]
+  },
+  "suite_evidence_model": {
+    "schema": "trust.compile-verify-program-index.suite-evidence.v1",
+    "gating_suites": ["proof-design"],
+    "candidate_suites": ["proof-design-candidates"],
+    "domination_policy": {
+      "proof-design": {
+        "evidence_class": "admissible_gating",
+        "candidate_rows_allowed": false,
+        "candidate_evidence": false,
+        "admissible_for_domination": true
+      },
+      "proof-design-candidates": {
+        "evidence_class": "candidate_non_gating",
+        "candidate_rows_allowed": true,
+        "candidate_evidence": true,
+        "admissible_for_domination": false
+      }
+    }
+  },
+  "coverage_model": {
+    "schema": "trust.compile-verify-program-index.coverage.v1",
+    "known_program_policy": "Every benchmark program is explicitly paired as a known-good or known-flawed variant. Compile slots should accept both variants; the trust-verify slot should prove known-good variants and reject known-flawed variants.",
+    "tiers": [
+      {
+        "id": "simple-classics",
+        "description": "Algorithmic examples that exercise realistic control flow and indexing before verification-specific safety kernels.",
+        "pair_ids": [
+          "hello_world",
+          "leetcode_two_sum",
+          "leetcode_valid_parentheses",
+          "binary_search",
+          "midpoint",
+          "statistics"
+        ]
+      },
+      {
+        "id": "verification-targeted",
+        "description": "Focused safety obligations used to measure verifier and backend behavior with direct good/flawed counterparts.",
+        "suites": ["l0-safety", "proof-design"]
+      },
+      {
+        "id": "proof-design-candidates",
+        "description": "Formatter-free low-cost candidate pairs that extend proof-design coverage into ADTs, iterators, borrowing, and recursion before they become release gates.",
+        "suite": "proof-design-candidates",
+        "pair_ids": [
+          "candidate_option_result",
+          "candidate_iterator_bounds",
+          "candidate_stack_invariant",
+          "candidate_borrow_transfer",
+          "candidate_recursion_termination"
+        ]
+      },
+      {
+        "id": "adversarial-targets",
+        "description": "Known-good/known-flawed adversarial pairs organized by verifier behavior target. These rows are deliberately not greenwashed: every current trust-verify deviation is tied to a named expected gap.",
+        "suite": "adversarial",
+        "target_groups": [
+          {
+            "id": "path",
+            "description": "Path-sensitive branch predicates and short-circuit guard preservation.",
+            "pair_ids": ["adversarial_path_guard"],
+            "expected_gap_ids": ["trust-verify-adversarial-path-guard-gap"]
+          },
+          {
+            "id": "loop",
+            "description": "Loop-carried slice bounds and termination/invariant proof strength.",
+            "pair_ids": ["adversarial_loop_bounds"],
+            "expected_gap_ids": ["trust-verify-adversarial-loop-bounds-gap"]
+          },
+          {
+            "id": "interprocedural",
+            "description": "Callee summaries that must preserve preconditions across helper calls.",
+            "pair_ids": ["adversarial_interprocedural_summary"],
+            "expected_gap_ids": ["trust-verify-adversarial-interprocedural-summary-gap"]
+          },
+          {
+            "id": "data-model",
+            "description": "Enum/struct state agreement and ADT invariant modeling.",
+            "pair_ids": ["adversarial_data_model_state"],
+            "expected_gap_ids": ["trust-verify-adversarial-data-model-state-gap"]
+          },
+          {
+            "id": "memory-fat-pointer-provenance",
+            "description": "Slice fat-pointer metadata, raw pointer bounds, and provenance-sensitive reads.",
+            "pair_ids": ["adversarial_memory_provenance"],
+            "expected_gap_ids": ["trust-verify-adversarial-memory-provenance-gap"]
+          },
+          {
+            "id": "std-format",
+            "description": "Formatter and allocation-heavy std surfaces kept separate from formatter-free fixtures.",
+            "pair_ids": ["adversarial_format_bridge"],
+            "expected_gap_ids": ["trust-verify-adversarial-format-bridge-gap"]
+          },
+          {
+            "id": "backprop-proof-strengthening",
+            "description": "Flawed rows that should produce a counterexample or repair candidate for strengthening a missing guard.",
+            "pair_ids": ["adversarial_backprop_strengthening"],
+            "expected_gap_ids": ["trust-verify-adversarial-backprop-strengthening-gap"]
+          }
+        ]
+      }
+    ]
+  },
+  "expectation_model": {
+    "schema": "trust.compile-verify-program-index.expectations.v1",
+    "purpose": "Declarative expected outcomes for compile, verify, runtime parity, backward-pass/backprop, LLVM, trust-cg, and documented exception accounting. This is fixture metadata, not runner code.",
+    "default_by_variant": {
+      "good": {
+        "rust_parity": {"compile": "pass", "runtime": "parity_when_executed"},
+        "trust_verify": {"expected": "verify_pass"},
+        "backward_pass": {"expected": "no_repair_needed"},
+        "llvm": {"compile": "pass", "execution": "parity_when_executed"},
+        "trust-cg": {"compile": "pass_or_report_mode_exception", "execution": "parity_when_emit_ready", "documented_exception_hooks": ["trust_cg_exception_model"]}
+      },
+      "flawed": {
+        "rust_parity": {"compile": "pass", "runtime": "parity_when_executed"},
+        "trust_verify": {"expected": "verify_fail"},
+        "backward_pass": {"expected": "counterexample_or_repair_candidate"},
+        "llvm": {"compile": "pass", "execution": "parity_when_executed"},
+        "trust-cg": {"compile": "pass_or_report_mode_exception", "execution": "parity_when_emit_ready", "documented_exception_hooks": ["trust_cg_exception_model"]}
+      }
+    },
+    "program_exception_hooks": {
+      "all.good": ["trust-verify-formatter-adt-modeling"],
+      "binary_search.flawed": ["trust-verify-zani-runtime-checked-complex-flawed-demos"],
+      "statistics.flawed": ["trust-verify-zani-runtime-checked-complex-flawed-demos"],
+      "hello_world.flawed": ["trust-verify-hello-world-flawed-formatter-const-gap"],
+      "leetcode_two_sum.good": ["trust-verify-leetcode-two-sum-loop-gap"],
+      "leetcode_two_sum.flawed": ["trust-verify-leetcode-two-sum-loop-gap"],
+      "leetcode_valid_parentheses.good": ["trust-verify-leetcode-valid-parentheses-loop-gap"],
+      "leetcode_valid_parentheses.flawed": ["trust-verify-leetcode-valid-parentheses-loop-gap"],
+      "proof_assertion.good": ["trust-verify-proof-assertion-const-gap"],
+      "proof_assertion.flawed": ["trust-verify-proof-assertion-const-gap"],
+      "proof_mul_overflow.good": ["trust-verify-proof-mul-overflow-runtime-checked-gap"],
+      "proof_mul_overflow.flawed": ["trust-verify-proof-mul-overflow-flawed-timeout-gap"],
+      "proof_slice_oob.good": ["trust-verify-proof-slice-unsize-gap"],
+      "proof_unreachable.good": ["trust-verify-proof-unreachable-zani-gap"],
+      "proof_unreachable.flawed": ["trust-verify-proof-unreachable-zani-gap"],
+      "candidate_option_result.good": ["trust-verify-candidate-adt-modeling-gap"],
+      "candidate_option_result.flawed": ["trust-verify-candidate-adt-modeling-gap"],
+      "candidate_stack_invariant.good": ["trust-verify-candidate-adt-modeling-gap"],
+      "candidate_stack_invariant.flawed": ["trust-verify-candidate-adt-modeling-gap"],
+      "candidate_iterator_bounds.good": ["trust-verify-candidate-iterator-slice-gap"],
+      "candidate_iterator_bounds.flawed": ["trust-verify-candidate-iterator-slice-gap"],
+      "candidate_recursion_termination.good": ["trust-verify-candidate-recursion-termination-gap"],
+      "candidate_recursion_termination.flawed": ["trust-verify-candidate-recursion-termination-gap"],
+      "adversarial_path_guard.good": ["trust-verify-adversarial-path-guard-gap"],
+      "adversarial_path_guard.flawed": ["trust-verify-adversarial-path-guard-gap"],
+      "adversarial_loop_bounds.good": ["trust-verify-adversarial-loop-bounds-gap"],
+      "adversarial_loop_bounds.flawed": ["trust-verify-adversarial-loop-bounds-gap"],
+      "adversarial_interprocedural_summary.good": ["trust-verify-adversarial-interprocedural-summary-gap"],
+      "adversarial_interprocedural_summary.flawed": ["trust-verify-adversarial-interprocedural-summary-gap"],
+      "adversarial_data_model_state.good": ["trust-verify-adversarial-data-model-state-gap"],
+      "adversarial_data_model_state.flawed": ["trust-verify-adversarial-data-model-state-gap"],
+      "adversarial_memory_provenance.good": ["trust-verify-adversarial-memory-provenance-gap"],
+      "adversarial_memory_provenance.flawed": ["trust-verify-adversarial-memory-provenance-gap"],
+      "adversarial_format_bridge.good": ["trust-verify-adversarial-format-bridge-gap"],
+      "adversarial_format_bridge.flawed": ["trust-verify-adversarial-format-bridge-gap"],
+      "adversarial_backprop_strengthening.good": ["trust-verify-adversarial-backprop-strengthening-gap"],
+      "adversarial_backprop_strengthening.flawed": ["trust-verify-adversarial-backprop-strengthening-gap"],
+      "assertion.good": ["trust-verify-assertion-good-path-condition-gap"],
+      "float_overflow.good": ["trust-verify-float-overflow-good-float-range-gap"],
+      "mul_overflow.flawed": ["trust-verify-mul-overflow-flawed-formatter-timeout-gap"],
+      "unreachable.flawed": ["trust-verify-unreachable-flawed-runtime-checked-gap"]
+    },
+    "exception_hook_policy": "Every non-trust-cg exception to these expectations must be named in expected_known_gaps and referenced here. trust-cg exceptions are represented by trust_cg_exception_model classes."
+  },
+  "expected_known_gaps": [
+    {
+      "id": "trust-verify-adversarial-path-guard-gap",
+      "slot": "trust-verify",
+      "program_ids": [
+        "adversarial_path_guard.good",
+        "adversarial_path_guard.flawed"
+      ],
+      "observed": ["verify_inconclusive", "verify_fail", "timeout"],
+      "stderr_contains_any": [
+        "adversarial_path_guard",
+        "\"kind\":\"division_by_zero\"",
+        "path_condition"
+      ],
+      "reason": "Adversarial path guard rows document the current need for proof-grade path predicate preservation before the good variant can be a release gate or the flawed variant can require repair evidence."
+    },
+    {
+      "id": "trust-verify-adversarial-loop-bounds-gap",
+      "slot": "trust-verify",
+      "program_ids": [
+        "adversarial_loop_bounds.good",
+        "adversarial_loop_bounds.flawed"
+      ],
+      "observed": ["verify_inconclusive", "verify_fail", "timeout"],
+      "stderr_contains_any": [
+        "adversarial_loop_bounds",
+        "\"kind\":\"termination\"",
+        "MIR router has no proof-grade zani encoding"
+      ],
+      "reason": "Adversarial loop rows require loop-carried slice-bound invariants and termination evidence; current zani/MIR transport can leave these obligations unknown or runtime-checked."
+    },
+    {
+      "id": "trust-verify-adversarial-interprocedural-summary-gap",
+      "slot": "trust-verify",
+      "program_ids": [
+        "adversarial_interprocedural_summary.good",
+        "adversarial_interprocedural_summary.flawed"
+      ],
+      "observed": ["verify_inconclusive", "verify_fail", "timeout"],
+      "stderr_contains_any": [
+        "adversarial_interprocedural_summary",
+        "interprocedural_summary",
+        "\"kind\":\"division_by_zero\""
+      ],
+      "reason": "Adversarial interprocedural rows require helper summaries to preserve denominator preconditions across calls before they can become hard gates."
+    },
+    {
+      "id": "trust-verify-adversarial-data-model-state-gap",
+      "slot": "trust-verify",
+      "program_ids": [
+        "adversarial_data_model_state.good",
+        "adversarial_data_model_state.flawed"
+      ],
+      "observed": ["verify_inconclusive", "verify_fail", "timeout"],
+      "stderr_contains_any": [
+        "adversarial_data_model_state",
+        "unsupported MIR `TyKind::Adt`",
+        "\"kind\":\"unreach\""
+      ],
+      "reason": "Adversarial data-model rows intentionally require enum tag and struct-state reasoning that is not yet consistently proof-grade in the native verifier."
+    },
+    {
+      "id": "trust-verify-adversarial-memory-provenance-gap",
+      "slot": "trust-verify",
+      "program_ids": [
+        "adversarial_memory_provenance.good",
+        "adversarial_memory_provenance.flawed"
+      ],
+      "observed": ["verify_inconclusive", "verify_fail", "timeout"],
+      "stderr_contains_any": [
+        "adversarial_memory_provenance",
+        "PointerCoercion::Unsize",
+        "unsupported MIR"
+      ],
+      "reason": "Adversarial memory rows exercise slice fat-pointer metadata and raw-pointer provenance, which remain documented verifier modeling gaps rather than hidden green rows."
+    },
+    {
+      "id": "trust-verify-adversarial-format-bridge-gap",
+      "slot": "trust-verify",
+      "program_ids": [
+        "adversarial_format_bridge.good",
+        "adversarial_format_bridge.flawed"
+      ],
+      "observed": ["verify_inconclusive", "verify_fail", "timeout"],
+      "stderr_contains_any": [
+        "adversarial_format_bridge",
+        "core::fmt::rt::ArgumentType",
+        "unsupported MIR `TyKind::Adt`"
+      ],
+      "reason": "Adversarial std/format rows deliberately cross allocation and formatter MIR so formatter-heavy proof gaps remain accounted separately from formatter-free fixtures."
+    },
+    {
+      "id": "trust-verify-adversarial-backprop-strengthening-gap",
+      "slot": "trust-verify",
+      "program_ids": [
+        "adversarial_backprop_strengthening.good",
+        "adversarial_backprop_strengthening.flawed"
+      ],
+      "observed": ["verify_inconclusive", "verify_fail", "timeout"],
+      "stderr_contains_any": [
+        "adversarial_backprop_strengthening",
+        "\"kind\":\"division_by_zero\"",
+        "counterexample"
+      ],
+      "reason": "Adversarial backprop rows keep a missing-guard repair target visible until verifier transport reliably carries counterexample or repair-candidate payloads with source attribution."
+    },
+    {
+      "id": "trust-verify-formatter-adt-modeling",
+      "slot": "trust-verify",
+      "variants": ["good"],
+      "observed": ["verify_inconclusive"],
+      "stderr_contains_any": ["unsupported MIR `TyKind::Adt`", "core::fmt::rt::ArgumentType"],
+      "reason": "Current verifier ADT modeling does not fully cover formatter machinery reached by println!-based example mains."
+    },
+    {
+      "id": "trust-verify-zani-runtime-checked-complex-flawed-demos",
+      "slot": "trust-verify",
+      "pair_ids": ["binary_search", "statistics"],
+      "variants": ["flawed"],
+      "observed": ["verify_inconclusive"],
+      "transport_min": {
+        "runtime_checked": 1
+      },
+      "reason": "Current zani/MIR bridge leaves complex slice/loop obligations runtime-checked instead of producing proof-grade failed obligations for these flawed demos."
+    },
+    {
+      "id": "trust-verify-leetcode-two-sum-loop-gap",
+      "slot": "trust-verify",
+      "program_ids": ["leetcode_two_sum.good", "leetcode_two_sum.flawed"],
+      "observed": ["verify_inconclusive"],
+      "stderr_contains_all": [
+        "leetcode_two_sum_",
+        "MIR router has no proof-grade zani encoding"
+      ],
+      "transport_min": {
+        "runtime_checked": 1,
+        "unknown": 1
+      },
+      "reason": "Current zani/MIR bridge leaves the nested-loop two-sum bounds, addition, and termination obligations runtime-checked or unknown instead of proving the guarded variant and rejecting the unchecked variant."
+    },
+    {
+      "id": "trust-verify-leetcode-valid-parentheses-loop-gap",
+      "slot": "trust-verify",
+      "program_ids": [
+        "leetcode_valid_parentheses.good",
+        "leetcode_valid_parentheses.flawed"
+      ],
+      "observed": ["verify_inconclusive"],
+      "stderr_contains_all": [
+        "leetcode_valid_parentheses_",
+        "MIR router has no proof-grade zani encoding"
+      ],
+      "transport_min": {
+        "runtime_checked": 1,
+        "unknown": 1
+      },
+      "reason": "Current zani/MIR bridge leaves the loop-backed stack bounds, stack pop, and termination obligations runtime-checked or unknown instead of proving the guarded parser and rejecting the unchecked pop."
+    },
+    {
+      "id": "trust-verify-hello-world-flawed-formatter-const-gap",
+      "slot": "trust-verify",
+      "program_id": "hello_world.flawed",
+      "observed": ["verify_inconclusive"],
+      "stderr_contains_all": [
+        "hello_world_flawed.rs",
+        "unsupported MIR `TyKind::Adt`",
+        "unsupported MIR `Const`"
+      ],
+      "transport_min": {
+        "unknown": 1
+      },
+      "reason": "Current verifier stops on hello-world formatter/string MIR and assertion macro constants before reaching the intentionally unguarded assertion helper; this keeps the flawed hello-world fixture visible as a proof gap."
+    },
+    {
+      "id": "trust-verify-proof-assertion-const-gap",
+      "slot": "trust-verify",
+      "program_ids": ["proof_assertion.good", "proof_assertion.flawed"],
+      "observed": ["verify_inconclusive"],
+      "stderr_contains_all": [
+        "proof_assertion_",
+        "unsupported MIR `Const`"
+      ],
+      "transport_min": {
+        "unknown": 1
+      },
+      "reason": "Current verifier models the proof-design assertion helpers but stops on assertion macro string constants before proving the guarded variant or rejecting the unguarded variant."
+    },
+    {
+      "id": "trust-verify-proof-mul-overflow-runtime-checked-gap",
+      "slot": "trust-verify",
+      "program_id": "proof_mul_overflow.good",
+      "observed": ["verify_inconclusive"],
+      "stderr_contains_all": [
+        "proof_mul_overflow_good.rs",
+        "\"kind\":\"overflow:mul\"",
+        "\"outcome\":\"runtime_checked\""
+      ],
+      "transport_min": {
+        "runtime_checked": 1
+      },
+      "reason": "Current solver returns unknown for the guarded proof-design multiplication bound and leaves the obligation runtime-checked instead of proof-discharged."
+    },
+    {
+      "id": "trust-verify-proof-mul-overflow-flawed-timeout-gap",
+      "slot": "trust-verify",
+      "program_id": "proof_mul_overflow.flawed",
+      "observed": ["timeout"],
+      "stderr_contains_all": [
+        "\"function\":\"main\"",
+        "\"total\":0"
+      ],
+      "reason": "Current verifier times out on the unconstrained proof-design multiplication-overflow helper before producing the expected failed obligation."
+    },
+    {
+      "id": "trust-verify-proof-slice-unsize-gap",
+      "slot": "trust-verify",
+      "program_id": "proof_slice_oob.good",
+      "observed": ["verify_inconclusive"],
+      "stderr_contains_all": [
+        "proof_slice_oob_good.rs",
+        "unsupported MIR `CastKind::PointerCoercion::Unsize`"
+      ],
+      "transport_min": {
+        "unknown": 1
+      },
+      "reason": "Current verifier proves the guarded slice lookup helper but marks proof-design main inconclusive because slice unsizing metadata/provenance is not modeled."
+    },
+    {
+      "id": "trust-verify-proof-unreachable-zani-gap",
+      "slot": "trust-verify",
+      "program_ids": ["proof_unreachable.good", "proof_unreachable.flawed"],
+      "observed": ["verify_inconclusive"],
+      "stderr_contains_all": [
+        "\"kind\":\"termination\"",
+        "MIR router has no proof-grade zani encoding"
+      ],
+      "transport_min": {
+        "unknown": 1
+      },
+      "reason": "Current zani/MIR bridge reports proof-design unreachable helpers as termination unknowns instead of proving the total variant or rejecting the unchecked variant."
+    },
+    {
+      "id": "trust-verify-assertion-good-path-condition-gap",
+      "slot": "trust-verify",
+      "program_id": "assertion.good",
+      "observed": ["verify_fail"],
+      "stderr_contains_all": [
+        "\"kind\":\"assert\"",
+        "\"outcome\":\"failed\"",
+        "counterexample\":\"_2 = false, x = -1\""
+      ],
+      "reason": "Current verifier path-condition modeling reports an impossible assertion counterexample for the safe assertion example; this remains a proof false positive, not a passed proof."
+    },
+    {
+      "id": "trust-verify-float-overflow-good-float-range-gap",
+      "slot": "trust-verify",
+      "program_id": "float_overflow.good",
+      "observed": ["verify_fail"],
+      "stderr_contains_all": [
+        "\"kind\":\"float_overflow_to_infinity\"",
+        "\"outcome\":\"failed\"",
+        "counterexample"
+      ],
+      "reason": "Current verifier float range modeling does not discharge the SAFE_LIMIT guard in the safe float-overflow example; this remains a proof false positive, not a passed proof."
+    },
+    {
+      "id": "trust-verify-mul-overflow-flawed-formatter-timeout-gap",
+      "slot": "trust-verify",
+      "program_id": "mul_overflow.flawed",
+      "observed": ["timeout"],
+      "stderr_contains_all": [
+        "unsupported MIR `TyKind::Adt`",
+        "unsupported MIR `Const`"
+      ],
+      "transport_min": {
+        "unknown": 1
+      },
+      "reason": "Current verifier gets stuck behind println!/formatter unsupported MIR in the flawed multiplication example and times out before producing the expected multiplication-overflow failure."
+    },
+    {
+      "id": "trust-verify-unreachable-flawed-runtime-checked-gap",
+      "slot": "trust-verify",
+      "program_id": "unreachable.flawed",
+      "observed": ["verify_inconclusive"],
+      "stderr_contains_all": [
+        "\"kind\":\"unreach\"",
+        "\"outcome\":\"runtime_checked\"",
+        "unsupported MIR `TyKind::Str`"
+      ],
+      "transport_min": {
+        "runtime_checked": 1
+      },
+      "reason": "Current zani/MIR bridge runtime-checks the flawed unreachable obligation after unsupported string/formatter MIR instead of producing the expected proof-grade failed obligation."
+    },
+    {
+      "id": "trust-verify-candidate-adt-modeling-gap",
+      "slot": "trust-verify",
+      "program_ids": [
+        "candidate_option_result.good",
+        "candidate_option_result.flawed",
+        "candidate_stack_invariant.good",
+        "candidate_stack_invariant.flawed"
+      ],
+      "observed": ["verify_inconclusive", "verify_fail", "timeout"],
+      "stderr_contains_any": [
+        "unsupported MIR `TyKind::Adt`",
+        "candidate_option_result",
+        "candidate_stack_invariant"
+      ],
+      "reason": "Candidate ADT/enum/state fixtures intentionally reach Option/Result and small struct modeling that is not yet proof-grade across the native verifier."
+    },
+    {
+      "id": "trust-verify-candidate-iterator-slice-gap",
+      "slot": "trust-verify",
+      "program_ids": [
+        "candidate_iterator_bounds.good",
+        "candidate_iterator_bounds.flawed"
+      ],
+      "observed": ["verify_inconclusive", "verify_fail", "timeout"],
+      "stderr_contains_any": [
+        "core::slice::iter",
+        "PointerCoercion::Unsize",
+        "candidate_iterator_bounds"
+      ],
+      "reason": "Candidate iterator bounds fixtures intentionally route through slice iterator machinery before the verifier has full iterator/slice proof support."
+    },
+    {
+      "id": "trust-verify-candidate-recursion-termination-gap",
+      "slot": "trust-verify",
+      "program_ids": [
+        "candidate_recursion_termination.good",
+        "candidate_recursion_termination.flawed"
+      ],
+      "observed": ["verify_inconclusive", "verify_fail", "timeout"],
+      "stderr_contains_any": [
+        "\"kind\":\"termination\"",
+        "candidate_recursion_termination",
+        "MIR router has no proof-grade zani encoding"
+      ],
+      "reason": "Candidate recursion fixtures document the next termination/decrease proof target before recursive calls have proof-grade native verifier support."
+    }
+  ],
+  "programs": [
+    {
+      "id": "hello_world.flawed",
+      "pair_id": "hello_world",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/hello_world_flawed.rs",
+      "obligations": ["assertion"],
+      "suite": "demo",
+      "metadata": {
+        "classic": true,
+        "classic_kind": "hello-world",
+        "runtime_safe_main": true,
+        "runtime_expected_stdout": "hello world\n",
+        "known_flawed_mechanism": "unguarded assertion helper"
+      }
+    },
+    {
+      "id": "hello_world.good",
+      "pair_id": "hello_world",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/hello_world_good.rs",
+      "obligations": ["assertion"],
+      "suite": "demo",
+      "metadata": {
+        "classic": true,
+        "classic_kind": "hello-world",
+        "runtime_safe_main": true,
+        "runtime_expected_stdout": "hello world\n",
+        "known_good_mechanism": "guarded assertion helper"
+      }
+    },
+    {
+      "id": "assertion.flawed",
+      "pair_id": "assertion",
+      "variant": "flawed",
+      "path": "examples/verify_assertion.rs",
+      "obligations": ["assertion"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "assertion.good",
+      "pair_id": "assertion",
+      "variant": "good",
+      "path": "examples/showcase/safe/safe_assertion.rs",
+      "obligations": ["assertion"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "leetcode_two_sum.flawed",
+      "pair_id": "leetcode_two_sum",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/leetcode_two_sum_flawed.rs",
+      "obligations": ["overflow:add", "index_out_of_bounds"],
+      "suite": "demo",
+      "metadata": {
+        "classic": true,
+        "classic_kind": "leetcode-two-sum",
+        "runtime_safe_main": true,
+        "formatter_free": true,
+        "known_flawed_mechanism": "unchecked pair addition"
+      }
+    },
+    {
+      "id": "leetcode_two_sum.good",
+      "pair_id": "leetcode_two_sum",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/leetcode_two_sum_good.rs",
+      "obligations": ["overflow:add", "index_out_of_bounds"],
+      "suite": "demo",
+      "metadata": {
+        "classic": true,
+        "classic_kind": "leetcode-two-sum",
+        "runtime_safe_main": true,
+        "formatter_free": true,
+        "known_good_mechanism": "guarded pair addition"
+      }
+    },
+    {
+      "id": "leetcode_valid_parentheses.flawed",
+      "pair_id": "leetcode_valid_parentheses",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/leetcode_valid_parentheses_flawed.rs",
+      "obligations": ["overflow:sub", "index_out_of_bounds"],
+      "suite": "demo",
+      "metadata": {
+        "classic": true,
+        "classic_kind": "leetcode-valid-parentheses",
+        "runtime_safe_main": true,
+        "formatter_free": true,
+        "known_flawed_mechanism": "unguarded stack pop"
+      }
+    },
+    {
+      "id": "leetcode_valid_parentheses.good",
+      "pair_id": "leetcode_valid_parentheses",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/leetcode_valid_parentheses_good.rs",
+      "obligations": ["overflow:sub", "index_out_of_bounds"],
+      "suite": "demo",
+      "metadata": {
+        "classic": true,
+        "classic_kind": "leetcode-valid-parentheses",
+        "runtime_safe_main": true,
+        "formatter_free": true,
+        "known_good_mechanism": "guarded stack pop"
+      }
+    },
+    {
+      "id": "binary_search.flawed",
+      "pair_id": "binary_search",
+      "variant": "flawed",
+      "path": "examples/binary_search.rs",
+      "obligations": ["overflow:add", "overflow:sub", "index_out_of_bounds"],
+      "suite": "demo"
+    },
+    {
+      "id": "binary_search.good",
+      "pair_id": "binary_search",
+      "variant": "good",
+      "path": "examples/binary_search_fixed.rs",
+      "obligations": ["overflow:add", "overflow:sub", "index_out_of_bounds"],
+      "suite": "demo"
+    },
+    {
+      "id": "cast_overflow.flawed",
+      "pair_id": "cast_overflow",
+      "variant": "flawed",
+      "path": "examples/verify_cast_overflow.rs",
+      "obligations": ["cast_overflow"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "cast_overflow.good",
+      "pair_id": "cast_overflow",
+      "variant": "good",
+      "path": "examples/verify_cast_overflow_safe.rs",
+      "obligations": ["cast_overflow"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "div_zero.flawed",
+      "pair_id": "div_zero",
+      "variant": "flawed",
+      "path": "examples/verify_div_zero.rs",
+      "obligations": ["division_by_zero"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "div_zero.good",
+      "pair_id": "div_zero",
+      "variant": "good",
+      "path": "examples/verify_div_zero_safe.rs",
+      "obligations": ["division_by_zero"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "proof_div_zero.flawed",
+      "pair_id": "proof_div_zero",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/proof_div_zero_flawed.rs",
+      "obligations": ["division_by_zero"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-arithmetic",
+        "obligation_family": "division_by_zero"
+      }
+    },
+    {
+      "id": "proof_div_zero.good",
+      "pair_id": "proof_div_zero",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/proof_div_zero_good.rs",
+      "obligations": ["division_by_zero"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-arithmetic",
+        "obligation_family": "division_by_zero"
+      }
+    },
+    {
+      "id": "proof_add_overflow.flawed",
+      "pair_id": "proof_add_overflow",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/proof_add_overflow_flawed.rs",
+      "obligations": ["overflow:add"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-arithmetic",
+        "obligation_family": "overflow:add"
+      }
+    },
+    {
+      "id": "proof_add_overflow.good",
+      "pair_id": "proof_add_overflow",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/proof_add_overflow_good.rs",
+      "obligations": ["overflow:add"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-arithmetic",
+        "obligation_family": "overflow:add"
+      }
+    },
+    {
+      "id": "proof_short_circuit_guard.flawed",
+      "pair_id": "proof_short_circuit_guard",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/proof_short_circuit_guard_flawed.rs",
+      "obligations": ["division_by_zero", "path_condition"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-branch",
+        "obligation_family": "short_circuit_guard"
+      }
+    },
+    {
+      "id": "proof_short_circuit_guard.good",
+      "pair_id": "proof_short_circuit_guard",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/proof_short_circuit_guard_good.rs",
+      "obligations": ["division_by_zero", "path_condition"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-branch",
+        "obligation_family": "short_circuit_guard"
+      }
+    },
+    {
+      "id": "proof_interprocedural_guard.flawed",
+      "pair_id": "proof_interprocedural_guard",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/proof_interprocedural_guard_flawed.rs",
+      "obligations": ["division_by_zero", "interprocedural_summary"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "interprocedural",
+        "obligation_family": "callee_guard"
+      }
+    },
+    {
+      "id": "proof_interprocedural_guard.good",
+      "pair_id": "proof_interprocedural_guard",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/proof_interprocedural_guard_good.rs",
+      "obligations": ["division_by_zero", "interprocedural_summary"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "interprocedural",
+        "obligation_family": "callee_guard"
+      }
+    },
+    {
+      "id": "proof_range_slice_bounds.flawed",
+      "pair_id": "proof_range_slice_bounds",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/proof_range_slice_bounds_flawed.rs",
+      "obligations": ["slice_bounds_check", "range_bounds"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "bounds",
+        "obligation_family": "range_slice_bounds"
+      }
+    },
+    {
+      "id": "proof_range_slice_bounds.good",
+      "pair_id": "proof_range_slice_bounds",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/proof_range_slice_bounds_good.rs",
+      "obligations": ["slice_bounds_check", "range_bounds"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "bounds",
+        "obligation_family": "range_slice_bounds"
+      }
+    },
+    {
+      "id": "proof_assertion.flawed",
+      "pair_id": "proof_assertion",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/proof_assertion_flawed.rs",
+      "obligations": ["assertion"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-branch",
+        "obligation_family": "assertion"
+      }
+    },
+    {
+      "id": "proof_assertion.good",
+      "pair_id": "proof_assertion",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/proof_assertion_good.rs",
+      "obligations": ["assertion"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-branch",
+        "obligation_family": "assertion"
+      }
+    },
+    {
+      "id": "proof_cast_overflow.flawed",
+      "pair_id": "proof_cast_overflow",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/proof_cast_overflow_flawed.rs",
+      "obligations": ["cast_overflow"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-range",
+        "obligation_family": "cast_overflow"
+      }
+    },
+    {
+      "id": "proof_cast_overflow.good",
+      "pair_id": "proof_cast_overflow",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/proof_cast_overflow_good.rs",
+      "obligations": ["cast_overflow"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-range",
+        "obligation_family": "cast_overflow"
+      }
+    },
+    {
+      "id": "proof_float_div_zero.flawed",
+      "pair_id": "proof_float_div_zero",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/proof_float_div_zero_flawed.rs",
+      "obligations": ["float_division_by_zero"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "floating-point",
+        "obligation_family": "float_division_by_zero"
+      }
+    },
+    {
+      "id": "proof_float_div_zero.good",
+      "pair_id": "proof_float_div_zero",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/proof_float_div_zero_good.rs",
+      "obligations": ["float_division_by_zero"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "floating-point",
+        "obligation_family": "float_division_by_zero"
+      }
+    },
+    {
+      "id": "proof_float_overflow.flawed",
+      "pair_id": "proof_float_overflow",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/proof_float_overflow_flawed.rs",
+      "obligations": ["float_overflow_to_infinity"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "floating-point",
+        "obligation_family": "float_overflow_to_infinity"
+      }
+    },
+    {
+      "id": "proof_float_overflow.good",
+      "pair_id": "proof_float_overflow",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/proof_float_overflow_good.rs",
+      "obligations": ["float_overflow_to_infinity"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "floating-point",
+        "obligation_family": "float_overflow_to_infinity"
+      }
+    },
+    {
+      "id": "proof_index_oob.flawed",
+      "pair_id": "proof_index_oob",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/proof_index_oob_flawed.rs",
+      "obligations": ["index_out_of_bounds"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "bounds",
+        "obligation_family": "index_out_of_bounds"
+      }
+    },
+    {
+      "id": "proof_index_oob.good",
+      "pair_id": "proof_index_oob",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/proof_index_oob_good.rs",
+      "obligations": ["index_out_of_bounds"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "bounds",
+        "obligation_family": "index_out_of_bounds"
+      }
+    },
+    {
+      "id": "proof_mul_overflow.flawed",
+      "pair_id": "proof_mul_overflow",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/proof_mul_overflow_flawed.rs",
+      "obligations": ["overflow:mul"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-arithmetic",
+        "obligation_family": "overflow:mul"
+      }
+    },
+    {
+      "id": "proof_mul_overflow.good",
+      "pair_id": "proof_mul_overflow",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/proof_mul_overflow_good.rs",
+      "obligations": ["overflow:mul"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-arithmetic",
+        "obligation_family": "overflow:mul"
+      }
+    },
+    {
+      "id": "proof_neg_overflow.flawed",
+      "pair_id": "proof_neg_overflow",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/proof_neg_overflow_flawed.rs",
+      "obligations": ["negation_overflow"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-arithmetic",
+        "obligation_family": "negation_overflow"
+      }
+    },
+    {
+      "id": "proof_neg_overflow.good",
+      "pair_id": "proof_neg_overflow",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/proof_neg_overflow_good.rs",
+      "obligations": ["negation_overflow"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-arithmetic",
+        "obligation_family": "negation_overflow"
+      }
+    },
+    {
+      "id": "proof_rem_zero.flawed",
+      "pair_id": "proof_rem_zero",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/proof_rem_zero_flawed.rs",
+      "obligations": ["remainder_by_zero"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-arithmetic",
+        "obligation_family": "remainder_by_zero"
+      }
+    },
+    {
+      "id": "proof_rem_zero.good",
+      "pair_id": "proof_rem_zero",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/proof_rem_zero_good.rs",
+      "obligations": ["remainder_by_zero"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-arithmetic",
+        "obligation_family": "remainder_by_zero"
+      }
+    },
+    {
+      "id": "proof_shift_overflow.flawed",
+      "pair_id": "proof_shift_overflow",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/proof_shift_overflow_flawed.rs",
+      "obligations": ["shift_overflow"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-arithmetic",
+        "obligation_family": "shift_overflow"
+      }
+    },
+    {
+      "id": "proof_shift_overflow.good",
+      "pair_id": "proof_shift_overflow",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/proof_shift_overflow_good.rs",
+      "obligations": ["shift_overflow"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-arithmetic",
+        "obligation_family": "shift_overflow"
+      }
+    },
+    {
+      "id": "proof_signed_div_overflow.flawed",
+      "pair_id": "proof_signed_div_overflow",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/proof_signed_div_overflow_flawed.rs",
+      "obligations": ["division_by_zero", "overflow:div"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-arithmetic",
+        "obligation_family": "signed_division"
+      }
+    },
+    {
+      "id": "proof_signed_div_overflow.good",
+      "pair_id": "proof_signed_div_overflow",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/proof_signed_div_overflow_good.rs",
+      "obligations": ["division_by_zero", "overflow:div"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-arithmetic",
+        "obligation_family": "signed_division"
+      }
+    },
+    {
+      "id": "proof_slice_oob.flawed",
+      "pair_id": "proof_slice_oob",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/proof_slice_oob_flawed.rs",
+      "obligations": ["slice_bounds_check"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "bounds",
+        "obligation_family": "slice_bounds_check"
+      }
+    },
+    {
+      "id": "proof_slice_oob.good",
+      "pair_id": "proof_slice_oob",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/proof_slice_oob_good.rs",
+      "obligations": ["slice_bounds_check"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "bounds",
+        "obligation_family": "slice_bounds_check"
+      }
+    },
+    {
+      "id": "proof_sub_overflow.flawed",
+      "pair_id": "proof_sub_overflow",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/proof_sub_overflow_flawed.rs",
+      "obligations": ["overflow:sub"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-arithmetic",
+        "obligation_family": "overflow:sub"
+      }
+    },
+    {
+      "id": "proof_sub_overflow.good",
+      "pair_id": "proof_sub_overflow",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/proof_sub_overflow_good.rs",
+      "obligations": ["overflow:sub"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "scalar-arithmetic",
+        "obligation_family": "overflow:sub"
+      }
+    },
+    {
+      "id": "proof_unreachable.flawed",
+      "pair_id": "proof_unreachable",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/proof_unreachable_flawed.rs",
+      "obligations": ["unreachable"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "control-flow",
+        "obligation_family": "unreachable"
+      }
+    },
+    {
+      "id": "proof_unreachable.good",
+      "pair_id": "proof_unreachable",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/proof_unreachable_good.rs",
+      "obligations": ["unreachable"],
+      "suite": "proof-design",
+      "metadata": {
+        "proof_design": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "control-flow",
+        "obligation_family": "unreachable"
+      }
+    },
+    {
+      "id": "candidate_option_result.flawed",
+      "pair_id": "candidate_option_result",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/candidate_option_result_flawed.rs",
+      "obligations": ["division_by_zero", "adt_control_flow"],
+      "suite": "proof-design-candidates",
+      "metadata": {
+        "proof_design": true,
+        "candidate": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "enum-control",
+        "obligation_family": "option_result_division"
+      }
+    },
+    {
+      "id": "candidate_option_result.good",
+      "pair_id": "candidate_option_result",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/candidate_option_result_good.rs",
+      "obligations": ["division_by_zero", "adt_control_flow"],
+      "suite": "proof-design-candidates",
+      "metadata": {
+        "proof_design": true,
+        "candidate": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "enum-control",
+        "obligation_family": "option_result_division"
+      }
+    },
+    {
+      "id": "candidate_iterator_bounds.flawed",
+      "pair_id": "candidate_iterator_bounds",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/candidate_iterator_bounds_flawed.rs",
+      "obligations": ["index_out_of_bounds", "iterator_bounds"],
+      "suite": "proof-design-candidates",
+      "metadata": {
+        "proof_design": true,
+        "candidate": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "iterator-bounds",
+        "obligation_family": "iterator_bounds"
+      }
+    },
+    {
+      "id": "candidate_iterator_bounds.good",
+      "pair_id": "candidate_iterator_bounds",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/candidate_iterator_bounds_good.rs",
+      "obligations": ["index_out_of_bounds", "iterator_bounds"],
+      "suite": "proof-design-candidates",
+      "metadata": {
+        "proof_design": true,
+        "candidate": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "iterator-bounds",
+        "obligation_family": "iterator_bounds"
+      }
+    },
+    {
+      "id": "candidate_stack_invariant.flawed",
+      "pair_id": "candidate_stack_invariant",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/candidate_stack_invariant_flawed.rs",
+      "obligations": ["index_out_of_bounds", "adt_invariant"],
+      "suite": "proof-design-candidates",
+      "metadata": {
+        "proof_design": true,
+        "candidate": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "adt-state",
+        "obligation_family": "stack_capacity"
+      }
+    },
+    {
+      "id": "candidate_stack_invariant.good",
+      "pair_id": "candidate_stack_invariant",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/candidate_stack_invariant_good.rs",
+      "obligations": ["index_out_of_bounds", "adt_invariant"],
+      "suite": "proof-design-candidates",
+      "metadata": {
+        "proof_design": true,
+        "candidate": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "adt-state",
+        "obligation_family": "stack_capacity"
+      }
+    },
+    {
+      "id": "candidate_borrow_transfer.flawed",
+      "pair_id": "candidate_borrow_transfer",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/candidate_borrow_transfer_flawed.rs",
+      "obligations": ["overflow:add", "overflow:sub", "borrow_invariant"],
+      "suite": "proof-design-candidates",
+      "metadata": {
+        "proof_design": true,
+        "candidate": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "borrow-state",
+        "obligation_family": "borrow_transfer"
+      }
+    },
+    {
+      "id": "candidate_borrow_transfer.good",
+      "pair_id": "candidate_borrow_transfer",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/candidate_borrow_transfer_good.rs",
+      "obligations": ["overflow:add", "overflow:sub", "borrow_invariant"],
+      "suite": "proof-design-candidates",
+      "metadata": {
+        "proof_design": true,
+        "candidate": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "borrow-state",
+        "obligation_family": "borrow_transfer"
+      }
+    },
+    {
+      "id": "candidate_recursion_termination.flawed",
+      "pair_id": "candidate_recursion_termination",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/candidate_recursion_termination_flawed.rs",
+      "obligations": ["termination"],
+      "suite": "proof-design-candidates",
+      "metadata": {
+        "proof_design": true,
+        "candidate": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "recursion",
+        "obligation_family": "termination"
+      }
+    },
+    {
+      "id": "candidate_recursion_termination.good",
+      "pair_id": "candidate_recursion_termination",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/candidate_recursion_termination_good.rs",
+      "obligations": ["termination"],
+      "suite": "proof-design-candidates",
+      "metadata": {
+        "proof_design": true,
+        "candidate": true,
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "ladder_step": "recursion",
+        "obligation_family": "termination"
+      }
+    },
+    {
+      "id": "adversarial_path_guard.flawed",
+      "pair_id": "adversarial_path_guard",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/adversarial_path_guard_flawed.rs",
+      "obligations": ["division_by_zero", "path_condition"],
+      "suite": "adversarial",
+      "metadata": {
+        "adversarial": true,
+        "adversarial_target": "path",
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "known_flawed_mechanism": "disjunctive guard allows tag-selected division with a zero denominator",
+        "expected_gap_ids": ["trust-verify-adversarial-path-guard-gap"]
+      }
+    },
+    {
+      "id": "adversarial_path_guard.good",
+      "pair_id": "adversarial_path_guard",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/adversarial_path_guard_good.rs",
+      "obligations": ["division_by_zero", "path_condition"],
+      "suite": "adversarial",
+      "metadata": {
+        "adversarial": true,
+        "adversarial_target": "path",
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "known_good_mechanism": "nested denominator check dominates every division path",
+        "expected_gap_ids": ["trust-verify-adversarial-path-guard-gap"]
+      }
+    },
+    {
+      "id": "adversarial_loop_bounds.flawed",
+      "pair_id": "adversarial_loop_bounds",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/adversarial_loop_bounds_flawed.rs",
+      "obligations": ["index_out_of_bounds", "loop_invariant", "termination"],
+      "suite": "adversarial",
+      "metadata": {
+        "adversarial": true,
+        "adversarial_target": "loop",
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "known_flawed_mechanism": "loop count is independent of the slice length",
+        "expected_gap_ids": ["trust-verify-adversarial-loop-bounds-gap"]
+      }
+    },
+    {
+      "id": "adversarial_loop_bounds.good",
+      "pair_id": "adversarial_loop_bounds",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/adversarial_loop_bounds_good.rs",
+      "obligations": ["index_out_of_bounds", "loop_invariant", "termination"],
+      "suite": "adversarial",
+      "metadata": {
+        "adversarial": true,
+        "adversarial_target": "loop",
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "known_good_mechanism": "loop count is clamped to the slice length before iteration",
+        "expected_gap_ids": ["trust-verify-adversarial-loop-bounds-gap"]
+      }
+    },
+    {
+      "id": "adversarial_interprocedural_summary.flawed",
+      "pair_id": "adversarial_interprocedural_summary",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/adversarial_interprocedural_summary_flawed.rs",
+      "obligations": ["division_by_zero", "interprocedural_summary", "path_condition"],
+      "suite": "adversarial",
+      "metadata": {
+        "adversarial": true,
+        "adversarial_target": "interprocedural",
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "known_flawed_mechanism": "callee summary weakens the enabled branch into a zero-denominator division path",
+        "expected_gap_ids": ["trust-verify-adversarial-interprocedural-summary-gap"]
+      }
+    },
+    {
+      "id": "adversarial_interprocedural_summary.good",
+      "pair_id": "adversarial_interprocedural_summary",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/adversarial_interprocedural_summary_good.rs",
+      "obligations": ["division_by_zero", "interprocedural_summary", "path_condition"],
+      "suite": "adversarial",
+      "metadata": {
+        "adversarial": true,
+        "adversarial_target": "interprocedural",
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "known_good_mechanism": "callee summary preserves the nonzero denominator precondition",
+        "expected_gap_ids": ["trust-verify-adversarial-interprocedural-summary-gap"]
+      }
+    },
+    {
+      "id": "adversarial_data_model_state.flawed",
+      "pair_id": "adversarial_data_model_state",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/adversarial_data_model_state_flawed.rs",
+      "obligations": ["adt_invariant", "unreachable", "path_condition"],
+      "suite": "adversarial",
+      "metadata": {
+        "adversarial": true,
+        "adversarial_target": "data-model",
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "known_flawed_mechanism": "armed flag is trusted without proving the enum tag carries a value",
+        "expected_gap_ids": ["trust-verify-adversarial-data-model-state-gap"]
+      }
+    },
+    {
+      "id": "adversarial_data_model_state.good",
+      "pair_id": "adversarial_data_model_state",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/adversarial_data_model_state_good.rs",
+      "obligations": ["adt_invariant", "unreachable", "path_condition"],
+      "suite": "adversarial",
+      "metadata": {
+        "adversarial": true,
+        "adversarial_target": "data-model",
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "known_good_mechanism": "enum tag and armed state are matched together before value access",
+        "expected_gap_ids": ["trust-verify-adversarial-data-model-state-gap"]
+      }
+    },
+    {
+      "id": "adversarial_memory_provenance.flawed",
+      "pair_id": "adversarial_memory_provenance",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/adversarial_memory_provenance_flawed.rs",
+      "obligations": ["pointer_bounds", "fat_pointer_metadata", "memory_provenance"],
+      "suite": "adversarial",
+      "metadata": {
+        "adversarial": true,
+        "adversarial_target": "memory-fat-pointer-provenance",
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "known_flawed_mechanism": "raw pointer offset is not guarded by the source slice length",
+        "expected_gap_ids": ["trust-verify-adversarial-memory-provenance-gap"]
+      }
+    },
+    {
+      "id": "adversarial_memory_provenance.good",
+      "pair_id": "adversarial_memory_provenance",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/adversarial_memory_provenance_good.rs",
+      "obligations": ["pointer_bounds", "fat_pointer_metadata", "memory_provenance"],
+      "suite": "adversarial",
+      "metadata": {
+        "adversarial": true,
+        "adversarial_target": "memory-fat-pointer-provenance",
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "known_good_mechanism": "raw pointer offset is dominated by an in-slice index guard",
+        "expected_gap_ids": ["trust-verify-adversarial-memory-provenance-gap"]
+      }
+    },
+    {
+      "id": "adversarial_format_bridge.flawed",
+      "pair_id": "adversarial_format_bridge",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/adversarial_format_bridge_flawed.rs",
+      "obligations": ["assertion", "std_format", "path_condition"],
+      "suite": "adversarial",
+      "metadata": {
+        "adversarial": true,
+        "adversarial_target": "std-format",
+        "formatter_free": false,
+        "runtime_safe_main": true,
+        "known_flawed_mechanism": "numeric guard is too weak for the formatted string length assertion",
+        "repair_strategy": "strengthen value < 100 to value < 10 before asserting single-digit formatting",
+        "expected_backward_evidence": "counterexample_or_repair_candidate",
+        "expected_gap_ids": ["trust-verify-adversarial-format-bridge-gap"]
+      }
+    },
+    {
+      "id": "adversarial_format_bridge.good",
+      "pair_id": "adversarial_format_bridge",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/adversarial_format_bridge_good.rs",
+      "obligations": ["assertion", "std_format", "path_condition"],
+      "suite": "adversarial",
+      "metadata": {
+        "adversarial": true,
+        "adversarial_target": "std-format",
+        "formatter_free": false,
+        "runtime_safe_main": true,
+        "known_good_mechanism": "string length assertion is guarded to single-digit formatted values",
+        "expected_gap_ids": ["trust-verify-adversarial-format-bridge-gap"]
+      }
+    },
+    {
+      "id": "adversarial_backprop_strengthening.flawed",
+      "pair_id": "adversarial_backprop_strengthening",
+      "variant": "flawed",
+      "path": "examples/bench/program_index/cases/adversarial_backprop_strengthening_flawed.rs",
+      "obligations": ["division_by_zero", "backprop_repair", "proof_strengthening"],
+      "suite": "adversarial",
+      "metadata": {
+        "adversarial": true,
+        "adversarial_target": "backprop-proof-strengthening",
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "known_flawed_mechanism": "enabled branch divides without strengthening the denominator precondition",
+        "repair_strategy": "strengthen enabled branch with den != 0",
+        "expected_backward_evidence": "counterexample_or_repair_candidate",
+        "expected_gap_ids": ["trust-verify-adversarial-backprop-strengthening-gap"]
+      }
+    },
+    {
+      "id": "adversarial_backprop_strengthening.good",
+      "pair_id": "adversarial_backprop_strengthening",
+      "variant": "good",
+      "path": "examples/bench/program_index/cases/adversarial_backprop_strengthening_good.rs",
+      "obligations": ["division_by_zero", "backprop_repair", "proof_strengthening"],
+      "suite": "adversarial",
+      "metadata": {
+        "adversarial": true,
+        "adversarial_target": "backprop-proof-strengthening",
+        "formatter_free": true,
+        "runtime_safe_main": true,
+        "known_good_mechanism": "enabled branch requires den != 0 before division",
+        "expected_gap_ids": ["trust-verify-adversarial-backprop-strengthening-gap"]
+      }
+    },
+    {
+      "id": "float_div_zero.flawed",
+      "pair_id": "float_div_zero",
+      "variant": "flawed",
+      "path": "examples/verify_float_div_zero.rs",
+      "obligations": ["float_division_by_zero"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "float_div_zero.good",
+      "pair_id": "float_div_zero",
+      "variant": "good",
+      "path": "examples/verify_float_div_zero_safe.rs",
+      "obligations": ["float_division_by_zero"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "float_overflow.flawed",
+      "pair_id": "float_overflow",
+      "variant": "flawed",
+      "path": "examples/verify_float_overflow.rs",
+      "obligations": ["float_overflow_to_infinity"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "float_overflow.good",
+      "pair_id": "float_overflow",
+      "variant": "good",
+      "path": "examples/verify_float_overflow_safe.rs",
+      "obligations": ["float_overflow_to_infinity"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "index_oob.flawed",
+      "pair_id": "index_oob",
+      "variant": "flawed",
+      "path": "examples/verify_index_oob.rs",
+      "obligations": ["index_out_of_bounds"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "index_oob.good",
+      "pair_id": "index_oob",
+      "variant": "good",
+      "path": "examples/verify_index_oob_safe.rs",
+      "obligations": ["index_out_of_bounds"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "midpoint.flawed",
+      "pair_id": "midpoint",
+      "variant": "flawed",
+      "path": "examples/midpoint.rs",
+      "obligations": ["overflow:add"],
+      "suite": "demo"
+    },
+    {
+      "id": "midpoint.good",
+      "pair_id": "midpoint",
+      "variant": "good",
+      "path": "examples/midpoint_textbook.rs",
+      "obligations": ["overflow:add"],
+      "suite": "demo"
+    },
+    {
+      "id": "mul_overflow.flawed",
+      "pair_id": "mul_overflow",
+      "variant": "flawed",
+      "path": "examples/verify_mul_overflow.rs",
+      "obligations": ["overflow:mul"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "mul_overflow.good",
+      "pair_id": "mul_overflow",
+      "variant": "good",
+      "path": "examples/verify_mul_overflow_safe.rs",
+      "obligations": ["overflow:mul"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "neg_overflow.flawed",
+      "pair_id": "neg_overflow",
+      "variant": "flawed",
+      "path": "examples/verify_neg_overflow.rs",
+      "obligations": ["negation_overflow"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "neg_overflow.good",
+      "pair_id": "neg_overflow",
+      "variant": "good",
+      "path": "examples/verify_neg_overflow_safe.rs",
+      "obligations": ["negation_overflow"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "rem_zero.flawed",
+      "pair_id": "rem_zero",
+      "variant": "flawed",
+      "path": "examples/verify_rem_zero.rs",
+      "obligations": ["remainder_by_zero"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "rem_zero.good",
+      "pair_id": "rem_zero",
+      "variant": "good",
+      "path": "examples/verify_rem_zero_safe.rs",
+      "obligations": ["remainder_by_zero"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "shift_overflow.flawed",
+      "pair_id": "shift_overflow",
+      "variant": "flawed",
+      "path": "examples/verify_shift_overflow.rs",
+      "obligations": ["shift_overflow"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "shift_overflow.good",
+      "pair_id": "shift_overflow",
+      "variant": "good",
+      "path": "examples/verify_shift_overflow_safe.rs",
+      "obligations": ["shift_overflow"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "signed_div_overflow.flawed",
+      "pair_id": "signed_div_overflow",
+      "variant": "flawed",
+      "path": "examples/verify_signed_div_overflow.rs",
+      "obligations": ["division_by_zero", "overflow:div"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "signed_div_overflow.good",
+      "pair_id": "signed_div_overflow",
+      "variant": "good",
+      "path": "examples/verify_signed_div_overflow_safe.rs",
+      "obligations": ["division_by_zero", "overflow:div"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "slice_oob.flawed",
+      "pair_id": "slice_oob",
+      "variant": "flawed",
+      "path": "examples/verify_slice_oob.rs",
+      "obligations": ["slice_bounds_check"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "slice_oob.good",
+      "pair_id": "slice_oob",
+      "variant": "good",
+      "path": "examples/verify_slice_oob_safe.rs",
+      "obligations": ["slice_bounds_check"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "statistics.flawed",
+      "pair_id": "statistics",
+      "variant": "flawed",
+      "path": "examples/verify_statistics.rs",
+      "obligations": ["division_by_zero", "overflow:add", "index_out_of_bounds"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "statistics.good",
+      "pair_id": "statistics",
+      "variant": "good",
+      "path": "examples/showcase/safe/safe_statistics.rs",
+      "obligations": ["division_by_zero", "overflow:add", "index_out_of_bounds"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "sub_overflow.flawed",
+      "pair_id": "sub_overflow",
+      "variant": "flawed",
+      "path": "examples/verify_sub_overflow.rs",
+      "obligations": ["overflow:sub"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "sub_overflow.good",
+      "pair_id": "sub_overflow",
+      "variant": "good",
+      "path": "examples/verify_sub_overflow_safe.rs",
+      "obligations": ["overflow:sub"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "unreachable.flawed",
+      "pair_id": "unreachable",
+      "variant": "flawed",
+      "path": "examples/verify_unreachable.rs",
+      "obligations": ["unreachable"],
+      "suite": "l0-safety"
+    },
+    {
+      "id": "unreachable.good",
+      "pair_id": "unreachable",
+      "variant": "good",
+      "path": "examples/showcase/safe/safe_classify.rs",
+      "obligations": ["unreachable"],
+      "suite": "l0-safety"
+    }
+  ],
+  "excluded_programs": [
+    {
+      "path": "examples/verify_precondition.rs",
+      "reason": "legacy contracts feature fixture; not upstream-rustc stable compatible"
+    },
+    {
+      "path": "examples/verify_postcondition.rs",
+      "reason": "legacy contracts feature fixture; not upstream-rustc stable compatible"
+    },
+    {
+      "path": "examples/verify_postcondition_safe.rs",
+      "reason": "legacy contracts feature fixture; not upstream-rustc stable compatible"
+    },
+    {
+      "path": "examples/verify_signed_gauntlet.rs",
+      "reason": "multi-obligation flawed stress case without a direct good pair in the default good/flawed matrix"
+    }
+  ]
+}

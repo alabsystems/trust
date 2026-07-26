@@ -1,0 +1,18 @@
+# trust-release: small release-gate primitives for trust evidence checks
+#
+[package]
+name = "trust-release"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+
+[lints]
+workspace = true
+
+[lib]
+name = "trust_release"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

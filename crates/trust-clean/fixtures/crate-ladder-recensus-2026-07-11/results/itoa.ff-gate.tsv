@@ -1,0 +1,18 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+Buffer::new	SHAPE_GAP	false	false	false	false	false	false	false
+<Buffer as core::clone::Clone>::clone	SHAPE_GAP	false	false	false	false	false	false	false
+<Buffer as core::default::Default>::default	SHAPE_GAP	false	false	false	false	false	false	false
+udiv128::u128_mulhi	SHAPE_GAP	false	false	false	false	false	false	false
+udiv128::udivmod_1e19	SHAPE_GAP	false	false	false	false	false	false	false
+<impl private::Sealed for i128>::write	SHAPE_GAP	false	false	false	false	false	false	false
+<impl private::Sealed for i16>::write	SHAPE_GAP	false	false	false	false	false	false	false
+<impl private::Sealed for i32>::write	SHAPE_GAP	false	false	false	false	false	false	false
+<impl private::Sealed for i64>::write	SHAPE_GAP	false	false	false	false	false	false	false
+<impl private::Sealed for i8>::write	SHAPE_GAP	false	false	false	false	false	false	false
+<impl private::Sealed for isize>::write	SHAPE_GAP	false	false	false	false	false	false	false
+<impl private::Sealed for u128>::write	SHAPE_GAP	false	false	false	false	false	false	false
+<impl private::Sealed for u16>::write	SHAPE_GAP	false	false	false	false	false	false	false
+<impl private::Sealed for u32>::write	SHAPE_GAP	false	false	false	false	false	false	false
+<impl private::Sealed for u64>::write	SHAPE_GAP	false	false	false	false	false	false	false
+<impl private::Sealed for u8>::write	SHAPE_GAP	false	false	false	false	false	false	false
+<impl private::Sealed for usize>::write	SHAPE_GAP	false	false	false	false	false	false	false

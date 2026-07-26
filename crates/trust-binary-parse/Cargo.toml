@@ -1,0 +1,23 @@
+# trust-binary-parse: Binary format parsing for trust reverse compilation
+#
+# Parses ELF, Mach-O, PE binaries, DWARF debug info, and symbol demangling
+# from first principles. Zero external dependencies (except thiserror).
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-binary-parse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+trust-types = { path = "../trust-types" }
+thiserror = { workspace = true }
+
+[dev-dependencies]

@@ -1,0 +1,19 @@
+error[E0582]: binding for associated type `Output` references lifetime `'b`, which does not appear in the trait input types
+  --> $DIR/closure-lifetime-unsoundness-112905.rs:10:51
+   |
+LL | fn unsound_explicit<F: for<'a, 'b> Fn(&'a str) -> &'b str>(_f: F) {}
+   |                                                   ^^^^^^^
+
+error[E0515]: cannot return value referencing local variable `local`
+  --> $DIR/closure-lifetime-unsoundness-112905.rs:16:5
+   |
+LL |     f(&local)
+   |     ^^------^
+   |     | |
+   |     | `local` is borrowed here
+   |     returns a value referencing data owned by the current function
+
+error: aborting due to 2 previous errors
+
+Some errors have detailed explanations: E0515, E0582.
+For more information about an error, try `trustc --explain E0515`.

@@ -1,0 +1,24 @@
+# Fixture crate for the stdlib-leaf-num-2026-07-16 harvest (P1 #2).
+#
+# This crate exists to DOCUMENT INTENT: it exercises the target core
+# integer-method leaf family at the concrete widths the harvest certifies
+# (u8/u16/u32/u64/i8/i16/i32/i64). It is NOT the source of the certified
+# MIR bodies — a downstream crate that merely *calls* `x.is_positive()` dumps
+# only the *caller* (the MIR dump records LOCAL bodies; core callees stay
+# opaque `Call` terminators). The certified bodies are extracted by compiling
+# THIS repo's `library/core` itself (see ../regenerate.sh + ../PROVENANCE.md),
+# exactly as the stdlib-leaf-ascii-2026-07-16 harvest did.
+#
+# Author: Andrew Yates | Copyright 2026 Andrew Yates | Apache-2.0 OR MIT
+[package]
+name = "stdlib-leaf-num-fixture"
+version = "0.1.0"
+edition = "2024"
+authors = ["Andrew Yates"]
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

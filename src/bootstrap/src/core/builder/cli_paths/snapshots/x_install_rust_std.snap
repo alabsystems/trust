@@ -1,0 +1,7 @@
+---
+source: src/core/builder/cli_paths/tests.rs
+expression: install rust-std
+---
+[Install] install::Std
+    targets: [aarch64-unknown-linux-gnu]
+    - Set({install::rust-std})

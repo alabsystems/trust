@@ -1,0 +1,295 @@
+{
+  "name": "both",
+  "def_path": "both",
+  "span": {
+    "file": "/tmp/src_vfL1.rs",
+    "line_start": 9,
+    "col_start": 0,
+    "line_end": 9,
+    "col_end": 36
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "__ret"
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "std::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Closure": {
+                    "name": "both::{closure#1}",
+                    "upvars": []
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "name": "__ensures_checker"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Closure": {
+            "name": "both::{closure#0}",
+            "upvars": [
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Int": {
+                      "width": 32,
+                      "signed": true
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "name": "__requires_checker"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 32,
+                "signed": true
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "std::option::Option",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "/tmp/src_vfL1.rs",
+                "line_start": 8,
+                "col_start": 0,
+                "line_end": 8,
+                "col_end": 50
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 1
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "/tmp/src_vfL1.rs",
+                "line_start": 9,
+                "col_start": 29,
+                "line_end": 9,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 4,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 1,
+            "span": {
+              "file": "/tmp/src_vfL1.rs",
+              "line_start": 9,
+              "col_start": 29,
+              "line_end": 9,
+              "col_end": 34
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "/tmp/src_vfL1.rs",
+                "line_start": 9,
+                "col_start": 29,
+                "line_end": 9,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Requires",
+      "span": {
+        "file": "/tmp/src_vfL1.rs",
+        "line_start": 7,
+        "col_start": 28,
+        "line_end": 7,
+        "col_end": 33
+      },
+      "body": "__trust_lowered_compiler_contract__:(x) > (0)"
+    },
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "/tmp/src_vfL1.rs",
+        "line_start": 8,
+        "col_start": 0,
+        "line_end": 8,
+        "col_end": 50
+      },
+      "body": "__trust_lowered_compiler_contract__:(result) > (0)"
+    }
+  ],
+  "preconditions": [
+    {
+      "Gt": [
+        {
+          "Var": [
+            "x",
+            "Int"
+          ]
+        },
+        {
+          "Int": 0
+        }
+      ]
+    }
+  ],
+  "postconditions": [
+    {
+      "Gt": [
+        {
+          "Var": [
+            "_0",
+            "Int"
+          ]
+        },
+        {
+          "Int": 0
+        }
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [
+      "(x) > (0)"
+    ],
+    "ensures": [
+      "(result) > (0)"
+    ],
+    "invariants": []
+  }
+}

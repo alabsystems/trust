@@ -1,0 +1,30 @@
+error[E0515]: cannot return value referencing temporary value
+  --> $DIR/pattern-lifetime-unsound-144312.rs:22:5
+   |
+LL |     let r: &(i32, i32) = &(local, 0);
+   |                           ---------- temporary value created here
+...
+LL |     x
+   |     ^ returns a value referencing data owned by the current function
+
+error[E0515]: cannot return value referencing temporary value
+  --> $DIR/pattern-lifetime-unsound-144312.rs:35:5
+   |
+LL |     let inner: &(i32,) = &(local,);
+   |                           -------- temporary value created here
+...
+LL |     val
+   |     ^^^ returns a value referencing data owned by the current function
+
+error[E0515]: cannot return value referencing local variable `local`
+  --> $DIR/pattern-lifetime-unsound-144312.rs:52:5
+   |
+LL |     let r: &Pair = &local;
+   |                    ------ `local` is borrowed here
+...
+LL |     escaped
+   |     ^^^^^^^ returns a value referencing data owned by the current function
+
+error: aborting due to 3 previous errors
+
+For more information about this error, try `trustc --explain E0515`.

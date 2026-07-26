@@ -1,0 +1,6 @@
+error: invalid `--check-cfg` argument: `cfg(foo,values(test()))`
+   |
+   = note: `test()` is invalid
+   = note: `values()` arguments must be string literals, `none()` or `any()`
+   = note: visit the Trust trustc check-cfg documentation for more details
+

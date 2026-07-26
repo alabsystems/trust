@@ -1,0 +1,18 @@
+error: Clean island declaration `hole` uses explicit `sorry`; strict islands reject all trust debt
+  --> $DIR/clean_island_tainted_citation.rs:10:5
+   |
+LL |     theorem hole : True := sorry
+   |     ^^^^^^^
+   |
+   = note: the island was parsed by the Clean parser and checked by the Clean CIC kernel during this build (two-language design E10)
+
+error: citation `registered_before_failure` cannot be validated because an earlier Clean island was rejected and the crate-local environment is tainted
+  --> $DIR/clean_island_tainted_citation.rs:15:23
+   |
+LL |     ensures 0 == 0 by registered_before_failure
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: positive citation evidence is forbidden after partial island registration
+
+error: aborting due to 2 previous errors
+

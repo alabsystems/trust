@@ -1,0 +1,28 @@
+{
+  "schema": "trust.js262.parse-verdict.v1",
+  "generated_at": "2026-07-21T11:17:36Z",
+  "corpus": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
+  "slice_sha256": "8fe0ce3162fbd899bd7eb61531bd32ae2d7eab2f6ddc4a7909e03675cc0ac342",
+  "parser": "trust-js-parse",
+  "oracle": {
+    "path": "/home/ayates/.local/opt/node-v24.5.0/bin/node",
+    "version": "v24.5.0",
+    "sha256": "47befb5f57df96771ce343d6293349ecf4d46c91110b626423ec3a49d2fee7c1"
+  },
+  "totals": {
+    "cases": 35346,
+    "runs": 68522,
+    "agree": 68024,
+    "disagree": 256,
+    "unsupported": 234,
+    "raw_skipped": 27,
+    "oracle_errors": 0,
+    "excepted_oracle_errors": 8
+  },
+  "gate": {
+    "disagree_ok": true,
+    "unwaived_disagree": 0,
+    "coverage_ratio": 0.9964682875572809,
+    "pass": true
+  }
+}

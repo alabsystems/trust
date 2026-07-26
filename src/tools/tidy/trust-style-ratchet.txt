@@ -1,0 +1,5 @@
+# Trust style ratchet: the highest style-finding count each root is
+# allowed to carry. See `TRUST_STYLE_RATCHET` in src/tools/tidy/src/style.rs.
+# Only ever goes down. `x.py test tidy --bless` writes the current lower count.
+crates 393
+targo-trust 12

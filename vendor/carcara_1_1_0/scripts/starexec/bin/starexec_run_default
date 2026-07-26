@@ -1,0 +1,3 @@
+#!/usr/bin/sh
+
+./carcara check $1

@@ -1,0 +1,19 @@
+{
+  "byte_range_facts": [
+    "instruction=0x401010;step=0;file_offset=0;size=1;instruction_bytes_sha256=9e076ceaf246b6003d9c2680a2b4cf0bffd069805902b0b5edeebf49039fe4bd"
+  ],
+  "control_flow_facts": [
+    "instruction=0x401010;step=0;architecture=x86_64;capability=fallthrough_or_no_branch_call_return;instruction_bytes_sha256=9e076ceaf246b6003d9c2680a2b4cf0bffd069805902b0b5edeebf49039fe4bd;validation_sha256=3b5913ac709b32efb1aad58bd88daaaea956b1557660514dd6c0f340e9621db2"
+  ],
+  "memory_effect_facts": [
+    "instruction=0x401010;step=0;witness_step=none;architecture=x86_64;kind=program_counter_update;subject=PC;memory_address=none;memory_width_bytes=none;validation_sha256=469ddf85686eef37b456a921af0852ea535e595ec48991df30ed828f06392653"
+  ],
+  "replay": "replayed",
+  "root_artifact_sha256": "9e076ceaf246b6003d9c2680a2b4cf0bffd069805902b0b5edeebf49039fe4bd",
+  "selected_image": {
+    "file_offset": 0,
+    "file_size": 1,
+    "sha256": "9e076ceaf246b6003d9c2680a2b4cf0bffd069805902b0b5edeebf49039fe4bd"
+  },
+  "transcript_digest": "<canonical-sha256>"
+}

@@ -1,0 +1,1 @@
+Trust-CG uses a fixed audited lowering and optimization pipeline; no configurable LLVM passes are available.

@@ -1,0 +1,34 @@
+# trust-witness: the typeck-moonshot warm-replay witness (docs/TYPECK_MOONSHOT.md,
+# reports/typeck-moonshot/p1/PLAN.md).
+#
+# "Elaborate once, check thereafter": rustc typeck stays the expensive elaborator;
+# on a cold compile we MINT a per-root witness (the full TypeckResults surface,
+# structurally encoded with 128-bit DefPathHashes); on a warm compile we DECODE +
+# RE-INTERN + CHECK it and replay instead of re-inferring. P0 proved the pieces
+# (checker r=0.086, reintern 0 mismatches, full-witness size 0.11-0.32x of rustc's
+# own incremental cache) — see reports/typeck-moonshot/p0/RESULTS.md.
+#
+# Requires rustc_private — built ONLY via `x.py build --stage 2` (mirrors
+# trust-thir-lower). Author: Andrew Yates | Copyright 2026 | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-witness"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Trust: rustc crates (resolved by the bootstrap build); mirror trust-thir-lower.
+rustc_abi = { path = "../../compiler/rustc_abi" }
+rustc_ast = { path = "../../compiler/rustc_ast" }
+rustc_ast_ir = { path = "../../compiler/rustc_ast_ir" }
+rustc_data_structures = { path = "../../compiler/rustc_data_structures" }
+rustc_hir = { path = "../../compiler/rustc_hir" }
+rustc_index = { path = "../../compiler/rustc_index" }
+rustc_middle = { path = "../../compiler/rustc_middle" }
+rustc_span = { path = "../../compiler/rustc_span" }
+tracing = "0.1"

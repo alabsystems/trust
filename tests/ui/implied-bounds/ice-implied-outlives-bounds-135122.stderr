@@ -1,0 +1,63 @@
+error[E0046]: not all trait items implemented, missing: `Assoc`
+  --> $DIR/ice-implied-outlives-bounds-135122.rs:26:1
+   |
+LL |     type Assoc;
+   |     ---------- `Assoc` from trait
+...
+LL | impl<B> IsSame<i16> for f32 where f32: IsSame<B, Assoc = B> {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `Assoc` in implementation
+
+error[E0207]: the type parameter `B` is not constrained by the impl trait, self type, or predicates
+  --> $DIR/ice-implied-outlives-bounds-135122.rs:26:6
+   |
+LL | impl<B> IsSame<i16> for f32 where f32: IsSame<B, Assoc = B> {}
+   |      ^ unconstrained type parameter
+
+warning: trait objects without an explicit `dyn` are deprecated
+  --> $DIR/ice-implied-outlives-bounds-135122.rs:37:15
+   |
+LL |     fn add(_: Data, _: Self::Output) {}
+   |               ^^^^
+   |
+   = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+   = note: `#[warn(bare_trait_objects)]` (part of `#[warn(rust_2021_compatibility)]`) on by default
+help: if this is a dyn-compatible trait, use `dyn`
+   |
+LL |     fn add(_: dyn Data, _: Self::Output) {}
+   |               +++
+
+error[E0191]: the value of the associated type `Elem` in `Data` must be specified
+  --> $DIR/ice-implied-outlives-bounds-135122.rs:37:15
+   |
+LL |     type Elem;
+   |     --------- `Elem` defined here
+...
+LL |     fn add(_: Data, _: Self::Output) {}
+   |               ^^^^
+   |
+help: specify the associated type
+   |
+LL |     fn add(_: Data<Elem = /* Type */>, _: Self::Output) {}
+   |                   +++++++++++++++++++
+
+error[E0277]: the trait bound `i8: Data` is not satisfied
+  --> $DIR/ice-implied-outlives-bounds-135122.rs:33:5
+   |
+LL |     i8: Data<Elem = A>,
+   |     ^^^^^^^^^^^^^^^^^^ the trait `Data` is not implemented for `i8`
+   |
+help: this trait has no implementations, consider adding one
+  --> $DIR/ice-implied-outlives-bounds-135122.rs:22:1
+   |
+LL | trait Data {
+   | ^^^^^^^^^^
+help: add `#![feature(trivial_bounds)]` to the crate attributes to enable
+   |
+LL + #![feature(trivial_bounds)]
+   |
+
+error: aborting due to 4 previous errors; 1 warning emitted
+
+Some errors have detailed explanations: E0046, E0191, E0207, E0277.
+For more information about an error, try `trustc --explain E0046`.

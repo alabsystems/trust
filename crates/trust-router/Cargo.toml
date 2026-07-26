@@ -1,0 +1,172 @@
+# trust-router: VC dispatch to verification backends
+#
+# The Router dispatches VCs to backends implementing VerificationBackend.
+# This crate provides the core routing logic, MockBackend, and the in-process
+# ay backend (`InProcessAyBackend`, behind the `ay-backend` feature).
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# MIR-level routing is the sole maintained pipeline. The former empty
+# `pipeline-v2` switch was retired with its deleted v1 implementation so
+# `--no-default-features` cannot silently hide the canonical public API.
+default = []
+# trust #420: ay-backend gates the native ay SMT backend module.
+#
+# Off by default so that merely depending on trust-router does not drag the
+# whole solver into a consumer's dependency tree — the same default-light
+# policy `check_dependency_fanout_policy` pins for trust-bmc and trust-types,
+# with `--fanout-tree-proof` as its evidence. It is NOT off because of a
+# version conflict: rustc_mir_transform turns `ay-backend` on in the compiler
+# workspace, so the shipped trustc already resolves and links ay's transitive
+# graph alongside the compiler's own pinned deps.
+# trust #886: Also gates ay-bindings for incremental push/pop sessions.
+ay-backend = [
+    "dep:ay",
+    "dep:num-bigint",
+    "dep:ay-bindings",
+    "ay-bindings/direct",
+    "trust-types/ay-bridge",
+    "dep:tracing",
+]
+# trust #798: ay-direct, trust-wp, trust-wp-direct features removed — Pipeline v2.
+trust-mc-backend = ["dep:trust-mc-verifier"]
+trust-wp-backend = ["dep:trust-wp-core"]
+trust-vc-backend = ["dep:trust-vc-core"]
+# trust #870: trust-codegen backend gates the trust-cg-bridge codegen integration.
+# When enabled, the MirRouter can dispatch scalar functions to the trust-codegen
+# verified codegen pipeline (lower to LIR, compile, translation-validate).
+trust-cg-backend = ["dep:trust-cg-bridge"]
+# Links the byte-level output-preservation gate into `verify_codegen`: emit the
+# function to a real object, decode the emitted bytes, compute their machine
+# semantics, and discharge equality against the semantics auto-derived from the
+# IR. Without it the backend can only report the structural round trip, which
+# never inspects an instruction and therefore cannot witness a miscompile.
+# Behind a feature because it pulls the disassembler, the machine-semantics
+# model, and the Clean kernel re-check into the dependency graph; trustc turns
+# it on so the shipped compiler never makes the weaker claim.
+trust-cg-output-gate = [
+    "trust-cg-backend",
+    "trust-cg-bridge/ay-proofs",
+    "trust-cg-bridge/kernel-recheck",
+]
+# N-version Alethe cross-check: forwards to clean-auto's carcara-verify so an
+# UNSAT proof can be independently re-checked by Carcara (a second, independent
+# Alethe checker) in addition to ay's own strict proof checker. Disabled by
+# default — Carcara pulls in GMP via `rug`. When enabled with `ay-backend`, the
+# live in-process UNSAT path calls `carcara_cross_check_proved` and may only
+# downgrade ay's strict-checked SmtBacked vote on rejection.
+carcara-crosscheck = ["dep:clean-auto", "clean-auto/carcara-verify"]
+# Experimental proof-carrying ay reconstruction for LIA, BV multiplication, and
+# BV shifts. It builds and locally checks Clean kernel proof candidates, but it
+# does NOT promote live router verdicts: `VerificationResult` cannot yet carry a
+# typed, VC-digest-bound Clean payload for downstream replay, so assurance stays
+# SmtBacked. This feature pulls in clean-auto WITHOUT `carcara-verify`; Carcara
+# is not involved. The BV lanes additionally forward
+# `clean-auto/ay-bv-blast`, enabling the native bvmul array-multiplier bit-blast
+# and barrel-shift reflection candidates. Disabled by default (links ay + Clean).
+# See src/ay_certify.rs.
+ay-certify = [
+    "ay-backend",
+    "dep:clean-auto",
+    "clean-auto/ay-bv-blast",
+    "dep:clean-kernel",
+    "dep:ay-core",
+    "dep:ay",
+    "dep:num-bigint",
+]
+# Enables the native three-suite verification path for full-verifier
+# integration tests and native trustc builds.
+trust-vc-native = ["trust-vc-bridge/trust-build"]
+trust-build = [
+    "trust-bmc/trust-mc-native-trust-ir-bundle",
+    "trust-wp/trust-build",
+    "trust-vc-native",
+    # Kernel replay for CleanCic proof authority (see trust-bmc's
+    # trust-mc-native-trust-ir-bundle note): native TrustVc requests only
+    # validate when the Clean kernel can recheck their certificates in-process.
+    "trust-ir/clean-expr",
+]
+
+[dependencies]
+trust-vcgen = { workspace = true }
+trust-types = { workspace = true }
+# Trust #540 (R1): the kernel REPLAY primitive behind the sealed caller-propagation
+# certificate (`strengthen_whole_program`). Unconditional on purpose — the sealed
+# token must not be mintable in a build configuration where its evidence cannot be
+# re-checked, and a feature-gated replay would be exactly that. Adds no new crate to
+# the compiler's graph (rustc_mir_transform already depends on trust-certify).
+trust-certify = { workspace = true }
+trust-verifier-api = { workspace = true }
+trust-vc-bridge = { workspace = true }
+trust-temporal = { workspace = true }
+trust-cache = { workspace = true }
+trust-bmc = { workspace = true }
+trust-wp = { workspace = true }
+trust-ir-bridge = { workspace = true }
+trust-ir = { workspace = true, features = ["serde"] }
+tla-mc-core = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rayon = { workspace = true }
+sha2 = { workspace = true }
+# Memory-jobserver + per-process RSS/total-RAM queries with NO subprocess
+# (getrusage / sysctl / kill-0), mirroring ay-sys without taking on its
+# transitive deps that conflict with compiler-pinned crate versions.
+libc = { workspace = true }
+
+# trust #420: Optional ay dependency for the ay-backend feature.
+ay = { workspace = true, optional = true }
+num-bigint = { workspace = true, optional = true }
+# trust #886: ay-bindings for incremental push/pop sessions.
+ay-bindings = { workspace = true, optional = true }
+# Suppresses ay's solver-internal tracing diagnostics during in-process solves
+# (thread-local no-op subscriber around the solve; TRUST_AY_LOG opts back in).
+# Resolves to the SAME tracing-core ay-dpll dispatches through, so ay's
+# `tracing::warn!` callsites see the scoped default. See in_process_ay_backend.
+tracing = { workspace = true, optional = true }
+
+# trust #870: Optional trust-codegen bridge for verified codegen backend.
+trust-cg-bridge = { workspace = true, optional = true }
+
+# N-version Alethe cross-check: optional clean-auto dep, gated behind the
+# `carcara-crosscheck` feature, which forwards to clean-auto's `carcara-verify`.
+clean-auto = { workspace = true, optional = true }
+
+# Experimental native reconstruction of ay UNSAT proofs. `clean-kernel` supplies
+# the checker and `ay-core` the structured proof data that clean-auto translates
+# into local candidates. The public router promotion remains hard-blocked until
+# the payload has digest-bound transport and mandatory replay.
+clean-kernel = { workspace = true, optional = true }
+ay-core = { workspace = true, optional = true }
+
+# trust #442: Optional solver backends
+# trust #798: ay-bindings, trust-mc_core, trust-wp-ay removed — Pipeline v2.
+trust-mc-verifier = { workspace = true, optional = true }
+trust-wp-core = { workspace = true, optional = true }
+trust-vc-core = { workspace = true, optional = true }
+
+# trust #887: Verification daemon binary — shared solver state over TCP.
+[[bin]]
+name = "trustd"
+path = "src/bin/trustd.rs"
+
+[dev-dependencies]
+toml = { workspace = true }
+trust-proof-cert = { workspace = true }
+trust-vcgen = { workspace = true }
+trust-report = { workspace = true }
+trust-ir-build = { workspace = true }
+trust-bmc = { workspace = true, features = ["trust-mc-core-types"] }

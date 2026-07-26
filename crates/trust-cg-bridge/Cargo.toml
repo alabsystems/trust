@@ -1,0 +1,76 @@
+# trust-cg-bridge: Bridge between trust-types VerifiableFunction and trust-codegen LIR
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-cg-bridge"
+description = "Bridge between trust-types VerifiableFunction and trust-codegen LIR"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Trust: M-POS — the proven-output gate (verify_output module) needs the
+# disassembler + machine semantics in the library, not just dev-deps.
+ay-proofs = ["dep:ay", "dep:ay-proof", "dep:trust-disasm", "dep:trust-machine-sem"]
+# Trust: RUNG 1 (anti-Thompson) — route the [PROVED] grade through the CLEAN
+# CIC KERNEL re-check. With this on, `try_kernel_recheckable_proof` hands the
+# ay-exported BvBlastProof to clean-auto's `kernel_recheck_proved_grade`, which
+# reduces `checkRefutes` in the kernel and applies the PROVED `checkRefutes_sound`
+# Theorem. [PROVED] is awarded ONLY when the KERNEL accepts the cert to `Unsat`
+# with ZERO domain axioms — removing ay from the [PROVED] emission TCB. Implies
+# `ay-proofs` (the gate needs the exporter). Acyclic: clean-auto's trust-* edges
+# are dev-deps only (see crates/Cargo.toml: clean-auto already consumed by
+# trust-clean). Behind a feature so default builds don't pull the clean kernel.
+kernel-recheck = ["ay-proofs", "dep:clean-auto", "dep:clean-kernel"]
+
+[dependencies]
+trust-types = { workspace = true }
+# Trust: the "trust-ir first" codegen seam consumes trust_ir::Module
+# (module_to_lir.rs); its reference interpreter is used by the test
+# value-differential. The trust-ir core crate is zero-required-dep.
+trust-ir = { workspace = true }
+trust-cg-lower = { workspace = true }
+trust-cg-ir = { workspace = true }
+trust-cg-codegen = { path = "../../first-party/trust-cg/crates/trust-cg-codegen", default-features = false }
+trust-cg-opt = { path = "../../first-party/trust-cg/crates/trust-cg-opt" }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+ay = { workspace = true, optional = true }
+# Trust: M-POS [PROVED] path — generalized zero-trust bit-blast exporter
+# (BvExpr + export_bv_blast_proof_expr). The gate lowers its Formula obligation
+# into ay-proof's BvExpr and exports a kernel-re-checkable BvBlastProof.
+ay-proof = { workspace = true, optional = true }
+# Trust: M-POS — byte-derived machine output for the proven-output gate
+# (decode emitted bytes -> Aarch64Semantics effects). Behind ay-proofs.
+trust-disasm = { workspace = true, optional = true }
+trust-machine-sem = { workspace = true, optional = true }
+# Trust: RUNG 1 — clean CIC kernel re-check for the [PROVED] grade. The gate
+# routes the ay-exported BvBlastProof through clean-auto's `proved_gate`
+# (kernel reflection re-check + zero-domain-axiom check). `ay-bv-blast` turns
+# on clean's bit-blast reflection lane. Behind the `kernel-recheck` feature so
+# default + ay-proofs-only builds do not pull the clean kernel.
+clean-auto = { workspace = true, optional = true, features = ["ay-bv-blast"] }
+# Trust: B4 — the O(1) structured-instantiation [PROVED] path builds clean-kernel
+# `Expr` terms (the `Clean.BVC.BvF` reflection) and runs the kernel `check_type`.
+# Optional, pulled in only by `kernel-recheck` (same as `clean-auto`).
+clean-kernel = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+trust-disasm = { workspace = true }
+trust-machine-sem = { workspace = true }
+# Trust: RUNG 4 (F3 retirement) — the trust_machine_sem <-> Lean ISA differential
+# (tests/lean_isa_machine_sem_differential.rs) registers the aarch64_isa.lean
+# B-defs as reducible kernel Definitions and reduces them via the clean-kernel
+# WHNF reducer to compute the Lean-side result, comparing it against
+# trust_machine_sem's effect for each covered linear-ALU opcode. Dev-dep only:
+# this is an [VALIDATED]/differential gate, not part of the gate's runtime TCB.
+clean-kernel = { workspace = true }
+trust-ir-bridge = { workspace = true }

@@ -1,0 +1,335 @@
+{
+  "name": "clone",
+  "def_path": "<Transform as std::clone::Clone>::clone",
+  "span": {
+    "file": "crates/a3d-geom/src/lib.rs",
+    "line_start": 836,
+    "col_start": 9,
+    "line_end": 836,
+    "col_end": 14
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Adt": {
+            "name": "Transform",
+            "fields": [
+              [
+                "rotation",
+                {
+                  "Adt": {
+                    "name": "Quat",
+                    "fields": [
+                      [
+                        "x",
+                        {
+                          "Float": {
+                            "width": 64
+                          }
+                        }
+                      ],
+                      [
+                        "y",
+                        {
+                          "Float": {
+                            "width": 64
+                          }
+                        }
+                      ],
+                      [
+                        "z",
+                        {
+                          "Float": {
+                            "width": 64
+                          }
+                        }
+                      ],
+                      [
+                        "w",
+                        {
+                          "Float": {
+                            "width": 64
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ],
+              [
+                "translation",
+                {
+                  "Adt": {
+                    "name": "Vec3",
+                    "fields": [
+                      [
+                        "x",
+                        {
+                          "Float": {
+                            "width": 64
+                          }
+                        }
+                      ],
+                      [
+                        "y",
+                        {
+                          "Float": {
+                            "width": 64
+                          }
+                        }
+                      ],
+                      [
+                        "z",
+                        {
+                          "Float": {
+                            "width": 64
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ],
+              [
+                "scale",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "Transform",
+                "fields": [
+                  [
+                    "rotation",
+                    {
+                      "Adt": {
+                        "name": "Quat",
+                        "fields": [
+                          [
+                            "x",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ],
+                          [
+                            "y",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ],
+                          [
+                            "z",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ],
+                          [
+                            "w",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ],
+                  [
+                    "translation",
+                    {
+                      "Adt": {
+                        "name": "Vec3",
+                        "fields": [
+                          [
+                            "x",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ],
+                          [
+                            "y",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ],
+                          [
+                            "z",
+                            {
+                              "Float": {
+                                "width": 64
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ],
+                  [
+                    "scale",
+                    {
+                      "Float": {
+                        "width": 64
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          }
+        },
+        "name": "self"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Adt": {
+        "name": "Transform",
+        "fields": [
+          [
+            "rotation",
+            {
+              "Adt": {
+                "name": "Quat",
+                "fields": [
+                  [
+                    "x",
+                    {
+                      "Float": {
+                        "width": 64
+                      }
+                    }
+                  ],
+                  [
+                    "y",
+                    {
+                      "Float": {
+                        "width": 64
+                      }
+                    }
+                  ],
+                  [
+                    "z",
+                    {
+                      "Float": {
+                        "width": 64
+                      }
+                    }
+                  ],
+                  [
+                    "w",
+                    {
+                      "Float": {
+                        "width": 64
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          ],
+          [
+            "translation",
+            {
+              "Adt": {
+                "name": "Vec3",
+                "fields": [
+                  [
+                    "x",
+                    {
+                      "Float": {
+                        "width": 64
+                      }
+                    }
+                  ],
+                  [
+                    "y",
+                    {
+                      "Float": {
+                        "width": 64
+                      }
+                    }
+                  ],
+                  [
+                    "z",
+                    {
+                      "Float": {
+                        "width": 64
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          ],
+          [
+            "scale",
+            {
+              "Float": {
+                "width": 64
+              }
+            }
+          ]
+        ],
+        "variants": [],
+        "disc_index_safe": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

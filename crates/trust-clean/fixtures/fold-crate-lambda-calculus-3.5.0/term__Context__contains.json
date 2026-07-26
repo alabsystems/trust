@@ -1,0 +1,1184 @@
+{
+  "name": "contains",
+  "def_path": "term::Context::contains",
+  "span": {
+    "file": "<dump-root>/term.rs",
+    "line_start": 94,
+    "col_start": 4,
+    "line_end": 96,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "term::Context",
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Adt": {
+                        "name": "std::vec::Vec",
+                        "fields": [
+                          [
+                            "buf",
+                            {
+                              "Adt": {
+                                "name": "alloc::raw_vec::RawVec",
+                                "fields": [
+                                  [
+                                    "inner",
+                                    {
+                                      "Adt": {
+                                        "name": "alloc::raw_vec::RawVecInner",
+                                        "fields": [
+                                          [
+                                            "ptr",
+                                            {
+                                              "Adt": {
+                                                "name": "std::ptr::Unique",
+                                                "fields": [
+                                                  [
+                                                    "pointer",
+                                                    {
+                                                      "Adt": {
+                                                        "name": "std::ptr::NonNull",
+                                                        "fields": [
+                                                          [
+                                                            "pointer",
+                                                            {
+                                                              "RawPtr": {
+                                                                "mutable": false,
+                                                                "pointee": {
+                                                                  "Int": {
+                                                                    "width": 8,
+                                                                    "signed": false
+                                                                  }
+                                                                }
+                                                              }
+                                                            }
+                                                          ]
+                                                        ],
+                                                        "variants": [],
+                                                        "disc_index_safe": false
+                                                      }
+                                                    }
+                                                  ],
+                                                  [
+                                                    "_marker",
+                                                    {
+                                                      "Adt": {
+                                                        "name": "std::marker::PhantomData",
+                                                        "fields": [],
+                                                        "variants": [],
+                                                        "disc_index_safe": false
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "cap",
+                                            {
+                                              "Adt": {
+                                                "name": "core::num::niche_types::UsizeNoHighBit",
+                                                "fields": [
+                                                  [
+                                                    "0",
+                                                    {
+                                                      "Int": {
+                                                        "width": 64,
+                                                        "signed": false
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "alloc",
+                                            {
+                                              "Adt": {
+                                                "name": "std::alloc::Global",
+                                                "fields": [],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "_marker",
+                                    {
+                                      "Adt": {
+                                        "name": "std::marker::PhantomData",
+                                        "fields": [],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ],
+                          [
+                            "len",
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Unsupported": {
+            "kind": "TyKind::Param",
+            "detail": "generic parameter S/#0 needs monomorphization"
+          }
+        },
+        "name": "name"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "std::iter::Map",
+                "fields": [
+                  [
+                    "iter",
+                    {
+                      "Adt": {
+                        "name": "std::slice::Iter",
+                        "fields": [
+                          [
+                            "ptr",
+                            {
+                              "Adt": {
+                                "name": "std::ptr::NonNull",
+                                "fields": [
+                                  [
+                                    "pointer",
+                                    {
+                                      "RawPtr": {
+                                        "mutable": false,
+                                        "pointee": {
+                                          "Adt": {
+                                            "name": "std::string::String",
+                                            "fields": [
+                                              [
+                                                "vec",
+                                                {
+                                                  "Adt": {
+                                                    "name": "std::vec::Vec",
+                                                    "fields": [
+                                                      [
+                                                        "buf",
+                                                        {
+                                                          "Adt": {
+                                                            "name": "alloc::raw_vec::RawVec",
+                                                            "fields": [
+                                                              [
+                                                                "inner",
+                                                                {
+                                                                  "Adt": {
+                                                                    "name": "alloc::raw_vec::RawVecInner",
+                                                                    "fields": [
+                                                                      [
+                                                                        "ptr",
+                                                                        {
+                                                                          "Adt": {
+                                                                            "name": "std::ptr::Unique",
+                                                                            "fields": [
+                                                                              [
+                                                                                "pointer",
+                                                                                {
+                                                                                  "Adt": {
+                                                                                    "name": "std::ptr::NonNull",
+                                                                                    "fields": [
+                                                                                      [
+                                                                                        "pointer",
+                                                                                        {
+                                                                                          "RawPtr": {
+                                                                                            "mutable": false,
+                                                                                            "pointee": {
+                                                                                              "Int": {
+                                                                                                "width": 8,
+                                                                                                "signed": false
+                                                                                              }
+                                                                                            }
+                                                                                          }
+                                                                                        }
+                                                                                      ]
+                                                                                    ],
+                                                                                    "variants": [],
+                                                                                    "disc_index_safe": false
+                                                                                  }
+                                                                                }
+                                                                              ],
+                                                                              [
+                                                                                "_marker",
+                                                                                {
+                                                                                  "Adt": {
+                                                                                    "name": "std::marker::PhantomData",
+                                                                                    "fields": [],
+                                                                                    "variants": [],
+                                                                                    "disc_index_safe": false
+                                                                                  }
+                                                                                }
+                                                                              ]
+                                                                            ],
+                                                                            "variants": [],
+                                                                            "disc_index_safe": false
+                                                                          }
+                                                                        }
+                                                                      ],
+                                                                      [
+                                                                        "cap",
+                                                                        {
+                                                                          "Adt": {
+                                                                            "name": "core::num::niche_types::UsizeNoHighBit",
+                                                                            "fields": [
+                                                                              [
+                                                                                "0",
+                                                                                {
+                                                                                  "Int": {
+                                                                                    "width": 64,
+                                                                                    "signed": false
+                                                                                  }
+                                                                                }
+                                                                              ]
+                                                                            ],
+                                                                            "variants": [],
+                                                                            "disc_index_safe": false
+                                                                          }
+                                                                        }
+                                                                      ],
+                                                                      [
+                                                                        "alloc",
+                                                                        {
+                                                                          "Adt": {
+                                                                            "name": "std::alloc::Global",
+                                                                            "fields": [],
+                                                                            "variants": [],
+                                                                            "disc_index_safe": false
+                                                                          }
+                                                                        }
+                                                                      ]
+                                                                    ],
+                                                                    "variants": [],
+                                                                    "disc_index_safe": false
+                                                                  }
+                                                                }
+                                                              ],
+                                                              [
+                                                                "_marker",
+                                                                {
+                                                                  "Adt": {
+                                                                    "name": "std::marker::PhantomData",
+                                                                    "fields": [],
+                                                                    "variants": [],
+                                                                    "disc_index_safe": false
+                                                                  }
+                                                                }
+                                                              ]
+                                                            ],
+                                                            "variants": [],
+                                                            "disc_index_safe": false
+                                                          }
+                                                        }
+                                                      ],
+                                                      [
+                                                        "len",
+                                                        {
+                                                          "Int": {
+                                                            "width": 64,
+                                                            "signed": false
+                                                          }
+                                                        }
+                                                      ]
+                                                    ],
+                                                    "variants": [],
+                                                    "disc_index_safe": false
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ],
+                          [
+                            "end_or_len",
+                            {
+                              "RawPtr": {
+                                "mutable": false,
+                                "pointee": {
+                                  "Adt": {
+                                    "name": "std::string::String",
+                                    "fields": [
+                                      [
+                                        "vec",
+                                        {
+                                          "Adt": {
+                                            "name": "std::vec::Vec",
+                                            "fields": [
+                                              [
+                                                "buf",
+                                                {
+                                                  "Adt": {
+                                                    "name": "alloc::raw_vec::RawVec",
+                                                    "fields": [
+                                                      [
+                                                        "inner",
+                                                        {
+                                                          "Adt": {
+                                                            "name": "alloc::raw_vec::RawVecInner",
+                                                            "fields": [
+                                                              [
+                                                                "ptr",
+                                                                {
+                                                                  "Adt": {
+                                                                    "name": "std::ptr::Unique",
+                                                                    "fields": [
+                                                                      [
+                                                                        "pointer",
+                                                                        {
+                                                                          "Adt": {
+                                                                            "name": "std::ptr::NonNull",
+                                                                            "fields": [
+                                                                              [
+                                                                                "pointer",
+                                                                                {
+                                                                                  "RawPtr": {
+                                                                                    "mutable": false,
+                                                                                    "pointee": {
+                                                                                      "Int": {
+                                                                                        "width": 8,
+                                                                                        "signed": false
+                                                                                      }
+                                                                                    }
+                                                                                  }
+                                                                                }
+                                                                              ]
+                                                                            ],
+                                                                            "variants": [],
+                                                                            "disc_index_safe": false
+                                                                          }
+                                                                        }
+                                                                      ],
+                                                                      [
+                                                                        "_marker",
+                                                                        {
+                                                                          "Adt": {
+                                                                            "name": "std::marker::PhantomData",
+                                                                            "fields": [],
+                                                                            "variants": [],
+                                                                            "disc_index_safe": false
+                                                                          }
+                                                                        }
+                                                                      ]
+                                                                    ],
+                                                                    "variants": [],
+                                                                    "disc_index_safe": false
+                                                                  }
+                                                                }
+                                                              ],
+                                                              [
+                                                                "cap",
+                                                                {
+                                                                  "Adt": {
+                                                                    "name": "core::num::niche_types::UsizeNoHighBit",
+                                                                    "fields": [
+                                                                      [
+                                                                        "0",
+                                                                        {
+                                                                          "Int": {
+                                                                            "width": 64,
+                                                                            "signed": false
+                                                                          }
+                                                                        }
+                                                                      ]
+                                                                    ],
+                                                                    "variants": [],
+                                                                    "disc_index_safe": false
+                                                                  }
+                                                                }
+                                                              ],
+                                                              [
+                                                                "alloc",
+                                                                {
+                                                                  "Adt": {
+                                                                    "name": "std::alloc::Global",
+                                                                    "fields": [],
+                                                                    "variants": [],
+                                                                    "disc_index_safe": false
+                                                                  }
+                                                                }
+                                                              ]
+                                                            ],
+                                                            "variants": [],
+                                                            "disc_index_safe": false
+                                                          }
+                                                        }
+                                                      ],
+                                                      [
+                                                        "_marker",
+                                                        {
+                                                          "Adt": {
+                                                            "name": "std::marker::PhantomData",
+                                                            "fields": [],
+                                                            "variants": [],
+                                                            "disc_index_safe": false
+                                                          }
+                                                        }
+                                                      ]
+                                                    ],
+                                                    "variants": [],
+                                                    "disc_index_safe": false
+                                                  }
+                                                }
+                                              ],
+                                              [
+                                                "len",
+                                                {
+                                                  "Int": {
+                                                    "width": 64,
+                                                    "signed": false
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false
+                                  }
+                                }
+                              }
+                            }
+                          ],
+                          [
+                            "_marker",
+                            {
+                              "Adt": {
+                                "name": "std::marker::PhantomData",
+                                "fields": [],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ],
+                  [
+                    "f",
+                    {
+                      "Closure": {
+                        "name": "term::Context::iter::{closure#0}",
+                        "upvars": []
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Adt": {
+            "name": "std::iter::Map",
+            "fields": [
+              [
+                "iter",
+                {
+                  "Adt": {
+                    "name": "std::slice::Iter",
+                    "fields": [
+                      [
+                        "ptr",
+                        {
+                          "Adt": {
+                            "name": "std::ptr::NonNull",
+                            "fields": [
+                              [
+                                "pointer",
+                                {
+                                  "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": {
+                                      "Adt": {
+                                        "name": "std::string::String",
+                                        "fields": [
+                                          [
+                                            "vec",
+                                            {
+                                              "Adt": {
+                                                "name": "std::vec::Vec",
+                                                "fields": [
+                                                  [
+                                                    "buf",
+                                                    {
+                                                      "Adt": {
+                                                        "name": "alloc::raw_vec::RawVec",
+                                                        "fields": [
+                                                          [
+                                                            "inner",
+                                                            {
+                                                              "Adt": {
+                                                                "name": "alloc::raw_vec::RawVecInner",
+                                                                "fields": [
+                                                                  [
+                                                                    "ptr",
+                                                                    {
+                                                                      "Adt": {
+                                                                        "name": "std::ptr::Unique",
+                                                                        "fields": [
+                                                                          [
+                                                                            "pointer",
+                                                                            {
+                                                                              "Adt": {
+                                                                                "name": "std::ptr::NonNull",
+                                                                                "fields": [
+                                                                                  [
+                                                                                    "pointer",
+                                                                                    {
+                                                                                      "RawPtr": {
+                                                                                        "mutable": false,
+                                                                                        "pointee": {
+                                                                                          "Int": {
+                                                                                            "width": 8,
+                                                                                            "signed": false
+                                                                                          }
+                                                                                        }
+                                                                                      }
+                                                                                    }
+                                                                                  ]
+                                                                                ],
+                                                                                "variants": [],
+                                                                                "disc_index_safe": false
+                                                                              }
+                                                                            }
+                                                                          ],
+                                                                          [
+                                                                            "_marker",
+                                                                            {
+                                                                              "Adt": {
+                                                                                "name": "std::marker::PhantomData",
+                                                                                "fields": [],
+                                                                                "variants": [],
+                                                                                "disc_index_safe": false
+                                                                              }
+                                                                            }
+                                                                          ]
+                                                                        ],
+                                                                        "variants": [],
+                                                                        "disc_index_safe": false
+                                                                      }
+                                                                    }
+                                                                  ],
+                                                                  [
+                                                                    "cap",
+                                                                    {
+                                                                      "Adt": {
+                                                                        "name": "core::num::niche_types::UsizeNoHighBit",
+                                                                        "fields": [
+                                                                          [
+                                                                            "0",
+                                                                            {
+                                                                              "Int": {
+                                                                                "width": 64,
+                                                                                "signed": false
+                                                                              }
+                                                                            }
+                                                                          ]
+                                                                        ],
+                                                                        "variants": [],
+                                                                        "disc_index_safe": false
+                                                                      }
+                                                                    }
+                                                                  ],
+                                                                  [
+                                                                    "alloc",
+                                                                    {
+                                                                      "Adt": {
+                                                                        "name": "std::alloc::Global",
+                                                                        "fields": [],
+                                                                        "variants": [],
+                                                                        "disc_index_safe": false
+                                                                      }
+                                                                    }
+                                                                  ]
+                                                                ],
+                                                                "variants": [],
+                                                                "disc_index_safe": false
+                                                              }
+                                                            }
+                                                          ],
+                                                          [
+                                                            "_marker",
+                                                            {
+                                                              "Adt": {
+                                                                "name": "std::marker::PhantomData",
+                                                                "fields": [],
+                                                                "variants": [],
+                                                                "disc_index_safe": false
+                                                              }
+                                                            }
+                                                          ]
+                                                        ],
+                                                        "variants": [],
+                                                        "disc_index_safe": false
+                                                      }
+                                                    }
+                                                  ],
+                                                  [
+                                                    "len",
+                                                    {
+                                                      "Int": {
+                                                        "width": 64,
+                                                        "signed": false
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false
+                          }
+                        }
+                      ],
+                      [
+                        "end_or_len",
+                        {
+                          "RawPtr": {
+                            "mutable": false,
+                            "pointee": {
+                              "Adt": {
+                                "name": "std::string::String",
+                                "fields": [
+                                  [
+                                    "vec",
+                                    {
+                                      "Adt": {
+                                        "name": "std::vec::Vec",
+                                        "fields": [
+                                          [
+                                            "buf",
+                                            {
+                                              "Adt": {
+                                                "name": "alloc::raw_vec::RawVec",
+                                                "fields": [
+                                                  [
+                                                    "inner",
+                                                    {
+                                                      "Adt": {
+                                                        "name": "alloc::raw_vec::RawVecInner",
+                                                        "fields": [
+                                                          [
+                                                            "ptr",
+                                                            {
+                                                              "Adt": {
+                                                                "name": "std::ptr::Unique",
+                                                                "fields": [
+                                                                  [
+                                                                    "pointer",
+                                                                    {
+                                                                      "Adt": {
+                                                                        "name": "std::ptr::NonNull",
+                                                                        "fields": [
+                                                                          [
+                                                                            "pointer",
+                                                                            {
+                                                                              "RawPtr": {
+                                                                                "mutable": false,
+                                                                                "pointee": {
+                                                                                  "Int": {
+                                                                                    "width": 8,
+                                                                                    "signed": false
+                                                                                  }
+                                                                                }
+                                                                              }
+                                                                            }
+                                                                          ]
+                                                                        ],
+                                                                        "variants": [],
+                                                                        "disc_index_safe": false
+                                                                      }
+                                                                    }
+                                                                  ],
+                                                                  [
+                                                                    "_marker",
+                                                                    {
+                                                                      "Adt": {
+                                                                        "name": "std::marker::PhantomData",
+                                                                        "fields": [],
+                                                                        "variants": [],
+                                                                        "disc_index_safe": false
+                                                                      }
+                                                                    }
+                                                                  ]
+                                                                ],
+                                                                "variants": [],
+                                                                "disc_index_safe": false
+                                                              }
+                                                            }
+                                                          ],
+                                                          [
+                                                            "cap",
+                                                            {
+                                                              "Adt": {
+                                                                "name": "core::num::niche_types::UsizeNoHighBit",
+                                                                "fields": [
+                                                                  [
+                                                                    "0",
+                                                                    {
+                                                                      "Int": {
+                                                                        "width": 64,
+                                                                        "signed": false
+                                                                      }
+                                                                    }
+                                                                  ]
+                                                                ],
+                                                                "variants": [],
+                                                                "disc_index_safe": false
+                                                              }
+                                                            }
+                                                          ],
+                                                          [
+                                                            "alloc",
+                                                            {
+                                                              "Adt": {
+                                                                "name": "std::alloc::Global",
+                                                                "fields": [],
+                                                                "variants": [],
+                                                                "disc_index_safe": false
+                                                              }
+                                                            }
+                                                          ]
+                                                        ],
+                                                        "variants": [],
+                                                        "disc_index_safe": false
+                                                      }
+                                                    }
+                                                  ],
+                                                  [
+                                                    "_marker",
+                                                    {
+                                                      "Adt": {
+                                                        "name": "std::marker::PhantomData",
+                                                        "fields": [],
+                                                        "variants": [],
+                                                        "disc_index_safe": false
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "len",
+                                            {
+                                              "Int": {
+                                                "width": 64,
+                                                "signed": false
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          }
+                        }
+                      ],
+                      [
+                        "_marker",
+                        {
+                          "Adt": {
+                            "name": "std::marker::PhantomData",
+                            "fields": [],
+                            "variants": [],
+                            "disc_index_safe": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ],
+              [
+                "f",
+                {
+                  "Closure": {
+                    "name": "term::Context::iter::{closure#0}",
+                    "upvars": []
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Closure": {
+            "name": "term::Context::contains::{closure#0}",
+            "upvars": [
+              {
+                "Ref": {
+                  "mutable": false,
+                  "inner": {
+                    "Unsupported": {
+                      "kind": "TyKind::Param",
+                      "detail": "generic parameter S/#0 needs monomorphization"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Unsupported": {
+                "kind": "TyKind::Param",
+                "detail": "generic parameter S/#0 needs monomorphization"
+              }
+            }
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "term::Context::iter",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "<worktree>/crates/trust-clean/fixtures/fold-crate-lambda-calculus-3.5.0/SOURCE/src/term.rs",
+              "line_start": 95,
+              "col_start": 8,
+              "line_end": 95,
+              "col_end": 19
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<worktree>/crates/trust-clean/fixtures/fold-crate-lambda-calculus-3.5.0/SOURCE/src/term.rs",
+                "line_start": 95,
+                "col_start": 8,
+                "line_end": 95,
+                "col_end": 19
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<worktree>/crates/trust-clean/fixtures/fold-crate-lambda-calculus-3.5.0/SOURCE/src/term.rs",
+                "line_start": 95,
+                "col_start": 24,
+                "line_end": 95,
+                "col_end": 52
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Closure": {
+                      "name": "term::Context::contains::{closure#0}",
+                      "captures": [
+                        {
+                          "Ref": {
+                            "mutable": false,
+                            "inner": {
+                              "Unsupported": {
+                                "kind": "TyKind::Param",
+                                "detail": "generic parameter S/#0 needs monomorphization"
+                              }
+                            }
+                          }
+                        }
+                      ],
+                      "call_kind": "FnMut"
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 6,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "<worktree>/crates/trust-clean/fixtures/fold-crate-lambda-calculus-3.5.0/SOURCE/src/term.rs",
+                "line_start": 95,
+                "col_start": 24,
+                "line_end": 95,
+                "col_end": 52
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "std::iter::Iterator::any",
+            "args": [
+              {
+                "Move": {
+                  "local": 3,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 5,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "<worktree>/crates/trust-clean/fixtures/fold-crate-lambda-calculus-3.5.0/SOURCE/src/term.rs",
+              "line_start": 95,
+              "col_start": 8,
+              "line_end": 95,
+              "col_end": 53
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "<worktree>/crates/trust-clean/fixtures/fold-crate-lambda-calculus-3.5.0/SOURCE/src/term.rs",
+              "line_start": 96,
+              "col_start": 4,
+              "line_end": 96,
+              "col_end": 5
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": "Return"
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 5,
+            "span": {
+              "file": "<worktree>/crates/trust-clean/fixtures/fold-crate-lambda-calculus-3.5.0/SOURCE/src/term.rs",
+              "line_start": 96,
+              "col_start": 4,
+              "line_end": 96,
+              "col_end": 5
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [],
+        "terminator": "Resume"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": "Bool"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

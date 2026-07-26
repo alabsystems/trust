@@ -1,0 +1,8 @@
+{
+  "obligations": [
+    "init_implies_invariant",
+    "body_preserves_invariant",
+    "invariant_and_exit_imply_postcondition"
+  ],
+  "valid": true
+}

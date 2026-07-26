@@ -1,0 +1,3 @@
+def_path	total	inhabited	type_grounded_not_inhabited	not_grounded	kernel_rejected	safety_obligations	safety_discharged	fully_faithful	via_trustir	mirsem_fallback	declined
+<i128 as BitField>::get_bit	1	1	0	0	0	1	1	1	0	1	0
+<u128 as BitField>::get_bit	1	1	0	0	0	1	1	1	0	1	0

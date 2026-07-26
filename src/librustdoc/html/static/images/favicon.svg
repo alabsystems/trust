@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- The Trust mark. The `favicon.svg` name is a static-file protocol shared with
+     `static_files.rs`, `build.rs` and `page.html`, so the mark changes and the
+     filename does not. Geometry is on a 32-unit grid with every edge on a
+     multiple of four, so the glyph stays pixel-crisp when a browser rasterises
+     it down to 16px. -->
+<svg width="100%" height="100%" viewBox="0 0 32 32" version="1.1" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <style type="text/css"><![CDATA[
+    #logo {
+      fill: #231F20;
+    }
+    @media (prefers-color-scheme: dark) {
+      #logo {
+        fill: #FFFFFF;
+      }
+    }
+  ]]></style>
+</defs>
+<path id="logo" d="M4,4 L28,4 L28,12 L20,12 L20,28 L12,28 L12,12 L4,12 Z"/>
+</svg>

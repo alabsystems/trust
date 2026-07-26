@@ -1,0 +1,6 @@
+note: Clean island kernel-checked: 1 declaration(s) registered (brace_text)
+  --> $DIR/clean_island_lexical_string.rs:7:5
+   |
+LL |     def brace_text : String := "}"
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+

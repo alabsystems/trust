@@ -1,0 +1,14 @@
+error: unused variable: `ordinary`
+  --> $DIR/native_contract_liveness.rs:35:5
+   |
+LL |     ordinary: u32,
+   |     ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_ordinary`
+   |
+note: the lint level is defined here
+  --> $DIR/native_contract_liveness.rs:14:29
+   |
+LL | #![deny(unused_assignments, unused_variables)]
+   |                             ^^^^^^^^^^^^^^^^
+
+error: aborting due to 1 previous error
+

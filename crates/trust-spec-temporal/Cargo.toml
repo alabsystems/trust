@@ -1,0 +1,104 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright 2026 Andrew Yates
+[package]
+name = "trust-spec-temporal"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "Trust temporal models, Clean notation, and capability-gated ty.cert/v1 kernel rechecking."
+
+[lints]
+workspace = true
+
+# Its own workspace root, and it has to stay one. The `[patch.crates-io]`
+# table below swaps num-bigint/num-integer/num-traits for ty's tla-bignum
+# rewrites so the temporal verifier and `ty` agree on bignum semantics down to
+# the arithmetic. Patch tables apply to a whole workspace, so folding this
+# package into `crates/` or the root would silently re-point num-bigint for
+# every other member that uses it (trust-router, trust-ny-bridge, the JS value
+# model, and ay underneath them) — a semantics change bought for tidiness.
+#
+# Isolation is a workspace property, not a location: the package must stay at
+# exactly `crates/trust-spec-temporal/`, because `targo trust temporal` refuses
+# any user crate whose trust-spec-temporal resolves to a manifest other than
+# this one (`canonical_temporal_engine_manifest`, targo-trust/src/temporal_cli.rs).
+# Moving the directory turns that anti-shadow-package check into a hard error.
+[workspace]
+
+# The lint policy this workspace's members inherit with `[lints] workspace =
+# true`. Kept in step with the root and crates/ tables so the opt-in resolves
+# here too; tidy's `workspace_lints` ratchet enforces the opt-in itself.
+[workspace.lints.rust]
+warnings = "warn"
+
+# Path dependencies do not inherit the repository root's source patches. Pin
+# every sibling edge pulled by `tla-check` back to this checkout so the temporal
+# verifier cannot silently compile against a different remote source. Both
+# Clean checkers are part of that authority closure.
+[patch."https://github.com/alabsystems/trust-ir.git"]
+trust-ir = { path = "../../first-party/trust-ir/crates/trust-ir" }
+trust-ir-build = { path = "../../first-party/trust-ir/crates/trust-ir-build" }
+
+[patch."https://github.com/alabsystems/clean.git"]
+clean-ck0 = { path = "../../first-party/clean/crates/clean-ck0" }
+clean-kernel = { path = "../../first-party/clean/crates/clean-kernel" }
+
+[patch."https://github.com/alabsystems/ay.git"]
+ay = { path = "../../first-party/ay/crates/ay" }
+ay-dpll = { path = "../../first-party/ay/crates/ay-dpll" }
+ay-core = { path = "../../first-party/ay/crates/ay-core" }
+ay-proof = { path = "../../first-party/ay/crates/ay-proof" }
+ay-allsat = { path = "../../first-party/ay/crates/ay-allsat" }
+ay-chc = { path = "../../first-party/ay/crates/ay-chc" }
+ay-sat = { path = "../../first-party/ay/crates/ay-sat" }
+ay-frontend = { path = "../../first-party/ay/crates/ay-frontend" }
+ay-translate = { path = "../../first-party/ay/crates/ay-translate" }
+ay-encode = { path = "../../first-party/ay/crates/ay-encode" }
+
+[patch."https://github.com/alabsystems/trust-cg.git"]
+trust-cg-codegen = { path = "../../first-party/trust-cg/crates/trust-cg-codegen" }
+trust-cg-ir = { path = "../../first-party/trust-cg/crates/trust-cg-ir" }
+trust-cg-lower = { path = "../../first-party/trust-cg/crates/trust-cg-lower" }
+trust-cg-opt = { path = "../../first-party/trust-cg/crates/trust-cg-opt" }
+trust-cg-jit-matrix = { path = "../../first-party/trust-cg/crates/trust-cg-jit-matrix" }
+
+[patch.crates-io]
+rustc-hash = { path = "../../first-party/ty/crates/tla-hash-fx" }
+num-bigint = { path = "../../first-party/ty/crates/tla-bignum/bigint" }
+num-integer = { path = "../../first-party/ty/crates/tla-bignum/integer" }
+num-traits = { path = "../../first-party/ty/crates/tla-bignum/traits" }
+
+[dependencies]
+trust-spec-temporal-macros = { path = "../trust-spec-temporal-macros" }
+# `ty certify` lane (R5 non-P1 step 2): parse the self-contained `ty.cert/v1`
+# certificate and BIND it to the generated spec bytes. The transport types are
+# local to this crate for now; a shared trust-types transport comes later.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Independent certificate consumer. `clean-tla` reconstructs the theorem from
+# `spec_src`; `clean-kernel` type-checks the resulting closed proof in-process.
+# This is intentionally narrower than ty's own cert-check surface.
+clean-tla = { path = "../../first-party/clean/crates/clean-tla" }
+clean-kernel = { path = "../../first-party/clean/crates/clean-kernel" }
+# Production Clean temporal source certification parses and elaborates authored
+# `□` / `◇` / `~>` declarations, so these are runtime dependencies rather than
+# test-only helpers.
+clean-elab = { path = "../../first-party/clean/crates/clean-elab" }
+clean-parser = { path = "../../first-party/clean/crates/clean-parser" }
+# The certificate producer and its independent re-checkers are linked into the
+# verifier.  This removes the mutable PATH/subprocess seam: safety (including
+# the explicit-fixpoint kernel lane), liveness, fairness assumptions, and
+# counterexample replay are all checked by the repository-pinned implementation
+# whose code is part of this build.
+tla-check = { path = "../../first-party/ty/crates/tla-check", default-features = false, features = ["im", "bumpalo", "clean-cic"] }
+tla-core = { path = "../../first-party/ty/crates/tla-core" }
+# Coherence sentinel: this direct path edge is intentionally used by
+# `dependency_coherence` to prove that tla-check's public trust-ir carrier is
+# the exact repository-owned type. An external Cargo root must repeat the
+# trust-ir/Clean source patches above because Cargo patches are not transitive;
+# otherwise trust-spec-temporal fails to compile instead of linking two semantic
+# universes.
+trust-ir = { path = "../../first-party/trust-ir/crates/trust-ir", features = ["clean-expr"] }
+
+[dev-dependencies]
+tempfile = "3"

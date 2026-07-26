@@ -1,0 +1,27 @@
+# trust-js-regexp: the faithful tier's standalone ECMA-262 §22.2 regular
+# expression engine — spec-exact pattern compilation + matching over UTF-16
+# code units, or a typed refusal (`Unsupported`); never a guessed result.
+# No JS object model here (RegExp objects / lastIndex / @@match live in
+# trust-js-interp; this crate is the pure Pattern semantics, M1 D4 slice S1d
+# prep — docs/design/2026-07-21-trustjs-m1-scope.md).
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-js-regexp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Differential harness only: parses the trust-js-trace driver's trace JSON.
+serde = { workspace = true }
+serde_json = { workspace = true }

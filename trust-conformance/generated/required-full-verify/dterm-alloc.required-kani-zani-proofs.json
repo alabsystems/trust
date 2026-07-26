@@ -1,0 +1,150 @@
+{
+  "generated_from_inventory": {
+    "ecosystem": "dterm",
+    "inventory_date": "2026-04-27",
+    "inventory_path": "trust-conformance/proof-item-migration-inventory/dterm-20260427.json",
+    "issue_refs": [
+      "#1117",
+      "#1108",
+      "#1095",
+      "#1043"
+    ],
+    "schema": "trust.proof-item-migration-inventory.v1",
+    "source_commit": "070b3484655985e03f41820a3a235c5d520de7b4"
+  },
+  "generation_policy": {
+    "bounded_legacy_imports_remain_rejected_as_full_proof": true,
+    "count_only_slices_are_not_materialized": true,
+    "fail_closed_on_missing_roots": true
+  },
+  "schema": "trust.required-kani-zani-proofs.v1",
+  "scopes": [
+    {
+      "engine": "kani",
+      "execution_mode": "bounded_regression",
+      "id": "dterm.alloc.default",
+      "import_status": "production-owned mirror for the #1146 dterm-alloc denominator delta; 9 default-visible harnesses",
+      "manifest_path": "trust-conformance/external/dterm/crates/dterm-alloc/Cargo.toml",
+      "native_target": {
+        "accepted_evidence_requires": "hash-addressed Zani CHC/PDR transcript",
+        "kind": "harness",
+        "mode": "required_full_verify",
+        "source": "native_proof_fn"
+      },
+      "required_features": [],
+      "required_proof_items": [
+        {
+          "bounded_depth": "unwind:6",
+          "engine": "zani",
+          "file": "trust-conformance/external/dterm/crates/dterm-alloc/src/array_vec.rs",
+          "harness": "array_vec::kani_proofs::arrayvec_push_at_capacity_panics",
+          "kind": "harness",
+          "mode": "bounded_regression",
+          "must_execute_full_verify": true,
+          "proof_item_id": "proof:dterm.alloc.default:array_vec::kani_proofs::arrayvec_push_at_capacity_panics",
+          "source": "kani_proof_attribute"
+        },
+        {
+          "bounded_depth": "unwind:6",
+          "engine": "zani",
+          "file": "trust-conformance/external/dterm/crates/dterm-alloc/src/array_vec.rs",
+          "harness": "array_vec::kani_proofs::arrayvec_retain_len_consistent",
+          "kind": "harness",
+          "mode": "bounded_regression",
+          "must_execute_full_verify": true,
+          "proof_item_id": "proof:dterm.alloc.default:array_vec::kani_proofs::arrayvec_retain_len_consistent",
+          "source": "kani_proof_attribute"
+        },
+        {
+          "bounded_depth": "unspecified",
+          "engine": "zani",
+          "file": "trust-conformance/external/dterm/crates/dterm-alloc/src/array_vec.rs",
+          "harness": "array_vec::kani_proofs::arrayvec_pop_lifo_order",
+          "kind": "harness",
+          "mode": "bounded_regression",
+          "must_execute_full_verify": true,
+          "proof_item_id": "proof:dterm.alloc.default:array_vec::kani_proofs::arrayvec_pop_lifo_order",
+          "source": "kani_proof_attribute"
+        },
+        {
+          "bounded_depth": "unwind:6",
+          "engine": "zani",
+          "file": "trust-conformance/external/dterm/crates/dterm-alloc/src/array_vec.rs",
+          "harness": "array_vec::kani_proofs::arrayvec_as_slice_len_and_content",
+          "kind": "harness",
+          "mode": "bounded_regression",
+          "must_execute_full_verify": true,
+          "proof_item_id": "proof:dterm.alloc.default:array_vec::kani_proofs::arrayvec_as_slice_len_and_content",
+          "source": "kani_proof_attribute"
+        },
+        {
+          "bounded_depth": "unwind:7",
+          "engine": "zani",
+          "file": "trust-conformance/external/dterm/crates/dterm-alloc/src/small_vec.rs",
+          "harness": "small_vec::kani_proofs::smallvec_push_spill_preserves_elements",
+          "kind": "harness",
+          "mode": "bounded_regression",
+          "must_execute_full_verify": true,
+          "proof_item_id": "proof:dterm.alloc.default:small_vec::kani_proofs::smallvec_push_spill_preserves_elements",
+          "source": "kani_proof_attribute"
+        },
+        {
+          "bounded_depth": "unwind:7",
+          "engine": "zani",
+          "file": "trust-conformance/external/dterm/crates/dterm-alloc/src/small_vec.rs",
+          "harness": "small_vec::kani_proofs::smallvec_insert_remove_ordering",
+          "kind": "harness",
+          "mode": "bounded_regression",
+          "must_execute_full_verify": true,
+          "proof_item_id": "proof:dterm.alloc.default:small_vec::kani_proofs::smallvec_insert_remove_ordering",
+          "source": "kani_proof_attribute"
+        },
+        {
+          "bounded_depth": "unwind:6",
+          "engine": "zani",
+          "file": "trust-conformance/external/dterm/crates/dterm-alloc/src/small_vec.rs",
+          "harness": "small_vec::kani_proofs::smallvec_retain_len_invariant",
+          "kind": "harness",
+          "mode": "bounded_regression",
+          "must_execute_full_verify": true,
+          "proof_item_id": "proof:dterm.alloc.default:small_vec::kani_proofs::smallvec_retain_len_invariant",
+          "source": "kani_proof_attribute"
+        },
+        {
+          "bounded_depth": "unwind:7",
+          "engine": "zani",
+          "file": "trust-conformance/external/dterm/crates/dterm-alloc/src/small_vec.rs",
+          "harness": "small_vec::kani_proofs::smallvec_spill_transition_preserves_all",
+          "kind": "harness",
+          "mode": "bounded_regression",
+          "must_execute_full_verify": true,
+          "proof_item_id": "proof:dterm.alloc.default:small_vec::kani_proofs::smallvec_spill_transition_preserves_all",
+          "source": "kani_proof_attribute"
+        },
+        {
+          "bounded_depth": "unwind:8",
+          "engine": "zani",
+          "file": "trust-conformance/external/dterm/crates/dterm-alloc/src/small_vec.rs",
+          "harness": "small_vec::kani_proofs::smallvec_as_slice_length_invariant",
+          "kind": "harness",
+          "mode": "bounded_regression",
+          "must_execute_full_verify": true,
+          "proof_item_id": "proof:dterm.alloc.default:small_vec::kani_proofs::smallvec_as_slice_length_invariant",
+          "source": "kani_proof_attribute"
+        }
+      ],
+      "required_rust_flags": [],
+      "root": "trust-conformance/external/dterm/crates/dterm-alloc/src",
+      "runner": [
+        "{targo}",
+        "kani",
+        "--manifest-path",
+        "{manifest_path}",
+        "--harness",
+        "{harness}"
+      ],
+      "runner_host": "trust-stage2",
+      "source_prefix": "trust-conformance/external/dterm"
+    }
+  ]
+}

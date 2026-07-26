@@ -1,0 +1,21 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "trust-2026.04.25-rc1",
+  "documentNamespace": "https://github.com/alabsystems/trust/spdx/trust-2026.04.25-rc1",
+  "creationInfo": {
+    "created": "2026-04-25T00:00:00Z",
+    "creators": ["Tool: dpub-publication-v3-placeholder"]
+  },
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-Package-trust",
+      "name": "trust",
+      "downloadLocation": "git+https://github.com/alabsystems/trust",
+      "filesAnalyzed": false,
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "copyrightText": "NOASSERTION"
+    }
+  ]
+}

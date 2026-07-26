@@ -1,0 +1,16 @@
+{
+  "schema": "publication-v3-release-gate-report/v1",
+  "generated_at": "2026-04-25T00:00:00Z",
+  "repo_root": "/repo",
+  "mode": "local-dry-run",
+  "gate_mode": "production",
+  "lifecycle": "final-aggregate",
+  "publishing": "never",
+  "summary": {"total": 2, "passed": 2, "failed": 0, "missing": 0, "skipped": 0},
+  "production_blockers": [],
+  "next_machine_checkable_artifacts": [],
+  "gates": [
+    {"name": "dscan-admission", "status": "passed", "tool": "scripts/validate_dscan_admission.py", "command": ["python3", "scripts/validate_dscan_admission.py"], "returncode": 0},
+    {"name": "trust-engines-lock", "status": "passed", "tool": "scripts/validate_trust_engines_lock.py", "command": ["python3", "scripts/validate_trust_engines_lock.py"], "returncode": 0}
+  ]
+}

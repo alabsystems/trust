@@ -1,0 +1,23 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+core::char::methods::<impl char>::is_ascii_uppercase	FULLY_FAITHFUL	true	true	true	true	true	false	true
+core::num::<impl u8>::ascii_change_case_unchecked	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::char::methods::<impl char>::to_ascii_lowercase	SHAPE_GAP	false	false	false	false	false	false	false
+core::char::methods::<impl char>::eq_ignore_ascii_case	SHAPE_GAP	false	false	false	false	false	false	false
+core::char::methods::<impl char>::is_ascii	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::char::methods::<impl char>::is_ascii_alphabetic	FULLY_FAITHFUL	true	true	true	true	true	false	true
+core::char::methods::<impl char>::is_ascii_digit	FULLY_FAITHFUL	true	true	true	true	true	false	true
+core::char::methods::<impl char>::is_ascii_hexdigit	FULLY_FAITHFUL	false	false	true	true	true	false	true
+core::char::methods::<impl char>::is_ascii_lowercase	FULLY_FAITHFUL	true	true	true	true	true	false	true
+core::char::methods::<impl char>::is_ascii_whitespace	FULLY_FAITHFUL	true	true	false	false	false	false	true
+core::char::methods::<impl char>::to_ascii_uppercase	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_case_roundtrip	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_eq_ignore_ascii_case	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_is_ascii_alphabetic	FULLY_FAITHFUL	true	true	true	true	true	false	true
+main::w_is_ascii_alphanumeric_composed	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_is_ascii_digit	FULLY_FAITHFUL	true	true	true	true	true	false	true
+main::w_is_ascii_hexdigit	FULLY_FAITHFUL	true	true	true	true	true	false	true
+main::w_is_ascii_lowercase	FULLY_FAITHFUL	true	true	true	true	true	false	true
+main::w_is_ascii_uppercase	FULLY_FAITHFUL	true	true	true	true	true	false	true
+main::w_is_ascii_whitespace	FULLY_FAITHFUL	true	true	true	true	true	false	true
+main::w_to_ascii_lowercase	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_to_ascii_uppercase	SHAPE_GAP	false	false	false	false	false	false	false

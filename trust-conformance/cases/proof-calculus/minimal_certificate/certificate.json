@@ -1,0 +1,25 @@
+{
+  "conclusion": "Q",
+  "format": "trust-proof-calculus/v1",
+  "steps": [
+    {
+      "id": "s1",
+      "rule": "assume",
+      "term": "P"
+    },
+    {
+      "id": "s2",
+      "rule": "assume",
+      "term": "P -> Q"
+    },
+    {
+      "from": [
+        "s1",
+        "s2"
+      ],
+      "id": "s3",
+      "rule": "modus_ponens",
+      "term": "Q"
+    }
+  ]
+}

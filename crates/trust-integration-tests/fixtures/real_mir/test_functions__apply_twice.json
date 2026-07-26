@@ -1,0 +1,216 @@
+{
+  "name": "apply_twice",
+  "def_path": "test_functions::apply_twice",
+  "span": {
+    "file": "test_functions.rs",
+    "line_start": 103,
+    "col_start": 1,
+    "line_end": 106,
+    "col_end": 2
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Closure": {
+            "name": "test_functions::apply_twice::{closure#0}",
+            "upvars": []
+          }
+        },
+        "name": "double"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 2
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Closure": {
+                      "name": "test_functions::apply_twice::{closure#0}"
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "test_functions.rs",
+                "line_start": 104,
+                "col_start": 18,
+                "line_end": 104,
+                "col_end": 30
+              }
+            }
+          },
+          {
+            "StorageLive": 3
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "test_functions::apply_twice::{closure#0}",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "test_functions.rs",
+              "line_start": 105,
+              "col_start": 5,
+              "line_end": 105,
+              "col_end": 22
+            },
+            "atomic": null
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageLive": 4
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "test_functions::apply_twice::{closure#0}",
+            "args": [
+              {
+                "Copy": {
+                  "local": 3,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "test_functions.rs",
+              "line_start": 105,
+              "col_start": 5,
+              "line_end": 105,
+              "col_end": 22
+            },
+            "atomic": null
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 4,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "test_functions.rs",
+                "line_start": 105,
+                "col_start": 5,
+                "line_end": 105,
+                "col_end": 22
+              }
+            }
+          },
+          {
+            "StorageDead": 4
+          },
+          {
+            "StorageDead": 3
+          },
+          {
+            "StorageDead": 2
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

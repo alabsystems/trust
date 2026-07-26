@@ -1,0 +1,25 @@
+def_path	verdict	lane	kernel_rejected	safety_obligations	safety_discharged	wall
+char::methods::<impl char>::is_ascii	FULLY_FAITHFUL	mirsem	0	0	0	-
+char::methods::<impl char>::is_ascii_alphabetic	FULLY_FAITHFUL	via_trustir	0	0	0	-
+char::methods::<impl char>::is_ascii_alphanumeric	FULLY_FAITHFUL	mirsem	0	0	0	-
+char::methods::<impl char>::is_ascii_control	FULLY_FAITHFUL	via_trustir	0	0	0	-
+char::methods::<impl char>::is_ascii_digit	FULLY_FAITHFUL	via_trustir	0	0	0	-
+char::methods::<impl char>::is_ascii_graphic	FULLY_FAITHFUL	via_trustir	0	0	0	-
+char::methods::<impl char>::is_ascii_hexdigit	FULLY_FAITHFUL	mirsem	0	0	0	-
+char::methods::<impl char>::is_ascii_lowercase	FULLY_FAITHFUL	via_trustir	0	0	0	-
+char::methods::<impl char>::is_ascii_octdigit	FULLY_FAITHFUL	via_trustir	0	0	0	-
+char::methods::<impl char>::is_ascii_punctuation	FULLY_FAITHFUL	mirsem	0	0	0	-
+char::methods::<impl char>::is_ascii_uppercase	FULLY_FAITHFUL	via_trustir	0	0	0	-
+char::methods::<impl char>::is_ascii_whitespace	FULLY_FAITHFUL	via_trustir	0	0	0	-
+num::<impl u8>::is_ascii	FULLY_FAITHFUL	mirsem	0	0	0	-
+num::<impl u8>::is_ascii_alphabetic	FULLY_FAITHFUL	via_trustir	0	0	0	-
+num::<impl u8>::is_ascii_alphanumeric	FULLY_FAITHFUL	mirsem	0	0	0	-
+num::<impl u8>::is_ascii_control	FULLY_FAITHFUL	via_trustir	0	0	0	-
+num::<impl u8>::is_ascii_digit	FULLY_FAITHFUL	via_trustir	0	0	0	-
+num::<impl u8>::is_ascii_graphic	FULLY_FAITHFUL	via_trustir	0	0	0	-
+num::<impl u8>::is_ascii_hexdigit	FULLY_FAITHFUL	mirsem	0	0	0	-
+num::<impl u8>::is_ascii_lowercase	FULLY_FAITHFUL	via_trustir	0	0	0	-
+num::<impl u8>::is_ascii_octdigit	FULLY_FAITHFUL	via_trustir	0	0	0	-
+num::<impl u8>::is_ascii_punctuation	FULLY_FAITHFUL	mirsem	0	0	0	-
+num::<impl u8>::is_ascii_uppercase	FULLY_FAITHFUL	via_trustir	0	0	0	-
+num::<impl u8>::is_ascii_whitespace	FULLY_FAITHFUL	via_trustir	0	0	0	-

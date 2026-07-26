@@ -1,0 +1,6 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful	total	inhabited	type_grounded_not_inhabited	not_grounded	kernel_rejected	safety_obligations	safety_discharged	census_fully_faithful	via_trustir	mirsem_fallback	declined	expr_fold_decline	wall
+ctl_min_i32	FULLY_FAITHFUL	true	true	true	true	true	false	true	1	1	0	0	0	0	0	1	1	0	0	-	-
+ctl_max_i32	FULLY_FAITHFUL	true	true	true	true	true	false	true	1	1	0	0	0	0	0	1	1	0	0	-	-
+ctl_min_u8	FULLY_FAITHFUL	true	true	true	true	true	false	true	1	1	0	0	0	0	0	1	1	0	0	-	-
+ctl_max_u8	FULLY_FAITHFUL	true	true	true	true	true	false	true	1	1	0	0	0	0	0	1	1	0	0	-	-
+ctl_clamp_i32	FULLY_FAITHFUL	true	true	true	true	true	false	true	1	1	0	0	0	0	0	1	1	0	0	-	-

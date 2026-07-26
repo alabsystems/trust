@@ -1,0 +1,175 @@
+{
+  "_stamp": "rustc 1.99.0-dev (e7645f809 2026-07-25) (trustc)",
+  "cases": {
+    "add_cast": {
+      "counterexample": false,
+      "failed": 0,
+      "proved": 1,
+      "rows": [
+        "proved:overflow:add"
+      ],
+      "runtime_checked": 0,
+      "total": 1,
+      "unknown": 0
+    },
+    "div_guard_cast_narrowing": {
+      "counterexample": true,
+      "failed": 1,
+      "proved": 1,
+      "rows": [
+        "failed:divzero",
+        "proved:divzero"
+      ],
+      "runtime_checked": 0,
+      "total": 2,
+      "unknown": 0
+    },
+    "div_guard_cast_widening_u16": {
+      "counterexample": false,
+      "failed": 0,
+      "proved": 2,
+      "rows": [
+        "proved:divzero"
+      ],
+      "runtime_checked": 0,
+      "total": 2,
+      "unknown": 0
+    },
+    "div_guard_cast_widening_u8": {
+      "counterexample": false,
+      "failed": 0,
+      "proved": 2,
+      "rows": [
+        "proved:divzero"
+      ],
+      "runtime_checked": 0,
+      "total": 2,
+      "unknown": 0
+    },
+    "div_guard_plain": {
+      "counterexample": false,
+      "failed": 0,
+      "proved": 2,
+      "rows": [
+        "proved:divzero"
+      ],
+      "runtime_checked": 0,
+      "total": 2,
+      "unknown": 0
+    },
+    "loop_invariant_bounded_control": {
+      "counterexample": false,
+      "failed": 0,
+      "proved": 3,
+      "rows": [
+        "proved:overflow:add",
+        "proved:overflow:sub",
+        "proved:termination"
+      ],
+      "runtime_checked": 0,
+      "total": 3,
+      "unknown": 0
+    },
+    "loop_invariant_countdown": {
+      "counterexample": true,
+      "failed": 1,
+      "proved": 1,
+      "rows": [
+        "failed:overflow:add",
+        "proved:overflow:sub"
+      ],
+      "runtime_checked": 0,
+      "total": 2,
+      "unknown": 0
+    },
+    "mul_cast": {
+      "counterexample": false,
+      "failed": 0,
+      "proved": 1,
+      "rows": [
+        "proved:overflow:mul"
+      ],
+      "runtime_checked": 0,
+      "total": 1,
+      "unknown": 0
+    },
+    "mul_cast_u32": {
+      "counterexample": false,
+      "failed": 0,
+      "proved": 1,
+      "rows": [
+        "proved:overflow:mul"
+      ],
+      "runtime_checked": 0,
+      "total": 1,
+      "unknown": 0
+    },
+    "mul_guard": {
+      "counterexample": false,
+      "failed": 0,
+      "proved": 1,
+      "rows": [
+        "proved:overflow:mul"
+      ],
+      "runtime_checked": 0,
+      "total": 1,
+      "unknown": 0
+    },
+    "mul_var_times_var_widening": {
+      "counterexample": false,
+      "failed": 0,
+      "proved": 0,
+      "rows": [
+        "runtime_checked:overflow:mul"
+      ],
+      "runtime_checked": 1,
+      "total": 1,
+      "unknown": 0
+    },
+    "neg_nonlinear_mul": {
+      "counterexample": true,
+      "failed": 1,
+      "proved": 0,
+      "rows": [
+        "failed:overflow:mul"
+      ],
+      "runtime_checked": 0,
+      "total": 1,
+      "unknown": 0
+    },
+    "neg_unguarded_add": {
+      "counterexample": true,
+      "failed": 1,
+      "proved": 0,
+      "rows": [
+        "failed:overflow:add"
+      ],
+      "runtime_checked": 0,
+      "total": 1,
+      "unknown": 0
+    },
+    "neg_unguarded_div": {
+      "counterexample": true,
+      "failed": 1,
+      "proved": 1,
+      "rows": [
+        "failed:divzero",
+        "proved:divzero"
+      ],
+      "runtime_checked": 0,
+      "total": 2,
+      "unknown": 0
+    },
+    "shl_cast": {
+      "counterexample": false,
+      "failed": 0,
+      "proved": 1,
+      "rows": [
+        "proved:shift:left"
+      ],
+      "runtime_checked": 0,
+      "total": 1,
+      "unknown": 0
+    }
+  }
+}

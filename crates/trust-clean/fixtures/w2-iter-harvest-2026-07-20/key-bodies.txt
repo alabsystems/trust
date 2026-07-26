@@ -1,0 +1,200 @@
+====================================================================================================
+(1) THE FOR-LOOP DESUGAR: into_iter once (bb0), then Iter::next as an EXPLICIT Call each iteration.
+    Loop header = bb2 (&mut iter; Call next -> bb3). bb3 switches on discriminant(Option): 0/None -> bb6 exit,
+    1/Some -> bb5 body (downcast, deref, CheckedAdd + Overflow Assert) -> bb7 -> Goto bb2 BACK-EDGE.
+    ff-gate: SHAPE_GAP (loop lane declines the in-loop Call).
+----------------------------------------------------------------------------------------------------
+FN sum_loop
+  arg_count=1 return=i32 locals=11 blocks=8
+  _0: i32
+  _1: &[i32] // s
+  _2: i32 // a
+  _3: std::slice::Iter
+  _4: std::slice::Iter // iter
+  _5: std::option::Option
+  _6: &mut std::slice::Iter
+  _7: i64
+  _8: &i32 // x
+  _9: i32
+  _10: (i32, Bool)
+  bb0:
+     _2 = const {"Int": 0}
+     T: Call _3 = <&[i32] as std::iter::IntoIterator>::into_iter(_1) -> bb1
+  bb1:
+     _4 = move _3
+     T: Goto bb2
+  bb2:
+     _6 = &mut _4
+     T: Call _5 = <std::slice::Iter<'_, i32> as std::iter::Iterator>::next(_6) -> bb3
+  bb3:
+     _7 = discriminant(_5)
+     T: SwitchInt(move _7) targets=[[0, 6], [1, 5]]
+  bb4:
+     T: Unreachable
+  bb5:
+     _8 = _5 as v#1.f0
+     _9 = (*_8)
+     _10 = CheckedAdd(_2, _9)
+     T: Assert(move _10.f1, expected=False, msg={"Overflow": "Add"}) -> bb7
+  bb6:
+     _0 = _2
+     T: Return
+  bb7:
+     _2 = move _10.f0
+     T: Goto bb2
+
+====================================================================================================
+(2) THE PTR-ARITHMETIC LEAF: slice::Iter::next DOES dump (12 blocks). Non-ZST path: ptr==end Eq check ->
+    None, else pointer post-increment appears as rvalue {Unsupported: BinOp::Offset, 'operation requires
+    explicit MIR semantics before proof'} (bb6) — the single fail-closed exit. ZST path (bb1/bb10/bb11,
+    dead behind SwitchInt(const false)) calls unchecked_sub::precondition_check, which was NOT monomorphized
+    into the dump. ff-gate: SHAPE_GAP (BinOp::Offset Unsupported).
+----------------------------------------------------------------------------------------------------
+FN <std::slice::Iter<'_, i32> as std::iter::Iterator>::next
+  arg_count=1 return=std::option::Option locals=18 blocks=12
+  _0: std::option::Option
+  _1: &mut std::slice::Iter // self
+  _2: std::ptr::NonNull // self
+  _3: *const i32 // self
+  _4: u64 // self
+  _5: u64 // addr
+  _6: Bool
+  _7: &std::ptr::NonNull // self
+  _8: &std::ptr::NonNull // other
+  _9: std::ptr::NonNull
+  _10: std::ptr::NonNull
+  _11: &i32
+  _12: &std::ptr::NonNull // self
+  _13: Unit
+  _14: *mut i32
+  _15: *mut i32
+  _16: *mut i32
+  _17: *const i32
+  bb0:
+     StorageLive(_2)
+     _2 = (*_1).f0
+     StorageLive(_3)
+     _3 = (*_1).f1
+     T: SwitchInt(const {"Bool": false}) targets=[[0, 4]]
+  bb1:
+     StorageLive(_4)
+     _4 = cast(_3 as u64)
+     T: SwitchInt(_4) targets=[[0, 2]]
+  bb2:
+     _0 = Aggregate {"Adt": {"name": "std::option::Option", "variant": 0, "active_field": null}} ()
+     StorageDead(_4)
+     T: Goto bb8
+  bb3:
+     T: SwitchInt(const {"Bool": true}) targets=[[0, 11]]
+  bb4:
+     StorageLive(_6)
+     StorageLive(_9)
+     _9 = cast(_3 as std::ptr::NonNull)
+     _14 = cast(_2 as *mut i32)
+     StorageLive(_15)
+     _15 = cast(_9 as *mut i32)
+     _6 = Eq(_14, _15)
+     StorageDead(_15)
+     T: SwitchInt(move _6) targets=[[0, 6]]
+  bb5:
+     StorageDead(_9)
+     _0 = Aggregate {"Adt": {"name": "std::option::Option", "variant": 0, "active_field": null}} ()
+     StorageDead(_6)
+     T: Goto bb8
+  bb6:
+     StorageDead(_9)
+     StorageDead(_6)
+     StorageLive(_10)
+     StorageLive(_16)
+     _16 = {"Unsupported": {"kind": "BinOp::Offset", "detail": "operation requires explicit MIR semantics before proof", "operands": [{"Copy": {"local": 14, "projections": []}}, {"Constant": {"Uint": [1, 64]}}]}}
+     _10 = cast(_16 as std::ptr::NonNull)
+     StorageDead(_16)
+     (*_1).f0 = move _10
+     StorageDead(_10)
+     T: Goto bb7
+  bb7:
+     StorageLive(_11)
+     StorageLive(_17)
+     _17 = cast(_2 as *const i32)
+     _11 = &(*_17)
+     StorageDead(_17)
+     _0 = Aggregate {"Adt": {"name": "std::option::Option", "variant": 1, "active_field": null}} (_11)
+     StorageDead(_11)
+     StorageDead(_3)
+     StorageDead(_2)
+     T: Goto bb9
+  bb8:
+     StorageDead(_3)
+     StorageDead(_2)
+     T: Goto bb9
+  bb9:
+     T: Return
+  bb10:
+     T: Call _13 = core::num::<impl usize>::unchecked_sub::precondition_check(_4, const {"Uint": [1, 64]}) -> bb11
+  bb11:
+     _5 = Sub(_4, const {"Uint": [1, 64]})
+     (*_1).f1 = cast(_5 as *const i32)
+     StorageDead(_4)
+     T: Goto bb7
+
+====================================================================================================
+(4) THE INDEX-LOOP CONTROL (no iterator, zero Calls): PtrMetadata len + Lt guard + BoundsCheck Assert +
+    two CheckedAdd Overflow Asserts. ff-gate TODAY: SAFETY_GAP with via_mirsem_loop_shape=TRUE,
+    via_mirsem_loop_full=FALSE — the loop lane RECOGNIZES the shape; only safety discharge
+    (bounds + i32-accumulator overflow, which needs an invariant) is open.
+----------------------------------------------------------------------------------------------------
+FN while_idx
+  arg_count=1 return=i32 locals=13 blocks=7
+  _0: i32
+  _1: &[i32] // s
+  _2: i32 // a
+  _3: u64 // i
+  _4: Bool
+  _5: u64
+  _6: u64
+  _7: i32
+  _8: u64
+  _9: u64
+  _10: Bool
+  _11: (i32, Bool)
+  _12: (u64, Bool)
+  bb0:
+     _2 = const {"Int": 0}
+     _3 = const {"Uint": [0, 64]}
+     T: Goto bb1
+  bb1:
+     _5 = _3
+     _6 = PtrMetadata(_1)
+     _4 = Lt(move _5, move _6)
+     T: SwitchInt(move _4) targets=[[0, 6]]
+  bb2:
+     _8 = _3
+     _9 = PtrMetadata(_1)
+     _10 = Lt(_8, _9)
+     T: Assert(move _10, expected=True, msg="BoundsCheck") -> bb3
+  bb3:
+     _7 = (*_1)[_8]
+     _11 = CheckedAdd(_2, _7)
+     T: Assert(move _11.f1, expected=False, msg={"Overflow": "Add"}) -> bb4
+  bb4:
+     _2 = move _11.f0
+     _12 = CheckedAdd(_3, const {"Uint": [1, 64]})
+     T: Assert(move _12.f1, expected=False, msg={"Overflow": "Add"}) -> bb5
+  bb5:
+     _3 = move _12.f0
+     T: Goto bb1
+  bb6:
+     _0 = _2
+     T: Return
+
+====================================================================================================
+(3) APPENDIX — Iterator::sum call chain (depth 5 from wrapper to arithmetic):
+  sum_iter -> core::slice::<impl [i32]>::iter -> <slice::Iter as Iterator>::sum::<i32>   [pure 1-call trampoline]
+           -> <i32 as Sum<&i32>>::sum::<slice::Iter>                                     [pure 1-call trampoline, passes closure as CallableItem const]
+           -> <slice::Iter as Iterator>::fold::<i32, {sum closure#0}>                    [28 blocks, 117 stmts: SPECIALIZED — does NOT call next;
+                                                                                          len = ptr_offset_from_unsigned intrinsic, element addr via
+                                                                                          {Unsupported: BinOp::Offset}(base, idx), idx bump via
+                                                                                          unchecked_add + its precondition_check, closure invoked as
+                                                                                          FnMut::call_mut each iteration]
+           -> {closure#0} body                                                           [straight-line CheckedAdd+Assert; SAFETY_GAP, shape OK]
+  Iter::count is likewise specialized: NO next loop — count = ptr_offset_from_unsigned(end, start) + precondition_check; SHAPE_GAP.

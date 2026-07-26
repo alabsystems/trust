@@ -1,0 +1,20 @@
+# Sample crate for trust-integration-tests scale testing
+#
+# Contains 100+ functions across 20+ source files exercising various
+# VcKind categories: bounds, overflow, null, div-zero, contracts, ownership.
+#
+# This is a standalone fixture crate (not part of the parent workspace).
+# Note: Source files use #[requires]/[ensures] annotations for trust
+# verification. These are parsed by source_analysis but are not standard
+# Rust attributes -- the crate compiles with `rustc` only when trust's
+# spec-attribute support is enabled.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[workspace]
+
+[package]
+name = "sample-crate"
+version = "0.1.0"
+edition = "2021"

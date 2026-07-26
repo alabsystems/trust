@@ -1,0 +1,67 @@
+# S-module — the frozen "module-goal core" Test262 slice for TrustJS calibration.
+# It is S0's selection contract with rule 4 set to REQUIRE the `module` flag
+# (module-goal tests), keeping only the CanBlock* flag exclusions. `async` is NOT
+# excluded, so module + top-level-await (TLA) tests are IN scope (a TLA test is
+# `flags: [module, async]`). Every other rule (prefixes, suffix, $262., features,
+# proposal features, poisoned includes) is byte-identical to S0 and S-async, so
+# the three slices partition the corpus's language/built-ins tests along the
+# async / module-goal boundaries.
+#
+# Like S0.toml / S-async.toml, this slice is payload-external: the full path list
+# is NOT embedded. It is re-derived from the pinned corpus
+# (tests/js262/corpus-pin.json) by applying the [rules] below exactly, then
+# checked against [derived]: the sorted list must have exactly `count` entries and
+# hash to `list_sha256` (sha256 over the UTF-8 concatenation of each relative path
+# + "\n", paths sorted bytewise ascending). Any mismatch is drift — fail closed.
+# The canonical selection-rules text hashes to
+# rules_sha256 = 80bbd976494e0b1581efa957c60906a641407f5e0f07cba40024f415e4241027
+# (SliceKind::SModule in crates/trust-js-differential/src/slice.rs).
+#
+# NOT YET CALIBRATED. Module-goal tests require the module-goal driver — an ES
+# module evaluated with the correct base URL (so relative `import()`/`import`
+# resolve against the test directory, not trace_driver.mjs) and a settled module
+# graph, with the harness injected per the test262 module protocol. That driver is
+# the M2 D2/D5 build (see docs/design/2026-07-22-trustjs-m2-scope.md); it changes
+# driver_sha256 and will re-bless S0 + S-async. This slice contract is frozen
+# ahead of it so the target is fixed before the driver exists. Landing the
+# module-goal driver also RESOLVES the one deferred S-async row
+# (dynamic-import/import-errored-module.js — see tests/js262/divergence-audit.toml),
+# whose relative dynamic import the script-eval harness cannot faithfully resolve.
+#
+# Author: Andrew Yates
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+schema_version = "0.1.0"
+id = "js262.s-module.2026-07-23-v1"
+
+[corpus]
+revision = "tc39/test262:9e61c12835c5e4a3bdba93850427e6742c4f64c4"
+
+[rules]
+include_prefixes = ["test/language/", "test/built-ins/"]
+exclude_prefixes = [
+    "test/intl402/",
+    "test/staging/",
+    "test/annexB/",
+    "test/built-ins/Temporal/",
+]
+exclude_suffixes = ["_FIXTURE.js"]
+require_flags = ["module"]
+exclude_flags = ["CanBlockIsTrue", "CanBlockIsFalse"]
+exclude_content_substrings = ["$262."]
+exclude_features = [
+    "Atomics",
+    "SharedArrayBuffer",
+    "Temporal",
+    "tail-call-optimization",
+    "IsHTMLDDA",
+    "cross-realm",
+    "host-gc-required",
+]
+exclude_feature_substrings = ["Intl"]
+exclude_proposal_features_from = "features.txt#Proposed language features"
+exclude_include_content_substrings = ["$262."]
+
+[derived]
+count = 693
+list_sha256 = "77efc64a11dcb682c65f91424b13fb6b9400d26bd4e0f8e5b25f29830daa5dde"

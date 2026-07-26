@@ -1,0 +1,15 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+main::w_then::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+core::bool::<impl bool>::then::<u32, {closure@main.rs:12:12: 12:14}>	SHAPE_GAP	false	false	false	false	false	false	false
+core::bool::<impl bool>::then_some::<u32>	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_and_leaf	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_and_op	FULLY_FAITHFUL	false	false	true	true	true	false	true
+main::w_cmp	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_not_leaf	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_not_op	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_or_leaf	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_or_op	FULLY_FAITHFUL	false	false	true	true	true	false	true
+main::w_then	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_then_some	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_xor_leaf	SHAPE_GAP	false	false	false	false	false	false	false
+main::w_xor_op	FULLY_FAITHFUL	false	false	true	true	true	false	true

@@ -1,0 +1,94 @@
+# trust-bmc: trustc integration boundary for trust-mc safety verifier
+#
+# Exposes trust-mc's core MIR analysis as a library API callable from trust's
+# verification pass. The target contract architecture is
+# designs/2026-04-25-trust-contracts-first-class-target.md.
+#
+# Re-exports trust-mc-core types (BmcVc, ChcVc, Violation, PropertyKind) and defines
+# the high-level verify_function / encode_function API. Subprocess mode is a
+# compatibility bridge only; target trustc builds must call trust-mc codegen_ay
+# in-process and preserve whether the proof came from BMC, CHC, or PDR/IC3.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-bmc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Exposes trust-mc-core VC/proof/result types from trust-bmc's public API and
+# compiles the native trust_mc verifier-api adapter. Default builds use a
+# fail-closed metadata-only adapter so trust-bmc does not pull solver fanout.
+trust-mc-core-types = ["dep:trust-mc-core", "dep:ay-bindings"]
+# trust #789: trust-build enables compilation against the trustc compiler tree.
+# Target behavior: verify_function accepts TyCtxt + DefId directly in-process.
+# Subprocess mode is compatibility only.
+trust-build = ["trust-mc-core-types", "trust-mc-native-trust-ir-bundle"]
+# Enables the native trust-mc encode/solve facade types without enabling the
+# in-process AY solver. Solving native BMC artifacts fails closed in this mode.
+trust-mc-native = ["trust-mc-core-types", "dep:trust-mc-compiler", "trust-mc-native-driver"]
+# Enables the lightweight native driver facade used to fail closed for native
+# solve requests without pulling the in-process AY typed CHC/PDR solver.
+trust-mc-native-driver = ["trust-mc-core-types", "dep:trust-mc-driver"]
+# Enables the library-only native typed CHC/PDR solver through trust-mc-driver
+# without linking the rustc-private trust-mc-compiler crate.
+#
+# Sealed-authority S3: also exposes `replay_oracle`, the gate-side CHC/PDR
+# invariant replay oracle. The direct ay-chc dependency adds no fanout beyond
+# what trust-mc-driver/native-typed-chc-pdr already pulls (same patched path
+# package); sha2 is only used for the domain-separated problem fingerprint.
+# NOTE: keep this feature on ONE line — verifier_api's
+# native_typed_chc_pdr_solver_feature_does_not_enable_trust_mc_compiler_facade
+# test pins its contents by single-line manifest parse.
+trust-mc-native-solver = ["trust-mc-native-driver", "trust-mc-driver/native-typed-chc-pdr", "dep:ay-chc", "dep:sha2"]
+# Accepts typed TrustIr NativeVerificationBundle values from trust-ir-bridge and
+# solves trust-mc CHC/PDR requests through the native proof-grade transport path.
+trust-mc-native-trust-ir-bundle = [
+    "trust-mc-core-types",
+    "trust-mc-native-solver",
+    "trust-mc-driver/native-trust-ir-bundle",
+    "dep:trust-ir",
+    # Kernel replay for CleanCic proof authority: without clean-expr,
+    # trust-ir's NativeProofAuthority is hardwired false and NO TrustVc
+    # request can pass native bundle validation (every certificate on a
+    # strong-status obligation demands in-process replayed authority).
+    "trust-ir/clean-expr",
+    "dep:trust-mc-trust-bmc",
+]
+
+[dependencies]
+trust-types = { workspace = true }
+trust-verifier-api = { workspace = true }
+# trust: deadline-bounded child processes (own process group, group kill).
+trust-os = { workspace = true }
+trust-mc-core = { workspace = true, optional = true }
+# Native CHC/PDR VC construction currently goes through trust-mc-core's public
+# ay-backed IR, and trust-mc-core itself depends on ay-bindings unconditionally.
+# Gating this direct dependency alone would not reduce default fanout until
+# trust-mc-core grows a non-AY metadata-only feature split.
+ay-bindings = { workspace = true, optional = true }
+# Sealed-authority S3 replay oracle (trust-mc-native-solver feature): direct
+# access to ay_chc::engines::validate_external_invariant_model plus the
+# InvariantModel/ChcProblem/PdrConfig types. Resolves to the same package
+# instance trust-mc-driver uses (workspace [patch] redirects trust-mc's
+# git-pinned ay-chc to this path).
+ay-chc = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+trust-ir = { workspace = true, optional = true }
+trust-mc-compiler = { path = "../../first-party/trust-mc/trust-mc-compiler", default-features = false, optional = true }
+trust-mc-driver = { path = "../../first-party/trust-mc/trust-mc-driver", default-features = false, optional = true }
+trust-mc-trust-bmc = { workspace = true, optional = true }
+
+[dev-dependencies]
+trust-ir-build = { workspace = true }
+toml = { workspace = true }

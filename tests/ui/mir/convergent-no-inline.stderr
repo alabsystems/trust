@@ -1,0 +1,14 @@
+error: attributes starting with `rustc` are reserved for use by the `rustc` compiler
+  --> $DIR/convergent-no-inline.rs:13:3
+   |
+LL | #[rustc_convergent]
+   |   ^^^^^^^^^^^^^^^^
+
+error: cannot find attribute `rustc_convergent` in this scope
+  --> $DIR/convergent-no-inline.rs:13:3
+   |
+LL | #[rustc_convergent]
+   |   ^^^^^^^^^^^^^^^^
+
+error: aborting due to 2 previous errors
+

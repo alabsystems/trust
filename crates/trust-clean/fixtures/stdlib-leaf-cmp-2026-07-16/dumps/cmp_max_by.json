@@ -1,0 +1,739 @@
+{
+  "name": "max_by",
+  "def_path": "cmp::max_by",
+  "span": {
+    "file": "library/core/src/cmp.rs",
+    "line_start": 1712,
+    "col_start": 0,
+    "line_end": 1718,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Unsupported": {
+            "kind": "TyKind::Param",
+            "detail": "generic parameter T/#0 needs monomorphization"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Unsupported": {
+            "kind": "TyKind::Param",
+            "detail": "generic parameter T/#0 needs monomorphization"
+          }
+        },
+        "name": "v1"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Unsupported": {
+            "kind": "TyKind::Param",
+            "detail": "generic parameter T/#0 needs monomorphization"
+          }
+        },
+        "name": "v2"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Unsupported": {
+            "kind": "TyKind::Param",
+            "detail": "generic parameter F/#1 needs monomorphization"
+          }
+        },
+        "name": "compare"
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Adt": {
+            "name": "cmp::Ordering",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Less",
+                "discriminant": 255,
+                "fields": []
+              },
+              {
+                "name": "Equal",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Greater",
+                "discriminant": 1,
+                "fields": []
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Tuple": [
+            {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Unsupported": {
+                    "kind": "TyKind::Param",
+                    "detail": "generic parameter T/#0 needs monomorphization"
+                  }
+                }
+              }
+            },
+            {
+              "Ref": {
+                "mutable": false,
+                "inner": {
+                  "Unsupported": {
+                    "kind": "TyKind::Param",
+                    "detail": "generic parameter T/#0 needs monomorphization"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Unsupported": {
+                "kind": "TyKind::Param",
+                "detail": "generic parameter T/#0 needs monomorphization"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Unsupported": {
+                "kind": "TyKind::Param",
+                "detail": "generic parameter T/#0 needs monomorphization"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": false
+                  }
+                }
+              },
+              "span": {
+                "file": "library/core/src/cmp.rs",
+                "line_start": 1717,
+                "col_start": 7,
+                "line_end": 1717,
+                "col_end": 32
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": false
+                  }
+                }
+              },
+              "span": {
+                "file": "library/core/src/cmp.rs",
+                "line_start": 1717,
+                "col_start": 7,
+                "line_end": 1717,
+                "col_end": 32
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "library/core/src/cmp.rs",
+                "line_start": 1717,
+                "col_start": 7,
+                "line_end": 1717,
+                "col_end": 32
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "library/core/src/cmp.rs",
+                "line_start": 1717,
+                "col_start": 7,
+                "line_end": 1717,
+                "col_end": 32
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "library/core/src/cmp.rs",
+                "line_start": 1717,
+                "col_start": 15,
+                "line_end": 1717,
+                "col_end": 18
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "library/core/src/cmp.rs",
+                "line_start": 1717,
+                "col_start": 20,
+                "line_end": 1717,
+                "col_end": 23
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Copy": {
+                        "local": 7,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Copy": {
+                        "local": 8,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "library/core/src/cmp.rs",
+                "line_start": 1717,
+                "col_start": 7,
+                "line_end": 1717,
+                "col_end": 24
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<F as ops::function::FnOnce<(&T, &T)>>::call_once",
+            "args": [
+              {
+                "Copy": {
+                  "local": 3,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 6,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 5,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "library/core/src/cmp.rs",
+              "line_start": 1717,
+              "col_start": 7,
+              "line_end": 1717,
+              "col_end": 24
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "cmp::Ordering::is_gt",
+            "args": [
+              {
+                "Move": {
+                  "local": 5,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "library/core/src/cmp.rs",
+              "line_start": 1717,
+              "col_start": 7,
+              "line_end": 1717,
+              "col_end": 32
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                4
+              ]
+            ],
+            "otherwise": 3,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "library/core/src/cmp.rs",
+              "line_start": 1717,
+              "col_start": 7,
+              "line_end": 1717,
+              "col_end": 32
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": false
+                  }
+                }
+              },
+              "span": {
+                "file": "library/core/src/cmp.rs",
+                "line_start": 1717,
+                "col_start": 35,
+                "line_end": 1717,
+                "col_end": 37
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "library/core/src/cmp.rs",
+                "line_start": 1717,
+                "col_start": 35,
+                "line_end": 1717,
+                "col_end": 37
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 5
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": false
+                  }
+                }
+              },
+              "span": {
+                "file": "library/core/src/cmp.rs",
+                "line_start": 1717,
+                "col_start": 47,
+                "line_end": 1717,
+                "col_end": 49
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "library/core/src/cmp.rs",
+                "line_start": 1717,
+                "col_start": 47,
+                "line_end": 1717,
+                "col_end": 49
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 5
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 9,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                6
+              ]
+            ],
+            "otherwise": 10,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "library/core/src/cmp.rs",
+              "line_start": 1718,
+              "col_start": 0,
+              "line_end": 1718,
+              "col_end": 1
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 10,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                7
+              ]
+            ],
+            "otherwise": 11,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "library/core/src/cmp.rs",
+              "line_start": 1718,
+              "col_start": 0,
+              "line_end": 1718,
+              "col_end": 1
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [],
+        "terminator": "Return"
+      },
+      {
+        "id": 8,
+        "stmts": [],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 13,
+            "span": {
+              "file": "library/core/src/cmp.rs",
+              "line_start": 1718,
+              "col_start": 0,
+              "line_end": 1718,
+              "col_end": 1
+            }
+          }
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [],
+        "terminator": "Resume"
+      },
+      {
+        "id": 10,
+        "stmts": [],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 6,
+            "span": {
+              "file": "library/core/src/cmp.rs",
+              "line_start": 1718,
+              "col_start": 0,
+              "line_end": 1718,
+              "col_end": 1
+            }
+          }
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 1,
+              "projections": []
+            },
+            "target": 7,
+            "span": {
+              "file": "library/core/src/cmp.rs",
+              "line_start": 1718,
+              "col_start": 0,
+              "line_end": 1718,
+              "col_end": 1
+            }
+          }
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 1,
+              "projections": []
+            },
+            "target": 9,
+            "span": {
+              "file": "library/core/src/cmp.rs",
+              "line_start": 1718,
+              "col_start": 0,
+              "line_end": 1718,
+              "col_end": 1
+            }
+          }
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 10,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                9
+              ]
+            ],
+            "otherwise": 12,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "library/core/src/cmp.rs",
+              "line_start": 1718,
+              "col_start": 0,
+              "line_end": 1718,
+              "col_end": 1
+            }
+          }
+        }
+      }
+    ],
+    "arg_count": 3,
+    "return_ty": {
+      "Unsupported": {
+        "kind": "TyKind::Param",
+        "detail": "generic parameter T/#0 needs monomorphization"
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

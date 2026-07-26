@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Trust: TrustdMenubar bundle Info.plist (menubar-only observer app). -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>TrustdMenubar</string>
+    <key>CFBundleDisplayName</key>
+    <string>Trustd Monitor</string>
+    <key>CFBundleIdentifier</key>
+    <string>name.andrewyates.trustd-menubar</string>
+    <key>CFBundleExecutable</key>
+    <string>TrustdMenubar</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleVersion</key>
+    <string>7</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.4.1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <!-- Menubar-only: no Dock icon, no app menu. Paired with
+         NSApp.setActivationPolicy(.accessory) at runtime. -->
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright 2026 Andrew Yates. License: Apache 2.0</string>
+</dict>
+</plist>

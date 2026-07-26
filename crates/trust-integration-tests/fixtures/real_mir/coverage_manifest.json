@@ -1,0 +1,60 @@
+{
+  "schema": "trust.real-mir.coverage.v1",
+  "required_generated_fixtures": [
+    "test_functions__apply_twice",
+    "test_functions__checked_add",
+    "test_functions__classify",
+    "test_functions__increment",
+    "test_functions__max_of",
+    "test_functions__read_ref",
+    "test_functions__safe_divide",
+    "test_functions__string_creation",
+    "test_functions__sum_to",
+    "test_functions__unsafe_read",
+    "test_functions__use_generic_max",
+    "test_functions__use_identity",
+    "test_functions__wrapping_mul"
+  ],
+  "unsupported_source_anchors": [
+    {
+      "function": "slice_first",
+      "fixture": "test_functions__slice_first",
+      "status": "unsupported_until_modeled",
+      "model_gap": "slice_fat_pointer_provenance",
+      "source_markers": ["pub fn slice_first", "&[u32]", "data[0]"],
+      "expected_unsupported_detail_any": ["slice", "fat-pointer", "metadata", "provenance"]
+    },
+    {
+      "function": "slice_len",
+      "fixture": "test_functions__slice_len",
+      "status": "unsupported_until_modeled",
+      "model_gap": "slice_fat_pointer_provenance",
+      "source_markers": ["pub fn slice_len", "&[u32]", "data.len()"],
+      "expected_unsupported_detail_any": ["slice", "fat-pointer", "metadata", "provenance"]
+    },
+    {
+      "function": "array_as_slice_len",
+      "fixture": "test_functions__array_as_slice_len",
+      "status": "unsupported_until_modeled",
+      "model_gap": "slice_fat_pointer_provenance",
+      "source_markers": ["pub fn array_as_slice_len", "&[u32; 4]", "let slice: &[u32]"],
+      "expected_unsupported_detail_any": ["slice", "fat-pointer", "metadata", "provenance"]
+    },
+    {
+      "function": "raw_slice_from_parts",
+      "fixture": "test_functions__raw_slice_from_parts",
+      "status": "unsupported_until_modeled",
+      "model_gap": "slice_fat_pointer_provenance",
+      "source_markers": ["pub fn raw_slice_from_parts", "*const [u32]", "slice_from_raw_parts"],
+      "expected_unsupported_detail_any": ["slice", "fat-pointer", "metadata", "provenance"]
+    },
+    {
+      "function": "exposed_addr_as_usize",
+      "fixture": "test_functions__exposed_addr_as_usize",
+      "status": "unsupported_until_modeled",
+      "model_gap": "pointer_provenance",
+      "source_markers": ["pub fn exposed_addr_as_usize", "*const u32", "as usize"],
+      "expected_unsupported_detail_any": ["provenance", "pointer", "address"]
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- The Trust mark, at the sidebar size. The `rust-logo.svg` name is a
+     static-file protocol shared with `static_files.rs`, `build.rs` and
+     `page.html`, so the mark changes and the filename does not. Flat fill, no
+     stroke: rustdoc's dark themes render this element through a white
+     drop-shadow halo, which reads as an outline only if the silhouette is
+     solid. -->
+<svg version="1.1" height="106" width="106" viewBox="0 0 106 106" xmlns="http://www.w3.org/2000/svg">
+<path id="logo" fill="#231F20" d="M13,13 L93,13 L93,39 L66,39 L66,93 L40,93 L40,39 L13,39 Z"/>
+</svg>

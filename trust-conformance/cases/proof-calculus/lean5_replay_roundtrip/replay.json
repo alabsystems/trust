@@ -1,0 +1,17 @@
+{
+  "format": "trust-lean5-replay-report/v1",
+  "input_certificate": "trust-conformance/cases/proof-calculus/minimal_certificate/certificate.json",
+  "input_certificate_sha256": "sha256:71db9066551e7f9af1c90f04bdf38a75cf2cc99d7661d3e934b58aa51f717ed0",
+  "output_certificate": "trust-conformance/cases/proof-calculus/minimal_certificate/certificate.json",
+  "roundtrip": {
+    "kernel_checked": true,
+    "preserved_conclusion": "Q",
+    "preserved_step_count": 3,
+    "status": "replayed"
+  },
+  "tool": {
+    "mode": "fixture",
+    "name": "lean5",
+    "version": "publication-v3-seed"
+  }
+}

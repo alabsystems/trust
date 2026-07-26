@@ -1,0 +1,38 @@
+note: contract clause #0 (Ensures) is monitored: a kernel-certified runtime monitor exists (monitor = true ↔ proposition; sha256:5fb67b58a924019d2d822145cfd8457ac365fe7da2db20e2489aa70c7d1318a1)
+  --> $DIR/monitor_report.rs:22:13
+   |
+LL |     ensures result == x
+   |             ^^^^^^^^^^^
+
+note: contract clause #0 (Ensures) is unmonitored (unsupported clause variable type `i32`): not runtime-checked, never a fake value (sha256:ffc873ce73c7cb14cff55998c375aa1ef8d8e21342cc33d575c48c1ec0ae6fe5)
+  --> $DIR/monitor_report.rs:31:13
+   |
+LL |     ensures result == x
+   |             ^^^^^^^^^^^
+
+
+=== Trust Verification Report (monitor_report) ===
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/monitor_report.rs:21:1
+   |
+LL | / pub fn f_machine(x: u64) -> u64
+LL | |     ensures result == x
+...  |
+LL | |     x
+LL | | }
+   | |_^
+   |
+   = note: of which 1 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/monitor_report.rs:30:1
+   |
+LL | / pub fn identity(x: i32) -> i32
+LL | |     ensures result == x
+...  |
+LL | |     x
+LL | | }
+   | |_^
+   |
+   = note: of which 1 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)

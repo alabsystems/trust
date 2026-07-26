@@ -1,0 +1,27 @@
+note: Clean island kernel-checked: 1 declaration(s) registered (u64_ge_refl)
+  --> $DIR/e9_result_binding_discharge.rs:15:5
+   |
+LL | /     theorem u64_ge_refl : forall (x : UInt64),
+LL | |         Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
+LL | |         fun x => Nat.le.refl (UInt64.toNat x)
+   | |_____________________________________________^
+
+
+=== Trust Verification Report (e9_result_binding_discharge) ===
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_result_binding_discharge.rs:20:1
+   |
+LL | pub fn identity(x: u64) -> u64 ensures result >= x by u64_ge_refl { x }
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `identity`, with a clean certification audit
+  --> $DIR/e9_result_binding_discharge.rs:20:55
+   |
+LL | pub fn identity(x: u64) -> u64 ensures result >= x by u64_ge_refl { x }
+   |                                                       ^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+

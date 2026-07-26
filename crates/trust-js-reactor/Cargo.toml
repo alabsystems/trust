@@ -1,0 +1,39 @@
+# trust-js-reactor: the TrustJS deterministic event loop — M2 D1
+#
+# The host-clock-free reactor the M2 runtime (docs/design/2026-07-22-trustjs-m2-scope.md
+# D1) wires under the tier-0 interpreter: a FIFO microtask (Promise-job) queue, a
+# (deadline, seq)-ordered macrotask/timer queue, a virtual clock that advances only
+# when the loop pops a timer, and a REUSABLE Promise state machine parameterized over
+# an opaque host value type and host callback handle (the interp plugs in its JsValue
+# and function-call closure). It mirrors the M0 trace driver's proven virtual-time /
+# microtask-drain model EXACTLY (crates/trust-js-trace/js/trace_driver.mjs) so the
+# eventual async ObservableTrace stays byte-reproducible: no Instant::now, no thread
+# scheduling, no HashMap iteration order in any observable path.
+#
+# ENGINE only: no JS object model (that stays in trust-js-value / trust-js-interp).
+# Everything the reactor cannot decide without a host — is-this-a-thenable, invoking a
+# JS handler, building the Promise.all result array — is a typed seam (the `Host`
+# trait). Depends on nothing but thiserror + indexmap (insertion-ordered, so the
+# unhandled-rejection log is deterministic).
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-js-reactor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+indexmap = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+trust-js-trace = { workspace = true }

@@ -1,0 +1,228 @@
+error[E0716]: temporary value dropped while borrowed
+  --> $DIR/compile-time-issue-137636.rs:36:13
+   |
+LL |     let x = ().or(()).or(());
+   |             ^^^^^^^^^       - temporary value is freed at the end of this statement
+   |             |
+   |             creates a temporary value which is freed while still in use
+LL |     let x = x.or(x).or(x).or(x);
+   |             - borrow later used here
+   |
+help: consider using a `let` binding to create a longer lived value
+   |
+LL ~     let binding = ().or(());
+LL ~     let x = binding.or(());
+   |
+
+error[E0716]: temporary value dropped while borrowed
+  --> $DIR/compile-time-issue-137636.rs:37:13
+   |
+LL |     let x = x.or(x).or(x).or(x);
+   |             ^^^^^^^            - temporary value is freed at the end of this statement
+   |             |
+   |             creates a temporary value which is freed while still in use
+LL |     let x = x.or(x).or(x).or(x);
+   |             - borrow later used here
+   |
+help: consider using a `let` binding to create a longer lived value
+   |
+LL ~     let binding = x.or(x);
+LL ~     let x = binding.or(x).or(x);
+   |
+
+error[E0716]: temporary value dropped while borrowed
+  --> $DIR/compile-time-issue-137636.rs:37:13
+   |
+LL |     let x = x.or(x).or(x).or(x);
+   |             ^^^^^^^^^^^^^      - temporary value is freed at the end of this statement
+   |             |
+   |             creates a temporary value which is freed while still in use
+LL |     let x = x.or(x).or(x).or(x);
+   |             - borrow later used here
+   |
+help: consider using a `let` binding to create a longer lived value
+   |
+LL ~     let binding = x.or(x).or(x);
+LL ~     let x = binding.or(x);
+   |
+
+error[E0505]: cannot move out of `x` because it is borrowed
+  --> $DIR/compile-time-issue-137636.rs:37:18
+   |
+LL |     let x = ().or(()).or(());
+   |         - binding `x` declared here
+LL |     let x = x.or(x).or(x).or(x);
+   |             - -- ^ move out of `x` occurs here
+   |             | |
+   |             | borrow later used by call
+   |             borrow of `x` occurs here
+
+error[E0505]: cannot move out of `x` because it is borrowed
+  --> $DIR/compile-time-issue-137636.rs:37:24
+   |
+LL |     let x = ().or(()).or(());
+   |         - binding `x` declared here
+LL |     let x = x.or(x).or(x).or(x);
+   |             -------    ^       - ... and the borrow might be used here, when that temporary is dropped and runs the destructor for type `impl A<'_>`
+   |             |          |
+   |             |          move out of `x` occurs here
+   |             borrow of `x` occurs here
+   |             a temporary with access to the borrow is created here ...
+
+error[E0382]: use of moved value: `x`
+  --> $DIR/compile-time-issue-137636.rs:37:24
+   |
+LL |     let x = ().or(()).or(());
+   |         - move occurs because `x` has type `impl A<'_>`, which does not implement the `Copy` trait
+LL |     let x = x.or(x).or(x).or(x);
+   |                  -     ^ value used here after move
+   |                  |
+   |                  value moved here
+   |
+note: consider changing this parameter type in method `or` to borrow instead if owning the value isn't necessary
+  --> $DIR/compile-time-issue-137636.rs:26:25
+   |
+LL |     fn or(&self, other: impl A<'a>) -> impl A<'a> {
+   |        --               ^^^^^^^^^^ this parameter takes ownership of the value
+   |        |
+   |        in this method
+
+error[E0505]: cannot move out of `x` because it is borrowed
+  --> $DIR/compile-time-issue-137636.rs:37:30
+   |
+LL |     let x = ().or(()).or(());
+   |         - binding `x` declared here
+LL |     let x = x.or(x).or(x).or(x);
+   |             -------          ^ - ... and the borrow might be used here, when that temporary is dropped and runs the destructor for type `impl A<'_>`
+   |             |                |
+   |             |                move out of `x` occurs here
+   |             borrow of `x` occurs here
+   |             a temporary with access to the borrow is created here ...
+
+error[E0382]: use of moved value: `x`
+  --> $DIR/compile-time-issue-137636.rs:37:30
+   |
+LL |     let x = ().or(()).or(());
+   |         - move occurs because `x` has type `impl A<'_>`, which does not implement the `Copy` trait
+LL |     let x = x.or(x).or(x).or(x);
+   |                        -     ^ value used here after move
+   |                        |
+   |                        value moved here
+   |
+note: consider changing this parameter type in method `or` to borrow instead if owning the value isn't necessary
+  --> $DIR/compile-time-issue-137636.rs:26:25
+   |
+LL |     fn or(&self, other: impl A<'a>) -> impl A<'a> {
+   |        --               ^^^^^^^^^^ this parameter takes ownership of the value
+   |        |
+   |        in this method
+
+error[E0716]: temporary value dropped while borrowed
+  --> $DIR/compile-time-issue-137636.rs:38:13
+   |
+LL |     let x = x.or(x).or(x).or(x);
+   |             ^^^^^^^            - temporary value is freed at the end of this statement
+   |             |
+   |             creates a temporary value which is freed while still in use
+...
+LL | }
+   | - borrow might be used here, when `x` is dropped and runs the destructor for type `impl A<'_>`
+   |
+help: consider using a `let` binding to create a longer lived value
+   |
+LL ~     let binding = x.or(x);
+LL ~     let x = binding.or(x).or(x);
+   |
+
+error[E0716]: temporary value dropped while borrowed
+  --> $DIR/compile-time-issue-137636.rs:38:13
+   |
+LL |     let x = x.or(x).or(x).or(x);
+   |             ^^^^^^^^^^^^^      - temporary value is freed at the end of this statement
+   |             |
+   |             creates a temporary value which is freed while still in use
+...
+LL | }
+   | - borrow might be used here, when `x` is dropped and runs the destructor for type `impl A<'_>`
+   |
+help: consider using a `let` binding to create a longer lived value
+   |
+LL ~     let binding = x.or(x).or(x);
+LL ~     let x = binding.or(x);
+   |
+
+error[E0505]: cannot move out of `x` because it is borrowed
+  --> $DIR/compile-time-issue-137636.rs:38:18
+   |
+LL |     let x = x.or(x).or(x).or(x);
+   |         - binding `x` declared here
+LL |     let x = x.or(x).or(x).or(x);
+   |             - -- ^ move out of `x` occurs here
+   |             | |
+   |             | borrow later used by call
+   |             borrow of `x` occurs here
+
+error[E0505]: cannot move out of `x` because it is borrowed
+  --> $DIR/compile-time-issue-137636.rs:38:24
+   |
+LL |     let x = x.or(x).or(x).or(x);
+   |         - binding `x` declared here
+LL |     let x = x.or(x).or(x).or(x);
+   |             -------    ^       - ... and the borrow might be used here, when that temporary is dropped and runs the destructor for type `impl A<'_>`
+   |             |          |
+   |             |          move out of `x` occurs here
+   |             borrow of `x` occurs here
+   |             a temporary with access to the borrow is created here ...
+
+error[E0382]: use of moved value: `x`
+  --> $DIR/compile-time-issue-137636.rs:38:24
+   |
+LL |     let x = x.or(x).or(x).or(x);
+   |         - move occurs because `x` has type `impl A<'_>`, which does not implement the `Copy` trait
+LL |     let x = x.or(x).or(x).or(x);
+   |                  -     ^ value used here after move
+   |                  |
+   |                  value moved here
+   |
+note: consider changing this parameter type in method `or` to borrow instead if owning the value isn't necessary
+  --> $DIR/compile-time-issue-137636.rs:26:25
+   |
+LL |     fn or(&self, other: impl A<'a>) -> impl A<'a> {
+   |        --               ^^^^^^^^^^ this parameter takes ownership of the value
+   |        |
+   |        in this method
+
+error[E0505]: cannot move out of `x` because it is borrowed
+  --> $DIR/compile-time-issue-137636.rs:38:30
+   |
+LL |     let x = x.or(x).or(x).or(x);
+   |         - binding `x` declared here
+LL |     let x = x.or(x).or(x).or(x);
+   |             -------          ^ - ... and the borrow might be used here, when that temporary is dropped and runs the destructor for type `impl A<'_>`
+   |             |                |
+   |             |                move out of `x` occurs here
+   |             borrow of `x` occurs here
+   |             a temporary with access to the borrow is created here ...
+
+error[E0382]: use of moved value: `x`
+  --> $DIR/compile-time-issue-137636.rs:38:30
+   |
+LL |     let x = x.or(x).or(x).or(x);
+   |         - move occurs because `x` has type `impl A<'_>`, which does not implement the `Copy` trait
+LL |     let x = x.or(x).or(x).or(x);
+   |                        -     ^ value used here after move
+   |                        |
+   |                        value moved here
+   |
+note: consider changing this parameter type in method `or` to borrow instead if owning the value isn't necessary
+  --> $DIR/compile-time-issue-137636.rs:26:25
+   |
+LL |     fn or(&self, other: impl A<'a>) -> impl A<'a> {
+   |        --               ^^^^^^^^^^ this parameter takes ownership of the value
+   |        |
+   |        in this method
+
+error: aborting due to 15 previous errors
+
+Some errors have detailed explanations: E0382, E0505, E0716.
+For more information about an error, try `trustc --explain E0382`.

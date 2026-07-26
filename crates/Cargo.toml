@@ -1,0 +1,412 @@
+# trust verification pipeline workspace
+#
+# This is the dev/test lane for the Trust crates. It exists so `cargo
+# check`/`cargo test` over the pipeline is a single command that does not have
+# to load — or build — the rustc graph; the root workspace cannot offer that,
+# because rustc-main is a member there and `--workspace` therefore means "the
+# whole compiler".
+#
+# Most members here are ALSO members of the root workspace, because the
+# compiler links them. They are consequently resolved twice, against two
+# lockfiles that today disagree on the patch version of ~89 third-party
+# packages. Treat a green run here as evidence about *this* graph; proof-
+# bearing claims belong to the compiler lane, whose graph is the root lockfile.
+#
+# The split is not caused by a dependency conflict. Folding every member into
+# the root workspace resolves with no version disagreement (it adds only
+# ny-cert and ny-contracts). What holds the split in place is that this
+# manifest path is named by 39 files — gate rows, harness lanes, fixture
+# regenerators, targo-trust source — so collapsing the workspaces means moving
+# all of them in the same change.
+#
+# `scripts/check_cargo_manifest_alignment.py` keeps this manifest's [patch]
+# tables identical to the root's and reports membership drift. It is not only a
+# drift checker: it also enforces the default dependency-fanout policy
+# (`--fanout-tree-proof`) that keeps the native solver backends out of the
+# default trust-bmc/trust-router trees. That policy outlives any workspace
+# consolidation.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+# P3 dev-build profile tuning.
+#
+# Measured impact on this workspace (clean cold build, default toolchain):
+#   default profile:     ~61s
+#   with these tweaks:   ~47s (-23%)
+#
+# `debug = "line-tables-only"` keeps the line-number info needed for
+# panics and backtraces but drops local-variable and type debug info.
+# Substantially reduces debug-info codegen and link time without
+# affecting stack traces. Use `debug = 2` (the default) only when
+# stepping through with a debugger.
+#
+# `incremental = true` is the cargo default for dev, stated explicitly
+# so it is not silently disabled by CI inheriting `CARGO_INCREMENTAL=0`.
+#
+# `split-debuginfo = "unpacked"` is the cargo default on macOS/Linux
+# for dev profile; stated explicitly so it survives target changes.
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+split-debuginfo = "unpacked"
+
+# Dependencies don't need debug info at all for our workflow — we never
+# step into serde / proc-macro2 / etc. Dropping their debug info
+# significantly reduces link time on cold builds.
+[profile.dev.package."*"]
+debug = false
+
+# The Lean↔Clean bridge gate (trust-clean's DEFAULT-ON tests/lean_clean_bridge.rs)
+# kernel-checks ~40 theorems against a machine-imported 14.7K-constant olean
+# environment; at opt-level 0 the clean kernel/elaborator make that run (and the
+# other clean-kernel-heavy suites) an order of magnitude slower. Optimize just
+# the clean crates in dev/test dependency builds — a pure speed knob, no
+# semantic change (cargo builds test-target DEPENDENCIES with the dev profile).
+[profile.dev.package.clean-kernel]
+opt-level = 2
+[profile.dev.package.clean-olean]
+opt-level = 2
+[profile.dev.package.clean-parser]
+opt-level = 2
+[profile.dev.package.clean-elab]
+opt-level = 2
+
+# Keep `cargo test` compilation aligned with dev-build iteration: tests still
+# get line-number backtraces, but avoid generating full debug info for every
+# crate and dependency.
+[profile.test]
+debug = "line-tables-only"
+incremental = true
+split-debuginfo = "unpacked"
+
+[profile.test.package."*"]
+debug = false
+
+[patch.crates-io]
+rustc-hash = { path = "../first-party/ty/crates/tla-hash-fx" }
+rustc_version = { path = "../vendor/rustc_version_0_4_1" }
+
+[patch."https://github.com/alabsystems/trust-ir"]
+trust-ir = { path = "../first-party/trust-ir/crates/trust-ir" }
+trust-ir-build = { path = "../first-party/trust-ir/crates/trust-ir-build" }
+
+# HTTPS with `.git` is the exact source declared by the checked-in Trust
+# submodules. Keep it local instead of letting mutable remote refs escape.
+[patch."https://github.com/alabsystems/trust-ir.git"]
+trust-ir = { path = "../first-party/trust-ir/crates/trust-ir" }
+trust-ir-build = { path = "../first-party/trust-ir/crates/trust-ir-build" }
+
+[patch."ssh://git@github.com/alabsystems/trust-ir.git"]
+trust-ir = { path = "../first-party/trust-ir/crates/trust-ir" }
+trust-ir-build = { path = "../first-party/trust-ir/crates/trust-ir-build" }
+
+[patch."ssh://git@github.com:22/alabsystems/trust-ir.git"]
+trust-ir = { path = "../first-party/trust-ir/crates/trust-ir" }
+trust-ir-build = { path = "../first-party/trust-ir/crates/trust-ir-build" }
+
+[patch."https://github.com/alabsystems/ay"]
+ay = { path = "../first-party/ay/crates/ay" }
+ay-core = { path = "../first-party/ay/crates/ay-core" }
+ay-dpll = { path = "../first-party/ay/crates/ay-dpll" }
+ay-frontend = { path = "../first-party/ay/crates/ay-frontend" }
+ay-proof = { path = "../first-party/ay/crates/ay-proof" }
+ay-translate = { path = "../first-party/ay/crates/ay-translate" }
+ay-chc = { path = "../first-party/ay/crates/ay-chc" }
+ay-allsat = { path = "../first-party/ay/crates/ay-allsat" }
+ay-sat = { path = "../first-party/ay/crates/ay-sat" }
+ay-bindings = { path = "../first-party/ay/crates/ay-bindings" }
+ay-sys = { path = "../first-party/ay/crates/ay-sys" }
+ay-encode = { path = "../first-party/ay/crates/ay-encode" }
+
+[patch."https://github.com/alabsystems/ay.git"]
+ay = { path = "../first-party/ay/crates/ay" }
+ay-core = { path = "../first-party/ay/crates/ay-core" }
+ay-dpll = { path = "../first-party/ay/crates/ay-dpll" }
+ay-frontend = { path = "../first-party/ay/crates/ay-frontend" }
+ay-proof = { path = "../first-party/ay/crates/ay-proof" }
+ay-translate = { path = "../first-party/ay/crates/ay-translate" }
+ay-chc = { path = "../first-party/ay/crates/ay-chc" }
+ay-bindings = { path = "../first-party/ay/crates/ay-bindings" }
+ay-sys = { path = "../first-party/ay/crates/ay-sys" }
+ay-encode = { path = "../first-party/ay/crates/ay-encode" }
+
+[patch."ssh://git@github.com/alabsystems/ay.git"]
+ay = { path = "../first-party/ay/crates/ay" }
+ay-chc = { path = "../first-party/ay/crates/ay-chc" }
+
+[patch."ssh://git@github.com/alabsystems/trust-cg.git"]
+trust-cg-codegen = { path = "../first-party/trust-cg/crates/trust-cg-codegen" }
+trust-cg-ir = { path = "../first-party/trust-cg/crates/trust-cg-ir" }
+trust-cg-lower = { path = "../first-party/trust-cg/crates/trust-cg-lower" }
+trust-cg-opt = { path = "../first-party/trust-cg/crates/trust-cg-opt" }
+
+# Redirect the active clean.git dependency to the local submodule so
+# clean-kernel is built once. The clean-mathverse and clean-olean dependencies
+# are optional behind trust-ir-build's default-off slackcertz-anchor feature;
+# patching them in this graph only creates stale unused-patch entries.
+[patch."https://github.com/alabsystems/clean.git"]
+clean-kernel = { path = "../first-party/clean/crates/clean-kernel" }
+
+[patch."ssh://git@github.com/alabsystems/trust-vc"]
+trust-vc-merge-contract = { path = "../first-party/trust-vc/crates/trust-vc-merge-contract" }
+
+# Carcara (clean-auto's `carcara-verify` N-version Alethe cross-checker) pinned
+# at ufmg-smite/carcara rev fecb4224def3c26f93a5d4f1804ecf58eb979650 (v1.1.0),
+# vendored byte-identical under vendor/carcara_1_1_0 so full-verify seed caches
+# stay registry-only (a git source in the lockfile materializes cargo git
+# checkout/db state, which the cargo-cache materialization gate rejects).
+[patch."https://github.com/ufmg-smite/carcara"]
+carcara = { path = "../vendor/carcara_1_1_0/carcara" }
+
+[workspace]
+resolver = "2"
+
+members = [
+    "trust-binary-parse",
+    "trust-cache",
+    "trust-buildcache",
+    "trust-deps",
+    "trust-disasm",
+    "trust-loop",
+    "trust-types",
+    "trust-upstream-compat",
+    "trust-verifier-api",
+    "trust-version",
+    "trust-vcgen",
+    "trust-os",
+    "trust-router",
+    "trust-report",
+    "trust-ts-embed",
+    "trust-release",
+    "trust-convergence",
+    "trust-temporal",
+    "trust-proof-cert",
+    "trust-clean",
+    "trust-certify",
+    "trust-semantics",
+    "trust-decompile",
+    "trust-strengthen",
+    "trust-spec",
+    "trust-backprop",
+    "trust-symex",
+    "trust-transval",
+    "trust-integration-tests",
+    "trust-lift",
+    "trust-machine-sem",
+    "trust-bmc",
+    "trust-wp",
+    "trust-vc-bridge",
+    "trust-wasm-bridge",
+    "trust-cg-bridge",
+    "trust-ir-bridge",
+    "trust-ny-bridge",
+    # R4 landing (two-language spec surface §5): the L2 elaborator + honesty
+    # meter, migrated from trust-wp into trust proper.
+    "trust-cert-meter",
+    "trust-spec-elab",
+    # TrustJS M0 (docs/design/2026-07-20-trustjs-m0-scope.md): the measurement
+    # apparatus — trace projection, independent-semantics skeleton, and the
+    # Channel-A differential harness.
+    "trust-js-trace",
+    "trust-js-sem",
+    "trust-js-differential",
+    # TrustJS M1 (docs/design/2026-07-21-trustjs-m1-scope.md): the faithful
+    # tier — parser, value model, tier-0 interpreter (fourth harness head).
+    "trust-js-parse",
+    "trust-js-value",
+    "trust-js-interp",
+    "trust-js-regexp",
+    # TrustJS M2 (docs/design/2026-07-22-trustjs-m2-scope.md D1): the deterministic
+    # event loop — microtask/timer queues, virtual clock, reusable Promise core.
+    "trust-js-reactor",
+    # TrustJS M2 (docs/design/2026-07-22-trustjs-m2-scope.md D2): the module graph —
+    # ParseModule records, the three-phase link, evaluate state machine, top-level await.
+    "trust-js-modules",
+    # TrustTS (front-end increment 1): the fail-closed TS->JS type eraser that
+    # lets the faithful interpreter run erasable TypeScript. Untrusted,
+    # zero-authority; erase-or-refuse, never a wrong strip.
+    "trust-ts-strip",
+    # TrustJS M3 D2 (docs/design/2026-07-22-trustjs-m3-scope.md): the first
+    # kernel-certified JS builtin — String.prototype.toLowerCase over ASCII,
+    # bridged through the trust-certify finite-table lane to a CleanCic receipt.
+    "trust-js-certify-bridge",
+    # TrustJS M4 strict-mode arithmetic FLOOR (docs/design-notes/2026-07-23-m4-strict-arith-floor.md):
+    # the DETERMINISTIC, correct-by-construction lowering of ONE tiny pure-arith
+    # JS fragment, fidelity-checked bit-for-bit against the trust-js-interp
+    # oracle. NOT the M4 autoformalization tier (no LLM / intent / native install).
+    "trust-js-autoform",
+]
+# trust-mir-extract requires rustc_private (nightly).
+exclude = [
+    "trust-mir-extract",
+    "trust-thir-lower",
+    "trust-witness",
+]
+
+# The lint policy Trust-owned members inherit with `[lints] workspace = true`.
+# It exists so tightening the policy reaches every member from one place; the
+# opt-in itself is enforced by tidy's `workspace_lints` ratchet. Keep it in
+# step with the root workspace's table.
+[workspace.lints.rust]
+warnings = "warn"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+
+[workspace.dependencies]
+trust-binary-parse = { path = "trust-binary-parse" }
+trust-cache = { path = "trust-cache" }
+trust-buildcache = { path = "trust-buildcache" }
+trust-deps = { path = "trust-deps" }
+trust-disasm = { path = "trust-disasm" }
+trust-loop = { path = "trust-loop" }
+trust-types = { path = "trust-types" }
+trust-verifier-api = { path = "trust-verifier-api" }
+trust-version = { path = "trust-version" }
+trust-vcgen = { path = "trust-vcgen" }
+trust-os = { path = "trust-os" }
+trust-router = { path = "trust-router" }
+trust-report = { path = "trust-report" }
+trust-ts-embed = { path = "trust-ts-embed" }
+trust-release = { path = "trust-release" }
+trust-clean = { path = "trust-clean" }
+trust-convergence = { path = "trust-convergence" }
+trust-temporal = { path = "trust-temporal" }
+trust-proof-cert = { path = "trust-proof-cert" }
+trust-semantics = { path = "trust-semantics" }
+trust-decompile = { path = "trust-decompile" }
+trust-strengthen = { path = "trust-strengthen" }
+trust-spec = { path = "trust-spec" }
+trust-backprop = { path = "trust-backprop" }
+trust-symex = { path = "trust-symex" }
+trust-transval = { path = "trust-transval" }
+trust-integration-tests = { path = "trust-integration-tests" }
+trust-lift = { path = "trust-lift" }
+trust-machine-sem = { path = "trust-machine-sem" }
+trust-bmc = { path = "trust-bmc" }
+trust-wp = { path = "trust-wp" }
+trust-vc-bridge = { path = "trust-vc-bridge" }
+trust-wasm-bridge = { path = "trust-wasm-bridge" }
+trust-certify = { path = "trust-certify" }
+trust-cert-meter = { path = "trust-cert-meter" }
+trust-spec-elab = { path = "trust-spec-elab" }
+trust-ny-bridge = { path = "trust-ny-bridge" }
+trust-js-trace = { path = "trust-js-trace" }
+trust-js-sem = { path = "trust-js-sem" }
+trust-js-differential = { path = "trust-js-differential" }
+trust-js-parse = { path = "trust-js-parse" }
+trust-js-value = { path = "trust-js-value" }
+trust-js-interp = { path = "trust-js-interp" }
+trust-js-regexp = { path = "trust-js-regexp" }
+trust-js-reactor = { path = "trust-js-reactor" }
+trust-js-modules = { path = "trust-js-modules" }
+trust-js-certify-bridge = { path = "trust-js-certify-bridge" }
+trust-js-autoform = { path = "trust-js-autoform" }
+trust-ts-strip = { path = "trust-ts-strip" }
+# trust-ny-bridge (NS-Stage 0): the LEAF ny-cert certificate crate. Light deps
+# (serde / serde_json / thiserror / num-*); routed through trust-certify so a
+# neural-shaped Farkas obligation hits the same clean-kernel-checked path.
+ny-cert = { path = "../first-party/ny/crates/ny-cert" }
+rustc-hash = "2.0.0"
+indexmap = "2.7"
+sha2 = "0.10"
+hmac = "0.12"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+bincode = "1.3"
+num-bigint = "0.4"
+proptest = "1.11"
+reqwest = { version = "0.12", features = ["json", "blocking"], default-features = false }
+tla-mc-core = { path = "../first-party/ty/crates/tla-mc-core" }
+# clean-kernel: workspace dep for trust-clean (renamed from trust-clean).
+clean-kernel = { path = "../first-party/clean/crates/clean-kernel", features = ["math-overlays"] }
+# clean-auto: in-process ay backend + kernel proof reconstruction, consumed by
+# trust-certify for the Certified tier (de Bruijn criterion). Public API only.
+clean-auto = { path = "../first-party/clean/crates/clean-auto" }
+# clean-verify: kernel self-verification spec. Consumed by trust-certify's
+# checker-core lane to obtain the DerivedProved KExpr de Bruijn lemma
+# (`lift_instantiate_swap`) proof term + goal, kernel-rechecked in-process.
+# Public API only (`Specification`, `SpecDefinition`).
+clean-verify = { path = "../first-party/clean/crates/clean-verify" }
+# clean-parser / clean-elab: used by the checker-core lane ONLY to elaborate the
+# negative-control fake term in the spec environment (parse -> ElabCtx ->
+# instantiate), so the kernel recheck rejects a well-formed wrong-typed term.
+# Already in the dependency graph via clean-verify.
+clean-parser = { path = "../first-party/clean/crates/clean-parser" }
+clean-elab = { path = "../first-party/clean/crates/clean-elab" }
+# clean-olean: machine-import of trust-ir's real Lean 4.8 .olean semantics into a
+# clean-kernel Environment. Consumed by trust-clean's Lean↔Clean bridge gate
+# (`trustir_bridge`), which loads the VENDORED artifacts under
+# crates/trust-clean/fixtures/trustir-oleans + vendor/lean-core-oleans and proves
+# the per-op semIntBinOp agreement theorems against the imported constants.
+clean-olean = { path = "../first-party/clean/crates/clean-olean" }
+rayon = "1.10"
+# tracing: used by trust-router's in-process ay backend to suppress ay's
+# solver-internal diagnostics during a solve (thread-local no-op subscriber;
+# TRUST_AY_LOG opts back in). Must unify with the tracing-core version ay-dpll
+# dispatches through (single tracing-core 0.1.x in the lockfile).
+tracing = "0.1"
+# trust: ay resolves from the repo-owned snapshot; do not restore Git sources here.
+ay = { path = "../first-party/ay/crates/ay" }
+# trust (proof-carrying ay, milestone 1): ay-core supplies the structured
+# `Proof`/`TermStore`/`FarkasAnnotation` data that clean-auto reconstructs into a
+# kernel term. Consumed by trust-router's `ay-certify` feature.
+ay-core = { path = "../first-party/ay/crates/ay-core" }
+# trust: ay-bindings typed builder API for direct ay integration
+ay-bindings = { path = "../first-party/ay/crates/ay-bindings" }
+# trust (sealed-authority S3): ay-chc typed CHC/PDR solver — consumed by
+# trust-bmc's replay_oracle behind the trust-mc-native-solver feature so the
+# gate can re-run validate_external_invariant_model in-process. The [patch]
+# entries below unify this path source with trust-mc's git-pinned ay-chc.
+ay-chc = { path = "../first-party/ay/crates/ay-chc" }
+# trust #879: ay-proof-common shared types for proof checker crates
+ay-proof-common = { path = "../first-party/ay/crates/ay-proof-common" }
+# trust: ay-proof zero-trust bit-blast proof exporter (BvExpr + export_bv_blast_proof_expr)
+# consumed by the trust-cg M-POS gate to produce kernel-re-checkable bit-blast certs.
+ay-proof = { path = "../first-party/ay/crates/ay-proof" }
+# trust: trust-mc bounded model checker
+trust-mc-verifier = { path = "../first-party/trust-mc", package = "trust-mc" }
+# trust: trust-mc-core VC IR for direct BMC/CHC integration
+trust-mc-core = { path = "../first-party/trust-mc/trust-mc-core" }
+trust-mc-trust-bmc = { path = "../first-party/trust-mc/trust-mc-trust-bmc" }
+# trust: trust-wp deductive verification
+trust-wp-core = { path = "../first-party/trust-wp/crates/trust-wp-core" }
+trust-wp-ay = { path = "../first-party/trust-wp/crates/trust-wp-ay" }
+# trust: trust-vc ownership-aware verification
+trust-vc-core = { path = "../first-party/trust-vc/crates/trust-vc-core" }
+trust-vc-trust-engine = { path = "../first-party/trust-vc/crates/trust-vc-trust-engine" }
+# trust #815: trust-cg verified codegen backend
+# trust: trust-cg resolves from the repo-owned snapshot; do not restore Git sources here.
+trust-cg-ir = { path = "../first-party/trust-cg/crates/trust-cg-ir" }
+trust-cg-lower = { path = "../first-party/trust-cg/crates/trust-cg-lower" }
+trust-cg-verify = { path = "../first-party/trust-cg/crates/trust-cg-verify" }
+trust-cg-codegen = { path = "../first-party/trust-cg/crates/trust-cg-codegen" }
+trust-cg-bridge = { path = "trust-cg-bridge" }
+trust-ir-bridge = { path = "trust-ir-bridge" }
+# trust #869: TrustIr universal proof-carrying IR
+# clean-expr: CleanCic kernel-replay proof authority is live in every workspace
+# build — without it trust-ir's NativeProofAuthority is hardwired false and no
+# native TrustVc request can pass bundle validation (the trust-vc lane would be
+# structurally dark in dev builds).
+trust-ir = { path = "../first-party/trust-ir/crates/trust-ir", features = ["clean-expr"] }
+trust-ir-build = { path = "../first-party/trust-ir/crates/trust-ir-build" }
+# trust: cross-repo shared verification vocabulary (Formula/Sort/Symbol/BlockId,
+# translation-validation records, proof-assurance enums). Re-exported by
+# trust-types/trust-verifier-api; consumed directly by backends (clean).
+trust-ir-contract = { path = "../first-party/trust-ir/crates/trust-ir-contract" }
+tempfile = "3"
+fs2 = "0.4"
+anyhow = "1"
+dirs = "5"
+libc = "0.2"
+syn = { version = "2", features = ["full", "visit", "extra-traits"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"

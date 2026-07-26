@@ -1,0 +1,328 @@
+{
+  "name": "fold_fvar_opt",
+  "def_path": "expr::visitor::opt::ExprFolderOpt::fold_fvar_opt",
+  "span": {
+    "file": "src/expr/visitor_opt.rs",
+    "line_start": 109,
+    "col_start": 4,
+    "line_end": 111,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Adt": {
+            "name": "std::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Adt": {
+                    "name": "expr::Expr",
+                    "fields": [
+                      [
+                        "kind",
+                        {
+                          "Datatype": {
+                            "name": "expr::kind::ExprKind",
+                            "variants": []
+                          }
+                        }
+                      ],
+                      [
+                        "meta",
+                        {
+                          "Adt": {
+                            "name": "expr::meta::ExprMeta",
+                            "fields": [
+                              [
+                                "0",
+                                {
+                                  "Int": {
+                                    "width": 64,
+                                    "signed": false
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Adt": {
+                        "name": "expr::Expr",
+                        "fields": [
+                          [
+                            "kind",
+                            {
+                              "Datatype": {
+                                "name": "expr::kind::ExprKind",
+                                "variants": []
+                              }
+                            }
+                          ],
+                          [
+                            "meta",
+                            {
+                              "Adt": {
+                                "name": "expr::meta::ExprMeta",
+                                "fields": [
+                                  [
+                                    "0",
+                                    {
+                                      "Int": {
+                                        "width": 64,
+                                        "signed": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Unsupported": {
+                "kind": "TyKind::Param",
+                "detail": "generic parameter Self/#0 needs monomorphization"
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "expr::types::FVarId",
+            "fields": [
+              [
+                "0",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": "_id"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "std::option::Option",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "src/expr/visitor_opt.rs",
+                "line_start": 110,
+                "col_start": 8,
+                "line_end": 110,
+                "col_end": 12
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Adt": {
+        "name": "std::option::Option",
+        "fields": [
+          [
+            "__tag",
+            {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            }
+          ],
+          [
+            "__v1_0",
+            {
+              "Adt": {
+                "name": "expr::Expr",
+                "fields": [
+                  [
+                    "kind",
+                    {
+                      "Datatype": {
+                        "name": "expr::kind::ExprKind",
+                        "variants": []
+                      }
+                    }
+                  ],
+                  [
+                    "meta",
+                    {
+                      "Adt": {
+                        "name": "expr::meta::ExprMeta",
+                        "fields": [
+                          [
+                            "0",
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          ]
+        ],
+        "variants": [
+          {
+            "name": "None",
+            "discriminant": 0,
+            "fields": []
+          },
+          {
+            "name": "Some",
+            "discriminant": 1,
+            "fields": [
+              [
+                "0",
+                {
+                  "Adt": {
+                    "name": "expr::Expr",
+                    "fields": [
+                      [
+                        "kind",
+                        {
+                          "Datatype": {
+                            "name": "expr::kind::ExprKind",
+                            "variants": []
+                          }
+                        }
+                      ],
+                      [
+                        "meta",
+                        {
+                          "Adt": {
+                            "name": "expr::meta::ExprMeta",
+                            "fields": [
+                              [
+                                "0",
+                                {
+                                  "Int": {
+                                    "width": 64,
+                                    "signed": false
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ]
+            ]
+          }
+        ],
+        "disc_index_safe": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "schema": "dpub.provenance-bundle.v1",
+  "release_id": "trust-2026.04.25-rc1",
+  "materials": [
+    {"uri": "git+https://github.com/alabsystems/trust@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "digest": {"sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+    {"uri": "trust-engines.lock", "digest": {"sha256": "4444444444444444444444444444444444444444444444444444444444444444"}}
+  ],
+  "subjects": [
+    {"uri": "reports/release/trust-2026.04.25-rc1/dpub.release.v1.json", "digest": {"sha256": "3333333333333333333333333333333333333333333333333333333333333333"}}
+  ],
+  "builder": {"id": "github.com/alabsystems/dpub"}
+}

@@ -1,0 +1,5 @@
+9d722f3d3fc792d2070b573e32e5745d016d0f3bdb3276e8f7ec1d3187804a60  library/core/src/num/int_macros.rs
+32c5b549de1e056fd21ced3568e4e576b9f0ac39fe6963c2344f8a56194524de  library/core/src/num/uint_macros.rs
+c73e8e7b6f5d7ff5c1d1584072072f049ff70efb2b15b5503a24f9b7b179d2a4  crates/trust-clean/fixtures/stdlib-leaf-num-2026-07-16/SOURCE/Cargo.toml
+a20eefaeefca1110594452e42dbbcecd5bf7e5c729e279c8409621695cfe078e  crates/trust-clean/fixtures/stdlib-leaf-num-2026-07-16/SOURCE/src/lib.rs
+dd49f6c50b07c7731d7f40bfd30a4ff3fe75c1eea82ecf7209473c0c6dc4e67a  crates/trust-clean/fixtures/stdlib-leaf-num-2026-07-16/int_log10-workaround.diff

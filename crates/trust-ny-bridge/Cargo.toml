@@ -1,0 +1,46 @@
+# trust-ny-bridge: route a ny-cert Farkas certificate through trust-certify.
+#
+# NS-Stage 0 of docs/NEURO_SYMBOLIC.md. A neural-shaped infeasibility
+# certificate (ny-cert's exact-rational Farkas certificates) is translated into
+# the SAME trust_types::Formula violation that trust-certify::certify_violation
+# refutes via the clean CIC kernel. Each constraint is cleared to an equivalent
+# integer constraint (scaled by the checked-u128 LCM of its denominators) first.
+# The certificate AND the solver that produced it land OUTSIDE the trusted base
+# for that fragment (the de Bruijn criterion).
+#
+# Fail-closed: anything that does not clear to a QF_LIA-integer violation under
+# checked u128/i128 arithmetic — a denominator beyond u128, an LCM overflow, a
+# scaled value beyond i128 — returns `None`. A false `Certified` is the worst
+# possible bug; a conservative `None` is fine.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-ny-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Default build is an EMPTY lib: the heavy ny-cert + clean kernel + ay tree is
+# only pulled in under the `ny` feature. No-feature builds compile instantly.
+default = []
+ny = ["dep:ny-cert"]
+
+[dependencies]
+trust-types = { workspace = true }
+trust-ir = { workspace = true, features = ["serde"] }
+trust-certify = { workspace = true }
+# ny-cert is the LEAF certificate crate (serde / num-* / thiserror only). It is
+# OPTIONAL and gated behind the `ny` feature so the no-feature build stays light.
+ny-cert = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Tests build Rat values with >u128 numerators/denominators to prove the
+# clearing arithmetic fails closed on overflow.
+num-bigint = { workspace = true }

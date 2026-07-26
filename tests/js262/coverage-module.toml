@@ -1,0 +1,37 @@
+# TrustJS S-module coverage ratchet — the module-goal core (increment 2b).
+#
+# The S-module slice (693 module-goal tests; tests/js262/S-module.toml) run by the
+# module-goal execution driver. This ratchets the in-house faithful head (trustjs)
+# COVERAGE — every covered case is trace-equal to Node or Bun (equal == covered),
+# every uncovered case a sound NoCoverage refusal, ZERO wrong traces.
+#
+# Increment 2b-part-1: trustjs covers the negative:parse module tests via
+# parse_module -> EarlyError -> the SyntaxError throw an engine raises when
+# import()-ing the module (matching Node). Well-formed modules are still sound
+# refusals — module LINKING + EVALUATION (ResolveExport, the module graph) are the
+# next 2b build. sem still soundly refuses all module goal (0 covered).
+#
+# Judged by: trust-js-differential calibrate --slice S-module.toml (the trustjs
+# head audit; trustjs_audit_ok = equal == covered && divergent == 0).
+
+[[entries]]
+id = "cov-module-trustjs-2026-07-23"
+date = "2026-07-23"
+scorecard = "tests/js262/evidence/2026-07-23-smodule-2b/scorecard.json"
+head = "trustjs"
+cases = 693
+covered = 225
+equal = 225
+divergent = 0
+no_coverage = 468
+
+[[entries]]
+id = "cov-module-sem-2026-07-23"
+date = "2026-07-23"
+scorecard = "tests/js262/evidence/2026-07-23-smodule-2b/scorecard.json"
+head = "sem"
+cases = 693
+covered = 0
+equal = 0
+divergent = 0
+no_coverage = 693

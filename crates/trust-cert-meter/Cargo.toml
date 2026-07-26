@@ -1,0 +1,29 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# R4 landing (two-language spec surface, docs/design/2026-07-09-two-language-
+# spec-surface.md §5 note 1 / §8 R4): the ONE honesty meter migrates from
+# first-party/trust-wp/spikes/cert-meter into trust proper — it is toolchain
+# infrastructure (it serves every engine), not a trust-wp asset. Source moved
+# verbatim; the lib target keeps the original crate name `cert_meter` so the
+# frozen INTERFACE-v1 consumers (`use cert_meter::…`) are byte-compatible.
+# The trust-wp spike copy remains until the spike corpus re-keys (R4 gate);
+# THIS crate is the canonical home.
+
+[package]
+name = "trust-cert-meter"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The ONE honesty meter: strictly audit a kernel proof judgment and its complete declaration/provenance closure."
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+license = "Apache-2.0 OR MIT"
+
+[lints]
+workspace = true
+
+[lib]
+name = "cert_meter"
+
+[dependencies]
+clean-kernel = { workspace = true }

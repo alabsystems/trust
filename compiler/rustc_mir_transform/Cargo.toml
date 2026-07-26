@@ -1,0 +1,53 @@
+[features]
+default = []
+
+[package]
+name = "rustc_mir_transform"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+# tidy-alphabetical-start
+either = "1"
+itertools = "0.15"
+libc = "0.2"
+rustc_abi = { path = "../rustc_abi" }
+rustc_arena = { path = "../rustc_arena" }
+rustc_ast = { path = "../rustc_ast" }
+rustc_const_eval = { path = "../rustc_const_eval" }
+rustc_data_structures = { path = "../rustc_data_structures" }
+rustc_errors = { path = "../rustc_errors" }
+rustc_hir = { path = "../rustc_hir" }
+rustc_index = { path = "../rustc_index" }
+rustc_infer = { path = "../rustc_infer" }
+rustc_lexer = { path = "../rustc_lexer" }
+rustc_macros = { path = "../rustc_macros" }
+rustc_middle = { path = "../rustc_middle" }
+rustc_mir_dataflow = { path = "../rustc_mir_dataflow" }
+rustc_session = { path = "../rustc_session" }
+rustc_span = { path = "../rustc_span" }
+rustc_target = { path = "../rustc_target" }
+rustc_trait_selection = { path = "../rustc_trait_selection" }
+serde_json = { workspace = true }
+smallvec = { version = "1.8.1", features = ["union", "may_dangle"] }
+tracing = "0.1"
+trust-cache = { workspace = true }
+trust-certify = { workspace = true }
+trust-ir = { workspace = true, features = ["serde"] }
+trust-ir-bridge = { workspace = true, features = ["compiler-context"] }
+trust-mir-extract = { workspace = true }
+# Trust: enable the in-process ay SMT backend inside rustc so the verifier has
+# an artifact-backed (replayable unsat-proof) arithmetic prover. The historical
+# stacker/cc dep conflict that gated this off appears resolved (stacker aligned
+# at 0.1.24 across workspaces). Revert if the bootstrap dep graph conflicts.
+trust-router = { workspace = true, features = ["ay-backend", "ay-certify", "trust-build", "trust-cg-output-gate"] }
+trust-spec-elab = { workspace = true }
+trust-strengthen = { workspace = true }
+# Trust: P1 item 5 — the trust-ir flip (trust_ir_flip.rs) re-derives codegen MIR from the green
+# trust-ir Module recorded at the mir_built hook (trust_thir_lower::{flip, flip_registry}).
+trust-thir-lower = { workspace = true }
+trust-types = { workspace = true }
+trust-vc-bridge = { workspace = true }
+trust-vcgen = { workspace = true }
+trust-verifier-api = { workspace = true }
+# tidy-alphabetical-end

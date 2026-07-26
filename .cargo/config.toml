@@ -1,0 +1,53 @@
+# Trust workspace cargo config.
+#
+# A small set of Trust verification crates uses the compiler-internal
+# `contracts_internals` feature for `contract_requires { ... }` fixtures. Keep
+# the bootstrap escape scoped to those crates so ordinary workspace Cargo
+# invocations do not receive blanket unstable-feature semantics.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+#
+# Incremental-compilation scope split (cross-ref bootstrap.toml [rust] incremental):
+#   bootstrap.toml sets `incremental = false`, but that knob is SCOPED to the
+#   rustc self-build only (the stage1/stage2 compiler self-compilation, where an
+#   interrupted incremental build once produced a corrupted-mmap SIGBUS). It does
+#   NOT govern the Trust-owned `crates/` workspace. This config sets no
+#   `[build] incremental`, so the `crates/` workspace keeps Cargo's default
+#   `incremental = true` for fast crates-only iteration (`targo check`,
+#   `scripts/check_all.sh`). Do not "unify" these: the bootstrap disable is a
+#   self-build stability fix, not a workspace-wide policy.
+
+[env]
+# trust_vcgen was dropped from this allowlist: its `#![feature(contracts_internals)]`
+# + `#![feature(register_tool)]` gates were removed at the root (see
+# crates/trust-vcgen/src/lib.rs), so it now builds on the stable release channel
+# with no bootstrap escape. The remaining three crates still carry
+# `contract_requires { ... }` fixtures / `#[trust::..]` attributes that require it.
+# Windows genesis build: disabled — these crates are not built in the stage2
+# compiler/std/targo pass, and an inherited RUSTC_BOOTSTRAP poisons bootstrap.
+# RUSTC_BOOTSTRAP = "trust_mir_extract,trust_machine_sem,trust_cache"
+
+# Nudge humans off raw `cargo` and onto `targo` (see scripts/trust-rustc-guard.sh).
+# Raw cargo can serve a stale trustc (cache-hit ⇒ trustc never re-runs) and skips
+# the verifier flags; targo force-cleans + pins stage2 trustc + injects them.
+# The guard is a RUSTC_WRAPPER so it sees every rustc spawn (a build.rs would miss
+# the cache-hit case). It only WARNS (one notice/build) and execs the real rustc,
+# so it can't break x.py or targo; it stays silent for compiler descendants
+# marked by targo (`TRUST_TARGO_FRONTEND=1`) and for cargo's probe invocations.
+# `force = false` lets targo's own RUSTC_WRAPPER win. Set TRUST_STRICT_CARGO=1
+# for hard-fail; TRUST_RUSTC_GUARD=off to disable.
+# Windows genesis build: disabled — this is a POSIX shell script and cannot be
+# spawned as a RUSTC_WRAPPER on Windows (would break every rustc invocation).
+# RUSTC_WRAPPER = { value = "scripts/trust-rustc-guard.sh", relative = true, force = false }
+
+# Some submodules under first-party/ reach the `alabsystems/ay` private
+# repository through hard-pinned HTTPS git URLs in their own workspaces. Trust's
+# top-level [patch] sections can't override deps inside another workspace, so
+# cargo would otherwise try to clone the private repo over HTTPS and fail with
+# "could not read Username" on developer machines that auth GitHub via SSH.
+# Using the git CLI lets git's own credential helpers / SSH config resolve
+# authentication (see also the url."git@github.com:".insteadOf entry in this
+# repo's local git config, set up by ./scripts/bootstrap.sh).
+[net]
+git-fetch-with-cli = true

@@ -1,0 +1,78 @@
+{
+  "name": "fbits",
+  "def_path": "fbits",
+  "span": {
+    "file": "<dump-root>/bigreal_src.rs",
+    "line_start": 17,
+    "col_start": 0,
+    "line_end": 17,
+    "col_end": 33
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Float": {
+            "width": 32
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Float": {
+            "width": 32
+          }
+        },
+        "name": "f"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/bigreal_src.rs",
+                "line_start": 17,
+                "col_start": 30,
+                "line_end": 17,
+                "col_end": 31
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Float": {
+        "width": 32
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

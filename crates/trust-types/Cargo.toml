@@ -1,0 +1,62 @@
+# trust-types: Verification IR for the trust compiler
+#
+# Defines the data structures the entire verification pipeline operates on.
+# Decoupled from rustc internals — only trust-mir-extract touches rustc types.
+# Everything downstream (vcgen, router, report) operates on these types.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Default ON: enables the custom `Try`/`FromResidual` impls for `Discharge`
+# (the fail-closed `?` sugar), which require the nightly `try_trait_v2` feature.
+# Stable-only consumers (e.g. the `clean` workspace) depend with
+# `default-features = false` to drop the nightly requirement; the `Discharge`
+# type and all its combinators remain available on stable, only `?`-sugar is off.
+default = ["try-sugar"]
+try-sugar = []
+test-utils = []
+# trust #571: ay-bindings for Formula->Expr conversion bridge.
+ay-bridge = ["dep:ay-bindings"]
+# Opt-in: run the FP bridge's *end-to-end solver* regression tests in-process
+# (pulls the ay-dpll backend via `ay-bindings/direct`). Heavy; not in default or
+# plain `ay-bridge`. Run: `cargo test -p trust-types --features ay-bridge-solve`.
+ay-bridge-solve = ["ay-bridge", "ay-bindings/direct"]
+# trust #632: trust-wp-core PureExpr conversion bridge for native trust-wp integration.
+trust-wp-bridge = ["dep:trust-wp-core"]
+
+[dependencies]
+# trust: canonical home of the SMT Formula/Sort/Symbol/BlockId vocabulary and
+# the translation-validation data records. trust-types re-exports these so its
+# public API (and the whole compiler) is unchanged; the leaf crate lets backends
+# (e.g. clean) share the vocabulary without depending on the Trust repo.
+trust-ir-contract = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+# Trust (R1 corpus): `unbounded_depth` gates `Deserializer::disable_recursion_limit`,
+# used ONLY by `json_depth::from_str_deep` (bounded big-stack fallback for
+# compiler-emitted formula payloads deeper than serde_json's 128 default).
+serde_json = { workspace = true, features = ["unbounded_depth"] }
+sha2 = { workspace = true }
+# trust #837: Deterministic hashing for compilation reproducibility
+rustc-hash = { workspace = true }
+indexmap = { workspace = true }
+# trust #571: ay-bindings for Formula->Expr conversion bridge (optional bridge).
+ay-bindings = { workspace = true, optional = true }
+# trust #632: trust-wp-core for Formula→PureExpr bridge (optional, behind trust-wp-bridge feature)
+trust-wp-core = { workspace = true, optional = true }
+
+[dev-dependencies]
+bincode = { workspace = true }
+proptest = { workspace = true }
+tempfile = { workspace = true }

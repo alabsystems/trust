@@ -1,0 +1,4 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+arrayvec::ArrayVec::<T, CAP>::len	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<arrayvec::ArrayVec<T, CAP> as arrayvec_impl::ArrayVecImpl>::len	FULLY_FAITHFUL	true	true	true	true	true	false	true
+arrayvec::ArrayVec::<T, CAP>::is_empty	FULLY_FAITHFUL	true	true	true	true	true	false	true

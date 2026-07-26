@@ -1,0 +1,26 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+<char as Check>::is_control	FULLY_FAITHFUL	false	false	true	true	true	false	true
+<char as Check>::is_digit	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<char as Check>::is_extended	FULLY_FAITHFUL	false	false	true	true	true	false	true
+<char as Check>::is_letter	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<char as Check>::is_lower	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<char as Check>::is_printable	FULLY_FAITHFUL	false	false	true	true	true	false	true
+<char as Check>::is_space	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<char as Check>::is_upper	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<char as Check>::is_us_ascii	FULLY_FAITHFUL	false	false	true	true	true	false	true
+<errors::AsciiError as std::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+<errors::AsciiError as std::cmp::PartialEq>::eq	SHAPE_GAP	false	false	false	false	false	false	false
+<errors::AsciiError as std::error::Error>::cause	SHAPE_GAP	false	false	false	false	false	false	false
+<errors::AsciiError as std::error::Error>::description	SHAPE_GAP	false	false	false	false	false	false	false
+<errors::AsciiError as std::fmt::Debug>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<errors::AsciiError as std::fmt::Display>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<u8 as Check>::is_control	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<u8 as Check>::is_digit	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<u8 as Check>::is_extended	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<u8 as Check>::is_letter	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<u8 as Check>::is_lower	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<u8 as Check>::is_printable	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<u8 as Check>::is_space	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<u8 as Check>::is_upper	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<u8 as Check>::is_us_ascii	FULLY_FAITHFUL	true	true	true	true	true	false	true
+check_ascii_printable	SHAPE_GAP	false	false	false	false	false	false	false

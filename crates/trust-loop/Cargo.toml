@@ -1,0 +1,22 @@
+# trust-loop: Iterative verification over in-memory verification conditions
+#
+# Operates directly on in-memory VCs and solver results rather than on the
+# file paths the loop was originally driven by.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+trust-types = { workspace = true }
+trust-convergence = { workspace = true }
+thiserror = { workspace = true }

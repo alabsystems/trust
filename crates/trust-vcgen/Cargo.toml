@@ -1,0 +1,59 @@
+# trust-vcgen: Verification condition generation for trust
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-vcgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# The former `pipeline-v2` switch was retired after v2 became the only maintained
+# implementation. Keeping an off-state advertised a legacy v1 build that no
+# longer existed and let `--no-default-features` select an incoherent cfg mix.
+# Optional features below add formats or audits; none select VC semantics.
+default = []
+# Experimental, injectable legacy taint prototype. This does not wire the
+# analysis into `generate_vcs` or the compiler's verification verdict. A
+# production implementation requires a TrustIR CFG fixpoint and exact callee
+# identities; see `src/infoflow.rs`.
+prototype-infoflow = []
+# Forward binary parser/lifter support for reusable relift APIs.
+elf = ["trust-lift/elf"]
+macho = ["trust-lift/macho"]
+[dependencies]
+# trust-types is consumed as a pure data layer here (VerifiableFunction,
+# VerificationCondition, Formula, ...). We deliberately do NOT pull its
+# default `try-sugar` feature (which enables the nightly `try_trait_v2`
+# `?`-sugar on `Discharge`): trust-vcgen never uses `?` on `Discharge`, so
+# forcing nightly transitively just to depend on the structs is wrong.
+# Declared as a direct path dep with default-features = false (instead of
+# `{ workspace = true }`, which re-enables try-sugar) so trust-vcgen builds
+# on the stable release channel. Trust's own build that needs the sugar
+# enables it on the crate that actually uses `?` (trust-types itself / any
+# real consumer via `features = ["try-sugar"]`).
+trust-types = { path = "../trust-types", default-features = false }
+# trust #513: Binary verification bridge — lift adapter converts LiftedFunction to VCs.
+trust-lift = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+trust-router = { workspace = true }
+trust-report = { workspace = true }
+# range.rs's bound helpers are duplicated verbatim in trust-semantics, which
+# needs them to state the kernel `noOverflow` denotation without depending on
+# the generator. A copy that nothing compares is a false-proof hazard: the
+# kernel definition and the emitted VC would silently come to mean different
+# things. The dev-dependency exists so `range.rs`'s own tests are the thing
+# that compares them.
+trust-semantics = { workspace = true }
+# trust #475: Property-based testing for Formula simplification correctness.
+proptest = { workspace = true }

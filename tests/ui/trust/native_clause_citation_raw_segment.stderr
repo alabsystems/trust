@@ -1,0 +1,8 @@
+error: expected a theorem name after `by` in the contract clause citation
+  --> $DIR/native_clause_citation_raw_segment.rs:6:25
+   |
+LL |     ensures result == x by r#lemma
+   |                         ^^
+
+error: aborting due to 1 previous error
+

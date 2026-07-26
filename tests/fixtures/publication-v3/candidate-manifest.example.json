@@ -1,0 +1,28 @@
+{
+  "schema": "dpub.candidate-manifest.v1",
+  "release_id": "trust-2026.04.25-rc1",
+  "candidate_id": "trust-2026.04.25-rc1",
+  "product": "trust",
+  "source": {
+    "repo": "https://github.com/alabsystems/trust",
+    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "artifacts": [
+    {"name": "candidate-manifest", "kind": "manifest", "path": "reports/release/trust-2026.04.25-rc1/candidate-manifest.json", "hash_field": "candidate_manifest_hash", "hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
+    {"name": "dscan-attestation", "kind": "attestation", "path": "reports/release/trust-2026.04.25-rc1/dscan.attestation.v1.json", "hash_field": "dscan_attestation_hash", "hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
+    {"name": "dpub-release-ledger", "kind": "ledger", "path": "reports/release/trust-2026.04.25-rc1/dpub.release.v1.json", "hash_field": "dpub_release_hash", "hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333"},
+    {"name": "trust-engines-lock", "kind": "lockfile", "path": "trust-engines.lock", "hash_field": "trust_engines_lock_hash", "hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444"},
+    {"name": "conformance-report", "kind": "evidence", "path": "reports/release/trust-2026.04.25-rc1/conformance-report.json", "hash_field": "conformance_report_hash", "hash": "sha256:5555555555555555555555555555555555555555555555555555555555555555"},
+    {"name": "release-gate-report", "kind": "evidence", "path": "reports/release/trust-2026.04.25-rc1/release-gate-report.json", "hash_field": "release_gate_report_hash", "hash": "sha256:6666666666666666666666666666666666666666666666666666666666666666"},
+    {"name": "sbom", "kind": "provenance", "path": "reports/release/trust-2026.04.25-rc1/sbom.spdx.json", "hash_field": "sbom_hash", "hash": "sha256:7777777777777777777777777777777777777777777777777777777777777777"},
+    {"name": "provenance-bundle", "kind": "provenance", "path": "reports/release/trust-2026.04.25-rc1/provenance.bundle.json", "hash_field": "provenance_bundle_hash", "hash": "sha256:8888888888888888888888888888888888888888888888888888888888888888"},
+    {"name": "rollback-plan", "kind": "rollback", "path": "reports/release/trust-2026.04.25-rc1/rollback-plan.json", "hash_field": "rollback_plan_hash", "hash": "sha256:9999999999999999999999999999999999999999999999999999999999999999"}
+  ],
+  "engines": [
+    {"name": "sunder", "role": "deductive-engine", "repo": "https://github.com/alabsystems/sunder", "ref_kind": "commit-or-signed-tag", "rev": "TBD", "api": "trust-verifier-api@TBD", "vendor_path": "third_party/sunder", "vendor_snapshot": "TBD"},
+    {"name": "zani", "role": "reachability-engine", "repo": "https://github.com/alabsystems/zani", "ref_kind": "commit-or-signed-tag", "rev": "TBD", "api": "trust-verifier-api@TBD", "vendor_path": "../zani", "vendor_snapshot": "TBD"},
+    {"name": "certus", "role": "proof-calculus-engine", "repo": "https://github.com/alabsystems/certus", "ref_kind": "commit-or-signed-tag", "rev": "TBD", "api": "trust-verifier-api@TBD", "vendor_path": "third_party/certus", "vendor_snapshot": "TBD"},
+    {"name": "tla2", "role": "temporal-spec-engine", "repo": "https://github.com/alabsystems/ty", "ref_kind": "commit-or-signed-tag", "rev": "TBD", "api": "trust-verifier-api@TBD", "vendor_path": "third_party/tla2", "vendor_snapshot": "TBD"},
+    {"name": "ay", "role": "solver-proof-kernel", "repo": "https://github.com/alabsystems/ay", "ref_kind": "commit-or-signed-tag", "rev": "TBD", "api": "trust-verifier-api@TBD", "vendor_path": "third_party/ay", "vendor_snapshot": "TBD"}
+  ]
+}

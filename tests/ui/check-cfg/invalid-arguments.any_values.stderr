@@ -1,0 +1,5 @@
+error: invalid `--check-cfg` argument: `cfg(any(),values())`
+   |
+   = note: `values()` cannot be specified before the names
+   = note: visit the Trust trustc check-cfg documentation for more details
+

@@ -1,0 +1,15 @@
+note: Clean island kernel-checked: 1 declaration(s) registered (zero_eq_thm)
+  --> $DIR/native_clause_citation_mismatch.rs:10:5
+   |
+LL |     theorem zero_eq_thm : 0 = 0 := rfl
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: citation `zero_eq_thm` failed the strict Clean statement/certification audit: strict certification audit failed: [TermRejected { error: "TypeMismatch { expected: App(App(Const(Name { inner: Str(Name { inner: Str(Name { inner: Anon, cached_hash: 1723 }, \"Nat\"), cached_hash: 11442535297760353691 }, \"le\"), cached_hash: 10778933377320331970 }, []), Const(Name { inner: Str(Name { inner: Str(Name { inner: Anon, cached_hash: 1723 }, \"Nat\"), cached_hash: 11442535297760353691 }, \"zero\"), cached_hash: 13428217069302927667 }, [])), Const(Name { inner: Str(Name { inner: Str(Name { inner: Anon, cached_hash: 1723 }, \"Nat\"), cached_hash: 11442535297760353691 }, \"zero\"), cached_hash: 13428217069302927667 }, [])), inferred: App(App(App(Const(Name { inner: Str(Name { inner: Anon, cached_hash: 1723 }, \"Eq\"), cached_hash: 16122875713692181903 }, [Succ(Zero)]), Const(Name { inner: Str(Name { inner: Anon, cached_hash: 1723 }, \"Nat\"), cached_hash: 11442535297760353691 }, [])), Lit(Nat(Small(0)))), Lit(Nat(Small(0)))), location: None }" }]
+  --> $DIR/native_clause_citation_mismatch.rs:14:23
+   |
+LL |     ensures 0 <= 0 by zero_eq_thm
+   |                       ^^^^^^^^^^^
+   |
+   = note: statement drift and authority/provenance failures are hard citation errors; there is no router fallback (E9)
+
+error: aborting due to 1 previous error

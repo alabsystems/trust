@@ -1,0 +1,412 @@
+{
+  "name": "empty",
+  "def_path": "Aabb::empty",
+  "span": {
+    "file": "crates/a3d-geom/src/lib.rs",
+    "line_start": 246,
+    "col_start": 4,
+    "line_end": 251,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Adt": {
+            "name": "Aabb",
+            "fields": [
+              [
+                "min",
+                {
+                  "Adt": {
+                    "name": "Vec3",
+                    "fields": [
+                      [
+                        "x",
+                        {
+                          "Float": {
+                            "width": 64
+                          }
+                        }
+                      ],
+                      [
+                        "y",
+                        {
+                          "Float": {
+                            "width": 64
+                          }
+                        }
+                      ],
+                      [
+                        "z",
+                        {
+                          "Float": {
+                            "width": 64
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ],
+              [
+                "max",
+                {
+                  "Adt": {
+                    "name": "Vec3",
+                    "fields": [
+                      [
+                        "x",
+                        {
+                          "Float": {
+                            "width": 64
+                          }
+                        }
+                      ],
+                      [
+                        "y",
+                        {
+                          "Float": {
+                            "width": 64
+                          }
+                        }
+                      ],
+                      [
+                        "z",
+                        {
+                          "Float": {
+                            "width": 64
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "Vec3",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "Vec3",
+            "fields": [
+              [
+                "x",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "y",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ],
+              [
+                "z",
+                {
+                  "Float": {
+                    "width": 64
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "Vec3::new",
+            "args": [
+              {
+                "Constant": {
+                  "FloatBits": {
+                    "bits": 9218868437227405312,
+                    "width": 64
+                  }
+                }
+              },
+              {
+                "Constant": {
+                  "FloatBits": {
+                    "bits": 9218868437227405312,
+                    "width": 64
+                  }
+                }
+              },
+              {
+                "Constant": {
+                  "FloatBits": {
+                    "bits": 9218868437227405312,
+                    "width": 64
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 1,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 248,
+              "col_start": 17,
+              "line_end": 248,
+              "col_end": 71
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "Vec3::new",
+            "args": [
+              {
+                "Constant": {
+                  "FloatBits": {
+                    "bits": 18442240474082181120,
+                    "width": 64
+                  }
+                }
+              },
+              {
+                "Constant": {
+                  "FloatBits": {
+                    "bits": 18442240474082181120,
+                    "width": 64
+                  }
+                }
+              },
+              {
+                "Constant": {
+                  "FloatBits": {
+                    "bits": 18442240474082181120,
+                    "width": 64
+                  }
+                }
+              }
+            ],
+            "dest": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "crates/a3d-geom/src/lib.rs",
+              "line_start": 249,
+              "col_start": 17,
+              "line_end": 249,
+              "col_end": 83
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "Aabb",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 1,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 2,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/a3d-geom/src/lib.rs",
+                "line_start": 247,
+                "col_start": 8,
+                "line_end": 250,
+                "col_end": 9
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 0,
+    "return_ty": {
+      "Adt": {
+        "name": "Aabb",
+        "fields": [
+          [
+            "min",
+            {
+              "Adt": {
+                "name": "Vec3",
+                "fields": [
+                  [
+                    "x",
+                    {
+                      "Float": {
+                        "width": 64
+                      }
+                    }
+                  ],
+                  [
+                    "y",
+                    {
+                      "Float": {
+                        "width": 64
+                      }
+                    }
+                  ],
+                  [
+                    "z",
+                    {
+                      "Float": {
+                        "width": 64
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          ],
+          [
+            "max",
+            {
+              "Adt": {
+                "name": "Vec3",
+                "fields": [
+                  [
+                    "x",
+                    {
+                      "Float": {
+                        "width": 64
+                      }
+                    }
+                  ],
+                  [
+                    "y",
+                    {
+                      "Float": {
+                        "width": 64
+                      }
+                    }
+                  ],
+                  [
+                    "z",
+                    {
+                      "Float": {
+                        "width": 64
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false
+              }
+            }
+          ]
+        ],
+        "variants": [],
+        "disc_index_safe": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

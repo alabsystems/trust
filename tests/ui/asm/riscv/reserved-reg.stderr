@@ -1,0 +1,8 @@
+error: cannot use register `x7`: x7 is a reserved register on this target
+  --> $DIR/reserved-reg.rs:17:18
+   |
+LL |         asm!("", out("x7") _);
+   |                  ^^^^^^^^^^^
+
+error: aborting due to 1 previous error
+

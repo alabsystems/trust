@@ -1,0 +1,36 @@
+# Seed fixture for the upstream Rust compatibility gate wiring contract.
+# Production ledgers live at tests/upstream-rust/{baseline,exceptions,test-exceptions,upstream-fixes}.toml.
+
+schema = "trust.upstream-rust.gate-wiring.v1"
+
+[gate]
+mode = "upstream-rust-compat"
+canonical_path = "targo trust domination upstream-tests"
+wrapper = "tests/run_trust_superset_suite.sh"
+wrapper_scope = "noncanonical-local-compatibility"
+wrapper_release_evidence = false
+validator_crate = "trust-upstream-compat"
+static_level = "L0"
+full_host_level = "L2"
+drift_level = "L4"
+full_run_env = "TRUST_RUN_FULL_UPSTREAM_RUST_TESTS"
+release_env = "TRUST_RELEASE_GATE"
+baseline = "tests/upstream-rust/baseline.toml"
+exceptions = "tests/upstream-rust/exceptions.toml"
+test_exceptions = "tests/upstream-rust/test-exceptions.toml"
+upstream_fixes = "tests/upstream-rust/upstream-fixes.toml"
+summary_schema = "trust.upstream-rust.compat-summary.v1"
+
+[release]
+requires_zero_unaccounted_failures = true
+requires_zero_unaccounted_skips = true
+requires_zero_expired_exceptions = true
+requires_zero_unaccounted_upstream_fixes = true
+requires_stage2_trustc = true
+requires_vanilla_mode = true
+requires_all_toolchain_components = true
+requires_per_component_results = true
+requires_per_component_exceptions = true
+requires_per_component_upstream_fixes = true
+requires_zero_missing_component_results = true
+required_toolchain_components = ["rustc", "rustdoc", "cargo", "rustfmt", "clippy", "miri", "rust-analyzer", "bootstrap/x.py", "compiletest/run-make", "standard-library", "proc-macro", "test-harness", "bench-harness"]

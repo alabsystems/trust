@@ -1,0 +1,15 @@
+{
+  "crate_list": "top_crates.txt",
+  "crate_list_sha256": "a384022020ed5063ee4fa46afcef14e53fd446aa355420b1bb6bc32137361545",
+  "corpus_id": "top-crates-2026-07-20",
+  "description": "Curated crates.io native-compilation compatibility corpus for Trust",
+  "entry_count": 123,
+  "limitations": [
+    "This corpus is curated; it is not a downloads-ranked or exhaustive crates.io census.",
+    "A pass establishes native unverified compilation for the exact locked versions in the receipt, not verified downstream proc-macro support.",
+    "Each generated top-level fixture has an empty main; proc-macro targets may be compiled, but the corpus does not inventory or independently attest each macro invocation.",
+    "Results apply only to the host and toolchain identities recorded in the receipt."
+  ],
+  "schema": "trust.crates-io-corpus.v1",
+  "selection": "widely used crates spanning proc macros, async, networking, parsing, compression, cryptography, and native build scripts"
+}

@@ -1,0 +1,15 @@
+error: lifetime may not live long enough
+  --> $DIR/paramenv-scope-leak-issue-134407.rs:31:9
+   |
+LL | impl<'a, 'b> Convert<'a, 'b> for ()
+   |      --  -- lifetime `'b` defined here
+   |      |
+   |      lifetime `'a` defined here
+...
+LL |         x
+   |         ^ associated function was supposed to return data with lifetime `'b` but it is returning data with lifetime `'a`
+   |
+   = help: consider adding the following bound: `'a: 'b`
+
+error: aborting due to 1 previous error
+

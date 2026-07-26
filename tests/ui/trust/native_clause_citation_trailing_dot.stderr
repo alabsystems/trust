@@ -1,0 +1,8 @@
+error: expected a name segment after `.` in the contract clause citation
+  --> $DIR/native_clause_citation_trailing_dot.rs:7:28
+   |
+LL |     ensures result == x by Lemma.
+   |                            ^^^^^^
+
+error: aborting due to 1 previous error
+

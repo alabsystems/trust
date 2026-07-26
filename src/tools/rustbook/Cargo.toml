@@ -1,0 +1,19 @@
+[workspace]
+members = ["../error_index_generator"]
+
+[package]
+name = "rustbook"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+edition = "2021"
+
+# Trust: `mdbook-spec` and `mdbook-trpl` are preprocessors that only the
+# rust-lang reference and TRPL sources activate (via `preprocessor.spec` /
+# `preprocessor.trpl-*` keys in their own `book.toml`). No book Trust ships
+# declares those keys, and both plugins lived inside the book trees themselves,
+# so the path dependencies could not outlive them.
+[dependencies]
+clap = { version = "4.0.32", features = ["cargo"] }
+mdbook-driver = { version = "0.5.4", features = ["search"] }
+mdbook-i18n-helpers = "0.4.0"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }

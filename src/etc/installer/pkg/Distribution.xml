@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<installer-gui-script minSpecVersion="2">
+    <title>The Trust Compiler</title>
+    <license file="LICENSE.txt" mime-type="text/plain"/>
+    <pkg-ref id="org.trust-lang.trust"/>
+    <options customize="always" require-scripts="false" hostArchitectures="i386,x86_64"/>
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true" />
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="10.12"/>
+        </allowed-os-versions>
+    </volume-check>
+    <choices-outline>
+      <line choice="install">
+      <line choice="trustc"/>
+      <line choice="trust-std"/>
+      <line choice="targo"/>
+      <!-- tool-targo-trust-start -->
+      <line choice="targo-trust"/>
+      <!-- tool-targo-trust-end -->
+      <!-- tool-trust-docs-start -->
+      <line choice="trust-docs"/>
+      <!-- tool-trust-docs-end -->
+      <!-- tool-trustfmt-start -->
+      <line choice="trustfmt"/>
+      <!-- tool-trustfmt-end -->
+      <!-- tool-tippy-start -->
+      <line choice="tippy"/>
+      <!-- tool-tippy-end -->
+      <!-- tool-trust-analyzer-start -->
+      <line choice="trust-analyzer"/>
+      <!-- tool-trust-analyzer-end -->
+      <!-- tool-trust-miri-start -->
+      <line choice="trust-miri"/>
+      <!-- tool-trust-miri-end -->
+      </line>
+      <line choice="uninstall" />
+    </choices-outline>
+    <!--
+    These 'selected' scripts ensure that install and uninstall can never be selected at
+    the same time. Exactly how they work is pretty mysterious, tied to the unspecified algorithm
+    the installer uses to traverse the options after one is toggled.
+      -->
+    <choice id="install" visible="true"
+        title="Install Trust" description="Install the Trust compiler, package manager, verification tool, and documentation."
+        customLocation="/usr/local"
+        selected="!choices.uninstall.selected"
+        />
+    <choice id="uninstall" visible="true"
+        title="Uninstall Trust" description="Select this option to uninstall an existing Trust installation."
+        customLocation="/usr/local"
+        selected="!(choices.install.selected || choices.trustc.selected || choices['trust-std'].selected || choices.targo.selected || choices['targo-trust'].selected || choices['trust-docs'].selected || choices.trustfmt.selected || choices['tippy'].selected || choices['trust-analyzer'].selected || choices['trust-miri'].selected)"
+        start_selected="false"
+        >
+        <pkg-ref id="org.trust-lang.uninstall"/>
+    </choice>
+    <choice id="trustc" visible="true"
+        title="Compiler" description="trustc, the Trust compiler, and trustdoc, the API documentation tool."
+        selected="(!choices.uninstall.selected &amp;&amp; (choices.trustc.selected || choices['targo-trust'].selected || choices['tippy'].selected)) || (choices.uninstall.selected &amp;&amp; choices.install.selected)"
+        >
+        <pkg-ref id="org.trust-lang.trustc"/>
+    </choice>
+    <choice id="targo" visible="true"
+        title="targo" description="the Trust package manager."
+        selected="(!choices.uninstall.selected &amp;&amp; (choices.targo.selected || choices['targo-trust'].selected || choices['tippy'].selected)) || (choices.uninstall.selected &amp;&amp; choices.install.selected)"
+        >
+        <pkg-ref id="org.trust-lang.targo"/>
+    </choice>
+    <!-- tool-targo-trust-start -->
+    <choice id="targo-trust" visible="true"
+        title="targo trust" description="the Trust verification command."
+        selected="(!choices.uninstall.selected &amp;&amp; choices['targo-trust'].selected) || (choices.uninstall.selected &amp;&amp; choices.install.selected)"
+        >
+        <pkg-ref id="org.trust-lang.targo-trust"/>
+    </choice>
+    <!-- tool-targo-trust-end -->
+    <choice id="trust-std" visible="true"
+        title="Standard Library" description="The Trust standard library."
+        selected="(!choices.uninstall.selected &amp;&amp; (choices['trust-std'].selected || choices['targo-trust'].selected || choices['tippy'].selected)) || (choices.uninstall.selected &amp;&amp; choices.install.selected)"
+        >
+        <pkg-ref id="org.trust-lang.trust-std"/>
+    </choice>
+    <!-- tool-trust-docs-start -->
+    <choice id="trust-docs" visible="true"
+        title="Documentation" description="HTML documentation."
+        selected="(!choices.uninstall.selected &amp;&amp; choices['trust-docs'].selected) || (choices.uninstall.selected &amp;&amp; choices.install.selected)"
+        >
+        <pkg-ref id="org.trust-lang.trust-docs"/>
+    </choice>
+    <!-- tool-trust-docs-end -->
+    <!-- tool-trustfmt-start -->
+    <choice id="trustfmt" visible="true"
+        title="trustfmt" description="the Trust formatter and Cargo formatter frontend."
+        selected="(!choices.uninstall.selected &amp;&amp; choices.trustfmt.selected) || (choices.uninstall.selected &amp;&amp; choices.install.selected)"
+        >
+        <pkg-ref id="org.trust-lang.trustfmt"/>
+    </choice>
+    <!-- tool-trustfmt-end -->
+    <!-- tool-tippy-start -->
+    <choice id="tippy" visible="true"
+        title="tippy" description="the Trust linting tools."
+        selected="(!choices.uninstall.selected &amp;&amp; choices['tippy'].selected) || (choices.uninstall.selected &amp;&amp; choices.install.selected)"
+        >
+        <pkg-ref id="org.trust-lang.tippy"/>
+    </choice>
+    <!-- tool-tippy-end -->
+    <!-- tool-trust-analyzer-start -->
+    <choice id="trust-analyzer" visible="true"
+        title="trust-analyzer" description="the Trust language server."
+        selected="(!choices.uninstall.selected &amp;&amp; choices['trust-analyzer'].selected) || (choices.uninstall.selected &amp;&amp; choices.install.selected)"
+        >
+        <pkg-ref id="org.trust-lang.trust-analyzer"/>
+    </choice>
+    <!-- tool-trust-analyzer-end -->
+    <!-- tool-trust-miri-start -->
+    <choice id="trust-miri" visible="true"
+        title="trust-miri" description="the Trust interpreter tools."
+        selected="(!choices.uninstall.selected &amp;&amp; choices['trust-miri'].selected) || (choices.uninstall.selected &amp;&amp; choices.install.selected)"
+        >
+        <pkg-ref id="org.trust-lang.trust-miri"/>
+    </choice>
+    <!-- tool-trust-miri-end -->
+    <pkg-ref id="org.trust-lang.trustc" version="0" onConclusion="none">trustc.pkg</pkg-ref>
+    <pkg-ref id="org.trust-lang.targo" version="0" onConclusion="none">targo.pkg</pkg-ref>
+    <!-- tool-targo-trust-start -->
+    <pkg-ref id="org.trust-lang.targo-trust" version="0" onConclusion="none">targo-trust.pkg</pkg-ref>
+    <!-- tool-targo-trust-end -->
+    <!-- tool-trust-docs-start -->
+    <pkg-ref id="org.trust-lang.trust-docs" version="0" onConclusion="none">trust-docs.pkg</pkg-ref>
+    <!-- tool-trust-docs-end -->
+    <pkg-ref id="org.trust-lang.trust-std" version="0" onConclusion="none">trust-std.pkg</pkg-ref>
+    <!-- tool-trustfmt-start -->
+    <pkg-ref id="org.trust-lang.trustfmt" version="0" onConclusion="none">trustfmt.pkg</pkg-ref>
+    <!-- tool-trustfmt-end -->
+    <!-- tool-tippy-start -->
+    <pkg-ref id="org.trust-lang.tippy" version="0" onConclusion="none">tippy.pkg</pkg-ref>
+    <!-- tool-tippy-end -->
+    <!-- tool-trust-analyzer-start -->
+    <pkg-ref id="org.trust-lang.trust-analyzer" version="0" onConclusion="none">trust-analyzer.pkg</pkg-ref>
+    <!-- tool-trust-analyzer-end -->
+    <!-- tool-trust-miri-start -->
+    <pkg-ref id="org.trust-lang.trust-miri" version="0" onConclusion="none">trust-miri.pkg</pkg-ref>
+    <!-- tool-trust-miri-end -->
+    <pkg-ref id="org.trust-lang.uninstall" version="0" onConclusion="none">uninstall.pkg</pkg-ref>
+    <background file="rust-logo.png" mime-type="image/png"
+                alignment="bottomleft"/>
+</installer-gui-script>

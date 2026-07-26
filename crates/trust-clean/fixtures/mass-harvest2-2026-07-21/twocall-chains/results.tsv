@@ -1,0 +1,35 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+<i32 as core::cmp::Ord>::max	SHAPE_GAP	false	false	false	false	false	false	false
+<i32 as core::cmp::Ord>::min	SHAPE_GAP	false	false	false	false	false	false	false
+<i64 as core::cmp::Ord>::max	SHAPE_GAP	false	false	false	false	false	false	false
+<i64 as core::cmp::Ord>::min	SHAPE_GAP	false	false	false	false	false	false	false
+<u8 as core::cmp::Ord>::max	SHAPE_GAP	false	false	false	false	false	false	false
+<u8 as core::cmp::Ord>::min	SHAPE_GAP	false	false	false	false	false	false	false
+<usize as core::cmp::Ord>::max	SHAPE_GAP	false	false	false	false	false	false	false
+<usize as core::cmp::Ord>::min	SHAPE_GAP	false	false	false	false	false	false	false
+core::cmp::max::<i32>	SHAPE_GAP	false	false	false	false	false	false	false
+core::cmp::max::<i64>	SHAPE_GAP	false	false	false	false	false	false	false
+core::cmp::max::<u8>	SHAPE_GAP	false	false	false	false	false	false	false
+core::cmp::max::<usize>	SHAPE_GAP	false	false	false	false	false	false	false
+core::cmp::min::<i32>	SHAPE_GAP	false	false	false	false	false	false	false
+core::cmp::min::<i64>	SHAPE_GAP	false	false	false	false	false	false	false
+core::cmp::min::<u8>	SHAPE_GAP	false	false	false	false	false	false	false
+core::cmp::min::<usize>	SHAPE_GAP	false	false	false	false	false	false	false
+main::clamp_mm_i32	SHAPE_GAP	false	false	false	false	false	false	false
+main::clamp_mm_i64	SHAPE_GAP	false	false	false	false	false	false	false
+main::clamp_mm_u8	SHAPE_GAP	false	false	false	false	false	false	false
+main::clamp_mm_usize	SHAPE_GAP	false	false	false	false	false	false	false
+main::max_min_i32	SHAPE_GAP	false	false	false	false	false	false	false
+main::max_min_i64	SHAPE_GAP	false	false	false	false	false	false	false
+main::max_min_u8	SHAPE_GAP	false	false	false	false	false	false	false
+main::max_min_usize	SHAPE_GAP	false	false	false	false	false	false	false
+main::min_max_i32	SHAPE_GAP	false	false	false	false	false	false	false
+main::min_max_i64	SHAPE_GAP	false	false	false	false	false	false	false
+main::min_max_u8	SHAPE_GAP	false	false	false	false	false	false	false
+main::min_max_usize	SHAPE_GAP	false	false	false	false	false	false	false
+main::sat_add_sub_i32	SHAPE_GAP	false	false	false	false	false	false	false
+main::sat_add_sub_i64	SHAPE_GAP	false	false	false	false	false	false	false
+main::sat_add_sub_u8	SHAPE_GAP	false	false	false	false	false	false	false
+main::sat_add_sub_usize	SHAPE_GAP	false	false	false	false	false	false	false
+main::wrap_add_sub_i32	SHAPE_GAP	false	false	false	false	false	false	false
+main::wrap_add_sub_u8	SHAPE_GAP	false	false	false	false	false	false	false

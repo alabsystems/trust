@@ -1,0 +1,71 @@
+Guard ScalarEvolution cross-PHI recursion (SIGBUS/stack overflow in trustc)
+
+Trust carries exactly one local change to LLVM. Building the compiler crashed
+trustc with SIGBUS inside LLVM ScalarEvolution ("cycle encountered after 4
+frames with period 15" through createAddRecFromPHI / createSimpleAffineAddRec /
+createSCEV): createSimpleAffineAddRec evaluates the start/accum operands via
+getSCEV BEFORE any placeholder is inserted into ValueExprMap, so a chain of
+header PHIs whose operands reach back to the first PHI recurses unboundedly --
+the general path's symbolic-name cycle breaker is never reached, because the
+simple path runs first on every re-entry.
+
+Fix: a PendingAddRecPHIs set (mirroring the existing PendingPhiRanges idiom)
+guards createAddRecFromPHI. Re-entry for an in-progress PHI returns nullptr, so
+that occurrence is modelled as a plain SCEVUnknown (a sound over-approximation)
+and the outer construction completes and memoizes the precise AddRec. The set
+is transient and scope-exit-erased; no invalidation plumbing is needed.
+
+Validated by a full stage-2 build on default stacks with zero SIGBUS; the crash
+was previously reproducible, and RUST_MIN_STACK=128M only outran it, which
+confirmed unbounded recursion rather than a deep-but-finite stack.
+
+Applies to the LLVM 22.1.x line (the tree Trust develops against is 22.1.2).
+Upstream LLVM releases -- including distribution packages such as Homebrew's
+llvm@22 -- carry the unguarded code, so an external LLVM must be patched and
+rebuilt before it can host a Trust build. See patches/README.md.
+
+Origin: Trust commit 1d1d11bed9fa32dfa20e45592dd748b0fef64e4d.
+
+diff --git a/llvm/include/llvm/Analysis/ScalarEvolution.h b/llvm/include/llvm/Analysis/ScalarEvolution.h
+index dcd11daf9e..cd0d55485e 100644
+--- a/llvm/include/llvm/Analysis/ScalarEvolution.h
++++ b/llvm/include/llvm/Analysis/ScalarEvolution.h
+@@ -1532,6 +1532,16 @@ private:
+   // Mark SCEVUnknown Phis currently being processed by isImpliedViaMerge.
+   SmallPtrSet<const PHINode *, 6> PendingMerges;
+ 
++  /// Set of Phis whose AddRec construction is in progress. Guards
++  /// createAddRecFromPHI against cross-PHI recursion cycles: the simple
++  /// affine path (createSimpleAffineAddRec) evaluates the start/accum
++  /// operands BEFORE any symbolic placeholder is inserted into
++  /// ValueExprMap, so a chain of header PHIs whose operands reach back to
++  /// the first PHI recurses without ever hitting the general path's
++  /// symbolic-name cycle breaker (observed as unbounded
++  /// createSCEV -> createAddRecFromPHI recursion; stack overflow).
++  SmallPtrSet<const PHINode *, 6> PendingAddRecPHIs;
++
+   /// Set to true by isLoopBackedgeGuardedByCond when we're walking the set of
+   /// conditions dominating the backedge of a loop.
+   bool WalkingBEDominatingConds = false;
+diff --git a/llvm/lib/Analysis/ScalarEvolution.cpp b/llvm/lib/Analysis/ScalarEvolution.cpp
+index e19de5f46f..7c1fa27ab4 100644
+--- a/llvm/lib/Analysis/ScalarEvolution.cpp
++++ b/llvm/lib/Analysis/ScalarEvolution.cpp
+@@ -5807,6 +5807,17 @@ const SCEV *ScalarEvolution::createAddRecFromPHI(PHINode *PN) {
+   if (!L || L->getHeader() != PN->getParent())
+     return nullptr;
+ 
++  // Make sure we do not run over cycled PHIs (mirrors PendingPhiRanges):
++  // re-entering for a PHI already under construction means a cross-PHI
++  // operand cycle reached back here through createSimpleAffineAddRec's
++  // pre-placeholder getSCEV calls. Returning nullptr lets the caller model
++  // this occurrence as a plain SCEVUnknown — a sound over-approximation —
++  // and the outer in-progress construction completes and memoizes the
++  // precise AddRec.
++  if (!PendingAddRecPHIs.insert(PN).second)
++    return nullptr;
++  auto ClearPending = make_scope_exit([&]() { PendingAddRecPHIs.erase(PN); });
++
+   // The loop may have multiple entrances or multiple exits; we can analyze
+   // this phi as an addrec if it has a unique entry value and a unique
+   // backedge value.

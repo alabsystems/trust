@@ -1,0 +1,144 @@
+# Seed fixture for adopted upstream Rust baseline accounting.
+# Commit values are shape-only fixture data; the real gate must verify reachability.
+
+schema = "trust.upstream-rust.baseline.v1"
+upstream_remote = "https://github.com/rust-lang/rust"
+adopted_commit = "0123456789abcdef0123456789abcdef01234567"
+tracked_until_commit = "89abcdef0123456789abcdef0123456789abcdef"
+host = "aarch64-apple-darwin"
+generated_at = "2026-04-26T00:00:00Z"
+
+[coverage_model]
+minimum_evidence = "at-least-upstream"
+component_status = "release-blocking"
+required_toolchain_components = ["rustc", "rustdoc", "cargo", "rustfmt", "clippy", "miri", "rust-analyzer", "bootstrap/x.py", "compiletest/run-make", "standard-library", "proc-macro", "test-harness", "bench-harness"]
+
+[[toolchain_component]]
+id = "rustc"
+name = "rustc compiler"
+category = "compiler"
+upstream_artifact = "compiler/rustc_driver"
+upstream_test_roots = ["tests/ui", "tests/compile-fail", "tests/codegen", "tests/incremental", "tests/crashes"]
+evidence_kind = "upstream-test-suite"
+required = true
+compatibility_rule = "stage2 trustc must pass host-applicable upstream rustc suites in vanilla mode"
+
+[[toolchain_component]]
+id = "rustdoc"
+name = "rustdoc"
+category = "tool"
+upstream_artifact = "src/librustdoc"
+upstream_test_roots = ["tests/rustdoc", "tests/rustdoc-ui", "tests/rustdoc-json"]
+evidence_kind = "upstream-test-suite"
+required = true
+compatibility_rule = "trust rustdoc must match upstream rustdoc behavior for all host-applicable upstream rustdoc suites"
+
+[[toolchain_component]]
+id = "cargo"
+name = "cargo"
+category = "tool"
+upstream_artifact = "src/tools/cargo"
+upstream_test_roots = ["src/tools/cargo/tests", "tests/run-make"]
+evidence_kind = "upstream-test-suite"
+required = true
+compatibility_rule = "trust cargo must preserve upstream cargo tests and rustc integration behavior"
+
+[[toolchain_component]]
+id = "rustfmt"
+name = "rustfmt"
+category = "tool"
+upstream_artifact = "src/tools/rustfmt"
+upstream_test_roots = ["src/tools/rustfmt/tests"]
+evidence_kind = "upstream-test-suite"
+required = true
+compatibility_rule = "trust rustfmt must pass the upstream rustfmt formatting and configuration suite"
+
+[[toolchain_component]]
+id = "clippy"
+name = "clippy"
+category = "tool"
+upstream_artifact = "src/tools/clippy"
+upstream_test_roots = ["src/tools/clippy/tests"]
+evidence_kind = "upstream-test-suite"
+required = true
+compatibility_rule = "trust clippy must pass upstream clippy lint and UI tests with upstream-compatible diagnostics"
+
+[[toolchain_component]]
+id = "miri"
+name = "miri"
+category = "tool"
+upstream_artifact = "src/tools/miri"
+upstream_test_roots = ["src/tools/miri/tests"]
+evidence_kind = "upstream-test-suite"
+required = true
+compatibility_rule = "trust miri must pass upstream miri interpreter and isolation tests for supported hosts"
+
+[[toolchain_component]]
+id = "rust-analyzer"
+name = "rust-analyzer"
+category = "tool"
+upstream_artifact = "src/tools/rust-analyzer"
+upstream_test_roots = ["src/tools/rust-analyzer/crates"]
+evidence_kind = "upstream-test-suite"
+required = true
+compatibility_rule = "trust rust-analyzer must preserve upstream analysis, completion, and proc-macro integration tests"
+
+[[toolchain_component]]
+id = "bootstrap/x.py"
+name = "bootstrap x.py"
+category = "bootstrap"
+upstream_artifact = "x.py"
+upstream_test_roots = ["src/bootstrap", "tests/run-make"]
+evidence_kind = "upstream-test-suite"
+required = true
+compatibility_rule = "trust bootstrap and x.py must pass upstream bootstrap smoke and stage wiring tests"
+
+[[toolchain_component]]
+id = "compiletest/run-make"
+name = "compiletest and run-make"
+category = "test-infrastructure"
+upstream_artifact = "src/tools/compiletest"
+upstream_test_roots = ["src/tools/compiletest", "tests/run-make"]
+evidence_kind = "upstream-test-suite"
+required = true
+compatibility_rule = "trust compiletest must execute upstream run-make and suite metadata with upstream-compatible semantics"
+
+[[toolchain_component]]
+id = "standard-library"
+name = "standard library"
+category = "library"
+upstream_artifact = "library"
+upstream_test_roots = ["library", "tests/ui", "tests/run-make"]
+evidence_kind = "upstream-test-suite"
+required = true
+compatibility_rule = "trust core, alloc, std, and test-visible library behavior must match upstream on supported hosts"
+
+[[toolchain_component]]
+id = "proc-macro"
+name = "proc macro"
+category = "language-support"
+upstream_artifact = "library/proc_macro"
+upstream_test_roots = ["tests/ui/proc-macro", "tests/run-make"]
+evidence_kind = "upstream-test-suite"
+required = true
+compatibility_rule = "trust proc-macro ABI, diagnostics, and expansion behavior must match upstream proc-macro tests"
+
+[[toolchain_component]]
+id = "test-harness"
+name = "test harness"
+category = "library"
+upstream_artifact = "library/test"
+upstream_test_roots = ["library/test", "tests/ui/test-attrs", "tests/run-make"]
+evidence_kind = "upstream-test-suite"
+required = true
+compatibility_rule = "trust libtest and rustc --test behavior must match upstream test harness behavior"
+
+[[toolchain_component]]
+id = "bench-harness"
+name = "bench harness"
+category = "library"
+upstream_artifact = "library/test"
+upstream_test_roots = ["library/test/benches", "tests/ui/feature-gates", "tests/run-make"]
+evidence_kind = "upstream-test-suite"
+required = true
+compatibility_rule = "trust bench harness and unstable bench feature behavior must match upstream where enabled"

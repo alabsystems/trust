@@ -1,0 +1,3 @@
+# Trust owned internal repository version records.
+# This file is required by the release/metadata check gates.
+# Add `[[repos]]` entries here when owned dependencies need to be tracked.

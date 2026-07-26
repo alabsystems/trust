@@ -1,0 +1,1728 @@
+manifest-version = "2"
+date = "2026-07-13"
+
+[pkg]
+
+[pkg.enzyme-preview]
+version = "1.99.0-dev (629729f69 2026-07-13)"
+git_commit_hash = "629729f69eefb1cfe6ed766c6c01ee38aa7b0484"
+
+[pkg.gcc-x86_64-unknown-linux-gnu-preview]
+version = ""
+
+[pkg.llvm-bitcode-linker-preview]
+version = "1.99.0-dev (629729f69 2026-07-13)"
+git_commit_hash = "629729f69eefb1cfe6ed766c6c01ee38aa7b0484"
+
+[pkg.reproducible-artifacts]
+version = "1.99.0-dev (629729f69 2026-07-13)"
+git_commit_hash = "629729f69eefb1cfe6ed766c6c01ee38aa7b0484"
+
+[pkg.rustc-codegen-cranelift-preview]
+version = ""
+
+[pkg.rustc-codegen-gcc-preview]
+version = ""
+
+[pkg.trust]
+version = "1.99.0-dev (629729f69 2026-07-13)"
+git_commit_hash = "629729f69eefb1cfe6ed766c6c01ee38aa7b0484"
+
+[pkg.trust-analysis]
+version = "1.99.0-dev (629729f69 2026-07-13)"
+git_commit_hash = "629729f69eefb1cfe6ed766c6c01ee38aa7b0484"
+
+[pkg.trust-analyzer-preview]
+version = "0.0.0-dev"
+git_commit_hash = "629729f69eefb1cfe6ed766c6c01ee38aa7b0484"
+
+[pkg.trust-analyzer-preview.target]
+
+[pkg.trust-analyzer-preview.target.aarch64-apple-darwin]
+available = true
+xz_url = "file://{trust-root}/bootstrap/trust-stage0/dist/2026-07-13/trust-analyzer-1.99.0-trust-aarch64-apple-darwin.tar.xz"
+xz_hash = "a2ef4ff50c5136e94a9a1899b59fb4fd4cd1b5f613077ce0b976142551ef96d0"
+
+[pkg.trust-analyzer-preview.target.aarch64-pc-windows-gnullvm]
+available = false
+
+[pkg.trust-analyzer-preview.target.aarch64-pc-windows-msvc]
+available = false
+
+[pkg.trust-analyzer-preview.target.aarch64-unknown-freebsd]
+available = false
+
+[pkg.trust-analyzer-preview.target.aarch64-unknown-linux-gnu]
+available = false
+
+[pkg.trust-analyzer-preview.target.aarch64-unknown-linux-musl]
+available = false
+
+[pkg.trust-analyzer-preview.target.aarch64-unknown-linux-ohos]
+available = false
+
+[pkg.trust-analyzer-preview.target.arm-unknown-linux-gnueabi]
+available = false
+
+[pkg.trust-analyzer-preview.target.arm-unknown-linux-gnueabihf]
+available = false
+
+[pkg.trust-analyzer-preview.target.armv7-unknown-linux-gnueabihf]
+available = false
+
+[pkg.trust-analyzer-preview.target.i686-pc-windows-gnu]
+available = false
+
+[pkg.trust-analyzer-preview.target.i686-pc-windows-msvc]
+available = false
+
+[pkg.trust-analyzer-preview.target.i686-unknown-linux-gnu]
+available = false
+
+[pkg.trust-analyzer-preview.target.loongarch64-unknown-linux-gnu]
+available = false
+
+[pkg.trust-analyzer-preview.target.loongarch64-unknown-linux-musl]
+available = false
+
+[pkg.trust-analyzer-preview.target.powerpc-unknown-linux-gnu]
+available = false
+
+[pkg.trust-analyzer-preview.target.powerpc64-unknown-linux-gnu]
+available = false
+
+[pkg.trust-analyzer-preview.target.powerpc64-unknown-linux-musl]
+available = false
+
+[pkg.trust-analyzer-preview.target.powerpc64le-unknown-linux-gnu]
+available = false
+
+[pkg.trust-analyzer-preview.target.powerpc64le-unknown-linux-musl]
+available = false
+
+[pkg.trust-analyzer-preview.target.riscv64gc-unknown-linux-gnu]
+available = false
+
+[pkg.trust-analyzer-preview.target.s390x-unknown-linux-gnu]
+available = false
+
+[pkg.trust-analyzer-preview.target.sparcv9-sun-solaris]
+available = false
+
+[pkg.trust-analyzer-preview.target.x86_64-apple-darwin]
+available = false
+
+[pkg.trust-analyzer-preview.target.x86_64-pc-solaris]
+available = false
+
+[pkg.trust-analyzer-preview.target.x86_64-pc-windows-gnu]
+available = false
+
+[pkg.trust-analyzer-preview.target.x86_64-pc-windows-gnullvm]
+available = false
+
+[pkg.trust-analyzer-preview.target.x86_64-pc-windows-msvc]
+available = false
+
+[pkg.trust-analyzer-preview.target.x86_64-unknown-freebsd]
+available = false
+
+[pkg.trust-analyzer-preview.target.x86_64-unknown-illumos]
+available = false
+
+[pkg.trust-analyzer-preview.target.x86_64-unknown-linux-gnu]
+available = false
+
+[pkg.trust-analyzer-preview.target.x86_64-unknown-linux-musl]
+available = false
+
+[pkg.trust-analyzer-preview.target.x86_64-unknown-netbsd]
+available = false
+
+[pkg.trust-docs]
+version = "1.99.0-dev (629729f69 2026-07-13)"
+git_commit_hash = "629729f69eefb1cfe6ed766c6c01ee38aa7b0484"
+
+[pkg.trust-docs.target]
+
+[pkg.trust-docs.target.aarch64-apple-darwin]
+available = false
+
+[pkg.trust-docs.target.aarch64-pc-windows-gnullvm]
+available = false
+
+[pkg.trust-docs.target.aarch64-pc-windows-msvc]
+available = false
+
+[pkg.trust-docs.target.aarch64-unknown-freebsd]
+available = false
+
+[pkg.trust-docs.target.aarch64-unknown-linux-gnu]
+available = false
+
+[pkg.trust-docs.target.aarch64-unknown-linux-musl]
+available = false
+
+[pkg.trust-docs.target.aarch64-unknown-linux-ohos]
+available = false
+
+[pkg.trust-docs.target.arm-unknown-linux-gnueabi]
+available = false
+
+[pkg.trust-docs.target.arm-unknown-linux-gnueabihf]
+available = false
+
+[pkg.trust-docs.target.armv7-unknown-linux-gnueabihf]
+available = false
+
+[pkg.trust-docs.target.i686-pc-windows-gnu]
+available = false
+
+[pkg.trust-docs.target.i686-pc-windows-msvc]
+available = false
+
+[pkg.trust-docs.target.i686-unknown-linux-gnu]
+available = false
+
+[pkg.trust-docs.target.loongarch64-unknown-linux-gnu]
+available = false
+
+[pkg.trust-docs.target.loongarch64-unknown-linux-musl]
+available = false
+
+[pkg.trust-docs.target.powerpc-unknown-linux-gnu]
+available = false
+
+[pkg.trust-docs.target.powerpc64-unknown-linux-gnu]
+available = false
+
+[pkg.trust-docs.target.powerpc64-unknown-linux-musl]
+available = false
+
+[pkg.trust-docs.target.powerpc64le-unknown-linux-gnu]
+available = false
+
+[pkg.trust-docs.target.powerpc64le-unknown-linux-musl]
+available = false
+
+[pkg.trust-docs.target.riscv64gc-unknown-linux-gnu]
+available = false
+
+[pkg.trust-docs.target.s390x-unknown-linux-gnu]
+available = false
+
+[pkg.trust-docs.target.sparcv9-sun-solaris]
+available = false
+
+[pkg.trust-docs.target.x86_64-apple-darwin]
+available = false
+
+[pkg.trust-docs.target.x86_64-pc-solaris]
+available = false
+
+[pkg.trust-docs.target.x86_64-pc-windows-gnu]
+available = false
+
+[pkg.trust-docs.target.x86_64-pc-windows-gnullvm]
+available = false
+
+[pkg.trust-docs.target.x86_64-pc-windows-msvc]
+available = false
+
+[pkg.trust-docs.target.x86_64-unknown-freebsd]
+available = false
+
+[pkg.trust-docs.target.x86_64-unknown-illumos]
+available = false
+
+[pkg.trust-docs.target.x86_64-unknown-linux-gnu]
+available = false
+
+[pkg.trust-docs.target.x86_64-unknown-linux-musl]
+available = false
+
+[pkg.trust-docs.target.x86_64-unknown-netbsd]
+available = false
+
+[pkg.trust-docs-json-preview]
+version = "1.99.0-dev (629729f69 2026-07-13)"
+git_commit_hash = "629729f69eefb1cfe6ed766c6c01ee38aa7b0484"
+
+[pkg.trust-llvm-tools-preview]
+version = ""
+
+[pkg.trust-llvm-tools-preview.target]
+
+[pkg.trust-llvm-tools-preview.target.aarch64-apple-darwin]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-apple-ios]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-apple-ios-macabi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-apple-ios-sim]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-apple-tvos]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-apple-tvos-sim]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-apple-visionos]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-apple-visionos-sim]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-apple-watchos]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-apple-watchos-sim]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-linux-android]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-pc-windows-gnullvm]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-pc-windows-msvc]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-unknown-freebsd]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-unknown-fuchsia]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-unknown-linux-gnu]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-unknown-linux-musl]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-unknown-linux-ohos]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-unknown-none]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-unknown-none-softfloat]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.aarch64-unknown-uefi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.arm-linux-androideabi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.arm-unknown-linux-gnueabi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.arm-unknown-linux-gnueabihf]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.arm-unknown-linux-musleabi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.arm-unknown-linux-musleabihf]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.arm64ec-pc-windows-msvc]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.armv5te-unknown-linux-gnueabi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.armv5te-unknown-linux-musleabi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.armv7-linux-androideabi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.armv7-unknown-linux-gnueabi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.armv7-unknown-linux-gnueabihf]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.armv7-unknown-linux-musleabi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.armv7-unknown-linux-musleabihf]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.armv7-unknown-linux-ohos]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.armv7a-none-eabi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.armv7a-none-eabihf]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.armv7r-none-eabi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.armv7r-none-eabihf]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.armv8r-none-eabihf]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.i586-unknown-linux-gnu]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.i586-unknown-linux-musl]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.i686-linux-android]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.i686-pc-windows-gnu]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.i686-pc-windows-gnullvm]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.i686-pc-windows-msvc]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.i686-unknown-freebsd]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.i686-unknown-linux-gnu]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.i686-unknown-linux-musl]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.i686-unknown-uefi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.loongarch64-unknown-linux-gnu]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.loongarch64-unknown-linux-musl]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.loongarch64-unknown-none]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.loongarch64-unknown-none-softfloat]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.nvptx64-nvidia-cuda]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.powerpc-unknown-linux-gnu]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.powerpc64-unknown-linux-gnu]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.powerpc64-unknown-linux-musl]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.powerpc64le-unknown-linux-gnu]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.powerpc64le-unknown-linux-musl]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.riscv32i-unknown-none-elf]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.riscv32im-unknown-none-elf]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.riscv32imac-unknown-none-elf]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.riscv32imafc-unknown-none-elf]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.riscv32imc-unknown-none-elf]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.riscv64a23-unknown-linux-gnu]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.riscv64gc-unknown-linux-gnu]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.riscv64gc-unknown-linux-musl]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.riscv64gc-unknown-none-elf]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.riscv64imac-unknown-none-elf]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.s390x-unknown-linux-gnu]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.s390x-unknown-none-softfloat]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.sparc64-unknown-linux-gnu]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.sparcv9-sun-solaris]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.thumbv6m-none-eabi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.thumbv7a-none-eabi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.thumbv7a-none-eabihf]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.thumbv7em-none-eabi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.thumbv7em-none-eabihf]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.thumbv7m-none-eabi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.thumbv7neon-linux-androideabi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.thumbv7neon-unknown-linux-gnueabihf]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.thumbv7r-none-eabi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.thumbv7r-none-eabihf]
+available = false
+
+[pkg.trust-llvm-tools-preview.target."thumbv8m.base-none-eabi"]
+available = false
+
+[pkg.trust-llvm-tools-preview.target."thumbv8m.main-none-eabi"]
+available = false
+
+[pkg.trust-llvm-tools-preview.target."thumbv8m.main-none-eabihf"]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.thumbv8r-none-eabihf]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.wasm32-unknown-emscripten]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.wasm32-unknown-unknown]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.wasm32-wasip1]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.wasm32-wasip1-threads]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.wasm32-wasip2]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.wasm32v1-none]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-apple-darwin]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-apple-ios]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-apple-ios-macabi]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-fortanix-unknown-sgx]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-linux-android]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-pc-solaris]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-pc-windows-gnu]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-pc-windows-gnullvm]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-pc-windows-msvc]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-unknown-freebsd]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-unknown-fuchsia]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-unknown-illumos]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-unknown-linux-gnu]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-unknown-linux-gnuasan]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-unknown-linux-gnumsan]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-unknown-linux-gnutsan]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-unknown-linux-gnux32]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-unknown-linux-musl]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-unknown-linux-ohos]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-unknown-netbsd]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-unknown-none]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-unknown-redox]
+available = false
+
+[pkg.trust-llvm-tools-preview.target.x86_64-unknown-uefi]
+available = false
+
+[pkg.trust-mingw]
+version = "1.99.0-dev (629729f69 2026-07-13)"
+git_commit_hash = "629729f69eefb1cfe6ed766c6c01ee38aa7b0484"
+
+[pkg.trust-miri-preview]
+version = ""
+
+[pkg.trust-src]
+version = "1.99.0-dev (629729f69 2026-07-13)"
+git_commit_hash = "629729f69eefb1cfe6ed766c6c01ee38aa7b0484"
+
+[pkg.trust-src.target]
+
+[pkg.trust-src.target."*"]
+available = true
+xz_url = "file://{trust-root}/bootstrap/trust-stage0/dist/2026-07-13/trust-src-1.99.0-trust.tar.xz"
+xz_hash = "d5c82aee2b2fe233aa0ec8178a8f0eb8fe0f0a1d8b78302ce5ad31294e56ed48"
+
+[pkg.trust-std]
+version = "1.99.0-dev (629729f69 2026-07-13)"
+git_commit_hash = "629729f69eefb1cfe6ed766c6c01ee38aa7b0484"
+
+[pkg.trust-std.target]
+
+[pkg.trust-std.target.aarch64-apple-darwin]
+available = true
+xz_url = "file://{trust-root}/bootstrap/trust-stage0/dist/2026-07-13/trust-std-1.99.0-trust-aarch64-apple-darwin.tar.xz"
+xz_hash = "d49c16dfdbf90f89b2866b959a25cfe5e3feee652a2fec21b2c9eafe34b928dd"
+
+[pkg.trust-std.target.aarch64-apple-ios]
+available = false
+
+[pkg.trust-std.target.aarch64-apple-ios-macabi]
+available = false
+
+[pkg.trust-std.target.aarch64-apple-ios-sim]
+available = false
+
+[pkg.trust-std.target.aarch64-apple-tvos]
+available = false
+
+[pkg.trust-std.target.aarch64-apple-tvos-sim]
+available = false
+
+[pkg.trust-std.target.aarch64-apple-visionos]
+available = false
+
+[pkg.trust-std.target.aarch64-apple-visionos-sim]
+available = false
+
+[pkg.trust-std.target.aarch64-apple-watchos]
+available = false
+
+[pkg.trust-std.target.aarch64-apple-watchos-sim]
+available = false
+
+[pkg.trust-std.target.aarch64-linux-android]
+available = false
+
+[pkg.trust-std.target.aarch64-pc-windows-gnullvm]
+available = false
+
+[pkg.trust-std.target.aarch64-pc-windows-msvc]
+available = false
+
+[pkg.trust-std.target.aarch64-unknown-freebsd]
+available = false
+
+[pkg.trust-std.target.aarch64-unknown-fuchsia]
+available = false
+
+[pkg.trust-std.target.aarch64-unknown-linux-gnu]
+available = false
+
+[pkg.trust-std.target.aarch64-unknown-linux-musl]
+available = false
+
+[pkg.trust-std.target.aarch64-unknown-linux-ohos]
+available = false
+
+[pkg.trust-std.target.aarch64-unknown-none]
+available = false
+
+[pkg.trust-std.target.aarch64-unknown-none-softfloat]
+available = false
+
+[pkg.trust-std.target.aarch64-unknown-uefi]
+available = false
+
+[pkg.trust-std.target.arm-linux-androideabi]
+available = false
+
+[pkg.trust-std.target.arm-unknown-linux-gnueabi]
+available = false
+
+[pkg.trust-std.target.arm-unknown-linux-gnueabihf]
+available = false
+
+[pkg.trust-std.target.arm-unknown-linux-musleabi]
+available = false
+
+[pkg.trust-std.target.arm-unknown-linux-musleabihf]
+available = false
+
+[pkg.trust-std.target.arm64ec-pc-windows-msvc]
+available = false
+
+[pkg.trust-std.target.armv5te-unknown-linux-gnueabi]
+available = false
+
+[pkg.trust-std.target.armv5te-unknown-linux-musleabi]
+available = false
+
+[pkg.trust-std.target.armv7-linux-androideabi]
+available = false
+
+[pkg.trust-std.target.armv7-unknown-linux-gnueabi]
+available = false
+
+[pkg.trust-std.target.armv7-unknown-linux-gnueabihf]
+available = false
+
+[pkg.trust-std.target.armv7-unknown-linux-musleabi]
+available = false
+
+[pkg.trust-std.target.armv7-unknown-linux-musleabihf]
+available = false
+
+[pkg.trust-std.target.armv7-unknown-linux-ohos]
+available = false
+
+[pkg.trust-std.target.armv7a-none-eabi]
+available = false
+
+[pkg.trust-std.target.armv7a-none-eabihf]
+available = false
+
+[pkg.trust-std.target.armv7r-none-eabi]
+available = false
+
+[pkg.trust-std.target.armv7r-none-eabihf]
+available = false
+
+[pkg.trust-std.target.armv8r-none-eabihf]
+available = false
+
+[pkg.trust-std.target.i586-unknown-linux-gnu]
+available = false
+
+[pkg.trust-std.target.i586-unknown-linux-musl]
+available = false
+
+[pkg.trust-std.target.i686-linux-android]
+available = false
+
+[pkg.trust-std.target.i686-pc-windows-gnu]
+available = false
+
+[pkg.trust-std.target.i686-pc-windows-gnullvm]
+available = false
+
+[pkg.trust-std.target.i686-pc-windows-msvc]
+available = false
+
+[pkg.trust-std.target.i686-unknown-freebsd]
+available = false
+
+[pkg.trust-std.target.i686-unknown-linux-gnu]
+available = false
+
+[pkg.trust-std.target.i686-unknown-linux-musl]
+available = false
+
+[pkg.trust-std.target.i686-unknown-uefi]
+available = false
+
+[pkg.trust-std.target.loongarch64-unknown-linux-gnu]
+available = false
+
+[pkg.trust-std.target.loongarch64-unknown-linux-musl]
+available = false
+
+[pkg.trust-std.target.loongarch64-unknown-none]
+available = false
+
+[pkg.trust-std.target.loongarch64-unknown-none-softfloat]
+available = false
+
+[pkg.trust-std.target.nvptx64-nvidia-cuda]
+available = false
+
+[pkg.trust-std.target.powerpc-unknown-linux-gnu]
+available = false
+
+[pkg.trust-std.target.powerpc64-unknown-linux-gnu]
+available = false
+
+[pkg.trust-std.target.powerpc64-unknown-linux-musl]
+available = false
+
+[pkg.trust-std.target.powerpc64le-unknown-linux-gnu]
+available = false
+
+[pkg.trust-std.target.powerpc64le-unknown-linux-musl]
+available = false
+
+[pkg.trust-std.target.riscv32i-unknown-none-elf]
+available = false
+
+[pkg.trust-std.target.riscv32im-unknown-none-elf]
+available = false
+
+[pkg.trust-std.target.riscv32imac-unknown-none-elf]
+available = false
+
+[pkg.trust-std.target.riscv32imafc-unknown-none-elf]
+available = false
+
+[pkg.trust-std.target.riscv32imc-unknown-none-elf]
+available = false
+
+[pkg.trust-std.target.riscv64a23-unknown-linux-gnu]
+available = false
+
+[pkg.trust-std.target.riscv64gc-unknown-linux-gnu]
+available = false
+
+[pkg.trust-std.target.riscv64gc-unknown-linux-musl]
+available = false
+
+[pkg.trust-std.target.riscv64gc-unknown-none-elf]
+available = false
+
+[pkg.trust-std.target.riscv64imac-unknown-none-elf]
+available = false
+
+[pkg.trust-std.target.s390x-unknown-linux-gnu]
+available = false
+
+[pkg.trust-std.target.s390x-unknown-none-softfloat]
+available = false
+
+[pkg.trust-std.target.sparc64-unknown-linux-gnu]
+available = false
+
+[pkg.trust-std.target.sparcv9-sun-solaris]
+available = false
+
+[pkg.trust-std.target.thumbv6m-none-eabi]
+available = false
+
+[pkg.trust-std.target.thumbv7a-none-eabi]
+available = false
+
+[pkg.trust-std.target.thumbv7a-none-eabihf]
+available = false
+
+[pkg.trust-std.target.thumbv7em-none-eabi]
+available = false
+
+[pkg.trust-std.target.thumbv7em-none-eabihf]
+available = false
+
+[pkg.trust-std.target.thumbv7m-none-eabi]
+available = false
+
+[pkg.trust-std.target.thumbv7neon-linux-androideabi]
+available = false
+
+[pkg.trust-std.target.thumbv7neon-unknown-linux-gnueabihf]
+available = false
+
+[pkg.trust-std.target.thumbv7r-none-eabi]
+available = false
+
+[pkg.trust-std.target.thumbv7r-none-eabihf]
+available = false
+
+[pkg.trust-std.target."thumbv8m.base-none-eabi"]
+available = false
+
+[pkg.trust-std.target."thumbv8m.main-none-eabi"]
+available = false
+
+[pkg.trust-std.target."thumbv8m.main-none-eabihf"]
+available = false
+
+[pkg.trust-std.target.thumbv8r-none-eabihf]
+available = false
+
+[pkg.trust-std.target.wasm32-unknown-emscripten]
+available = false
+
+[pkg.trust-std.target.wasm32-unknown-unknown]
+available = false
+
+[pkg.trust-std.target.wasm32-wasip1]
+available = false
+
+[pkg.trust-std.target.wasm32-wasip1-threads]
+available = false
+
+[pkg.trust-std.target.wasm32-wasip2]
+available = false
+
+[pkg.trust-std.target.wasm32v1-none]
+available = false
+
+[pkg.trust-std.target.x86_64-apple-darwin]
+available = false
+
+[pkg.trust-std.target.x86_64-apple-ios]
+available = false
+
+[pkg.trust-std.target.x86_64-apple-ios-macabi]
+available = false
+
+[pkg.trust-std.target.x86_64-fortanix-unknown-sgx]
+available = false
+
+[pkg.trust-std.target.x86_64-linux-android]
+available = false
+
+[pkg.trust-std.target.x86_64-pc-solaris]
+available = false
+
+[pkg.trust-std.target.x86_64-pc-windows-gnu]
+available = false
+
+[pkg.trust-std.target.x86_64-pc-windows-gnullvm]
+available = false
+
+[pkg.trust-std.target.x86_64-pc-windows-msvc]
+available = false
+
+[pkg.trust-std.target.x86_64-unknown-freebsd]
+available = false
+
+[pkg.trust-std.target.x86_64-unknown-fuchsia]
+available = false
+
+[pkg.trust-std.target.x86_64-unknown-illumos]
+available = false
+
+[pkg.trust-std.target.x86_64-unknown-linux-gnu]
+available = false
+
+[pkg.trust-std.target.x86_64-unknown-linux-gnuasan]
+available = false
+
+[pkg.trust-std.target.x86_64-unknown-linux-gnumsan]
+available = false
+
+[pkg.trust-std.target.x86_64-unknown-linux-gnutsan]
+available = false
+
+[pkg.trust-std.target.x86_64-unknown-linux-gnux32]
+available = false
+
+[pkg.trust-std.target.x86_64-unknown-linux-musl]
+available = false
+
+[pkg.trust-std.target.x86_64-unknown-linux-ohos]
+available = false
+
+[pkg.trust-std.target.x86_64-unknown-netbsd]
+available = false
+
+[pkg.trust-std.target.x86_64-unknown-none]
+available = false
+
+[pkg.trust-std.target.x86_64-unknown-redox]
+available = false
+
+[pkg.trust-std.target.x86_64-unknown-uefi]
+available = false
+
+[pkg.trustc]
+version = "1.99.0-dev (629729f69 2026-07-13)"
+git_commit_hash = "629729f69eefb1cfe6ed766c6c01ee38aa7b0484"
+
+[pkg.trustc.target]
+
+[pkg.trustc.target.aarch64-apple-darwin]
+available = true
+xz_url = "file://{trust-root}/bootstrap/trust-stage0/dist/2026-07-13/trustc-1.99.0-trust-aarch64-apple-darwin.tar.xz"
+xz_hash = "fb1303066c27a852c05d61b8aaa38b483367f5b9597f5b0714e02530bb002cf5"
+
+[pkg.trustc.target.aarch64-pc-windows-gnullvm]
+available = false
+
+[pkg.trustc.target.aarch64-pc-windows-msvc]
+available = false
+
+[pkg.trustc.target.aarch64-unknown-freebsd]
+available = false
+
+[pkg.trustc.target.aarch64-unknown-linux-gnu]
+available = false
+
+[pkg.trustc.target.aarch64-unknown-linux-musl]
+available = false
+
+[pkg.trustc.target.aarch64-unknown-linux-ohos]
+available = false
+
+[pkg.trustc.target.arm-unknown-linux-gnueabi]
+available = false
+
+[pkg.trustc.target.arm-unknown-linux-gnueabihf]
+available = false
+
+[pkg.trustc.target.armv7-unknown-linux-gnueabihf]
+available = false
+
+[pkg.trustc.target.i686-pc-windows-gnu]
+available = false
+
+[pkg.trustc.target.i686-pc-windows-msvc]
+available = false
+
+[pkg.trustc.target.i686-unknown-linux-gnu]
+available = false
+
+[pkg.trustc.target.loongarch64-unknown-linux-gnu]
+available = false
+
+[pkg.trustc.target.loongarch64-unknown-linux-musl]
+available = false
+
+[pkg.trustc.target.powerpc-unknown-linux-gnu]
+available = false
+
+[pkg.trustc.target.powerpc64-unknown-linux-gnu]
+available = false
+
+[pkg.trustc.target.powerpc64-unknown-linux-musl]
+available = false
+
+[pkg.trustc.target.powerpc64le-unknown-linux-gnu]
+available = false
+
+[pkg.trustc.target.powerpc64le-unknown-linux-musl]
+available = false
+
+[pkg.trustc.target.riscv64gc-unknown-linux-gnu]
+available = false
+
+[pkg.trustc.target.s390x-unknown-linux-gnu]
+available = false
+
+[pkg.trustc.target.sparcv9-sun-solaris]
+available = false
+
+[pkg.trustc.target.x86_64-apple-darwin]
+available = false
+
+[pkg.trustc.target.x86_64-pc-solaris]
+available = false
+
+[pkg.trustc.target.x86_64-pc-windows-gnu]
+available = false
+
+[pkg.trustc.target.x86_64-pc-windows-gnullvm]
+available = false
+
+[pkg.trustc.target.x86_64-pc-windows-msvc]
+available = false
+
+[pkg.trustc.target.x86_64-unknown-freebsd]
+available = false
+
+[pkg.trustc.target.x86_64-unknown-illumos]
+available = false
+
+[pkg.trustc.target.x86_64-unknown-linux-gnu]
+available = false
+
+[pkg.trustc.target.x86_64-unknown-linux-musl]
+available = false
+
+[pkg.trustc.target.x86_64-unknown-netbsd]
+available = false
+
+[pkg.trustc-dev]
+version = "1.99.0-dev (629729f69 2026-07-13)"
+git_commit_hash = "629729f69eefb1cfe6ed766c6c01ee38aa7b0484"
+
+[pkg.trustc-dev.target]
+
+[pkg.trustc-dev.target.aarch64-apple-darwin]
+available = true
+xz_url = "file://{trust-root}/bootstrap/trust-stage0/dist/2026-07-13/trustc-dev-1.99.0-trust-aarch64-apple-darwin.tar.xz"
+xz_hash = "e61176cb5a62ca57a6352591c4b67928ed26625fcd4532d71fb2274996f46c83"
+
+[pkg.trustc-dev.target.aarch64-pc-windows-gnullvm]
+available = false
+
+[pkg.trustc-dev.target.aarch64-pc-windows-msvc]
+available = false
+
+[pkg.trustc-dev.target.aarch64-unknown-freebsd]
+available = false
+
+[pkg.trustc-dev.target.aarch64-unknown-linux-gnu]
+available = false
+
+[pkg.trustc-dev.target.aarch64-unknown-linux-musl]
+available = false
+
+[pkg.trustc-dev.target.aarch64-unknown-linux-ohos]
+available = false
+
+[pkg.trustc-dev.target.arm-unknown-linux-gnueabi]
+available = false
+
+[pkg.trustc-dev.target.arm-unknown-linux-gnueabihf]
+available = false
+
+[pkg.trustc-dev.target.armv7-unknown-linux-gnueabihf]
+available = false
+
+[pkg.trustc-dev.target.i686-pc-windows-gnu]
+available = false
+
+[pkg.trustc-dev.target.i686-pc-windows-msvc]
+available = false
+
+[pkg.trustc-dev.target.i686-unknown-linux-gnu]
+available = false
+
+[pkg.trustc-dev.target.loongarch64-unknown-linux-gnu]
+available = false
+
+[pkg.trustc-dev.target.loongarch64-unknown-linux-musl]
+available = false
+
+[pkg.trustc-dev.target.powerpc-unknown-linux-gnu]
+available = false
+
+[pkg.trustc-dev.target.powerpc64-unknown-linux-gnu]
+available = false
+
+[pkg.trustc-dev.target.powerpc64-unknown-linux-musl]
+available = false
+
+[pkg.trustc-dev.target.powerpc64le-unknown-linux-gnu]
+available = false
+
+[pkg.trustc-dev.target.powerpc64le-unknown-linux-musl]
+available = false
+
+[pkg.trustc-dev.target.riscv64gc-unknown-linux-gnu]
+available = false
+
+[pkg.trustc-dev.target.s390x-unknown-linux-gnu]
+available = false
+
+[pkg.trustc-dev.target.sparcv9-sun-solaris]
+available = false
+
+[pkg.trustc-dev.target.x86_64-apple-darwin]
+available = false
+
+[pkg.trustc-dev.target.x86_64-pc-solaris]
+available = false
+
+[pkg.trustc-dev.target.x86_64-pc-windows-gnu]
+available = false
+
+[pkg.trustc-dev.target.x86_64-pc-windows-gnullvm]
+available = false
+
+[pkg.trustc-dev.target.x86_64-pc-windows-msvc]
+available = false
+
+[pkg.trustc-dev.target.x86_64-unknown-freebsd]
+available = false
+
+[pkg.trustc-dev.target.x86_64-unknown-illumos]
+available = false
+
+[pkg.trustc-dev.target.x86_64-unknown-linux-gnu]
+available = false
+
+[pkg.trustc-dev.target.x86_64-unknown-linux-musl]
+available = false
+
+[pkg.trustc-dev.target.x86_64-unknown-netbsd]
+available = false
+
+[pkg.trustc-docs]
+version = "1.99.0-dev (629729f69 2026-07-13)"
+git_commit_hash = "629729f69eefb1cfe6ed766c6c01ee38aa7b0484"
+
+[pkg.trustfmt-preview]
+version = "1.9.0-dev"
+git_commit_hash = "629729f69eefb1cfe6ed766c6c01ee38aa7b0484"
+
+[pkg.trustfmt-preview.target]
+
+[pkg.trustfmt-preview.target.aarch64-apple-darwin]
+available = true
+xz_url = "file://{trust-root}/bootstrap/trust-stage0/dist/2026-07-13/trustfmt-1.99.0-trust-aarch64-apple-darwin.tar.xz"
+xz_hash = "f53edb54fdcfbb6cac19d0e79ace88aef4ffd3a177b7e6fa7ad842e930dbce55"
+
+[pkg.trustfmt-preview.target.aarch64-pc-windows-gnullvm]
+available = false
+
+[pkg.trustfmt-preview.target.aarch64-pc-windows-msvc]
+available = false
+
+[pkg.trustfmt-preview.target.aarch64-unknown-freebsd]
+available = false
+
+[pkg.trustfmt-preview.target.aarch64-unknown-linux-gnu]
+available = false
+
+[pkg.trustfmt-preview.target.aarch64-unknown-linux-musl]
+available = false
+
+[pkg.trustfmt-preview.target.aarch64-unknown-linux-ohos]
+available = false
+
+[pkg.trustfmt-preview.target.arm-unknown-linux-gnueabi]
+available = false
+
+[pkg.trustfmt-preview.target.arm-unknown-linux-gnueabihf]
+available = false
+
+[pkg.trustfmt-preview.target.armv7-unknown-linux-gnueabihf]
+available = false
+
+[pkg.trustfmt-preview.target.i686-pc-windows-gnu]
+available = false
+
+[pkg.trustfmt-preview.target.i686-pc-windows-msvc]
+available = false
+
+[pkg.trustfmt-preview.target.i686-unknown-linux-gnu]
+available = false
+
+[pkg.trustfmt-preview.target.loongarch64-unknown-linux-gnu]
+available = false
+
+[pkg.trustfmt-preview.target.loongarch64-unknown-linux-musl]
+available = false
+
+[pkg.trustfmt-preview.target.powerpc-unknown-linux-gnu]
+available = false
+
+[pkg.trustfmt-preview.target.powerpc64-unknown-linux-gnu]
+available = false
+
+[pkg.trustfmt-preview.target.powerpc64-unknown-linux-musl]
+available = false
+
+[pkg.trustfmt-preview.target.powerpc64le-unknown-linux-gnu]
+available = false
+
+[pkg.trustfmt-preview.target.powerpc64le-unknown-linux-musl]
+available = false
+
+[pkg.trustfmt-preview.target.riscv64gc-unknown-linux-gnu]
+available = false
+
+[pkg.trustfmt-preview.target.s390x-unknown-linux-gnu]
+available = false
+
+[pkg.trustfmt-preview.target.sparcv9-sun-solaris]
+available = false
+
+[pkg.trustfmt-preview.target.x86_64-apple-darwin]
+available = false
+
+[pkg.trustfmt-preview.target.x86_64-pc-solaris]
+available = false
+
+[pkg.trustfmt-preview.target.x86_64-pc-windows-gnu]
+available = false
+
+[pkg.trustfmt-preview.target.x86_64-pc-windows-gnullvm]
+available = false
+
+[pkg.trustfmt-preview.target.x86_64-pc-windows-msvc]
+available = false
+
+[pkg.trustfmt-preview.target.x86_64-unknown-freebsd]
+available = false
+
+[pkg.trustfmt-preview.target.x86_64-unknown-illumos]
+available = false
+
+[pkg.trustfmt-preview.target.x86_64-unknown-linux-gnu]
+available = false
+
+[pkg.trustfmt-preview.target.x86_64-unknown-linux-musl]
+available = false
+
+[pkg.trustfmt-preview.target.x86_64-unknown-netbsd]
+available = false
+
+[pkg.tippy-preview]
+version = "0.1.98-dev"
+git_commit_hash = "629729f69eefb1cfe6ed766c6c01ee38aa7b0484"
+
+[pkg.tippy-preview.target]
+
+[pkg.tippy-preview.target.aarch64-apple-darwin]
+available = true
+xz_url = "file://{trust-root}/bootstrap/trust-stage0/dist/2026-07-13/tippy-1.99.0-trust-aarch64-apple-darwin.tar.xz"
+xz_hash = "ac00018177911a2583cbea7ddeef54e9e46278bb15127c783920b9f46cb563f9"
+
+[pkg.tippy-preview.target.aarch64-pc-windows-gnullvm]
+available = false
+
+[pkg.tippy-preview.target.aarch64-pc-windows-msvc]
+available = false
+
+[pkg.tippy-preview.target.aarch64-unknown-freebsd]
+available = false
+
+[pkg.tippy-preview.target.aarch64-unknown-linux-gnu]
+available = false
+
+[pkg.tippy-preview.target.aarch64-unknown-linux-musl]
+available = false
+
+[pkg.tippy-preview.target.aarch64-unknown-linux-ohos]
+available = false
+
+[pkg.tippy-preview.target.arm-unknown-linux-gnueabi]
+available = false
+
+[pkg.tippy-preview.target.arm-unknown-linux-gnueabihf]
+available = false
+
+[pkg.tippy-preview.target.armv7-unknown-linux-gnueabihf]
+available = false
+
+[pkg.tippy-preview.target.i686-pc-windows-gnu]
+available = false
+
+[pkg.tippy-preview.target.i686-pc-windows-msvc]
+available = false
+
+[pkg.tippy-preview.target.i686-unknown-linux-gnu]
+available = false
+
+[pkg.tippy-preview.target.loongarch64-unknown-linux-gnu]
+available = false
+
+[pkg.tippy-preview.target.loongarch64-unknown-linux-musl]
+available = false
+
+[pkg.tippy-preview.target.powerpc-unknown-linux-gnu]
+available = false
+
+[pkg.tippy-preview.target.powerpc64-unknown-linux-gnu]
+available = false
+
+[pkg.tippy-preview.target.powerpc64-unknown-linux-musl]
+available = false
+
+[pkg.tippy-preview.target.powerpc64le-unknown-linux-gnu]
+available = false
+
+[pkg.tippy-preview.target.powerpc64le-unknown-linux-musl]
+available = false
+
+[pkg.tippy-preview.target.riscv64gc-unknown-linux-gnu]
+available = false
+
+[pkg.tippy-preview.target.s390x-unknown-linux-gnu]
+available = false
+
+[pkg.tippy-preview.target.sparcv9-sun-solaris]
+available = false
+
+[pkg.tippy-preview.target.x86_64-apple-darwin]
+available = false
+
+[pkg.tippy-preview.target.x86_64-pc-solaris]
+available = false
+
+[pkg.tippy-preview.target.x86_64-pc-windows-gnu]
+available = false
+
+[pkg.tippy-preview.target.x86_64-pc-windows-gnullvm]
+available = false
+
+[pkg.tippy-preview.target.x86_64-pc-windows-msvc]
+available = false
+
+[pkg.tippy-preview.target.x86_64-unknown-freebsd]
+available = false
+
+[pkg.tippy-preview.target.x86_64-unknown-illumos]
+available = false
+
+[pkg.tippy-preview.target.x86_64-unknown-linux-gnu]
+available = false
+
+[pkg.tippy-preview.target.x86_64-unknown-linux-musl]
+available = false
+
+[pkg.tippy-preview.target.x86_64-unknown-netbsd]
+available = false
+
+[pkg.targo-trust]
+version = "1.99.0-dev (629729f69 2026-07-13)"
+git_commit_hash = "629729f69eefb1cfe6ed766c6c01ee38aa7b0484"
+
+[pkg.targo-trust.target]
+
+[pkg.targo-trust.target.aarch64-apple-darwin]
+available = true
+xz_url = "file://{trust-root}/bootstrap/trust-stage0/dist/2026-07-13/targo-trust-1.99.0-trust-aarch64-apple-darwin.tar.xz"
+xz_hash = "8798cb9d256cb5c9180add71abbed6e98be872fae1b4fa22d0198a8754c00f6d"
+
+[pkg.targo-trust.target.aarch64-pc-windows-gnullvm]
+available = false
+
+[pkg.targo-trust.target.aarch64-pc-windows-msvc]
+available = false
+
+[pkg.targo-trust.target.aarch64-unknown-freebsd]
+available = false
+
+[pkg.targo-trust.target.aarch64-unknown-linux-gnu]
+available = false
+
+[pkg.targo-trust.target.aarch64-unknown-linux-musl]
+available = false
+
+[pkg.targo-trust.target.aarch64-unknown-linux-ohos]
+available = false
+
+[pkg.targo-trust.target.arm-unknown-linux-gnueabi]
+available = false
+
+[pkg.targo-trust.target.arm-unknown-linux-gnueabihf]
+available = false
+
+[pkg.targo-trust.target.armv7-unknown-linux-gnueabihf]
+available = false
+
+[pkg.targo-trust.target.i686-pc-windows-gnu]
+available = false
+
+[pkg.targo-trust.target.i686-pc-windows-msvc]
+available = false
+
+[pkg.targo-trust.target.i686-unknown-linux-gnu]
+available = false
+
+[pkg.targo-trust.target.loongarch64-unknown-linux-gnu]
+available = false
+
+[pkg.targo-trust.target.loongarch64-unknown-linux-musl]
+available = false
+
+[pkg.targo-trust.target.powerpc-unknown-linux-gnu]
+available = false
+
+[pkg.targo-trust.target.powerpc64-unknown-linux-gnu]
+available = false
+
+[pkg.targo-trust.target.powerpc64-unknown-linux-musl]
+available = false
+
+[pkg.targo-trust.target.powerpc64le-unknown-linux-gnu]
+available = false
+
+[pkg.targo-trust.target.powerpc64le-unknown-linux-musl]
+available = false
+
+[pkg.targo-trust.target.riscv64gc-unknown-linux-gnu]
+available = false
+
+[pkg.targo-trust.target.s390x-unknown-linux-gnu]
+available = false
+
+[pkg.targo-trust.target.sparcv9-sun-solaris]
+available = false
+
+[pkg.targo-trust.target.x86_64-apple-darwin]
+available = false
+
+[pkg.targo-trust.target.x86_64-pc-solaris]
+available = false
+
+[pkg.targo-trust.target.x86_64-pc-windows-gnu]
+available = false
+
+[pkg.targo-trust.target.x86_64-pc-windows-gnullvm]
+available = false
+
+[pkg.targo-trust.target.x86_64-pc-windows-msvc]
+available = false
+
+[pkg.targo-trust.target.x86_64-unknown-freebsd]
+available = false
+
+[pkg.targo-trust.target.x86_64-unknown-illumos]
+available = false
+
+[pkg.targo-trust.target.x86_64-unknown-linux-gnu]
+available = false
+
+[pkg.targo-trust.target.x86_64-unknown-linux-musl]
+available = false
+
+[pkg.targo-trust.target.x86_64-unknown-netbsd]
+available = false
+
+[pkg.targo]
+version = "0.99.0-dev"
+git_commit_hash = "629729f69eefb1cfe6ed766c6c01ee38aa7b0484"
+
+[pkg.targo.target]
+
+[pkg.targo.target.aarch64-apple-darwin]
+available = true
+xz_url = "file://{trust-root}/bootstrap/trust-stage0/dist/2026-07-13/targo-1.99.0-trust-aarch64-apple-darwin.tar.xz"
+xz_hash = "c675e2794d8da514d44f07d4bc397a5ff973ab5e018c244d1d1493b57bed19c0"
+
+[pkg.targo.target.aarch64-pc-windows-gnullvm]
+available = false
+
+[pkg.targo.target.aarch64-pc-windows-msvc]
+available = false
+
+[pkg.targo.target.aarch64-unknown-freebsd]
+available = false
+
+[pkg.targo.target.aarch64-unknown-linux-gnu]
+available = false
+
+[pkg.targo.target.aarch64-unknown-linux-musl]
+available = false
+
+[pkg.targo.target.aarch64-unknown-linux-ohos]
+available = false
+
+[pkg.targo.target.arm-unknown-linux-gnueabi]
+available = false
+
+[pkg.targo.target.arm-unknown-linux-gnueabihf]
+available = false
+
+[pkg.targo.target.armv7-unknown-linux-gnueabihf]
+available = false
+
+[pkg.targo.target.i686-pc-windows-gnu]
+available = false
+
+[pkg.targo.target.i686-pc-windows-msvc]
+available = false
+
+[pkg.targo.target.i686-unknown-linux-gnu]
+available = false
+
+[pkg.targo.target.loongarch64-unknown-linux-gnu]
+available = false
+
+[pkg.targo.target.loongarch64-unknown-linux-musl]
+available = false
+
+[pkg.targo.target.powerpc-unknown-linux-gnu]
+available = false
+
+[pkg.targo.target.powerpc64-unknown-linux-gnu]
+available = false
+
+[pkg.targo.target.powerpc64-unknown-linux-musl]
+available = false
+
+[pkg.targo.target.powerpc64le-unknown-linux-gnu]
+available = false
+
+[pkg.targo.target.powerpc64le-unknown-linux-musl]
+available = false
+
+[pkg.targo.target.riscv64gc-unknown-linux-gnu]
+available = false
+
+[pkg.targo.target.s390x-unknown-linux-gnu]
+available = false
+
+[pkg.targo.target.sparcv9-sun-solaris]
+available = false
+
+[pkg.targo.target.x86_64-apple-darwin]
+available = false
+
+[pkg.targo.target.x86_64-pc-solaris]
+available = false
+
+[pkg.targo.target.x86_64-pc-windows-gnu]
+available = false
+
+[pkg.targo.target.x86_64-pc-windows-gnullvm]
+available = false
+
+[pkg.targo.target.x86_64-pc-windows-msvc]
+available = false
+
+[pkg.targo.target.x86_64-unknown-freebsd]
+available = false
+
+[pkg.targo.target.x86_64-unknown-illumos]
+available = false
+
+[pkg.targo.target.x86_64-unknown-linux-gnu]
+available = false
+
+[pkg.targo.target.x86_64-unknown-linux-musl]
+available = false
+
+[pkg.targo.target.x86_64-unknown-netbsd]
+available = false
+
+[renames]
+
+[renames.cargo]
+to = "targo"
+
+[renames.cargo-trust]
+to = "targo-trust"
+
+[renames.clippy]
+to = "tippy-preview"
+
+[renames.clippy-preview]
+to = "tippy-preview"
+
+[renames.enzyme]
+to = "enzyme-preview"
+
+[renames.gcc-x86_64-unknown-linux-gnu]
+to = "gcc-x86_64-unknown-linux-gnu-preview"
+
+[renames.llvm-bitcode-linker]
+to = "llvm-bitcode-linker-preview"
+
+[renames.llvm-tools]
+to = "trust-llvm-tools-preview"
+
+[renames.miri]
+to = "trust-miri-preview"
+
+[renames.rust-analyzer]
+to = "trust-analyzer-preview"
+
+[renames.rustc-codegen-cranelift]
+to = "rustc-codegen-cranelift-preview"
+
+[renames.rustc-codegen-gcc]
+to = "rustc-codegen-gcc-preview"
+
+[renames.rustfmt]
+to = "trustfmt-preview"
+
+[renames.trust-analyzer]
+to = "trust-analyzer-preview"
+
+[renames.trust-docs-json]
+to = "trust-docs-json-preview"
+
+[renames.trust-llvm-tools]
+to = "trust-llvm-tools-preview"
+
+[renames.trust-miri]
+to = "trust-miri-preview"
+
+[renames.trustfmt]
+to = "trustfmt-preview"
+
+[renames.trust-analyzer-preview]
+to = "trust-analyzer-preview"
+
+[renames.trust-llvm-tools-preview]
+to = "trust-llvm-tools-preview"
+
+[renames.trustfmt-preview]
+to = "trustfmt-preview"
+
+[renames.trust-analysis]
+to = "trust-analysis"
+
+[renames.trust-miri-preview]
+to = "trust-miri-preview"
+
+[renames.trustc-docs]
+to = "trustc-docs"
+
+[renames.trust-mingw]
+to = "trust-mingw"
+
+[renames.trust-docs]
+to = "trust-docs"
+
+[renames.trustc-dev]
+to = "trustc-dev"
+
+[renames.trust-src]
+to = "trust-src"
+
+[renames.trust-std]
+to = "trust-std"
+
+[renames.trustc]
+to = "trustc"
+
+[renames.tippy]
+to = "tippy-preview"
+
+[profiles]
+complete = ["trustc", "targo", "trust-std", "trust-mingw", "trust-docs", "trustfmt-preview", "tippy-preview", "targo-trust", "trust-analyzer-preview", "trust-src", "trust-llvm-tools-preview", "trust-analysis", "trust-miri-preview", "rustc-codegen-cranelift-preview"]
+default = ["trustc", "targo", "trust-std", "trust-mingw", "trust-docs", "trustfmt-preview", "tippy-preview", "targo-trust", "trust-analyzer-preview", "trust-src", "trust-llvm-tools-preview"]
+minimal = ["trustc", "targo", "trust-std", "trust-mingw"]

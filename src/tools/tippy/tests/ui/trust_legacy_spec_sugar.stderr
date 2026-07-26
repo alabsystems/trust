@@ -1,0 +1,52 @@
+error: legacy contracts attribute; Trust supports first-class signature clauses
+  --> tests/ui/trust_legacy_spec_sugar.rs:13:1
+   |
+LL | #[contracts::requires(x > 0)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: move the predicate into the signature: `fn f(..) requires x > 0 { .. }`
+   |
+   = note: `-D clippy::trust-legacy-spec-sugar` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::trust_legacy_spec_sugar)]`
+
+error: legacy contracts attribute; Trust supports first-class signature clauses
+  --> tests/ui/trust_legacy_spec_sugar.rs:19:1
+   |
+LL | #[contracts::ensures(|ret| *ret >= 0)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: move the predicate into the signature: `fn f(..) ensures |ret| *ret >= 0 { .. }`
+
+error: legacy contracts attribute; Trust supports first-class signature clauses
+  --> tests/ui/trust_legacy_spec_sugar.rs:26:1
+   |
+LL | #[contracts::ensures(|ret| *ret == old(x) + 1)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: move the predicate into the signature: `fn f(..) ensures |ret| *ret == old(x) + 1 { .. }`
+   |
+   = note: Trust has no `old()`: the entry state is the default; primes notation (`x'`) reads the post-state
+
+error: legacy contracts attribute; Trust supports first-class signature clauses
+  --> tests/ui/trust_legacy_spec_sugar.rs:35:1
+   |
+LL | #[kani::contracts::requires(x != 0)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: move the predicate into the signature: `fn f(..) requires x != 0 { .. }`
+
+error: legacy kani proof attribute; use `#[kani::harness]`
+  --> tests/ui/trust_legacy_spec_sugar.rs:41:1
+   |
+LL | #[kani::proof]
+   | ^^-----------^
+   |   |
+   |   help: use the native harness attribute: `kani::harness`
+
+error: legacy contracts attribute; Trust supports first-class signature clauses
+  --> tests/ui/trust_legacy_spec_sugar.rs:46:1
+   |
+LL | #[kani::requires(x > 0)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^ help: move the predicate into the signature: `fn f(..) requires x > 0 { .. }`
+
+error: legacy contracts attribute; Trust supports first-class signature clauses
+  --> tests/ui/trust_legacy_spec_sugar.rs:52:1
+   |
+LL | #[kani::ensures(|ret| *ret == old(x) + 1)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: move the predicate into the signature: `fn f(..) ensures |ret| *ret == old(x) + 1 { .. }`
+   |
+   = note: Trust has no `old()`: the entry state is the default; primes notation (`x'`) reads the post-state
+
+error: aborting due to 7 previous errors

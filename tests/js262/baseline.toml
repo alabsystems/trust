@@ -1,0 +1,114 @@
+# Production-shaped seed baseline for TrustJS Test262 calibration accounting.
+# Clones the discipline of tests/upstream-rust/baseline.toml for the js262
+# suite (docs/design/2026-07-20-trustjs-m0-scope.md, D5).
+#
+# Author: Andrew Yates
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+schema_version = "0.1.0"
+id = "js262.calibration-baseline.2026-07-21"
+
+[upstream]
+channel = "test262"
+revision = "tc39/test262:9e61c12835c5e4a3bdba93850427e6742c4f64c4"
+snapshot_date = "2026-07-21"
+
+[local]
+revision = "trust:main"
+workspace = "tRust"
+
+# How to populate the `status` fields below.
+#
+# Every entry currently carries `status = "unknown"` — i.e. "not yet
+# classified". These are seed placeholders, NOT a claim of calibration or
+# conformance. Do NOT hand-edit them to "compatible"/"diverged" from
+# intuition; that would fabricate a calibration claim. Each value must come
+# from a real calibration scorecard run against the pinned [upstream]
+# revision above (the M0 exit gate of
+# docs/design/2026-07-20-trustjs-m0-scope.md §4).
+#
+# Procedure to populate honestly:
+#   1. Run the canonical calibration over the frozen S0 slice:
+#        scripts/js262/calibrate.sh
+#      (fetches + checksum-verifies the pinned corpus, then runs the
+#      trust-js-differential `calibrate` subcommand over tests/js262/S0.toml
+#      with the pinned Node and Bun engines).
+#   2. Read the emitted scorecard. An entry becomes `compatible` only when
+#      its surface is trace-equal on the whole slice modulo ACTIVE
+#      tests/js262/test-exceptions.toml rows and classified
+#      tests/js262/divergence-audit.toml entries; a surface with unaccounted
+#      divergences becomes `diverged` and requires a ledger entry before any
+#      claim. `projection_too_strong` divergences can never account for a
+#      `compatible` status — they are harness bugs (fix crates/trust-js-trace).
+#   3. Bump `id` (date suffix) and refresh [upstream]/[local] revisions if
+#      the run pinned different commits, then commit the scorecard alongside
+#      as the evidence backing each status. Until such a run exists, leave
+#      these `unknown`.
+#
+# POPULATED 2026-07-21 from the M0 gate run (gate.pass=true):
+#   evidence: tests/js262/evidence/2026-07-21-m0-gate/{scorecard.json,
+#   adopted-execution-report.json}; dashboard: tests/js262/dashboard.md.
+#   35,346 S0 cases / 68,549 runs / 67,510 trace-equal (98.4843%); 1,037
+#   divergent runs across 614 cases, every one classified in
+#   divergence-audit.toml (zero unclassified, zero projection_too_strong
+#   outstanding); zero unexcepted harness errors; sem head: 3,046 covered
+#   runs all trace-equal, 65,501 sound NoCoverage, 0 divergent.
+#   engine.node / engine.bun are `diverged` — each engine fails specified
+#   behavior in classified families (node_bug / bun_bug rows) — while the
+#   apparatus surfaces (sem head, trace projection) are `compatible`.
+
+[[entries]]
+id = "engine.node"
+title = "Node oracle head trace calibration"
+surface = "js262"
+upstream_artifact = "test262 S0 slice (tests/js262/S0.toml)"
+local_artifact = "trust-js-differential Node head via crates/trust-js-trace js/trace_driver.mjs"
+status = "diverged"
+labels = ["js262", "calibration", "node", "oracle-head"]
+
+[entries.expectation]
+upstream_behavior = "Node v24.5.0 evaluates each S0 case under the trace driver and emits an ObservableTrace"
+local_behavior = "the harness projects the same case through the Node head reproducibly, byte-identical trace across repeated runs"
+compatibility_rule = "Node traces must be deterministic and trace-equal to the Bun head on the S0 slice unless the divergence is classified in divergence-audit.toml or covered by an active exception"
+
+[[entries]]
+id = "engine.bun"
+title = "Bun oracle head trace calibration"
+surface = "js262"
+upstream_artifact = "test262 S0 slice (tests/js262/S0.toml)"
+local_artifact = "trust-js-differential Bun head via crates/trust-js-trace js/trace_driver.mjs"
+status = "diverged"
+labels = ["js262", "calibration", "bun", "oracle-head"]
+
+[entries.expectation]
+upstream_behavior = "Bun 1.3.14 evaluates each S0 case under the trace driver and emits an ObservableTrace"
+local_behavior = "the harness projects the same case through the Bun head reproducibly, byte-identical trace across repeated runs"
+compatibility_rule = "Bun traces must be deterministic and trace-equal to the Node head on the S0 slice unless the divergence is classified in divergence-audit.toml or covered by an active exception"
+
+[[entries]]
+id = "engine.trust-js-sem"
+title = "trust-js-sem independent semantics head"
+surface = "js262"
+upstream_artifact = "test262 S0 bootstrap sub-slice"
+local_artifact = "crates/trust-js-sem small-step semantics emitting ObservableTrace"
+status = "compatible"
+labels = ["js262", "calibration", "trust-js-sem", "oracle-head"]
+
+[entries.expectation]
+upstream_behavior = "Node and Bun agree on the bootstrap sub-slice of S0"
+local_behavior = "trust-js-sem is trace-equal to both engine heads on the bootstrap slice and reports NoCoverage (never a false divergence) elsewhere"
+compatibility_rule = "bootstrap-slice traces must match both engine heads; the NoCoverage count must be audited to equal |S0| minus |bootstrap slice| — no silent passes"
+
+[[entries]]
+id = "harness.trace-projection"
+title = "ObservableTrace projection strength"
+surface = "js262"
+upstream_artifact = "ECMA-262 spec-mandated observables over the S0 slice"
+local_artifact = "crates/trust-js-trace schema + js/trace_driver.mjs projection"
+status = "compatible"
+labels = ["js262", "calibration", "projection", "harness"]
+
+[entries.expectation]
+upstream_behavior = "independent mature engines (Node, Bun) agree on spec-mandated observables for >= 99.9% of the S0 slice"
+local_behavior = "the projection captures exactly the spec-mandated observables — nothing engine-incidental (too strong) and no missing observables (too weak)"
+compatibility_rule = "every residual Node-vs-Bun divergence must be classified in divergence-audit.toml; any projection_too_strong classification is a harness bug that must be fixed in crates/trust-js-trace, never waived"

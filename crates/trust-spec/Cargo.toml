@@ -1,0 +1,23 @@
+# trust-spec: Stable contract attribute surface for trust
+#
+# Wave 1A ships a no-op proc-macro crate so downstream code can adopt a
+# trust-owned spec namespace on stable Rust before semantics land.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-spec"
+# NY now owns a separate compatibility surface (`ny-contracts`); this package
+# remains Trust's canonical contract attribute crate.
+version = "0.1.1"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "trust"
+proc-macro = true

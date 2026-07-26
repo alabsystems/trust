@@ -1,0 +1,422 @@
+# Coverage-ratchet ledger for the in-house harness heads (TrustJS M1 D4,
+# docs/design/2026-07-21-trustjs-m1-scope.md): per-head covered-run counts
+# from recorded gate scorecards. The ratchet is monotone: a landing whose
+# scorecard covers FEWER runs than the last entry for that head, or with any
+# divergent run, or with equal != covered, fails closed
+# (`trust-js-differential ratchet --check`). Entries are appended only from
+# `ratchet --propose` output against a committed-evidence scorecard.
+#
+# Author: Andrew Yates
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+schema_version = "0.1.0"
+
+[[entries]]
+id = "cov-sem-2026-07-21"
+date = "2026-07-21"
+scorecard = "tests/js262/evidence/2026-07-21-m1-d3-gate/scorecard.json"
+head = "sem"
+cases = 68547
+covered = 3046
+equal = 3046
+divergent = 0
+no_coverage = 65501
+
+[[entries]]
+id = "cov-trustjs-2026-07-21"
+date = "2026-07-21"
+scorecard = "tests/js262/evidence/2026-07-21-m1-d3-gate/scorecard.json"
+head = "trustjs"
+cases = 68547
+covered = 22288
+equal = 22288
+divergent = 0
+no_coverage = 46259
+[[entries]]
+id = "cov-sem-2026-07-21-s1b"
+date = "2026-07-21"
+scorecard = "tests/js262/evidence/2026-07-21-m1-s1b-gate/scorecard.json"
+head = "sem"
+cases = 68547
+covered = 15438
+equal = 15438
+divergent = 0
+no_coverage = 53109
+
+[[entries]]
+id = "cov-trustjs-2026-07-21-s1b"
+date = "2026-07-21"
+scorecard = "tests/js262/evidence/2026-07-21-m1-s1b-gate/scorecard.json"
+head = "trustjs"
+cases = 68547
+covered = 34877
+equal = 34877
+divergent = 0
+no_coverage = 33670
+[[entries]]
+id = "cov-sem-2026-07-21-s1c"
+date = "2026-07-21"
+scorecard = "tests/js262/evidence/2026-07-21-m1-s1c-gate/scorecard.json"
+head = "sem"
+cases = 68547
+covered = 22122
+equal = 22122
+divergent = 0
+no_coverage = 46425
+
+[[entries]]
+id = "cov-trustjs-2026-07-21-s1c"
+date = "2026-07-21"
+scorecard = "tests/js262/evidence/2026-07-21-m1-s1c-gate/scorecard.json"
+head = "trustjs"
+cases = 68547
+covered = 38406
+equal = 38406
+divergent = 0
+no_coverage = 30141
+[[entries]]
+id = "cov-sem-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-m1-s1d-gate/scorecard.json"
+head = "sem"
+cases = 68547
+covered = 29163
+equal = 29163
+divergent = 0
+no_coverage = 39384
+
+[[entries]]
+id = "cov-trustjs-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-m1-s1d-gate/scorecard.json"
+head = "trustjs"
+cases = 68547
+covered = 40874
+equal = 40874
+divergent = 0
+no_coverage = 27673
+[[entries]]
+id = "cov-sem-2026-07-22-s1e"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-m1-s1e-gate/scorecard.json"
+head = "sem"
+cases = 68547
+covered = 30588
+equal = 30588
+divergent = 0
+no_coverage = 37959
+
+[[entries]]
+id = "cov-trustjs-2026-07-22-s1e"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-m1-s1e-gate/scorecard.json"
+head = "trustjs"
+cases = 68547
+covered = 49159
+equal = 49159
+divergent = 0
+no_coverage = 19388
+[[entries]]
+id = "cov-sem-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-m1-s1f-gate/scorecard.json"
+head = "sem"
+cases = 68547
+covered = 34149
+equal = 34149
+divergent = 0
+no_coverage = 34398
+
+[[entries]]
+id = "cov-trustjs-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-m1-s1f-gate/scorecard.json"
+head = "trustjs"
+cases = 68547
+covered = 52118
+equal = 52118
+divergent = 0
+no_coverage = 16429
+[[entries]]
+id = "cov-sem-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-m1-eval-ta-gate/scorecard.json"
+head = "sem"
+cases = 68547
+covered = 36527
+equal = 36527
+divergent = 0
+no_coverage = 32020
+
+[[entries]]
+id = "cov-trustjs-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-m1-eval-ta-gate/scorecard.json"
+head = "trustjs"
+cases = 68547
+covered = 53476
+equal = 53476
+divergent = 0
+no_coverage = 15071
+[[entries]]
+id = "cov-sem-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-m2-async-gate/scorecard.json"
+head = "sem"
+cases = 68547
+covered = 39346
+equal = 39346
+divergent = 0
+no_coverage = 29201
+
+[[entries]]
+id = "cov-trustjs-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-m2-async-gate/scorecard.json"
+head = "trustjs"
+cases = 68547
+covered = 53908
+equal = 53908
+divergent = 0
+no_coverage = 14639
+[[entries]]
+id = "cov-sem-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-bigint-semasync-gate/scorecard.json"
+head = "sem"
+cases = 68547
+covered = 39778
+equal = 39778
+divergent = 0
+no_coverage = 28769
+
+[[entries]]
+id = "cov-trustjs-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-bigint-semasync-gate/scorecard.json"
+head = "trustjs"
+cases = 68547
+covered = 54956
+equal = 54956
+divergent = 0
+no_coverage = 13591
+[[entries]]
+id = "cov-sem-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-proxy-bigint-gate/scorecard.json"
+head = "sem"
+cases = 68547
+covered = 41538
+equal = 41538
+divergent = 0
+no_coverage = 27009
+
+[[entries]]
+id = "cov-trustjs-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-proxy-bigint-gate/scorecard.json"
+head = "trustjs"
+cases = 68547
+covered = 55695
+equal = 55695
+divergent = 0
+no_coverage = 12852
+[[entries]]
+id = "cov-sem-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-iter-semproxy-gate/scorecard.json"
+head = "sem"
+cases = 68547
+covered = 42752
+equal = 42752
+divergent = 0
+no_coverage = 25795
+
+[[entries]]
+id = "cov-trustjs-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-iter-semproxy-gate/scorecard.json"
+head = "trustjs"
+cases = 68547
+covered = 57795
+equal = 57795
+divergent = 0
+no_coverage = 10752
+[[entries]]
+id = "cov-sem-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-squeeze-gate/scorecard.json"
+head = "sem"
+cases = 68547
+covered = 43330
+equal = 43330
+divergent = 0
+no_coverage = 25217
+
+[[entries]]
+id = "cov-trustjs-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-squeeze-gate/scorecard.json"
+head = "trustjs"
+cases = 68547
+covered = 58007
+equal = 58007
+divergent = 0
+no_coverage = 10540
+[[entries]]
+id = "cov-sem-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-refmap-gate/scorecard.json"
+head = "sem"
+cases = 68547
+covered = 45484
+equal = 45484
+divergent = 0
+no_coverage = 23063
+
+[[entries]]
+id = "cov-trustjs-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-refmap-gate/scorecard.json"
+head = "trustjs"
+cases = 68547
+covered = 60463
+equal = 60463
+divergent = 0
+no_coverage = 8084
+[[entries]]
+id = "cov-sem-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-std-asyncm-gate/scorecard.json"
+head = "sem"
+cases = 68547
+covered = 46327
+equal = 46327
+divergent = 0
+no_coverage = 22220
+
+[[entries]]
+id = "cov-trustjs-2026-07-22"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-std-asyncm-gate/scorecard.json"
+head = "trustjs"
+cases = 68547
+covered = 60799
+equal = 60799
+divergent = 0
+no_coverage = 7748
+
+# Soundness decrease (ALLOWED, documented): the async correctness batch converts
+# a handful of previously-covered-but-fabricated S0 cases to sound NoCoverage
+# refusals — the try/finally fix (a throwing `finally` no longer overrides an
+# Abrupt::Fatal refusal) and the poisoned-Array-setter driver-artifact refusal.
+# divergent == 0 and equal == covered still hold; landed with
+# `ratchet --check --allow-soundness-decrease`. 60799 -> 60743.
+[[entries]]
+id = "cov-trustjs-2026-07-22-asyncbatch"
+date = "2026-07-22"
+scorecard = "tests/js262/evidence/2026-07-22-async-batch-s0/scorecard.json"
+head = "trustjs"
+cases = 68547
+covered = 60743
+equal = 60743
+divergent = 0
+no_coverage = 7804
+
+# 2026-07-23 slice RE-BASELINE (not a coverage regression): the proposal-feature
+# exclusion fix (fix(trust-js): S0/S-async proposal-feature exclusion missed 10
+# of 16 proposals) shrank S0 from 35,346 to 34,914 files (68,547 -> 67,717 runs)
+# by correctly excluding 432 proposal-feature test files that were wrongly
+# admitted. Covered counts drop proportionally (the removed cases were proposal
+# tests neither in-house head models — sound refusals / Node-vs-Bun divergences,
+# not real coverage). divergent == 0, equal == covered still hold; gate.pass=true.
+# Landed with ratchet --check --allow-soundness-decrease. Evidence:
+# tests/js262/evidence/2026-07-23-s0-proposal-rebless/.
+[[entries]]
+id = "cov-sem-2026-07-23-rebaseline"
+date = "2026-07-23"
+scorecard = "tests/js262/evidence/2026-07-23-s0-proposal-rebless/scorecard.json"
+head = "sem"
+cases = 67715
+covered = 46189
+equal = 46189
+divergent = 0
+no_coverage = 21526
+
+[[entries]]
+id = "cov-trustjs-2026-07-23-rebaseline"
+date = "2026-07-23"
+scorecard = "tests/js262/evidence/2026-07-23-s0-proposal-rebless/scorecard.json"
+head = "trustjs"
+cases = 67715
+covered = 60160
+equal = 60160
+divergent = 0
+no_coverage = 7555
+
+# 2026-07-23 async generators + async class methods (interp): trustjs 60,160 ->
+# 61,155 (+995), 0 divergent — the largest S0 coverage lever closed (async gen
+# §27.6 abstract operations + async class-method wiring; subtle .return()/yield*
+# delegation/for-await/non-spine-await stay sound refusals). sem unchanged.
+[[entries]]
+id = "cov-trustjs-2026-07-23-asyncgen"
+date = "2026-07-23"
+scorecard = "tests/js262/evidence/2026-07-23-asyncgen/scorecard.json"
+head = "trustjs"
+cases = 67715
+covered = 61155
+equal = 61155
+divergent = 0
+no_coverage = 6560
+
+# 2026-07-23 Iterator helpers (interp): trustjs 61,155 -> 61,869 (+714), 0
+# divergent. Iterator.prototype.{map,filter,take,drop,flatMap,reduce,toArray,
+# forEach,some,every,find} (§27.1.4) as lazy Iterator-Helper objects + eager
+# consumers. The differential loop caught 20 divergences on the first run;
+# guards tightened to refuse those classes -> 0 divergent.
+[[entries]]
+id = "cov-trustjs-2026-07-23-iterhelp"
+date = "2026-07-23"
+scorecard = "tests/js262/evidence/2026-07-23-iterhelp/scorecard.json"
+head = "trustjs"
+cases = 67715
+covered = 61869
+equal = 61869
+divergent = 0
+no_coverage = 5846
+
+# 2026-07-23 Promise statics on a subclass/custom receiver (interp): trustjs
+# 61,869 -> 62,101 (+232), 0 divergent. NewPromiseCapability(C) via new C(executor)
+# + GetPromiseResolve(C) + faithful Resolve/Reject Element functions for
+# Promise.resolve/reject/all/allSettled/race/any/withResolvers/try on a non-
+# intrinsic receiver; intrinsic %Promise% keeps its reactor fast-path (0 regression).
+# The "Promise static on subclass receiver" bucket dropped 242 -> 0.
+[[entries]]
+id = "cov-trustjs-2026-07-23-promsub"
+date = "2026-07-23"
+scorecard = "tests/js262/evidence/2026-07-23-promsub/scorecard.json"
+head = "trustjs"
+cases = 67715
+covered = 62101
+equal = 62101
+divergent = 0
+no_coverage = 5614
+
+# 2026-07-23 explicit resource management (interp): trustjs 62,101 -> 62,359
+# (+258), 0 divergent. Symbol.dispose/asyncDispose well-known symbols, sync
+# `using x =` declarations (dispose-at-scope-exit reverse order on normal AND
+# abrupt completion, non-callable @@dispose TypeError, SuppressedError nesting),
+# DisposableStack class (use/adopt/defer/dispose/move/disposed). The diff loop
+# caught 22 divergences (iterator Symbol.dispose/asyncDispose method shape) on the
+# first run → corrected/refused → 0 divergent. await using/AsyncDisposableStack
+# stay sound refusals.
+[[entries]]
+id = "cov-trustjs-2026-07-23-disposable"
+date = "2026-07-23"
+scorecard = "tests/js262/evidence/2026-07-23-disposable/scorecard.json"
+head = "trustjs"
+cases = 67715
+covered = 62359
+equal = 62359
+divergent = 0
+no_coverage = 5356

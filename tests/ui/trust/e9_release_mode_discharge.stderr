@@ -1,0 +1,31 @@
+note: Clean island kernel-checked: 2 declaration(s) registered (min2_case, min2_le_left)
+  --> $DIR/e9_release_mode_discharge.rs:14:5
+   |
+LL | /     theorem min2_case : forall (x y : UInt64) (d : Bool),
+LL | |         Eq Bool (Nat.ble (UInt64.toNat y) (UInt64.toNat x)) d ->
+LL | |         Nat.le (UInt64.toNat (Bool.rec (fun _ => UInt64) y x (Bool.not d))) (UInt64.toNat x) :=
+LL | |         fun x y d => Bool.rec
+...  |
+LL | |         fun x y => min2_case x y (Nat.ble (UInt64.toNat y) (UInt64.toNat x))
+LL | |             (Eq.refl Bool (Nat.ble (UInt64.toNat y) (UInt64.toNat x)))
+   | |______________________________________________________________________^
+
+
+=== Trust Verification Report (e9_release_mode_discharge) ===
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_release_mode_discharge.rs:33:1
+   |
+LL | pub fn caller(x: u64, y: u64) -> u64 ensures min2(x, y) <= x by min2_le_left { x }
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: citation `min2_le_left` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `caller`, with a clean certification audit
+  --> $DIR/e9_release_mode_discharge.rs:33:65
+   |
+LL | pub fn caller(x: u64, y: u64) -> u64 ensures min2(x, y) <= x by min2_le_left { x }
+   |                                                                 ^^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+

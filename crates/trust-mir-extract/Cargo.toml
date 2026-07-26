@@ -1,0 +1,38 @@
+# trust-mir-extract: Bridge from rustc MIR to trust-types verification model
+#
+# Requires rustc_private — built as part of the compiler via x.py.
+# The rustc crate dependencies use path references into compiler/.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-mir-extract"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = "1"
+trust-types = { path = "../trust-types" }
+trust-verifier-api = { path = "../trust-verifier-api" }
+trust-vcgen = { path = "../trust-vcgen" }
+# trust: rustc crates needed for MIR extraction (resolved by bootstrap build)
+rustc_abi = { path = "../../compiler/rustc_abi" }
+rustc_ast_ir = { path = "../../compiler/rustc_ast_ir" }
+rustc_data_structures = { path = "../../compiler/rustc_data_structures" }
+rustc_hir = { path = "../../compiler/rustc_hir" }
+rustc_middle = { path = "../../compiler/rustc_middle" }
+rustc_span = { path = "../../compiler/rustc_span" }
+
+[dev-dependencies]
+rustc_driver = { path = "../../compiler/rustc_driver" }
+rustc_interface = { path = "../../compiler/rustc_interface" }
+# Test-only producer/consumer parity pin for the exact direct MIR-memory JSON
+# schema consumed by trust-vc-bridge. Production extraction remains decoupled
+# from the TrustVC engine implementation.
+trust-vc-trust-engine = { path = "../../first-party/trust-vc/crates/trust-vc-trust-engine" }

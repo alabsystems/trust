@@ -1,0 +1,5 @@
+def_path	total	inhabited	type_grounded_not_inhabited	not_grounded	kernel_rejected	safety_obligations	safety_discharged	fully_faithful	via_trustir	mirsem_fallback	declined
+<char as Check>::is_control	1	1	0	0	0	0	0	1	0	1	0
+<char as Check>::is_extended	1	1	0	0	0	0	0	1	0	1	0
+<char as Check>::is_printable	1	1	0	0	0	0	0	1	0	1	0
+<char as Check>::is_us_ascii	1	1	0	0	0	0	0	1	0	1	0

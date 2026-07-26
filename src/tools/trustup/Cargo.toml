@@ -1,0 +1,10 @@
+[package]
+name = "trustup"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+
+[[bin]]
+name = "trustup"
+path = "src/main.rs"

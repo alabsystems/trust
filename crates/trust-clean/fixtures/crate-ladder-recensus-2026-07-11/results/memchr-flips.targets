@@ -1,0 +1,3 @@
+arch::all::memchr::One::confirm
+arch::all::memchr::One::find_raw::{closure#0}
+arch::all::memchr::One::rfind_raw::{closure#0}

@@ -1,0 +1,19 @@
+{
+  "schema": "dscan.attestation.v1",
+  "candidate_id": "trust-2026.04.25-rc1",
+  "source_repo": "https://github.com/alabsystems/trust",
+  "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "dpub_plan_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "trust_engines_lock_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+  "scan_policy_version": "dscan-policy-2026.04",
+  "conformance_report_hash": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+  "release_gate_report_hash": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+  "result": "accepted",
+  "reviewer": "human-reviewer@andrewyates",
+  "signer": "dscan-bot@andrewyates",
+  "signature": {
+    "algorithm": "dscan-ed25519-v1",
+    "keyid": "dscan-bot@andrewyates",
+    "value": "abcdefghijklmnopqrstuvwxyz012345"
+  }
+}

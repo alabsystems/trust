@@ -1,0 +1,49 @@
+# trust-js-differential: the TrustJS Channel-A harness — M0 runner
+#
+# The measurement instrument. An `EngineHead` (case + run-mode → ObservableTrace
+# | NoCoverage | HarnessError) with three M0 heads — Node, Bun, trust-js-sem —
+# plus the M1 D3 fourth head (trust-js-interp, the faithful tier) and its D4
+# coverage-ratchet subcommand (`ratchet`, tests/js262/coverage.toml),
+# driven over the pinned Test262 S0 slice: frontmatter parsing, harness-include
+# assembly, mandated run modes, negative-test interpretation, trace diffing,
+# divergence classification + delta-debug minimization, a fail-closed
+# scorecard, the js262 ledger validation (expiring waivers), and the
+# negative-control self-test (a corrupted head MUST be flagged, and an
+# uncorrupted run MUST pass — both legs, so a toothless harness fails).
+# The published scorecard is the only permitted conformance claim.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-js-differential"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "trust-js-differential"
+path = "src/main.rs"
+
+[dependencies]
+trust-js-trace = { workspace = true }
+trust-js-sem = { workspace = true }
+trust-js-parse = { workspace = true }
+trust-js-interp = { workspace = true }
+trust-ts-strip = { workspace = true }
+# The only JS -> Clean-kernel receipt path. The evidence report is where a
+# reader looks for what TrustJS has PROVED as opposed to differentially
+# measured, so the receipts are minted and re-checked here rather than living in
+# a crate nothing calls.
+trust-js-certify-bridge = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }

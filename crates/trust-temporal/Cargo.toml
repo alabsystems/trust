@@ -1,0 +1,22 @@
+# trust-temporal: State-machine and temporal-property scaffolding for trust
+#
+# This crate models control-flow/state-machine structure and temporal
+# properties in a self-contained form that can later be connected to
+# model checking backends.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-temporal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+trust-types = { workspace = true }
+tla-mc-core = { workspace = true }

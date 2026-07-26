@@ -1,0 +1,15 @@
+if let ExprKind::Block(block, None) = expr.kind
+    && block.stmts.is_empty()
+    && let Some(trailing_expr) = block.expr
+    && let ExprKind::UnsafeBinderCast(UnsafeBinderCastKind::Wrap, inner, None) = trailing_expr.kind
+    && let ExprKind::AddrOf(BorrowKind::Ref, Mutability::Not, inner1) = inner.kind
+{
+    // report your lint here
+}
+if let ExprKind::Block(block, None) = expr.kind
+    && block.stmts.is_empty()
+    && let Some(trailing_expr) = block.expr
+    && let ExprKind::UnsafeBinderCast(UnsafeBinderCastKind::Unwrap, inner, Some(ty)) = trailing_expr.kind
+{
+    // report your lint here
+}

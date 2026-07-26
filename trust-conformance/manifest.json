@@ -1,0 +1,219 @@
+{
+  "cases": [
+    {
+      "category": "deductive",
+      "checks": [
+        {
+          "kind": "file_exists",
+          "path": "trust-conformance/cases/deductive/loop_invariant_vc/input.trust"
+        },
+        {
+          "expected": true,
+          "kind": "json_pointer_equals",
+          "path": "trust-conformance/cases/deductive/loop_invariant_vc/expected.json",
+          "pointer": "/valid"
+        }
+      ],
+      "description": "Fixture-backed deductive verification case for loop invariant preservation and postcondition discharge.",
+      "evidence": [
+        "trust-conformance/cases/deductive/loop_invariant_vc/input.trust",
+        "trust-conformance/cases/deductive/loop_invariant_vc/expected.json"
+      ],
+      "id": "deductive.loop_invariant_vc",
+      "title": "Loop invariant verification condition"
+    },
+    {
+      "category": "reachability",
+      "checks": [
+        {
+          "kind": "file_exists",
+          "path": "trust-conformance/cases/reachability/cegar_counterexample/program.trust"
+        },
+        {
+          "expected": "reachable",
+          "kind": "json_pointer_equals",
+          "path": "trust-conformance/cases/reachability/cegar_counterexample/expected.json",
+          "pointer": "/target"
+        }
+      ],
+      "description": "Reachability corpus seed for a CEGAR-style counterexample trace with an explicit target state.",
+      "evidence": [
+        "trust-conformance/cases/reachability/cegar_counterexample/program.trust",
+        "trust-conformance/cases/reachability/cegar_counterexample/expected.json"
+      ],
+      "id": "reachability.cegar_counterexample",
+      "title": "Reachable assertion target"
+    },
+    {
+      "category": "proof-calculus",
+      "checks": [
+        {
+          "kind": "file_exists",
+          "path": "trust-conformance/cases/proof-calculus/minimal_certificate/certificate.json"
+        },
+        {
+          "expected": "modus_ponens",
+          "kind": "json_pointer_equals",
+          "path": "trust-conformance/cases/proof-calculus/minimal_certificate/certificate.json",
+          "pointer": "/steps/2/rule"
+        }
+      ],
+      "description": "Proof-calculus seed certificate for validating proof-step ordering and rule naming.",
+      "evidence": [
+        "trust-conformance/cases/proof-calculus/minimal_certificate/certificate.json"
+      ],
+      "id": "proof_calculus.minimal_certificate",
+      "title": "Minimal proof certificate"
+    },
+    {
+      "category": "temporal-spec",
+      "checks": [
+        {
+          "kind": "file_exists",
+          "path": "trust-conformance/cases/temporal-spec/two_phase_commit/Spec.tla"
+        },
+        {
+          "expected": "NoCommitWithoutPrepare",
+          "kind": "json_pointer_equals",
+          "path": "trust-conformance/cases/temporal-spec/two_phase_commit/expected.json",
+          "pointer": "/safety_property"
+        }
+      ],
+      "description": "Temporal/spec corpus seed for a small protocol safety property and its expected invariant name.",
+      "evidence": [
+        "trust-conformance/cases/temporal-spec/two_phase_commit/Spec.tla",
+        "trust-conformance/cases/temporal-spec/two_phase_commit/expected.json"
+      ],
+      "id": "temporal_spec.two_phase_commit_safety",
+      "title": "Two-phase commit safety invariant"
+    },
+    {
+      "category": "solver-evidence",
+      "checks": [
+        {
+          "kind": "file_exists",
+          "path": "trust-conformance/cases/solver-evidence/unsat_core/core.json"
+        },
+        {
+          "expected": "unsat",
+          "kind": "json_pointer_equals",
+          "path": "trust-conformance/cases/solver-evidence/unsat_core/core.json",
+          "pointer": "/result"
+        }
+      ],
+      "description": "Solver-evidence corpus seed for unsat result reporting and named-core retention.",
+      "evidence": [
+        "trust-conformance/cases/solver-evidence/unsat_core/core.json"
+      ],
+      "id": "solver_evidence.unsat_core",
+      "title": "Named unsat core evidence"
+    },
+    {
+      "category": "trust-integration",
+      "checks": [
+        {
+          "kind": "file_exists",
+          "path": "trust-conformance/cases/trust-integration/targo_trust_publication_json/publication.json"
+        },
+        {
+          "expected": "targo-trust-publication-json/v1",
+          "kind": "json_pointer_equals",
+          "path": "trust-conformance/cases/trust-integration/targo_trust_publication_json/publication.json",
+          "pointer": "/format"
+        },
+        {
+          "expected": "targo trust --publication-json",
+          "kind": "json_pointer_equals",
+          "path": "trust-conformance/cases/trust-integration/targo_trust_publication_json/publication.json",
+          "pointer": "/producer/command"
+        },
+        {
+          "expected": "trust.verifier-api.v1",
+          "kind": "json_pointer_equals",
+          "path": "trust-conformance/cases/trust-integration/targo_trust_publication_json/publication.json",
+          "pointer": "/bundle/schema_version"
+        },
+        {
+          "expected": "publication-v3-seed",
+          "kind": "json_pointer_equals",
+          "path": "trust-conformance/cases/trust-integration/targo_trust_publication_json/publication.json",
+          "pointer": "/bundle/publication/candidate_id"
+        },
+        {
+          "expected": "Proved",
+          "kind": "json_pointer_equals",
+          "path": "trust-conformance/cases/trust-integration/targo_trust_publication_json/publication.json",
+          "pointer": "/evidence/0/status"
+        },
+        {
+          "kind": "json_pointer_file_sha256_equals",
+          "path": "trust-conformance/cases/trust-integration/targo_trust_publication_json/publication.json",
+          "pointer": "/evidence/0/artifacts/0/hash/value",
+          "target_path": "trust-conformance/cases/proof-calculus/minimal_certificate/certificate.json"
+        }
+      ],
+      "description": "Fixture-backed targo-trust publication JSON seed covering the public verifier API envelope, publication hashes, and proof-certificate artifact binding.",
+      "evidence": [
+        "trust-conformance/cases/trust-integration/targo_trust_publication_json/publication.json",
+        "trust-conformance/cases/proof-calculus/minimal_certificate/certificate.json"
+      ],
+      "id": "trust_integration.targo_trust_publication_json",
+      "title": "targo-trust publication JSON contract"
+    },
+    {
+      "category": "proof-calculus",
+      "checks": [
+        {
+          "kind": "file_exists",
+          "path": "trust-conformance/cases/proof-calculus/lean5_replay_roundtrip/replay.json"
+        },
+        {
+          "expected": "trust-lean5-replay-report/v1",
+          "kind": "json_pointer_equals",
+          "path": "trust-conformance/cases/proof-calculus/lean5_replay_roundtrip/replay.json",
+          "pointer": "/format"
+        },
+        {
+          "expected": "replayed",
+          "kind": "json_pointer_equals",
+          "path": "trust-conformance/cases/proof-calculus/lean5_replay_roundtrip/replay.json",
+          "pointer": "/roundtrip/status"
+        },
+        {
+          "expected": true,
+          "kind": "json_pointer_equals",
+          "path": "trust-conformance/cases/proof-calculus/lean5_replay_roundtrip/replay.json",
+          "pointer": "/roundtrip/kernel_checked"
+        },
+        {
+          "expected": "Q",
+          "kind": "json_pointer_equals",
+          "path": "trust-conformance/cases/proof-calculus/lean5_replay_roundtrip/replay.json",
+          "pointer": "/roundtrip/preserved_conclusion"
+        },
+        {
+          "expected": 3,
+          "kind": "json_pointer_equals",
+          "path": "trust-conformance/cases/proof-calculus/lean5_replay_roundtrip/replay.json",
+          "pointer": "/roundtrip/preserved_step_count"
+        },
+        {
+          "kind": "json_pointer_file_sha256_equals",
+          "path": "trust-conformance/cases/proof-calculus/lean5_replay_roundtrip/replay.json",
+          "pointer": "/input_certificate_sha256",
+          "target_path": "trust-conformance/cases/proof-calculus/minimal_certificate/certificate.json"
+        }
+      ],
+      "description": "Fixture-backed Lean5 round-trip certificate replay report for the seed proof certificate, including certificate hash binding and preserved replay result.",
+      "evidence": [
+        "trust-conformance/cases/proof-calculus/lean5_replay_roundtrip/replay.json",
+        "trust-conformance/cases/proof-calculus/minimal_certificate/certificate.json"
+      ],
+      "id": "proof_calculus.lean5_replay_roundtrip",
+      "title": "Lean5 replay round-trip"
+    }
+  ],
+  "issue": 1053,
+  "schema_version": "trust-conformance-manifest/v1",
+  "suite": "publication-v3-initial"
+}

@@ -1,0 +1,482 @@
+{
+ "assoc_const_projection_no_ice.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "bodyless_contract_rejected.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "certified_monitor_bridge_frontier_report.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "certified_monitor_closed_numeric_report.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "certified_monitor_early_returns.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "certified_monitor_entry_snapshot.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "certified_monitor_legacy_marker_rejected.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "certified_monitor_linked_library.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "certified_monitor_multi_clause_runtime.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "certified_monitor_operator_runtime.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "certified_monitor_rejects_dependency_native_link.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "certified_monitor_rejects_dependency_startup_controls.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "certified_monitor_rejects_dependency_symbol_control.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "certified_monitor_rejects_dynamic_rust_link.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "certified_monitor_rejects_native_link.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "certified_monitor_rejects_startup_controls.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "certified_monitor_requires_entry.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "certified_monitor_resolved_types_report.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "certified_monitor_resolved_types_runtime.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "certified_monitor_skip_violation.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "certified_monitor_tail_call_rejected.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "certified_monitor_targo_scoped_out.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "certified_monitor_u8_wrapping.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "certified_monitor_violation.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "certified_monitor_wide_wrapping.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "clean_island_grammar.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "clean_island_kernel_reject.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "clean_island_lexical_block_comment.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "clean_island_lexical_line_comment.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "clean_island_lexical_string.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "clean_island_no_verify_sorry.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "clean_island_no_verify_trusted.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "clean_island_stateful.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "clean_island_tainted_citation.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "compiletest_default_isolation.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "contract_reserved_return_place_param.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "contract_synthetic_namespace_collision.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "e2_by_value_prime_discharge.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "e2_mut_by_value_prime_undischarged.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "e2_mut_prime_undischarged.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "e6_kernel_import_admits.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "e6_session_facets.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "e9_arbitrary_body_result_free_discharge.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "e9_arbitrary_body_result_undischarged.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "e9_definitional_call_discharge.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "e9_definitional_call_undischarged.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "e9_island_call_citation_battery.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "e9_island_call_divergence_battery.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "e9_island_defeq_discharge.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "e9_min2_case_split_discharge.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "e9_min2_case_split_undischarged.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "e9_multi_clause_discharge.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "e9_multi_clause_undischarged.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "e9_one_program_two_languages.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "e9_postcondition_citation_discharge.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "e9_postcondition_citation_undischarged.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "e9_release_mode_discharge.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "e9_result_binding_discharge.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "e9_result_binding_undischarged.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "e9_subset_binding_discharge.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "functional_contracts.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "mir_cycle_oracle.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "modular_callee_postcondition_reuse.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "monitor_report.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "native_clause_citation.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_clause_citation_doubled_dot.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_clause_citation_mismatch.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_clause_citation_missing_dot.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_clause_citation_outside_fragment.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_clause_citation_raw_segment.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_clause_citation_reserved_segment.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_clause_citation_trailing_dot.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_clause_empty_payload.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_clause_grammar.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_clause_prime_char_adjacency.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_clause_prime_whitespace.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_clause_primes.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_clause_semantics.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_contract_liveness.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "native_decreases_citation_blocked.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_decreases_type_errors.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_loop_clause_semantics.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "native_loop_clause_type_errors.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_loop_clauses.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_loop_collection_semantics.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "native_loop_feedback_semantics.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "native_loop_lint_preservation.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_recursive_decreases_semantics.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "native_recursive_requires_fresh_context.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "native_requires_assumed_binds_param.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "native_requires_shadow_not_assumed.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "paired_condvar_dark_init_no_crate_hash_ice.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "return_if_value_union_arms_no_ice.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "s1_div_by_zero_not_minted.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "s1_false_postcondition_refutation_immune.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "s1c_arith_ensures_no_false_pass.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "s1c_arith_true_ensures_proves.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "s1c_body_bound_bool_identity_receipt.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "s1c_body_bound_ge_refl.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "s1c_body_bound_gt_refl_refuted.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "s1c_branch_abs_proves.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "s1c_branch_false_ensures_refuted.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "s1c_int_open_never_failed.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "s1c_requires_bearing_stays_closed.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "scalar_safety_flawed.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "scalar_safety_good.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "sealed_dyn_probe.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "static_byte_table_ref_no_ice.rs": {
+  "ice": false,
+  "rc": 101
+ },
+ "thir_opaque_result_layout_no_cycle.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "thir_param_projection_normalize_no_ice.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "trust_ir_lower_rpit_no_cycle.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "trust_sealed_dyn_summary.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "trust_skip_attribute.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "twp29_arith_free_bare_claim_unchanged.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "twp29_bare_add_never_proved.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "twp29_bare_sub_never_proved.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "typed_citation_domain.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "typed_citation_domain_mismatch.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "typed_citation_result_scope.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "verifier_budget_termination.rs": {
+  "ice": false,
+  "rc": 1
+ }
+}

@@ -1,0 +1,10 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+helper1	FULLY_FAITHFUL	true	true	true	true	true	false	true
+helper2	FULLY_FAITHFUL	true	true	true	true	true	false	true
+helper_req	FULLY_FAITHFUL	true	true	true	true	true	false	true
+pick	FULLY_FAITHFUL	true	true	false	false	false	false	true
+pick_bad_arg	SHAPE_GAP	false	false	false	false	false	false	false
+pick_established	FULLY_FAITHFUL	true	true	false	false	false	false	true
+pick_mixed	FULLY_FAITHFUL	true	true	false	false	false	false	true
+pick_partial_establish	SHAPE_GAP	false	false	false	false	false	false	false
+pick_uncertified	SHAPE_GAP	false	false	false	false	false	false	false

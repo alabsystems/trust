@@ -1,0 +1,131 @@
+{
+  "name": "checked",
+  "def_path": "crate::checked",
+  "span": {
+    "file": "",
+    "line_start": 0,
+    "col_start": 0,
+    "line_end": 0,
+    "col_end": 0
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "_0"
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "a"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "b"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "",
+                "line_start": 0,
+                "col_start": 0,
+                "line_end": 0,
+                "col_end": 0
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Not": {
+        "Eq": [
+          {
+            "Var": [
+              "b",
+              "Int"
+            ]
+          },
+          {
+            "Int": 0
+          }
+        ]
+      }
+    },
+    {
+      "Not": {
+        "Eq": [
+          {
+            "Var": [
+              "a",
+              "Int"
+            ]
+          },
+          {
+            "Int": -2147483648
+          }
+        ]
+      }
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

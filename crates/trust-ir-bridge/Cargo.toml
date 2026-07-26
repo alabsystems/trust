@@ -1,0 +1,63 @@
+# trust-ir-bridge: Bridge between trust-types VerifiableFunction and TrustIr
+#
+# Pure translation layer from trust MIR model (VerifiableFunction) to the
+# TrustIr universal intermediate representation used by the solver tool chain.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-ir-bridge"
+description = "Bridge between trust-types VerifiableFunction and TrustIr IR"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+# FUSION (clean/designs/2026-06-20-fusion-obligation-as-clean-expr): forward the
+# `clean-expr` feature down to trust-ir so the lowering site can stamp the on-node
+# `ProofAnnotation::Goal(Box<ExprObligation>)` (a `clean_kernel::Expr` born from
+# the node's own fields) alongside the cheap safety marker. Off by default so the
+# production bridge link closure is unchanged (no clean-kernel dep); only typed-
+# proof producers opt in. Acyclic: the new edge is trust-ir --> clean-kernel.
+clean-expr = ["trust-ir/clean-expr"]
+# Compiler-only opaque paired-condvar authority. Off by default so the bridge
+# remains a stable, rustc-private-free translation crate. This edge is acyclic:
+# trust-mir-extract -> trust-vcgen, whose trust-router edge is dev-only.
+compiler-context = ["dep:trust-mir-extract"]
+
+[dependencies]
+# Pure translation layer over trust-types data structures; no use of the
+# `Discharge` `?`-sugar. Depend with default-features = false so we do NOT
+# transitively re-enable trust-types' nightly `try-sugar` feature, keeping
+# trust-ir-bridge buildable on the stable release channel (so the `clean`
+# workspace can consume the real lowering path). See trust-vcgen/Cargo.toml
+# for the same rationale.
+trust-types = { path = "../trust-types", default-features = false }
+trust-verifier-api = { workspace = true }
+# `binary` is a pure cfg-gate (`binary = []`, no deps) enabling the ratified
+# stable serializer behind `Module::stable_digest` — the canonical content-hash
+# `cache_key::module_stable_content_hash` exposes for verification caching.
+trust-ir = { workspace = true, features = ["serde", "binary"] }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+trust-mir-extract = { path = "../trust-mir-extract", optional = true }
+
+[dev-dependencies]
+trust-ir = { workspace = true, features = ["binary", "fmt", "parser", "serde"] }
+trust-ir-build = { path = "../../first-party/trust-ir/crates/trust-ir-build" }
+# Trust-IR spine (dimension B, verification-verdict parity): the parity oracle
+# in `src/parity.rs` runs the trust-types VC path (`trust_vcgen::generate_vcs`)
+# over the SAME VerifiableFunction inputs it lowers to trust-ir, then asserts
+# the trust-ir obligation summary covers every trust-vcgen safety VcKind (via
+# the documented coarse PanicFreedom mapping — item T1). This is a DEV-only
+# dependency so the production bridge crate's link closure is unchanged; it is
+# cycle-free because trust-vcgen's normal-dependency closure does not reach
+# trust-ir-bridge (its only path is via the dev-dep on trust-router).
+trust-vcgen = { workspace = true }

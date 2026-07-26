@@ -1,0 +1,44 @@
+---
+source: src/core/builder/cli_paths/tests.rs
+expression: doc
+---
+[Doc] doc::UnstableBook
+    targets: [aarch64-unknown-linux-gnu]
+    - Set({doc::src/doc/unstable-book})
+[Doc] doc::UnstableBookGen
+    targets: [x86_64-unknown-linux-gnu]
+    - Set({doc::src/tools/unstable-book-gen})
+[Doc] doc::Standalone
+    targets: [aarch64-unknown-linux-gnu]
+    - Set({doc::src/doc})
+    - Set({doc::standalone})
+[Doc] doc::Std
+    targets: [aarch64-unknown-linux-gnu]
+    - Set({doc::library})
+    - Set({doc::library/alloc})
+    - Set({doc::library/compiler-builtins/compiler-builtins})
+    - Set({doc::library/core})
+    - Set({doc::library/panic_abort})
+    - Set({doc::library/panic_unwind})
+    - Set({doc::library/proc_macro})
+    - Set({doc::library/rustc-std-workspace-core})
+    - Set({doc::library/std})
+    - Set({doc::library/std_detect})
+    - Set({doc::library/sysroot})
+    - Set({doc::library/test})
+    - Set({doc::library/unwind})
+[Doc] doc::ErrorIndex
+    targets: [x86_64-unknown-linux-gnu]
+    - Set({doc::src/tools/error_index_generator})
+[Doc] doc::RustdocBook
+    targets: [aarch64-unknown-linux-gnu]
+    - Set({doc::src/doc/rustdoc})
+[Doc] doc::RustcBook
+    targets: [x86_64-unknown-linux-gnu]
+    - Set({doc::src/doc/rustc})
+[Doc] doc::CargoBook
+    targets: [aarch64-unknown-linux-gnu]
+    - Set({doc::src/tools/targo/src/doc})
+[Doc] doc::ClippyBook
+    targets: [aarch64-unknown-linux-gnu]
+    - Set({doc::src/tools/tippy/book})

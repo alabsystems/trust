@@ -1,0 +1,215 @@
+# Structured upstream Rust compatibility divergence audit.
+#
+# This file separates accepted upstream-test divergences from blockers and
+# Trust-added proof debt. It does not make any gate pass. Release evidence must
+# still come from `targo trust domination upstream-tests` on the reviewed
+# commit with zero unaccounted failures.
+
+schema_version = "0.1.0"
+# Trust: re-reviewed 2026-07-24 — category-blocker decomposition per the PR
+# rule (category-level blockers are not a hiding place; break them into
+# per-test entries first). The two categories whose most recent executed
+# evidence names concrete tests — ui-diagnostic-drift (2 tests) and
+# stage-sysroot-skew (71 tests), both from the 2026-07-12 executed domination
+# run exec-c30dc44143 (reports/evidence-2026-07-11/execution/
+# failures-extract.json) — are decomposed into per-test rows in
+# tests/upstream-rust/test-exceptions.toml and their category rows retired.
+# rustdoc-linkcheck-drift and run-make-trust-defaults CANNOT yet be
+# decomposed: no current artifact names a concrete failing test for either
+# (the 2026-07-12 extract has zero rustdoc/run-make test rows), so both stay
+# category blockers marked EVIDENCE-REQUIRED pending a fresh strict stage2
+# lane. The six trust-added debt rows are retired as stale bookkeeping: their
+# backing ledger tests/trust-added/compiletest-exceptions.toml has ZERO
+# entries; the counts froze the 2026-05-01 75-entry census. This is review
+# bookkeeping, not compatibility acceptance.
+reviewed_on = "2026-07-24"
+owner = "@trust-release"
+
+# Resolved 2026-07-12 via the upstream crash-test retirement process:
+# tests/crashes/135122.rs deleted locally and replaced by the blessed
+# regression test tests/ui/implied-bounds/ice-implied-outlives-bounds-135122.rs
+# asserting the non-ICE diagnostics. Exception
+# test-exc.crashes.135122.no-ice is status = "resolved"; adopted-fix rationale
+# in tests/upstream-rust/upstream-fixes.toml
+# (fix.trait_solver.implied_outlives_bounds_infer_ice_135122).
+[[items]]
+id = "upstream.accepted.crashes.135122.no-ice"
+scope = "upstream-rust"
+status = "resolved"
+ledger = "tests/upstream-rust/test-exceptions.toml#test-exc.crashes.135122.no-ice"
+suite = "crashes"
+path = "tests/crashes/135122.rs"
+reason = "Retired: Trust emits ordinary diagnostics where upstream ICEs (rust-lang/rust#135122); the crashes entry is deleted and replaced by a ui regression test per the upstream-sanctioned de-ICE process."
+compatibility_impact = "No successful Rust program is rejected or miscompiled; the upstream crash-regression expectation is retired in favor of a fixed-behavior regression test."
+required_action = "None; drop this row if upstream deletes its crashes entry once the next-solver fix lands."
+expires_on = "2026-07-28"
+
+# Decomposed 2026-07-24 per the PR rule: the most recent executed domination
+# run (2026-07-12, exec-c30dc44143) recorded exactly two ui failures in this
+# category — tests/ui/linking/macos-ignoring-duplicate.rs and
+# tests/ui/linking/macos-search-path.rs — now ledgered per-test as
+# test-exc.linking.*.strict-exec-drift in
+# tests/upstream-rust/test-exceptions.toml (expire 2026-08-21).
+[[items]]
+id = "upstream.blocker.ui-diagnostic-drift"
+scope = "upstream-rust"
+status = "decomposed_to_per_test"
+ledger = "tests/upstream-rust/test-exceptions.toml#test-exc.linking.macos-ignoring-duplicate.strict-exec-drift"
+suite = "ui"
+path = "tests/ui/**"
+reason = "Retired as a category-level blocker per the PR rule (break category blockers into per-test entries): the 2026-07-12 executed domination run exec-c30dc44143 recorded exactly two tests/ui failures in this category (tests/ui/linking/macos-ignoring-duplicate.rs, tests/ui/linking/macos-search-path.rs), both now per-test rows in tests/upstream-rust/test-exceptions.toml. The former backing row was separately resolved to the audited porter model (accepted_narrow_divergence) with the vanilla tests/ui lane green (21159 passed / 0 failed / 606 ignored, reviewed 2026-07-11)."
+compatibility_impact = "Bounded to the two ledgered per-test rows until a fresh strict executed run reclassifies them; no category-wide unknown remains recorded."
+required_action = "Confirm or retire the two per-test rows on the next strict stage2 executed run (their waivers expire 2026-08-21)."
+expires_on = "2026-08-21"
+
+[[items]]
+id = "upstream.blocker.crash-status-drift"
+scope = "upstream-rust"
+status = "resolved"
+ledger = "tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.crash-status-drift"
+suite = "crashes"
+path = "tests/crashes/**"
+reason = "Resolved: the 2026-07-11 evidence inventory contained exactly one crash-status row, tests/crashes/135122.rs; e7aaf75872 retired it through the upstream de-ICE process and replaced it with a blessed non-ICE UI regression."
+compatibility_impact = "No remaining recorded crash-status divergence; ordinary diagnostics replace the former ICE expectation."
+required_action = "None; retain the replacement UI regression and adopted-fix record."
+expires_on = "2026-09-30"
+
+[[items]]
+id = "upstream.blocker.codegen-filecheck-drift"
+scope = "upstream-rust"
+status = "resolved"
+ledger = "tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.codegen-filecheck-drift"
+suite = "codegen-llvm"
+path = "tests/codegen-llvm/**"
+reason = "Resolved: c2c4747b8b implemented the i386 SysV small-struct return ABI; rustc_codegen_ssa already implements the foreign-unwind volatile anchor and intermediate landing pad; 863f86b2e8 corrected that regression's FileCheck line. A fresh exact stage2 run on cb246323ca passed all three revisions across both tests."
+compatibility_impact = "No remaining recorded codegen divergence; focused regressions cover both implementations."
+required_action = "None; retain both focused codegen regressions."
+expires_on = "2026-09-30"
+
+# Decomposed 2026-07-24 per the PR rule: the 2026-07-12 executed domination
+# run (exec-c30dc44143) recorded exactly 71 failing tests in this category —
+# every tests/ui-fulldeps/** row in its failure extract, all one root cause
+# (incoherent rustc-private sysroot: E0463/E0460) — now ledgered per-test as
+# the 71 test-exc.ui-fulldeps.*.sysroot-skew rows in
+# tests/upstream-rust/test-exceptions.toml (expire 2026-08-21). The harness
+# root cause stays recorded in the still-ACTIVE backing row
+# tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07
+# .stage-sysroot-skew, whose 2026-07-11 note also attributes the run's
+# rustdoc/parser rustc_private tool-build failures to the same skew (the run
+# additionally recorded one trust-router cargo-compile failure row).
+[[items]]
+id = "upstream.blocker.stage-sysroot-skew"
+scope = "upstream-rust"
+status = "decomposed_to_per_test"
+ledger = "tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
+suite = "tool"
+path = "src/tools/**"
+reason = "Retired as a category-level blocker per the PR rule: the 2026-07-12 executed domination run exec-c30dc44143 recorded exactly 71 failing tests in this category, all tests/ui-fulldeps/** rustc-private failures (E0463/E0460 from the incoherently assembled dylib-only rustc-private sysroot), now ledgered as 71 per-test rows in tests/upstream-rust/test-exceptions.toml. Harness/bootstrap root cause, not a trustc compiler regression; the fix obligation remains on the active backing divergences.toml row."
+compatibility_impact = "Harness validity risk bounded to the 71 ledgered per-test rows plus the backing row's tool-build failures; not proof of public Trust semantic divergence."
+required_action = "Fix prepare_rustc_private_sysroot to assemble a coherent stage2 rustc-private sysroot, then retire the 71 per-test rows on a fresh green fulldeps lane (waivers expire 2026-08-21)."
+expires_on = "2026-08-21"
+
+[[items]]
+id = "upstream.blocker.rustdoc-linkcheck-drift"
+scope = "upstream-rust"
+status = "blocker"
+ledger = "tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.rustdoc-linkcheck-drift"
+suite = "rustdoc"
+path = "tests/rustdoc*/**"
+reason = "rustdoc UI/output/linkcheck results differ in the strict compatibility lane. Backing row re-audited 2026-07-23: intervening branded expectations and compiler features are not a targeted root-cause fix, reviewed complete wording patch set, or fresh strict stage2 pass. EVIDENCE-REQUIRED (2026-07-24 decomposition review): this category CANNOT be broken into per-test entries — no current artifact names a concrete failing rustdoc test; the 2026-07-12 executed run's failure extract contains zero rustdoc test rows (its two rustdoc tool-build failures are attributed by the backing row to the rustc-private sysroot skew, not linkcheck drift). A fresh strict stage2 rustdoc/linkcheck lane must produce named failures before decomposition or retirement."
+compatibility_impact = "Public documentation behavior may differ; not accepted without reviewed Trust-owned wording patches."
+required_action = "Fix rustdoc/linkcheck behavior or encode reviewed Trust-owned wording changes in tests/upstream-rust/patches.toml."
+expires_on = "2026-08-06"
+
+[[items]]
+id = "upstream.blocker.run-make-trust-defaults"
+scope = "upstream-rust"
+status = "blocker"
+ledger = "tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.run-make-trust-defaults"
+suite = "run-make"
+path = "tests/run-make/**"
+reason = "run-make tests may expose Trust naming/default-verification differences. Backing row re-audited 2026-07-23: the focused certified-monitor run-make gate is green, but no fresh vanilla-mode full run-make pass proves the inherited lane clean after substantial launch/default churn. EVIDENCE-REQUIRED (2026-07-24 decomposition review): this category CANNOT be broken into per-test entries — no current artifact names a concrete failing run-make test; the 2026-07-12 executed run's failure extract contains zero run-make rows. A fresh vanilla-mode full run-make lane must produce named failures before decomposition or retirement."
+compatibility_impact = "Trust-owned naming differences may be expected-output patches; verification leakage into vanilla upstream compatibility is a real blocker."
+required_action = "Keep vanilla upstream compatibility on no-verification semantics and patch only reviewed Trust-owned output naming."
+expires_on = "2026-08-06"
+
+# RETIRED 2026-07-24 (all six trust-added.debt.* rows): stale bookkeeping.
+# Each row cited tests/trust-added/compiletest-exceptions.toml as its backing
+# ledger, but that ledger now contains ZERO entries (verified 2026-07-24).
+# The counts (3/63/5/2/1/1 = 75) froze the ledger's original 2026-05-01
+# 75-entry census by kind and were never updated. The ledger's own retirement
+# notes record the clearing: 22 entries retired 2026-07-02 (ui-parity
+# campaign, reports/ui-vanilla-rootcause-2026-07-01.md), 7 of 9 cleared in
+# c2c4747b8b, the last 2 mir-opt seeds re-categorized in 615070915d and then
+# resolved by implementing the asserted transforms (f2c01e5db0 rust-lang
+# #110737, e6021fecfd rust-lang#123305 — "the compiletest-exceptions ledger
+# is now EMPTY"). Retiring these census rows is NOT a fresh all-green audit
+# claim: any new trust-added audit failure re-enters via a fresh
+# tests/trust-added/compiletest-exceptions.toml entry, never by resurrecting
+# this census.
+
+[[items]]
+id = "trust-added.debt.missing-blessed-output"
+scope = "trust-added"
+status = "resolved"
+ledger = "tests/trust-added/compiletest-exceptions.toml"
+count = 3
+reason = "Retired 2026-07-24: the backing ledger has zero entries; no missing-blessed-output row remains of the 2026-05-01 census (the final two were re-categorized as pending-compiler-behavior in 615070915d, then resolved by implementing the asserted mir-opt transforms in f2c01e5db0 and e6021fecfd)."
+compatibility_impact = "None recorded; the empty backing ledger is the accounting of record."
+required_action = "None; a new trust-added audit failure re-enters via a fresh compiletest-exceptions.toml entry."
+expires_on = "2026-07-30"
+
+[[items]]
+id = "trust-added.debt.pending-compiler-behavior"
+scope = "trust-added"
+status = "resolved"
+ledger = "tests/trust-added/compiletest-exceptions.toml"
+count = 63
+reason = "Retired 2026-07-24: the backing ledger has zero entries; the 63 pending-compiler-behavior rows of the 2026-05-01 census were progressively fixed or honestly converted per the ledger's own retirement notes (22 retired 2026-07-02 ui-parity campaign; 7 of 9 cleared in c2c4747b8b; final mir-opt seeds implemented in f2c01e5db0 and e6021fecfd)."
+compatibility_impact = "None recorded; the empty backing ledger is the accounting of record."
+required_action = "None; a new trust-added audit failure re-enters via a fresh compiletest-exceptions.toml entry."
+expires_on = "2026-07-30"
+
+[[items]]
+id = "trust-added.debt.diagnostic-drift"
+scope = "trust-added"
+status = "resolved"
+ledger = "tests/trust-added/compiletest-exceptions.toml"
+count = 5
+reason = "Retired 2026-07-24: the backing ledger has zero entries; no diagnostic-drift row remains of the 2026-05-01 census."
+compatibility_impact = "None recorded; the empty backing ledger is the accounting of record."
+required_action = "None; a new trust-added audit failure re-enters via a fresh compiletest-exceptions.toml entry."
+expires_on = "2026-07-30"
+
+[[items]]
+id = "trust-added.debt.compiler-ice"
+scope = "trust-added"
+status = "resolved"
+ledger = "tests/trust-added/compiletest-exceptions.toml"
+count = 2
+reason = "Retired 2026-07-24: the backing ledger has zero entries; no compiler-ice row remains of the 2026-05-01 census."
+compatibility_impact = "None recorded; the empty backing ledger is the accounting of record."
+required_action = "None; a new trust-added audit failure re-enters via a fresh compiletest-exceptions.toml entry."
+expires_on = "2026-07-30"
+
+[[items]]
+id = "trust-added.debt.runtime-regression"
+scope = "trust-added"
+status = "resolved"
+ledger = "tests/trust-added/compiletest-exceptions.toml"
+count = 1
+reason = "Retired 2026-07-24: the backing ledger has zero entries; no runtime-regression row remains of the 2026-05-01 census."
+compatibility_impact = "None recorded; the empty backing ledger is the accounting of record."
+required_action = "None; a new trust-added audit failure re-enters via a fresh compiletest-exceptions.toml entry."
+expires_on = "2026-07-30"
+
+[[items]]
+id = "trust-added.debt.environment-or-dependency-gap"
+scope = "trust-added"
+status = "resolved"
+ledger = "tests/trust-added/compiletest-exceptions.toml"
+count = 1
+reason = "Retired 2026-07-24: the backing ledger has zero entries; no environment-or-dependency-gap row remains of the 2026-05-01 census."
+compatibility_impact = "None recorded; the empty backing ledger is the accounting of record."
+required_action = "None; a new trust-added audit failure re-enters via a fresh compiletest-exceptions.toml entry."
+expires_on = "2026-07-30"

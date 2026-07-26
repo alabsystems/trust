@@ -1,0 +1,50 @@
+# trust-thir-lower: lower source (THIR) DIRECTLY to trust-ir (the hub).
+#
+# THIR -> trust_ir::Module is the PRIMARY structural lowering (P1). trust-ir is the hub for native
+# codegen (trust-cg) and the LLVM-compat MIR shim (trust-ir -> MIR). Direct verification/CIC
+# authority remains gated until source contracts and obligations are bound to direct SSA values;
+# the retained MIR-compatibility bundle is proof-authoritative in the meantime. See
+# docs/DESIGN-P1-ir-inversion.md.
+#
+# `VerifiableFunction` / MIR are DERIVED views: trust-mir-extract + trust-ir-bridge are pulled in
+# only to produce the MIR-side trust-ir *oracle* the differential gate checks against.
+#
+# Requires rustc_private — built ONLY via `x.py build --stage 2` (mirrors trust-mir-extract).
+# Author: Andrew Yates <andrewyates.name@gmail.com> | Copyright 2026 | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-thir-lower"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# The DIRECT lowering target — trust-ir is the hub.
+# Trust: `binary` (zero-dep binary codec) + `fmt` (canonical text form) power `crate_module`'s
+# `-Ztrust-dump=ir:` artifact emission; both features are dependency-free (`binary = []`, `fmt = []`),
+# so this adds no crate edge and no Cargo.lock delta.
+trust-ir = { path = "../../first-party/trust-ir/crates/trust-ir", features = ["binary", "fmt"] }
+# Differential oracle only: MIR -> VerifiableFunction -> trust_ir Module (the retained
+# proof-authoritative compatibility path, using faithful scalar spellings for parity).
+trust-mir-extract = { path = "../trust-mir-extract" }
+trust-ir-bridge = { path = "../trust-ir-bridge" }
+# Trust: P1.2 slice 1 — the derived-vs-built MIR comparator canonicalizes the
+# trust-mir-extract VerifiableBody (trust-types) of BOTH bodies.
+trust-types = { path = "../trust-types" }
+trust-os = { workspace = true }
+# Trust: rustc crates for THIR access (resolved by the bootstrap build).
+rustc_abi = { path = "../../compiler/rustc_abi" }
+rustc_ast = { path = "../../compiler/rustc_ast" }
+rustc_ast_ir = { path = "../../compiler/rustc_ast_ir" }
+rustc_data_structures = { path = "../../compiler/rustc_data_structures" }
+rustc_hir = { path = "../../compiler/rustc_hir" }
+rustc_index = { path = "../../compiler/rustc_index" }
+rustc_middle = { path = "../../compiler/rustc_middle" }
+# Trust: P1 item 5 (the flip) — flip_registry names `rustc_session::config::DebugInfo` for the
+# session-level flip gates.
+rustc_session = { path = "../../compiler/rustc_session" }
+rustc_span = { path = "../../compiler/rustc_span" }

@@ -1,0 +1,7 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+<i32 as core::cmp::Ord>::max	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<i32 as core::cmp::Ord>::min	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<u8 as core::cmp::Ord>::max	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<u8 as core::cmp::Ord>::min	FULLY_FAITHFUL	true	true	false	false	false	false	true
+core::cmp::max::<i32>	FULLY_FAITHFUL	true	true	true	true	true	false	true
+core::cmp::min::<i32>	FULLY_FAITHFUL	true	true	true	true	true	false	true

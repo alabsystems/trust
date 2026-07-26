@@ -1,0 +1,8 @@
+---
+source: src/core/builder/cli_paths/tests.rs
+expression: dist rustc
+---
+[Dist] dist::Rustc
+    targets: [x86_64-unknown-linux-gnu]
+    - Set({dist::compiler/rustc})
+    - Set({dist::rustc})

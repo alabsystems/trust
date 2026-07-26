@@ -1,0 +1,539 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+<<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ExprKind>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__Field as level::_::_serde::Deserialize<'de>>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+<<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ExprKind>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ExprKind>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_bytes	SHAPE_GAP	false	false	false	false	false	false	false
+<<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ExprKind>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_str	SHAPE_GAP	false	false	false	false	false	false	false
+<<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ExprKind>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_u64	SHAPE_GAP	false	false	false	false	false	false	false
+<<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ExprKind>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ExprKind>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_map	SHAPE_GAP	false	false	false	false	false	false	false
+<<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ExprKind>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_seq	SHAPE_GAP	false	false	false	false	false	false	false
+<<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ZFCSetExpr>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__Field as level::_::_serde::Deserialize<'de>>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+<<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ZFCSetExpr>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ZFCSetExpr>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_bytes	SHAPE_GAP	false	false	false	false	false	false	false
+<<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ZFCSetExpr>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_str	SHAPE_GAP	false	false	false	false	false	false	false
+<<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ZFCSetExpr>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_u64	SHAPE_GAP	false	false	false	false	false	false	false
+<<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ZFCSetExpr>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ZFCSetExpr>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_map	SHAPE_GAP	false	false	false	false	false	false	false
+<<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ZFCSetExpr>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_seq	SHAPE_GAP	false	false	false	false	false	false	false
+<<level::_::<impl level::_::_serde::Deserialize<'de> for level::Level>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<<level::_::<impl level::_::_serde::Deserialize<'de> for level::Level>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_seq	SHAPE_GAP	false	false	false	false	false	false	false
+<<name::_::<impl level::_::_serde::Deserialize<'de> for name::NameInner>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<<name::_::<impl level::_::_serde::Deserialize<'de> for name::NameInner>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_seq	SHAPE_GAP	false	false	false	false	false	false	false
+expr::meta::mix_hash	SHAPE_GAP	false	false	false	false	false	false	false
+expr::meta::ExprMeta::pack	SHAPE_GAP	false	false	false	false	false	false	false
+expr::Expr::meta	SHAPE_GAP	false	false	false	false	false	false	false
+expr::meta::ExprMeta::approx_depth	SHAPE_GAP	false	false	false	false	false	false	false
+expr::meta::ExprMeta::hash	SHAPE_GAP	false	false	false	false	false	false	false
+expr::meta::ExprMeta::loose_bvar_range	FULLY_FAITHFUL	true	true	true	true	true	false	true
+expr::meta::ExprMeta::has_fvar	FULLY_FAITHFUL	true	true	true	true	true	false	true
+expr::meta::ExprMeta::has_expr_mvar	FULLY_FAITHFUL	true	true	true	true	true	false	true
+expr::meta::ExprMeta::has_level_mvar	FULLY_FAITHFUL	true	true	true	true	true	false	true
+expr::meta::ExprMeta::has_level_param	FULLY_FAITHFUL	true	true	true	true	true	false	true
+expr::meta::ExprMeta::mk_wrapper_meta	SHAPE_GAP	false	false	false	false	false	false	false
+expr::kind::zfc_set_expr_meta	SHAPE_GAP	false	false	false	false	false	false	false
+expr::meta::level_has_mvar	FULLY_FAITHFUL	true	true	false	false	false	false	true
+level::Level::has_params	SHAPE_GAP	false	false	false	false	false	false	false
+expr::meta::ExprMeta::mk_app_meta	SHAPE_GAP	false	false	false	false	false	false	false
+expr::meta::ExprMeta::mk_binder_meta	SHAPE_GAP	false	false	false	false	false	false	false
+expr::meta::ExprMeta::mk_let_meta	SHAPE_GAP	false	false	false	false	false	false	false
+expr::kind::ExprKind::compute_meta	SHAPE_GAP	false	false	false	false	false	false	false
+expr::Expr::from_kind	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::Expr as level::_::_serde::Deserialize<'de>>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::Expr as level::_::_serde::Serialize>::serialize	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::ZFCSetExpr as std::clone::Clone>::clone	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::ExprKind as std::clone::Clone>::clone	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::Expr as std::clone::Clone>::clone	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::Expr as std::convert::From<expr::kind::ExprKind>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::Expr as std::fmt::Debug>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::ExprKind as std::fmt::Debug>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::Expr as std::fmt::Debug>::fmt::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::Expr as std::hash::Hash>::hash	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::Expr as std::ops::Deref>::deref	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::ExprKind as std::hash::Hash>::hash	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::ZFCSetExpr as std::fmt::Debug>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::ZFCSetExpr as std::hash::Hash>::hash	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ExprKind>::deserialize::__Field as level::_::_serde::Deserialize<'de>>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ExprKind>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ExprKind>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_bytes	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ExprKind>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_str	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ExprKind>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_u64	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ExprKind>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ExprKind>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ZFCSetExpr>::deserialize::__Field as level::_::_serde::Deserialize<'de>>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ZFCSetExpr>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ZFCSetExpr>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_bytes	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ZFCSetExpr>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_str	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ZFCSetExpr>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_u64	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ZFCSetExpr>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ZFCSetExpr>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::meta::ExprMeta as std::cmp::PartialEq>::eq	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<expr::meta::ExprMeta as std::hash::Hash>::hash	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::meta::_::<impl level::_::_serde::Deserialize<'de> for expr::meta::ExprMeta>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::meta::_::<impl level::_::_serde::Deserialize<'de> for expr::meta::ExprMeta>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_newtype_struct	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::meta::_::<impl level::_::_serde::Deserialize<'de> for expr::meta::ExprMeta>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_seq	SHAPE_GAP	false	false	false	false	false	false	false
+expr::checked_add_u32	SHAPE_GAP	false	false	false	false	false	false	false
+expr::Expr::has_fvar_quick	FULLY_FAITHFUL	true	true	true	true	true	false	true
+expr::Expr::loose_bvar_range	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<expr::subst::Abstractor as expr::visitor::opt::ExprFolderOpt>::should_descend	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<expr::subst::Abstractor as expr::visitor::opt::ExprFolderOpt>::fold_expr_opt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::Abstractor as expr::visitor::opt::ExprFolderOpt>::fold_binder_body_opt	SHAPE_GAP	false	false	false	false	false	false	false
+expr::kind::ek	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::Abstractor as expr::visitor::opt::ExprFolderOpt>::fold_bvar_opt	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<expr::subst::Abstractor as expr::visitor::opt::ExprFolderOpt>::fold_expr_opt::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::Abstractor as expr::visitor::opt::ExprFolderOpt>::fold_fvar_opt	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<expr::subst::FVarSubst<'_> as expr::visitor::opt::ExprFolderOpt>::should_descend	FULLY_FAITHFUL	true	true	true	true	true	false	true
+expr::subst::FoldMemo::get	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::FoldMemo::put	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<expr::subst::FVarSubst<'_> as expr::visitor::opt::ExprFolderOpt>::fold_expr_opt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::FVarSubst<'_> as expr::visitor::opt::ExprFolderOpt>::fold_expr_opt::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::FVarSubst<'_> as expr::visitor::opt::ExprFolderOpt>::fold_fvar_opt	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<expr::subst::Instantiator<'_> as expr::visitor::opt::ExprFolderOpt>::should_descend	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<expr::subst::Instantiator<'_> as expr::visitor::opt::ExprFolderOpt>::fold_expr_opt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::Instantiator<'_> as expr::visitor::opt::ExprFolderOpt>::fold_binder_body_opt	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::lift_at	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::bvar	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::Instantiator<'_> as expr::visitor::opt::ExprFolderOpt>::fold_bvar_opt	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<expr::subst::Instantiator<'_> as expr::visitor::opt::ExprFolderOpt>::fold_expr_opt::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::LevelParamSubst<'_> as expr::visitor::opt::ExprFolderOpt>::fold_const_opt	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_map	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::LevelParamSubst<'_> as expr::visitor::opt::ExprFolderOpt>::fold_const_opt::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::Expr::has_level_param_quick	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<expr::subst::LevelParamSubst<'_> as expr::visitor::opt::ExprFolderOpt>::should_descend	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<expr::subst::LevelParamSubst<'_> as expr::visitor::opt::ExprFolderOpt>::fold_expr_opt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::LevelParamSubst<'_> as expr::visitor::opt::ExprFolderOpt>::fold_expr_opt::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+<level::Level as std::cmp::PartialEq>::eq	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::LevelParamSubst<'_> as expr::visitor::opt::ExprFolderOpt>::fold_sort_opt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::LevelParamSubstSlice<'_> as expr::visitor::opt::ExprFolderOpt>::fold_const_opt	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_slice	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::LevelParamSubstSlice<'_> as expr::visitor::opt::ExprFolderOpt>::fold_const_opt::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::LevelParamSubstSlice<'_> as expr::visitor::opt::ExprFolderOpt>::should_descend	FULLY_FAITHFUL	true	true	true	true	true	false	true
+<expr::subst::LevelParamSubstSlice<'_> as expr::visitor::opt::ExprFolderOpt>::fold_expr_opt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::LevelParamSubstSlice<'_> as expr::visitor::opt::ExprFolderOpt>::fold_expr_opt::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::LevelParamSubstSlice<'_> as expr::visitor::opt::ExprFolderOpt>::fold_sort_opt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::Lifter as expr::visitor::opt::ExprFolderOpt>::should_descend	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<expr::subst::Lifter as expr::visitor::opt::ExprFolderOpt>::fold_expr_opt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::Lifter as expr::visitor::opt::ExprFolderOpt>::fold_binder_body_opt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::Lifter as expr::visitor::opt::ExprFolderOpt>::fold_bvar_opt	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<expr::subst::Lifter as expr::visitor::opt::ExprFolderOpt>::fold_expr_opt::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::Lowerer as expr::visitor::opt::ExprFolderOpt>::should_descend	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<expr::subst::Lowerer as expr::visitor::opt::ExprFolderOpt>::fold_expr_opt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::Lowerer as expr::visitor::opt::ExprFolderOpt>::fold_binder_body_opt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::Lowerer as expr::visitor::opt::ExprFolderOpt>::fold_bvar_opt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::Lowerer as expr::visitor::opt::ExprFolderOpt>::fold_expr_opt::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::MultiInstantiator<'_> as expr::visitor::opt::ExprFolderOpt>::should_descend	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<expr::subst::MultiInstantiator<'_> as expr::visitor::opt::ExprFolderOpt>::fold_expr_opt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::MultiInstantiator<'_> as expr::visitor::opt::ExprFolderOpt>::fold_binder_body_opt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::MultiInstantiator<'_> as expr::visitor::opt::ExprFolderOpt>::fold_bvar_opt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::subst::MultiInstantiator<'_> as expr::visitor::opt::ExprFolderOpt>::fold_expr_opt::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::AppArgsIter<'a> as std::fmt::Debug>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::AppArgsIter<'a> as std::iter::Iterator>::next	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::AppArgsIter<'a> as std::iter::Iterator>::size_hint	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::BigNat as std::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::BigNat::limbs	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::BigNat as std::cmp::Ord>::cmp	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::BigNat as std::cmp::PartialOrd>::partial_cmp	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::BigNat as std::convert::From<u64>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::BigNat as std::default::Default>::default	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::BigNat as std::fmt::Display>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::BinderData as std::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::BinderData as std::convert::From<expr::types::BinderInfo>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::BinderInfo as std::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::FVarId as std::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::Literal as std::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::MDataValue as std::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::MDataValue as std::cmp::PartialEq>::eq	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::MDataValue as std::hash::Hash>::hash	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::Multiplicity as std::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BigNat>::deserialize::__Field as level::_::_serde::Deserialize<'de>>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BigNat>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BigNat>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_bytes	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BigNat>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_str	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BigNat>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_u64	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BigNat>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BigNat>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BinderData>::deserialize::__Field as level::_::_serde::Deserialize<'de>>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BinderData>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BinderData>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_bytes	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BinderData>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_str	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BinderData>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_u64	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BinderData>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BinderData>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_map	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BinderData>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_seq	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BinderInfo>::deserialize::__Field as level::_::_serde::Deserialize<'de>>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BinderInfo>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BinderInfo>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_bytes	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BinderInfo>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_str	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BinderInfo>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_u64	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BinderInfo>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BinderInfo>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::FVarId>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::FVarId>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_newtype_struct	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::FVarId>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_seq	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::Literal>::deserialize::__Field as level::_::_serde::Deserialize<'de>>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::Literal>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::Literal>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_bytes	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::Literal>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_str	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::Literal>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_u64	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::Literal>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::Literal>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::MDataValue>::deserialize::__Field as level::_::_serde::Deserialize<'de>>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::MDataValue>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::MDataValue>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_bytes	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::MDataValue>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_str	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::MDataValue>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_u64	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::MDataValue>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::MDataValue>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::Multiplicity>::deserialize::__Field as level::_::_serde::Deserialize<'de>>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::Multiplicity>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::Multiplicity>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_bytes	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::Multiplicity>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_str	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::Multiplicity>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_u64	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::Multiplicity>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::Multiplicity>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum	SHAPE_GAP	false	false	false	false	false	false	false
+<level::Level as std::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+<level::Level as std::fmt::Display>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_zero	FULLY_FAITHFUL	true	true	false	false	false	false	true
+level::Level::fmt_impl	SHAPE_GAP	false	false	false	false	false	false	false
+<level::Level as std::fmt::Display>::fmt::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+<level::Level as std::hash::Hash>::hash	SHAPE_GAP	false	false	false	false	false	false	false
+<level::_::<impl level::_::_serde::Deserialize<'de> for level::Level>::deserialize::__Field as level::_::_serde::Deserialize<'de>>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+<level::_::<impl level::_::_serde::Deserialize<'de> for level::Level>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<level::_::<impl level::_::_serde::Deserialize<'de> for level::Level>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_bytes	SHAPE_GAP	false	false	false	false	false	false	false
+<level::_::<impl level::_::_serde::Deserialize<'de> for level::Level>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_str	SHAPE_GAP	false	false	false	false	false	false	false
+<level::_::<impl level::_::_serde::Deserialize<'de> for level::Level>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_u64	SHAPE_GAP	false	false	false	false	false	false	false
+<level::_::<impl level::_::_serde::Deserialize<'de> for level::Level>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<level::_::<impl level::_::_serde::Deserialize<'de> for level::Level>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum	SHAPE_GAP	false	false	false	false	false	false	false
+name::murmur_hash_64a	SHAPE_GAP	false	false	false	false	false	false	false
+name::Name::compute_hash	SHAPE_GAP	false	false	false	false	false	false	false
+name::Name::from_inner	SHAPE_GAP	false	false	false	false	false	false	false
+<name::Name as level::_::_serde::Deserialize<'de>>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+<name::Name as level::_::_serde::Serialize>::serialize	SHAPE_GAP	false	false	false	false	false	false	false
+<name::Name as std::cmp::Ord>::cmp::components	SHAPE_GAP	false	false	false	false	false	false	false
+<name::Name as std::cmp::Ord>::cmp	SHAPE_GAP	false	false	false	false	false	false	false
+<name::NameInner as std::cmp::PartialEq>::eq	SHAPE_GAP	false	false	false	false	false	false	false
+<name::Name as std::cmp::PartialEq>::eq	SHAPE_GAP	false	false	false	false	false	false	false
+<name::Name as std::cmp::PartialOrd>::partial_cmp	SHAPE_GAP	false	false	false	false	false	false	false
+name::Name::is_anon	SHAPE_GAP	false	false	false	false	false	false	false
+<name::Name as std::fmt::Display>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<name::Name as std::hash::Hash>::hash	SHAPE_GAP	false	false	false	false	false	false	false
+name::Name::anon	SHAPE_GAP	false	false	false	false	false	false	false
+<name::Name as std::str::FromStr>::from_str	SHAPE_GAP	false	false	false	false	false	false	false
+name::name_parent	FULLY_FAITHFUL	true	true	true	true	true	false	true
+name::Name::num	SHAPE_GAP	false	false	false	false	false	false	false
+<name::Name as std::str::FromStr>::from_str::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+<name::NameInner as std::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+<name::NameInner as std::hash::Hash>::hash	SHAPE_GAP	false	false	false	false	false	false	false
+<name::_::<impl level::_::_serde::Deserialize<'de> for name::NameInner>::deserialize::__Field as level::_::_serde::Deserialize<'de>>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+<name::_::<impl level::_::_serde::Deserialize<'de> for name::NameInner>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<name::_::<impl level::_::_serde::Deserialize<'de> for name::NameInner>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_bytes	SHAPE_GAP	false	false	false	false	false	false	false
+<name::_::<impl level::_::_serde::Deserialize<'de> for name::NameInner>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_str	SHAPE_GAP	false	false	false	false	false	false	false
+<name::_::<impl level::_::_serde::Deserialize<'de> for name::NameInner>::deserialize::__FieldVisitor as level::_::_serde::de::Visitor<'de>>::visit_u64	SHAPE_GAP	false	false	false	false	false	false	false
+<name::_::<impl level::_::_serde::Deserialize<'de> for name::NameInner>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::expecting	SHAPE_GAP	false	false	false	false	false	false	false
+<name::_::<impl level::_::_serde::Deserialize<'de> for name::NameInner>::deserialize::__Visitor<'de> as level::_::_serde::de::Visitor<'de>>::visit_enum	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::has_loose_bvar_in_range	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::lower_loose_bvars	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::has_loose_bvar	SHAPE_GAP	false	false	false	false	false	false	false
+expr::has_loose_bvars_in_domain	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::BinderData::new	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::infer_implicit_n	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::infer_implicit	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::beta_normalize	SHAPE_GAP	false	false	false	false	false	false	false
+__extract_reachability_shim	SHAPE_GAP	false	false	false	false	false	false	false
+expr::Expr::compute_meta	SHAPE_GAP	false	false	false	false	false	false	false
+expr::Expr::fold_opt_or_clone	SHAPE_GAP	false	false	false	false	false	false	false
+expr::Expr::fold_opt_or_clone::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::Expr::has_expr_mvar_quick	FULLY_FAITHFUL	true	true	true	true	true	false	true
+expr::Expr::has_level_mvar_quick	FULLY_FAITHFUL	true	true	true	true	true	false	true
+expr::meta::ExprMeta::has_loose_bvars	FULLY_FAITHFUL	true	true	true	true	true	false	true
+expr::Expr::has_loose_bvars_quick	FULLY_FAITHFUL	true	true	true	true	true	false	true
+expr::Expr::hash_cached	SHAPE_GAP	false	false	false	false	false	false	false
+expr::Expr::kind	SHAPE_GAP	false	false	false	false	false	false	false
+expr::Expr::with_meta	SHAPE_GAP	false	false	false	false	false	false	false
+expr::bvar_in_range	FULLY_FAITHFUL	false	false	true	true	true	false	true
+expr::constructors::<impl expr::Expr>::app	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::app_arc	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::apps	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::apps_ref	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::apps_ref::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::arrow	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::bignat_lit	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::const_	SHAPE_GAP	false	false	false	false	false	false	false
+name::Name::from_string_uncached	SHAPE_GAP	false	false	false	false	false	false	false
+name::Name::from_string	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::const_str	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::const_str_levels	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::fvar	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::get_app_args_iter	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::get_app_args	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::get_app_fn	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::get_app_num_args	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::is_app	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::is_bvar	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::is_const	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::is_fvar	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::is_lam	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::is_let	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::is_lit	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::is_pi	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::is_proj	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::is_prop	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::is_sort	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::lam	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::lam_arc	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::let_	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::let_named	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::let_named_arc	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::mdata	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::nat_lit	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::BigNat::from_limbs	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::nat_lit_u128	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::pi	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::pi_arc	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::proj	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::proj_arc	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::zero	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::prop	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::sort	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::str_lit	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::strip_mdata	SHAPE_GAP	false	false	false	false	false	false	false
+level::level_arc	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::succ	SHAPE_GAP	false	false	false	false	false	false	false
+expr::constructors::<impl expr::Expr>::type_	SHAPE_GAP	false	false	false	false	false	false	false
+expr::kind::ExprKind::compute_meta::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::Abstractor::new	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::abstract_fvar_at	SHAPE_GAP	false	false	false	false	false	false	false
+expr::kind::ZFCSetExpr::abstract_fvar_at	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::collect_constants_into	SHAPE_GAP	false	false	false	false	false	false	false
+expr::kind::ZFCSetExpr::collect_constants_into	SHAPE_GAP	false	false	false	false	false	false	false
+expr::shift_bvar_range	SHAPE_GAP	false	false	false	false	false	false	false
+expr::kind::ZFCSetExpr::has_loose_bvar_in_range	SHAPE_GAP	false	false	false	false	false	false	false
+expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ExprKind>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::kind::_::<impl level::_::_serde::Deserialize<'de> for expr::kind::ZFCSetExpr>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::kind::_::<impl level::_::_serde::Serialize for expr::kind::ExprKind>::serialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::kind::_::<impl level::_::_serde::Serialize for expr::kind::ZFCSetExpr>::serialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::meta::_::<impl level::_::_serde::Deserialize<'de> for expr::meta::ExprMeta>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::meta::_::<impl level::_::_serde::Serialize for expr::meta::ExprMeta>::serialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::meta::hash_to_u64	SHAPE_GAP	false	false	false	false	false	false	false
+expr::stack_safe	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::abstract_fvar	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::instantiate_at	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::instantiate	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::beta_normalize_opt	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::beta_normalize::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::beta_normalize::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::beta_normalize_opt::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::beta_normalize_opt::{closure#10}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::beta_normalize_opt::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::beta_normalize_opt::{closure#2}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::beta_normalize_opt::{closure#3}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::beta_normalize_opt::{closure#4}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::beta_normalize_opt::{closure#5}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::beta_normalize_opt::{closure#6}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::beta_normalize_opt::{closure#7}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::beta_normalize_opt::{closure#8}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::beta_normalize_opt::{closure#9}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::collect_constants	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::collect_constants_into_impl	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::collect_constants_into::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::has_loose_bvar_in_range_impl	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::has_loose_bvar_in_range::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::has_loose_bvars	FULLY_FAITHFUL	true	true	true	true	true	false	true
+expr::subst::<impl expr::Expr>::instantiate_level_params_map	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::instantiate_level_params	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::instantiate_level_params_direct	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::instantiate_rev	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::lift	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::lift_from	SHAPE_GAP	false	false	false	false	false	false	false
+expr::subst::<impl expr::Expr>::subst_fvar	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::BigNat::checked_add_big	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::BigNat::is_zero	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::BigNat::mul_big_capped	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::BigNat::checked_mul_big	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::BigNat::from_u64	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::BigNat::is_zero::{closure#0}	FULLY_FAITHFUL	false	false	true	true	true	false	true
+expr::types::BigNat::pred	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::BigNat::saturating_sub_big	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::BigNat::to_u64	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::BinderData::unrestricted	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::FVarId::as_u64	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::FVarId::is_sentinel	FULLY_FAITHFUL	true	true	false	false	false	false	true
+expr::types::FVarId::new	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::Literal::nat	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::Multiplicity::add	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::Multiplicity::allows_many	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::Multiplicity::allows_zero	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::Multiplicity::mul	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BigNat>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BinderData>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::BinderInfo>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::FVarId>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::Literal>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::MDataValue>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::_::<impl level::_::_serde::Deserialize<'de> for expr::types::Multiplicity>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::_::<impl level::_::_serde::Serialize for expr::types::BigNat>::serialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::_::<impl level::_::_serde::Serialize for expr::types::BinderData>::serialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::_::<impl level::_::_serde::Serialize for expr::types::BinderInfo>::serialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::_::<impl level::_::_serde::Serialize for expr::types::FVarId>::serialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::_::<impl level::_::_serde::Serialize for expr::types::Literal>::serialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::_::<impl level::_::_serde::Serialize for expr::types::MDataValue>::serialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::types::_::<impl level::_::_serde::Serialize for expr::types::Multiplicity>::serialize	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_binder_body_opt	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_bvar_opt	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_const_opt	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt_extensions	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt_extensions::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt_extensions::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt_extensions::{closure#2}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt_extensions::{closure#3}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt_extensions::{closure#4}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt_extensions::{closure#5}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt_inner	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt_inner_full	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt_inner_full::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt_inner_full::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt_inner_full::{closure#2}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt_inner_full::{closure#3}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt_inner_full::{closure#4}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt_inner_full::{closure#5}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt_zfc	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt_zfc::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt_zfc::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_expr_opt_zfc::{closure#2}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_fvar_opt	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_lit_opt	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_sort_opt	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_zfc_set_expr_opt	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_zfc_set_expr_opt::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_zfc_set_expr_opt::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_zfc_set_expr_opt::{closure#2}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_zfc_set_expr_opt::{closure#3}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_zfc_set_expr_opt::{closure#4}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_zfc_set_expr_opt::{closure#5}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_zfc_set_expr_opt::{closure#6}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_zfc_set_expr_opt::{closure#7}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_zfc_set_expr_opt::{closure#8}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::fold_zfc_set_expr_opt::{closure#9}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::ExprFolderOpt::should_descend	FULLY_FAITHFUL	false	false	true	true	true	false	true
+expr::visitor::opt::merge2	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::merge2::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::merge2::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::merge3	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::merge3::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::merge3::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::merge3::{closure#2}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::merge4	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::merge4::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::merge4::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::merge4::{closure#2}	SHAPE_GAP	false	false	false	false	false	false	false
+expr::visitor::opt::merge4::{closure#3}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::add_offset	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::collect_params	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::collect_params_impl	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::collect_params::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::collect_params_impl::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::collect_params_impl::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::collect_params_impl::{closure#2}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::get_offset	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_explicit	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::dedup_max_args	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::has_params_impl	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::has_params::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::has_params_impl::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::has_params_impl::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::has_params_impl::{closure#2}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_nonzero	FULLY_FAITHFUL	true	true	false	false	false	false	true
+level::Level::normalize	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_geq	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::max	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::imax	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_def_eq	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_geq_core_compute	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_geq_core_cached	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_geq_core	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_geq::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_geq_core_compute::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_geq_core_compute::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_geq_core_compute::{closure#2}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_geq_core_compute::{closure#3}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_geq_core_compute::{closure#4}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_geq_core_compute::{closure#5}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_geq_core_compute::{closure#6}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_geq_core_compute::{closure#7}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::kind_ord	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_norm_lt	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_norm_lt::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::is_norm_lt::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::leq	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::mk_max_from_args	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::push_max_args	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::subsume_max_args	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::normalize_max	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::normalize_impl	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::normalize::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::normalize_impl::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::normalize_impl::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::normalize_impl::{closure#2}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::normalize_max::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::normalize_max::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::param	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::push_max_args::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::push_max_args::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_impl_opt	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_impl	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_impl::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_impl_opt::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_impl_opt::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_impl_opt::{closure#2}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_impl_opt::{closure#3}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_impl_opt::{closure#4}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_map_impl_opt	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_map_impl	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_map::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_map_impl::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_map_impl_opt::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_map_impl_opt::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_map_impl_opt::{closure#2}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_map_impl_opt::{closure#3}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_map_impl_opt::{closure#4}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_map_impl_opt::{closure#5}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_slice_impl_opt	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_slice_impl	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_slice::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_slice_impl::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_slice_impl_opt::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_slice_impl_opt::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_slice_impl_opt::{closure#2}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_slice_impl_opt::{closure#3}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::substitute_slice_impl_opt::{closure#4}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::subsume_max_args::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::subsume_max_args::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+level::Level::subsume_max_args::{closure#2}	SHAPE_GAP	false	false	false	false	false	false	false
+level::_::<impl level::_::_serde::Deserialize<'de> for level::Level>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+level::_::<impl level::_::_serde::Serialize for level::Level>::serialize	SHAPE_GAP	false	false	false	false	false	false	false
+name::Name::append	SHAPE_GAP	false	false	false	false	false	false	false
+name::Name::from_string_uncached::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+name::Name::inner	SHAPE_GAP	false	false	false	false	false	false	false
+name::NameInterner::global	SHAPE_GAP	false	false	false	false	false	false	false
+name::NameInterner::intern	SHAPE_GAP	false	false	false	false	false	false	false
+name::NameInterner::intern_name	SHAPE_GAP	false	false	false	false	false	false	false
+name::Name::interned	SHAPE_GAP	false	false	false	false	false	false	false
+name::Name::interned_arc	SHAPE_GAP	false	false	false	false	false	false	false
+name::Name::last_component	SHAPE_GAP	false	false	false	false	false	false	false
+name::Name::lean4_hash	SHAPE_GAP	false	false	false	false	false	false	false
+name::Name::str	SHAPE_GAP	false	false	false	false	false	false	false
+name::NameInterner::clear	SHAPE_GAP	false	false	false	false	false	false	false
+name::NameInterner::clear::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+name::NameInterner::intern::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+name::NameInterner::intern::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+name::NameInterner::intern::{closure#2}	SHAPE_GAP	false	false	false	false	false	false	false
+name::NameInterner::intern::{closure#3}	SHAPE_GAP	false	false	false	false	false	false	false
+name::NameInterner::len	SHAPE_GAP	false	false	false	false	false	false	false
+name::NameInterner::is_empty	SHAPE_GAP	false	false	false	false	false	false	false
+name::NameInterner::new	SHAPE_GAP	false	false	false	false	false	false	false
+name::TLS_NAME_CACHE::__rust_std_internal_init_fn	SHAPE_GAP	false	false	false	false	false	false	false
+name::_::<impl level::_::_serde::Deserialize<'de> for name::NameInner>::deserialize	SHAPE_GAP	false	false	false	false	false	false	false
+name::_::<impl level::_::_serde::Serialize for name::NameInner>::serialize	SHAPE_GAP	false	false	false	false	false	false	false

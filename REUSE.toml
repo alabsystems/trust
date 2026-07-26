@@ -1,0 +1,239 @@
+version = 1
+
+# Reuse annotations file.
+#
+# This file controls how reuse-tool finds copyright and license notices within
+# source files. As the tool has a habit of picking up random uses of the word
+# 'Copyright' within source code, and because it will complain that other files
+# do not contain any specific copyright and license notifications, we usually
+# just set a blanket license and copyright notice for a whole sub-tree at a
+# time.
+#
+# Trust carries two lineages and they are kept apart here. Trees that came from
+# rust-lang/rust stay with the Rust Project Developers even where Trust has
+# edited files inside them; trees Trust wrote are Andrew Yates's. Both grants
+# are the same dual license, so the split changes attribution, never terms.
+#
+# Annotations are matched last-wins, so each block that narrows an earlier one
+# must sit below it. The third-party exceptions and the Trust-owned block below
+# both depend on that ordering.
+#
+# See https://reuse.software and https://github.com/fsfe/reuse-tool for more
+# details. We currently use reuse-tool version 4.0.3.
+
+# ---------------------------------------------------------------------------
+# Inherited from rust-lang/rust.
+# ---------------------------------------------------------------------------
+
+[[annotations]]
+path = [
+    "compiler/**",
+    "library/**",
+    "tests/**",
+    "src/**",
+    ".github/**",
+    "Cargo.lock",
+    "Cargo.toml",
+    "CODE_OF_CONDUCT.md",
+    "bootstrap.example.toml",
+    "configure",
+    "COPYRIGHT",
+    "INSTALL.md",
+    "LICENSE-APACHE",
+    "license-metadata.json",
+    "LICENSE-MIT",
+    "REUSE.toml",
+    "rustfmt.toml",
+    "x",
+    "x.ps1",
+    "x.py",
+    ".gitignore",
+    ".gitmodules",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "The Rust Project Developers (see https://thanks.rust-lang.org)"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = "compiler/rustc_llvm/llvm-wrapper/SymbolWrapper.cpp"
+precedence = "override"
+SPDX-FileCopyrightText = [
+    "2003-2019 University of Illinois at Urbana-Champaign.",
+    "The Rust Project Developers (see https://thanks.rust-lang.org)",
+]
+SPDX-License-Identifier = "Apache-2.0 WITH LLVM-exception AND (Apache-2.0 OR MIT)"
+
+[[annotations]]
+path = "library/core/src/unicode/unicode_data.rs"
+precedence = "override"
+SPDX-FileCopyrightText = "1991-2024 Unicode, Inc."
+SPDX-License-Identifier = "Unicode-3.0"
+
+[[annotations]]
+path = "library/std/src/sync/mpmc/**"
+precedence = "override"
+SPDX-FileCopyrightText = [
+    "2019 The Crossbeam Project Developers",
+    "The Rust Project Developers (see https://thanks.rust-lang.org)",
+]
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = "library/std/src/sys/sync/mutex/fuchsia.rs"
+precedence = "override"
+SPDX-FileCopyrightText = [
+    "2016 The Fuchsia Authors",
+    "The Rust Project Developers (see https://thanks.rust-lang.org)",
+]
+SPDX-License-Identifier = "BSD-2-Clause AND (MIT OR Apache-2.0)"
+
+[[annotations]]
+path = "tests/rustdoc-html/auxiliary/enum-primitive.rs"
+precedence = "override"
+SPDX-FileCopyrightText = "2015 Anders Kaseorg <andersk@mit.edu>"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "src/librustdoc/html/static/fonts/Fira**"
+precedence = "override"
+SPDX-FileCopyrightText = ["2014, Mozilla Foundation", "2014, Telefonica S.A."]
+SPDX-License-Identifier = "OFL-1.1"
+
+[[annotations]]
+path = "src/librustdoc/html/static/fonts/NanumBarun**"
+precedence = "override"
+SPDX-FileCopyrightText = "2010 NAVER Corporation"
+SPDX-License-Identifier = "OFL-1.1"
+
+[[annotations]]
+path = [
+    "src/librustdoc/html/static/fonts/SourceCodePro**",
+    "src/librustdoc/html/static/fonts/SourceSerif4**",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2010, 2012, 2014-2023, Adobe Systems Incorporated"
+SPDX-License-Identifier = "OFL-1.1"
+
+[[annotations]]
+path = "src/librustdoc/html/static/css/normalize.css"
+precedence = "override"
+SPDX-FileCopyrightText = "Nicolas Gallagher and Jonathan Neal"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "src/librustdoc/html/static/css/rustdoc.css"
+precedence = "override"
+SPDX-FileCopyrightText = [
+    "2016 Ike Ku, Jessica Stokes and Leon Guan",
+    "The Rust Project Developers (see https://thanks.rust-lang.org)",
+]
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = "library/backtrace/**"
+precedence = "override"
+SPDX-FileCopyrightText = [
+    "2014 Alex Crichton",
+    "The Rust Project Developers (see https://thanks.rust-lang.org)",
+]
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = "src/llvm-project/**"
+precedence = "override"
+SPDX-FileCopyrightText = [
+    "2003-2019 by the contributors listed in CREDITS.TXT (https://github.com/rust-lang/llvm-project/blob/7738295178045041669876bf32b0543ec8319a5c/llvm/CREDITS.TXT)",
+    "2010 Apple Inc",
+    "2003-2019 University of Illinois at Urbana-Champaign.",
+]
+SPDX-License-Identifier = "NCSA AND Apache-2.0 WITH LLVM-exception"
+
+# ---------------------------------------------------------------------------
+# Trust's own code. Everything below narrows one of the inherited blocks above
+# and therefore has to stay below it.
+# ---------------------------------------------------------------------------
+
+[[annotations]]
+path = [
+    "crates/**",
+    "targo-trust/**",
+    "benchmarks/**",
+    "bootstrap/**",
+    "docs/**",
+    "examples/**",
+    "proofs/**",
+    "publish/**",
+    "release/**",
+    "scripts/**",
+    "tools/**",
+    "trust-conformance/**",
+    "src/tools/trustup/**",
+    "src/tools/trust-stage0-dist/**",
+    "CLAUDE.md",
+    "CONTRIBUTING.md",
+    "NOTICE",
+    "README.md",
+    "SECURITY.md",
+    "SUPPORT.md",
+    "VISION.md",
+    "patches/README.md",
+    ".gitleaks.toml",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Andrew Yates"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+# Patches Trust carries against third-party sources. The diffs are derived from
+# the software they patch, so they keep that software's terms rather than
+# Trust's; patches/README.md above is Trust's own prose. Today the only patch is
+# against LLVM, whose vendored tree is annotated identically further up.
+[[annotations]]
+path = "patches/*.patch"
+precedence = "override"
+SPDX-FileCopyrightText = [
+    "2003-2019 by the contributors listed in CREDITS.TXT (https://github.com/rust-lang/llvm-project/blob/7738295178045041669876bf32b0543ec8319a5c/llvm/CREDITS.TXT)",
+    "2010 Apple Inc",
+    "2003-2019 University of Illinois at Urbana-Champaign.",
+]
+SPDX-License-Identifier = "NCSA AND Apache-2.0 WITH LLVM-exception"
+
+# Trust-authored files that live inside an inherited crate because that is where
+# the compiler pass has to be. `trusty` targets are an unrelated upstream OS and
+# are deliberately not listed here.
+[[annotations]]
+path = [
+    "compiler/rustc_codegen_trust_cg/**",
+    "compiler/rustc_middle/src/mir/trust_contract.rs",
+    "compiler/rustc_middle/src/mir/trust_proof.rs",
+    "compiler/rustc_middle/src/mir/trust_proof_item.rs",
+    "compiler/rustc_mir_build/src/trust_replay.rs",
+    "compiler/rustc_mir_transform/src/trust_contract_query.rs",
+    "compiler/rustc_mir_transform/src/trust_contract_query/**",
+    "compiler/rustc_mir_transform/src/trust_ir_flip.rs",
+    "compiler/rustc_mir_transform/src/trust_ir_flip/**",
+    "compiler/rustc_mir_transform/src/trust_proof_query.rs",
+    "compiler/rustc_mir_transform/src/trust_r1_oracle.rs",
+    "compiler/rustc_mir_transform/src/trust_verify.rs",
+    "compiler/rustc_mir_transform/src/trust_verify/**",
+    "compiler/rustc_session/src/config/tests/trust_output_types.rs",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Andrew Yates"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+# The Trust mark. Replaces the Rust Foundation's logo assets, whose filenames are
+# a static-file protocol that rustdoc's templates and build script depend on, and
+# that the WiX installer sources reference by name.
+[[annotations]]
+path = [
+    "src/librustdoc/html/static/images/favicon.svg",
+    "src/librustdoc/html/static/images/favicon-32x32.png",
+    "src/librustdoc/html/static/images/rust-logo.svg",
+    "src/etc/installer/gfx/banner.bmp",
+    "src/etc/installer/gfx/dialogbg.bmp",
+    "src/etc/installer/gfx/rust-logo.ico",
+    "src/etc/installer/gfx/rust-logo.png",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Andrew Yates"
+SPDX-License-Identifier = "MIT OR Apache-2.0"

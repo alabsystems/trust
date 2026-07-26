@@ -1,0 +1,91 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+<parser::CToken as std::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+<parser::ParseError as std::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+<parser::ParseError as std::error::Error>::source	SHAPE_GAP	false	false	false	false	false	false	false
+<parser::ParseError as std::fmt::Display>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<parser::Token as std::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+<reduction::Order as std::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+<reduction::Order as std::fmt::Display>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<term::Context as std::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+term::Context::new	SHAPE_GAP	false	false	false	false	false	false	false
+<term::Context as std::convert::From<&[S]>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+<term::Context as std::convert::From<std::vec::Vec<std::string::String>>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::max_depth	SHAPE_GAP	false	false	false	false	false	false	false
+term::generate_binder_names	SHAPE_GAP	false	false	false	false	false	false	false
+term::Context::resolve_free_var	SHAPE_GAP	false	false	false	false	false	false	false
+term::parenthesize_if	SHAPE_GAP	false	false	false	false	false	false	false
+term::show_precedence_cla	SHAPE_GAP	false	false	false	false	false	false	false
+<term::DisplayWithContext<'a> as std::fmt::Display>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<term::Notation as std::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+<term::Term as std::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+term::show_precedence_dbr	SHAPE_GAP	false	false	false	false	false	false	false
+<term::Term as std::fmt::Debug>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::max_free_index_helper	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::max_free_index	SHAPE_GAP	false	false	false	false	false	false	false
+term::auto_generate_context	SHAPE_GAP	false	false	false	false	false	false	false
+<term::Term as std::fmt::Display>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<term::TermError as std::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+<term::TermError as std::error::Error>::source	SHAPE_GAP	false	false	false	false	false	false	false
+<term::TermError as std::fmt::Display>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+parser::_convert_classic_tokens	SHAPE_GAP	false	false	false	false	false	false	false
+parser::_convert_classic_tokens::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+parser::_get_ast	SHAPE_GAP	false	false	false	false	false	false	false
+term::Context::iter	SHAPE_GAP	false	false	false	false	false	false	false
+parser::convert_classic_tokens	SHAPE_GAP	false	false	false	false	false	false	false
+term::abs	SHAPE_GAP	false	false	false	false	false	false	false
+parser::fold_terms	SHAPE_GAP	false	false	false	false	false	false	false
+parser::fold_exprs	SAFETY_GAP	false	false	true	false	false	false	false
+parser::get_ast	SHAPE_GAP	false	false	false	false	false	false	false
+term::Context::empty	SHAPE_GAP	false	false	false	false	false	false	false
+parser::tokenize_dbr	SHAPE_GAP	false	false	false	false	false	false	false
+parser::tokenize_cla	SHAPE_GAP	false	false	false	false	false	false	false
+parser::parse_with_context	SHAPE_GAP	false	false	false	false	false	false	false
+parser::parse	SHAPE_GAP	false	false	false	false	false	false	false
+reduction::<impl term::Term>::update_free_variables	SHAPE_GAP	false	false	false	false	false	false	false
+reduction::<impl term::Term>::_apply	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::unabs_ref	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::unabs	SHAPE_GAP	false	false	false	false	false	false	false
+reduction::<impl term::Term>::apply	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::unapp_mut	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::lhs_mut	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::rhs_mut	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::unapp_ref	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::lhs_ref	SHAPE_GAP	false	false	false	false	false	false	false
+reduction::<impl term::Term>::is_reducible	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::unapp	SHAPE_GAP	false	false	false	false	false	false	false
+reduction::<impl term::Term>::eval	SHAPE_GAP	false	false	false	false	false	false	false
+reduction::<impl term::Term>::beta_app	SHAPE_GAP	false	false	false	false	false	false	false
+reduction::<impl term::Term>::beta_cbn	SHAPE_GAP	false	false	false	false	false	false	false
+reduction::<impl term::Term>::beta_cbv	SHAPE_GAP	false	false	false	false	false	false	false
+reduction::<impl term::Term>::beta_hap	SHAPE_GAP	false	false	false	false	false	false	false
+reduction::<impl term::Term>::beta_hsp	SHAPE_GAP	false	false	false	false	false	false	false
+reduction::<impl term::Term>::beta_hno	SHAPE_GAP	false	false	false	false	false	false	false
+reduction::<impl term::Term>::beta_nor	SHAPE_GAP	false	false	false	false	false	false	false
+reduction::<impl term::Term>::is_reducible::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+reduction::<impl term::Term>::reduce	SHAPE_GAP	false	false	false	false	false	false	false
+reduction::beta	SHAPE_GAP	false	false	false	false	false	false	false
+term::Context::contains	SHAPE_GAP	false	false	false	false	false	false	false
+term::Context::contains::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+term::Context::is_empty	SHAPE_GAP	false	false	false	false	false	false	false
+term::Context::iter::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+term::Context::len	SHAPE_GAP	false	false	false	false	false	false	false
+term::Context::new::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+term::Context::resolve_free_var::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::has_free_variables_helper	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::has_free_variables	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::is_isomorphic_to	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::is_supercombinator	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::lhs	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::rhs	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::rhs_ref	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::unabs_mut	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::unvar	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::unvar_mut	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::unvar_ref	SHAPE_GAP	false	false	false	false	false	false	false
+term::Term::with_context	SHAPE_GAP	false	false	false	false	false	false	false
+term::app	SHAPE_GAP	false	false	false	false	false	false	false
+term::base26_encode	SHAPE_GAP	false	false	false	false	false	false	false
+term::auto_generate_context::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+term::generate_binder_names::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false
+term::generate_binder_names::{closure#1}	SHAPE_GAP	false	false	false	false	false	false	false
+term::show_precedence_cla::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false

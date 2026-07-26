@@ -1,0 +1,1003 @@
+# Deterministic upstream Rust test patch manifest for
+# `targo trust domination upstream-tests`.
+#
+# The porting CLI reapplies this manifest after every upstream refetch/import
+# and records every edit in adapter-audit.jsonl. Keep patches narrow, reviewed,
+# expiring, and tied to a tracker item. Ordinary Trust regressions belong in
+# the compiler/toolchain, not here. True behavioral divergences belong in
+# tests/upstream-rust/test-exceptions.toml.
+
+schema_version = "0.1.0"
+
+# Re-reviewed 2026-07-23: the Trust naming adapter rules remain implemented
+# and covered by trust-upstream-compat's porting-engine tests; the concrete
+# check_abi and version-prefix replacements are present exactly once in the
+# adopted tree; and the full vanilla UI lane remains green at its recorded
+# 21159/0/606 census. These renewals preserve intentional Trust-owned branding
+# and one explicit type disambiguation; they do not admit semantic divergence.
+
+[[patches]]
+id = "trust.naming.ice-issue-url"
+status = "active"
+owner = "@trust-release"
+reason = "Trust-owned ICE diagnostics must point at Trust's issue template instead of upstream Rust's issue template."
+issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#reasonable-divergences"
+reviewed_on = "2026-07-23"
+expires_on = "2026-10-23"
+kind = "adapter-rule"
+rule = "ice_issue_url"
+allow_missing = true
+
+[[patches]]
+id = "trust.naming.ice-tool-name"
+status = "active"
+owner = "@trust-release"
+reason = "Trust-owned ICE diagnostics use the public Trust compiler name `trustc` instead of `rustc`."
+issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#reasonable-divergences"
+reviewed_on = "2026-07-23"
+expires_on = "2026-10-23"
+kind = "adapter-rule"
+rule = "ice_tool_name"
+allow_missing = true
+
+[[patches]]
+id = "trust.naming.ice-toolchain-snapshot"
+status = "active"
+owner = "@trust-release"
+reason = "Trust-owned ICE diagnostics refer to a Trust toolchain snapshot, not upstream Rust nightly."
+issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#reasonable-divergences"
+reviewed_on = "2026-07-23"
+expires_on = "2026-10-23"
+kind = "adapter-rule"
+rule = "ice_toolchain_snapshot_note"
+allow_missing = true
+
+[[patches]]
+id = "trust.naming.explain-tool-name"
+status = "active"
+owner = "@trust-release"
+reason = "Trust-owned diagnostics refer users to `trustc --explain` instead of the inherited upstream compiler name."
+issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#reasonable-divergences"
+reviewed_on = "2026-07-23"
+expires_on = "2026-10-23"
+kind = "adapter-rule"
+rule = "explain_tool_name"
+allow_missing = true
+
+[[patches]]
+id = "trust.naming.calling-conventions-print-tool-name"
+status = "active"
+owner = "@trust-release"
+reason = "Trust-owned invalid-ABI diagnostics refer users to `trustc --print=calling-conventions`."
+issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#reasonable-divergences"
+reviewed_on = "2026-07-23"
+expires_on = "2026-10-23"
+kind = "adapter-rule"
+rule = "calling_conventions_print_tool_name"
+allow_missing = true
+
+[[patches]]
+id = "trust.naming.asm-labels-docs-note"
+status = "active"
+owner = "@trust-release"
+reason = "Trust-owned inline-assembly label diagnostics refer to Trust documentation instead of upstream Rust By Example."
+issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#reasonable-divergences"
+reviewed_on = "2026-07-23"
+expires_on = "2026-10-23"
+kind = "adapter-rule"
+rule = "asm_labels_docs_note"
+allow_missing = true
+
+[[patches]]
+id = "trust.divergence.stable-rebrand-nightly-toolchain-help"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust's stable-channel diagnostic rebrand (compiler/rustc_session/src/config.rs) steers users to the Trust toolchain instead of `rustup default nightly`, which would push them off verification; semantics of the -Z rejection are unchanged."
+issue = "reports/ui-vanilla-rootcause-2026-07-01.md#d-deliberate-divergences"
+reviewed_on = "2026-07-02"
+expires_on = "2026-10-01"
+path = "tests/ui/bootstrap/rustc_bootstrap.force_stable.stderr"
+kind = "string-replace"
+find = "help: consider switching to a nightly toolchain: `rustup default nightly`"
+replace = "help: consider switching to the Trust toolchain: `rustup default trust`"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.stable-rebrand-stability-policy-note"
+status = "active"
+owner = "@trust-compiler"
+reason = "Companion to the stable-channel rebrand: the stability-policy pointer is replaced by Trust's unstable-option-model note (same diagnostic, Trust-owned wording)."
+issue = "reports/ui-vanilla-rootcause-2026-07-01.md#d-deliberate-divergences"
+reviewed_on = "2026-07-02"
+expires_on = "2026-10-01"
+path = "tests/ui/bootstrap/rustc_bootstrap.force_stable.stderr"
+kind = "string-replace"
+find = "note: for more information about Rust's stability policy, see <https://doc.rust-lang.org/book/appendix-07-nightly-rust.html#unstable-features>"
+replace = "note: Trust keeps the inherited unstable option model; use the Trust toolchain for `-Z` workflows."
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.riscv-reserve-x7-target-feature-list"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust adopted the RISC-V `reserve-x7` target feature (upstream soundness fix rust-lang#146393: inline asm must not hand out LLVM-reserved GPRs) ahead of upstream; the check-cfg expected-values list therefore contains one extra feature name."
+issue = "reports/ui-vanilla-rootcause-2026-07-01.md#d-deliberate-divergences"
+reviewed_on = "2026-07-02"
+expires_on = "2026-10-01"
+path = "tests/ui/check-cfg/target_feature.stderr"
+kind = "string-replace"
+find = "`relaxed-simd`\n`rmw`"
+replace = "`relaxed-simd`\n`reserve-x7`\n`rmw`"
+expected_replacements = 1
+allow_missing = false
+
+# RETIRED 2026-07-01: trust.naming.issue-112792-url-policy (adapter rule
+# `issue_112792_url_policy`) stripped `<https://github.com/rust-lang/rust/issues/N>`
+# from expected `see issue #N` notes while the compiler kept emitting the URL —
+# manufacturing ~37 spurious stderr mismatches in the vanilla ui replay. The rule
+# is deleted and the affected expectations re-blessed to the upstream URL form
+# (drop-in-preserving). See reports/ui-vanilla-rootcause-2026-07-01.md (B1).
+
+[[patches]]
+id = "trust.naming.docs-reference-notes"
+status = "active"
+owner = "@trust-release"
+reason = "Trust-owned diagnostics point to Trust documentation and issue-reference wording while preserving upstream diagnostic semantics."
+issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#reasonable-divergences"
+reviewed_on = "2026-07-23"
+expires_on = "2026-10-23"
+kind = "adapter-rule"
+rule = "trust_docs_reference_notes"
+allow_missing = true
+
+[[patches]]
+id = "trust.naming.stderr-normalizer"
+status = "active"
+owner = "@trust-release"
+reason = "Upstream normalizer directives must match Trust-owned ICE wording after the compiler rename."
+issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#reasonable-divergences"
+reviewed_on = "2026-07-23"
+expires_on = "2026-10-23"
+kind = "adapter-rule"
+rule = "trustc_version_normalizer"
+allow_missing = true
+
+[[patches]]
+id = "trust.naming.print-request-docs-help"
+status = "active"
+owner = "@trust-release"
+reason = "Trust-owned compiler help points to Trust compiler documentation instead of the upstream rustc book."
+issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#reasonable-divergences"
+reviewed_on = "2026-07-23"
+expires_on = "2026-10-23"
+kind = "adapter-rule"
+rule = "print_request_docs_help"
+allow_missing = true
+
+[[patches]]
+id = "trust.naming.refutability-docs-note"
+status = "active"
+owner = "@trust-release"
+reason = "Trust-owned diagnostics point to Trust documentation for refutability notes."
+issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#reasonable-divergences"
+reviewed_on = "2026-07-23"
+expires_on = "2026-10-23"
+kind = "adapter-rule"
+rule = "refutability_docs_note"
+allow_missing = true
+
+[[patches]]
+id = "trust.naming.terminal-error-code-url"
+status = "active"
+owner = "@trust-release"
+reason = "Trust terminal URL diagnostics point at Trust-owned error-code source links."
+issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#reasonable-divergences"
+reviewed_on = "2026-07-23"
+expires_on = "2026-10-23"
+kind = "adapter-rule"
+rule = "terminal_error_code_url"
+allow_missing = true
+
+[[patches]]
+id = "trust.naming.rustdoc-title-brand"
+status = "active"
+owner = "@trust-release"
+reason = "Trust rustdoc page titles use the Trust public documentation brand."
+issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#reasonable-divergences"
+reviewed_on = "2026-07-23"
+expires_on = "2026-10-23"
+kind = "adapter-rule"
+rule = "rustdoc_title_brand"
+allow_missing = true
+
+[[patches]]
+id = "trust.naming.rustdoc-gui-title-brand"
+status = "active"
+owner = "@trust-release"
+reason = "Trust rustdoc GUI title checks use the Trust public documentation brand."
+issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#reasonable-divergences"
+reviewed_on = "2026-07-23"
+expires_on = "2026-10-23"
+kind = "adapter-rule"
+rule = "rustdoc_gui_title_brand"
+allow_missing = true
+
+[[patches]]
+id = "trust.naming.rustdoc-description-brand"
+status = "active"
+owner = "@trust-release"
+reason = "Trust rustdoc meta descriptions use the Trust public documentation brand."
+issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#reasonable-divergences"
+reviewed_on = "2026-07-23"
+expires_on = "2026-10-23"
+kind = "adapter-rule"
+rule = "rustdoc_description_brand"
+allow_missing = true
+
+[[patches]]
+id = "trust.vanilla.check-abi-disambiguate-valid-range"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust's rustc_public test graph currently brings an additional `Into` candidate into scope; the upstream test assertion should state the intended `u128` endpoint explicitly."
+issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#vanilla-harness-patches"
+reviewed_on = "2026-07-23"
+expires_on = "2026-10-23"
+path = "tests/ui-fulldeps/rustc_public/check_abi.rs"
+kind = "string-replace"
+find = "    assert_eq!(valid_range.end, u8::MAX.into());"
+replace = "    assert_eq!(valid_range.end, u128::from(u8::MAX));"
+expected_replacements = 1
+allow_missing = true
+
+[[patches]]
+id = "trust.naming.run-make-version-prefix"
+status = "active"
+owner = "@trust-release"
+reason = "Trust's public compiler version output uses the `trustc` entrypoint name instead of the inherited upstream `rustc` name."
+issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#reasonable-divergences"
+reviewed_on = "2026-07-23"
+expires_on = "2026-10-23"
+path = "tests/run-make/version-check/rmake.rs"
+kind = "string-replace"
+find = "    let version = rustc_out.strip_prefix(\"rustc \").unwrap().trim_end();"
+replace = "    let version = rustc_out.strip_prefix(\"trustc \").unwrap().trim_end();"
+expected_replacements = 1
+allow_missing = true
+
+[[patches]]
+id = "trust.vanilla.rustc-dev-remap-remap-unremap-ast-ir"
+status = "inactive"
+owner = "@trust-compiler"
+reason = "RETIRED 2026-07-10 (rust-1.99 adoption): upstream now ships the rustc_ast_ir split, so the pristine expectation already names rustc_ast_ir; expectations restored to pristine. Original: Trust's rustc_ast_ir split moves the VisitorResult implementation locations from rustc_ast to rustc_ast_ir while preserving the upstream macro-origin note."
+issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#vanilla-harness-patches"
+reviewed_on = "2026-07-10"
+expires_on = "2026-08-06"
+path = "tests/ui-fulldeps/rustc-dev-remap.remap-unremap.stderr"
+kind = "string-replace"
+find = '''
+help: the following other types implement trait `VisitorResult`
+  --> $COMPILER_DIR_REAL/rustc_ast/src/visit.rs:LL:COL
+   |
+LL | impl VisitorResult for () {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^ `()`
+...
+LL | impl<T> VisitorResult for ControlFlow<T> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `ControlFlow<T>`
+'''
+replace = '''
+help: the following other types implement trait `VisitorResult`
+  --> $COMPILER_DIR_REAL/rustc_ast_ir/src/visit.rs:LL:COL
+   |
+LL | impl VisitorResult for () {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^ `()`
+...
+LL | impl<T> VisitorResult for ControlFlow<T> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `ControlFlow<T>`
+'''
+expected_replacements = 1
+allow_missing = true
+
+[[patches]]
+id = "trust.vanilla.rustc-dev-remap-only-remap-ast-ir"
+status = "inactive"
+owner = "@trust-compiler"
+reason = "RETIRED 2026-07-10 (rust-1.99 adoption): upstream now ships the rustc_ast_ir split, so the pristine expectation already names rustc_ast_ir; expectations restored to pristine. Original: Trust's rustc_ast_ir split moves the VisitorResult implementation locations from rustc_ast to rustc_ast_ir while preserving the upstream macro-origin note."
+issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#vanilla-harness-patches"
+reviewed_on = "2026-07-10"
+expires_on = "2026-08-06"
+path = "tests/ui-fulldeps/rustc-dev-remap.only-remap.stderr"
+kind = "string-replace"
+find = '''
+help: the following other types implement trait `VisitorResult`
+  --> /rustc-dev/xyz/compiler/rustc_ast/src/visit.rs:LL:COL
+   |
+   = note: `()`
+  ::: /rustc-dev/xyz/compiler/rustc_ast/src/visit.rs:LL:COL
+   |
+   = note: `ControlFlow<T>`
+'''
+replace = '''
+help: the following other types implement trait `VisitorResult`
+  --> /rustc-dev/xyz/compiler/rustc_ast_ir/src/visit.rs:LL:COL
+   |
+   = note: `()`
+  ::: /rustc-dev/xyz/compiler/rustc_ast_ir/src/visit.rs:LL:COL
+   |
+   = note: `ControlFlow<T>`
+'''
+expected_replacements = 1
+allow_missing = true
+
+# Example shape for future reviewed patches:
+#
+# [[patches]]
+# id = "trust.upstream.example"
+# status = "active"
+# owner = "@trust-release"
+# reason = "Trust-owned diagnostic wording differs intentionally from upstream Rust wording"
+# issue = "https://example.invalid/trust/upstream-example"
+# reviewed_on = "2026-05-07"
+# expires_on = "2026-08-05"
+# path = "tests/ui/example.stderr"
+# kind = "string-replace"
+# find = "upstream text"
+# replace = "Trust text"
+# expected_replacements = 1
+# allow_missing = false
+
+[[patches]]
+id = "trust.divergence.contracts-diagnostic-labels-1"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust's contracts implementation (its own contract system, predating upstream's experimental feature) emits richer multi-label type-mismatch diagnostics on malformed #[requires] bodies (adds the 'expected bool because of return type' label); blessed to Trust's output, semantic verdict identical."
+issue = "reports/ui-vanilla-rootcause-2026-07-01.md#d-deliberate-divergences"
+reviewed_on = "2026-07-10"
+expires_on = "2026-10-01"
+path = "tests/ui/contracts/empty-requires.stderr"
+kind = "string-replace"
+find = '''
+   | ^^^^^^^^^^^^^ expected `bool`, found `()`
+'''
+replace = '''
+   | ^^^^^^^^^^^^^
+   | |
+   | expected `bool`, found `()`
+   | expected `bool` because of return type
+'''
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.contracts-diagnostic-labels-2"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust's contracts implementation (its own contract system, predating upstream's experimental feature) emits richer multi-label type-mismatch diagnostics on malformed #[requires] bodies (adds the 'expected bool because of return type' label); blessed to Trust's output, semantic verdict identical."
+issue = "reports/ui-vanilla-rootcause-2026-07-01.md#d-deliberate-divergences"
+reviewed_on = "2026-07-10"
+expires_on = "2026-10-01"
+path = "tests/ui/contracts/requires-bool-expr-with-semicolon.stderr"
+kind = "string-replace"
+find = '''
+   | ^^^^^^^^^^^^^^^^^^ expected `bool`, found `()`
+'''
+replace = '''
+   | ^^^^^^^^^^^^^^^^^^
+   | |
+   | expected `bool`, found `()`
+   | expected `bool` because of return type
+'''
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.contracts-diagnostic-labels-3"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust's contracts implementation (its own contract system, predating upstream's experimental feature) emits richer multi-label type-mismatch diagnostics on malformed #[requires] bodies (adds the 'expected bool because of return type' label); blessed to Trust's output, semantic verdict identical."
+issue = "reports/ui-vanilla-rootcause-2026-07-01.md#d-deliberate-divergences"
+reviewed_on = "2026-07-10"
+expires_on = "2026-10-01"
+path = "tests/ui/contracts/requires-no-final-expression.stderr"
+kind = "string-replace"
+find = '''
+   | ^^^^^^^^^^^^^^^^^^^^^^^ expected `bool`, found `()`
+'''
+replace = '''
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+   | |
+   | expected `bool`, found `()`
+   | expected `bool` because of return type
+'''
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.hir-body-contract-field-stats-body"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust's hir::Body carries a `contract` field (the contract system's HIR anchor), growing Body 24 -> 32 bytes (accumulated 72 -> 96 over 3 bodies); -Zinput-stats sorts rows by accumulated size, so the patch both resizes AND moves the Body row to its sort rank."
+issue = "reports/ui-vanilla-rootcause-2026-07-01.md#d-deliberate-divergences"
+reviewed_on = "2026-07-10"
+expires_on = "2026-10-01"
+path = "tests/ui/stats/input-stats.stderr"
+kind = "string-replace"
+find = '''
+hir-stats - Semi                      32 (NN.N%)             1
+hir-stats Arm                       80 (NN.N%)             2            40
+hir-stats WherePredicate            72 (NN.N%)             3            24
+hir-stats - BoundPredicate            72 (NN.N%)             3
+hir-stats InlineAsm                 72 (NN.N%)             1            72
+hir-stats Body                      72 (NN.N%)             3            24
+'''
+replace = '''
+hir-stats - Semi                      32 (NN.N%)             1
+hir-stats Body                      96 (NN.N%)             3            32
+hir-stats Arm                       80 (NN.N%)             2            40
+hir-stats WherePredicate            72 (NN.N%)             3            24
+hir-stats - BoundPredicate            72 (NN.N%)             3
+hir-stats InlineAsm                 72 (NN.N%)             1            72
+'''
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.hir-body-contract-field-stats-total"
+status = "active"
+owner = "@trust-compiler"
+reason = "Companion to trust.divergence.hir-body-contract-field-stats-body: hir-stats Total reflects the 24-byte Body growth (3 bodies x 8 bytes)."
+issue = "reports/ui-vanilla-rootcause-2026-07-01.md#d-deliberate-divergences"
+reviewed_on = "2026-07-10"
+expires_on = "2026-10-01"
+path = "tests/ui/stats/input-stats.stderr"
+kind = "string-replace"
+find = '''
+hir-stats Total                  8_576                   172
+'''
+replace = '''
+hir-stats Total                  8_600                   172
+'''
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.naming.check-cfg-docs-annotations-suggest-alternative-name"
+status = "active"
+owner = "@trust-compiler"
+reason = "New 1.99 upstream test annotates the upstream check-cfg URL note; Trust's compiler emits the Trust check-cfg documentation prose (restored Trust diagnostic identity). Annotation prefix patched to the Trust wording."
+issue = "reports/ui-vanilla-rootcause-2026-07-01.md#d-deliberate-divergences"
+reviewed_on = "2026-07-10"
+expires_on = "2026-10-01"
+path = "tests/ui/cfg/suggest-alternative-name-on-target.rs"
+kind = "string-replace"
+find = "//~| NOTE see <https://doc.rust-lang.org"
+replace = "//~| NOTE see the Trust trustc check-cfg documentation"
+expected_replacements = 5
+allow_missing = false
+
+[[patches]]
+id = "trust.naming.print-request-docs-annotation-print-lints-help"
+status = "active"
+owner = "@trust-compiler"
+reason = "New 1.99 upstream test annotates the upstream rustc-book print-request help; Trust's compiler emits the Trust compiler documentation prose. Annotation patched to the Trust wording."
+issue = "reports/ui-vanilla-rootcause-2026-07-01.md#d-deliberate-divergences"
+reviewed_on = "2026-07-10"
+expires_on = "2026-10-01"
+path = "tests/ui/print-request/print-lints-help.rs"
+kind = "string-replace"
+find = "//~? HELP for more information, see the rustc book"
+replace = "//~? HELP for more information, see the Trust compiler documentation for `trustc --print`"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.prime-notation-str-as-char-3-annotations"
+status = "active"
+owner = "@trust-compiler"
+reason = "Post-state prime notation (two-language design D2/Q9) intentionally parses the invalid trailing quote as a standalone prime, so this upstream test's inline annotations must track the same Trust-owned parse diagnostics as its patched stderr files."
+issue = "local:docs/design/2026-07-09-two-language-spec-surface.md#11-open-questions"
+reviewed_on = "2026-07-11"
+expires_on = "2026-10-09"
+path = "tests/ui/lexer/lex-bad-str-literal-as-char-3.rs"
+kind = "string-replace"
+find = '''
+    //~^ ERROR unterminated character literal
+    //[rust2021]~| ERROR prefix `world` is unknown
+'''
+replace = '''
+    //~^ ERROR expected `while`, `for`, `loop` or `{` after a label
+    //~| ERROR labeled expression must be followed by `:`
+    //~| ERROR expected `,`, found `'`
+'''
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.prime-notation-str-as-char-3-rust2015"
+status = "active"
+owner = "@trust-compiler"
+reason = "Post-state prime notation (two-language design D2/Q9): a quote adjacent to an identifier that forms neither a valid char literal nor a lifetime now lexes as a prime token, so the single-quoted-string typo diagnoses as parse errors after prime lexing instead of an unterminated-char-literal lex fatal. The program is still rejected; wording is Trust-owned. Follow-up: targeted prime-outside-clause diagnostic with the double-quote suggestion."
+issue = "local:docs/design/2026-07-09-two-language-spec-surface.md#11-open-questions"
+reviewed_on = "2026-07-11"
+expires_on = "2026-10-09"
+path = "tests/ui/lexer/lex-bad-str-literal-as-char-3.rust2015.stderr"
+kind = "string-replace"
+find = '''
+error[E0762]: unterminated character literal
+  --> $DIR/lex-bad-str-literal-as-char-3.rs:6:26
+   |
+LL |     println!('hello world');
+   |                          ^^^
+   |
+help: if you meant to write a string literal, use double quotes
+   |
+LL -     println!('hello world');
+LL +     println!("hello world");
+   |
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `trustc --explain E0762`.
+'''
+replace = '''
+error: expected `while`, `for`, `loop` or `{` after a label
+  --> $DIR/lex-bad-str-literal-as-char-3.rs:6:21
+   |
+LL |     println!('hello world');
+   |                     ^^^^^ expected `while`, `for`, `loop` or `{` after a label
+   |
+help: consider removing the label
+   |
+LL -     println!('hello world');
+LL +     println!(world');
+   |
+
+error: labeled expression must be followed by `:`
+  --> $DIR/lex-bad-str-literal-as-char-3.rs:6:21
+   |
+LL |     println!('hello world');
+   |              ------ ^^^^^
+   |              |
+   |              the label
+   |
+   = note: labels are used before loops and blocks, allowing e.g., `break 'label` to them
+help: add `:` after the label
+   |
+LL |     println!('hello: world');
+   |                    +
+
+error: expected `,`, found `'`
+  --> $DIR/lex-bad-str-literal-as-char-3.rs:6:26
+   |
+LL |     println!('hello world');
+   |                          ^ expected `,`
+
+error: aborting due to 3 previous errors
+
+'''
+expected_replacements = 1
+allow_missing = false
+
+
+[[patches]]
+id = "trust.divergence.prime-notation-str-as-char-3-rust2018"
+status = "active"
+owner = "@trust-compiler"
+reason = "Post-state prime notation (two-language design D2/Q9): a quote adjacent to an identifier that forms neither a valid char literal nor a lifetime now lexes as a prime token, so the single-quoted-string typo diagnoses as parse errors after prime lexing instead of an unterminated-char-literal lex fatal. The program is still rejected; wording is Trust-owned. Follow-up: targeted prime-outside-clause diagnostic with the double-quote suggestion."
+issue = "local:docs/design/2026-07-09-two-language-spec-surface.md#11-open-questions"
+reviewed_on = "2026-07-11"
+expires_on = "2026-10-09"
+path = "tests/ui/lexer/lex-bad-str-literal-as-char-3.rust2018.stderr"
+kind = "string-replace"
+find = '''
+error[E0762]: unterminated character literal
+  --> $DIR/lex-bad-str-literal-as-char-3.rs:6:26
+   |
+LL |     println!('hello world');
+   |                          ^^^
+   |
+help: if you meant to write a string literal, use double quotes
+   |
+LL -     println!('hello world');
+LL +     println!("hello world");
+   |
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `trustc --explain E0762`.
+'''
+replace = '''
+error: expected `while`, `for`, `loop` or `{` after a label
+  --> $DIR/lex-bad-str-literal-as-char-3.rs:6:21
+   |
+LL |     println!('hello world');
+   |                     ^^^^^ expected `while`, `for`, `loop` or `{` after a label
+   |
+help: consider removing the label
+   |
+LL -     println!('hello world');
+LL +     println!(world');
+   |
+
+error: labeled expression must be followed by `:`
+  --> $DIR/lex-bad-str-literal-as-char-3.rs:6:21
+   |
+LL |     println!('hello world');
+   |              ------ ^^^^^
+   |              |
+   |              the label
+   |
+   = note: labels are used before loops and blocks, allowing e.g., `break 'label` to them
+help: add `:` after the label
+   |
+LL |     println!('hello: world');
+   |                    +
+
+error: expected `,`, found `'`
+  --> $DIR/lex-bad-str-literal-as-char-3.rs:6:26
+   |
+LL |     println!('hello world');
+   |                          ^ expected `,`
+
+error: aborting due to 3 previous errors
+
+'''
+expected_replacements = 1
+allow_missing = false
+
+
+[[patches]]
+id = "trust.divergence.prime-notation-str-as-char-3-rust2021"
+status = "active"
+owner = "@trust-compiler"
+reason = "Post-state prime notation (two-language design D2/Q9): a quote adjacent to an identifier that forms neither a valid char literal nor a lifetime now lexes as a prime token, so the single-quoted-string typo diagnoses as parse errors after prime lexing instead of an unterminated-char-literal lex fatal. The program is still rejected; wording is Trust-owned. Follow-up: targeted prime-outside-clause diagnostic with the double-quote suggestion."
+issue = "local:docs/design/2026-07-09-two-language-spec-surface.md#11-open-questions"
+reviewed_on = "2026-07-11"
+expires_on = "2026-10-09"
+path = "tests/ui/lexer/lex-bad-str-literal-as-char-3.rust2021.stderr"
+kind = "string-replace"
+find = '''
+error: prefix `world` is unknown
+  --> $DIR/lex-bad-str-literal-as-char-3.rs:6:21
+   |
+LL |     println!('hello world');
+   |                     ^^^^^ unknown prefix
+   |
+   = note: prefixed identifiers and literals are reserved since Rust 2021
+help: if you meant to write a string literal, use double quotes
+   |
+LL -     println!('hello world');
+LL +     println!("hello world");
+   |
+
+error[E0762]: unterminated character literal
+  --> $DIR/lex-bad-str-literal-as-char-3.rs:6:26
+   |
+LL |     println!('hello world');
+   |                          ^^^
+   |
+help: if you meant to write a string literal, use double quotes
+   |
+LL -     println!('hello world');
+LL +     println!("hello world");
+   |
+
+error: aborting due to 2 previous errors
+
+For more information about this error, try `trustc --explain E0762`.
+'''
+replace = '''
+error: expected `while`, `for`, `loop` or `{` after a label
+  --> $DIR/lex-bad-str-literal-as-char-3.rs:6:21
+   |
+LL |     println!('hello world');
+   |                     ^^^^^ expected `while`, `for`, `loop` or `{` after a label
+   |
+help: consider removing the label
+   |
+LL -     println!('hello world');
+LL +     println!(world');
+   |
+
+error: labeled expression must be followed by `:`
+  --> $DIR/lex-bad-str-literal-as-char-3.rs:6:21
+   |
+LL |     println!('hello world');
+   |              ------ ^^^^^
+   |              |
+   |              the label
+   |
+   = note: labels are used before loops and blocks, allowing e.g., `break 'label` to them
+help: add `:` after the label
+   |
+LL |     println!('hello: world');
+   |                    +
+
+error: expected `,`, found `'`
+  --> $DIR/lex-bad-str-literal-as-char-3.rs:6:26
+   |
+LL |     println!('hello world');
+   |                          ^ expected `,`
+
+error: aborting due to 3 previous errors
+
+'''
+expected_replacements = 1
+allow_missing = false
+[[patches]]
+id = "trust.divergence.check-cfg-trustverify-check-cfg-cargo-build-script"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust registers cfg(trust_verify) as a well-known cfg name (used via #[cfg_attr(trust_verify, trust::...)]), so check-cfg's expected-names count is 34 vs upstream 33 — a deliberate, correct divergence (Trust has one more known cfg)."
+issue = "reports/env-var-audit-2026-07-11.md"
+reviewed_on = "2026-07-12"
+expires_on = "2026-10-01"
+path = "tests/ui/check-cfg/cargo-build-script.stderr"
+kind = "string-replace"
+find = "and 33 more"
+replace = "and 34 more"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.check-cfg-trustverify-check-cfg-cargo-feature-none"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust registers cfg(trust_verify) as a well-known cfg name (used via #[cfg_attr(trust_verify, trust::...)]), so check-cfg's expected-names count is 34 vs upstream 33 — a deliberate, correct divergence (Trust has one more known cfg)."
+issue = "reports/env-var-audit-2026-07-11.md"
+reviewed_on = "2026-07-12"
+expires_on = "2026-10-01"
+path = "tests/ui/check-cfg/cargo-feature.none.stderr"
+kind = "string-replace"
+find = "and 33 more"
+replace = "and 34 more"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.check-cfg-trustverify-check-cfg-cargo-feature-some"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust registers cfg(trust_verify) as a well-known cfg name (used via #[cfg_attr(trust_verify, trust::...)]), so check-cfg's expected-names count is 34 vs upstream 33 — a deliberate, correct divergence (Trust has one more known cfg)."
+issue = "reports/env-var-audit-2026-07-11.md"
+reviewed_on = "2026-07-12"
+expires_on = "2026-10-01"
+path = "tests/ui/check-cfg/cargo-feature.some.stderr"
+kind = "string-replace"
+find = "and 33 more"
+replace = "and 34 more"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.check-cfg-trustverify-check-cfg-cfg-select"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust registers cfg(trust_verify) as a well-known cfg name (used via #[cfg_attr(trust_verify, trust::...)]), so check-cfg's expected-names count is 34 vs upstream 33 — a deliberate, correct divergence (Trust has one more known cfg)."
+issue = "reports/env-var-audit-2026-07-11.md"
+reviewed_on = "2026-07-12"
+expires_on = "2026-10-01"
+path = "tests/ui/check-cfg/cfg-select.stderr"
+kind = "string-replace"
+find = "and 33 more"
+replace = "and 34 more"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.check-cfg-trustverify-check-cfg-cfg-value-for-cfg-name-duplicate"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust registers cfg(trust_verify) as a well-known cfg name (used via #[cfg_attr(trust_verify, trust::...)]), so check-cfg's expected-names count is 34 vs upstream 33 — a deliberate, correct divergence (Trust has one more known cfg)."
+issue = "reports/env-var-audit-2026-07-11.md"
+reviewed_on = "2026-07-12"
+expires_on = "2026-10-01"
+path = "tests/ui/check-cfg/cfg-value-for-cfg-name-duplicate.stderr"
+kind = "string-replace"
+find = "and 33 more"
+replace = "and 34 more"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.check-cfg-trustverify-check-cfg-cfg-value-for-cfg-name-multiple"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust registers cfg(trust_verify) as a well-known cfg name (used via #[cfg_attr(trust_verify, trust::...)]), so check-cfg's expected-names count is 34 vs upstream 33 — a deliberate, correct divergence (Trust has one more known cfg)."
+issue = "reports/env-var-audit-2026-07-11.md"
+reviewed_on = "2026-07-12"
+expires_on = "2026-10-01"
+path = "tests/ui/check-cfg/cfg-value-for-cfg-name-multiple.stderr"
+kind = "string-replace"
+find = "and 33 more"
+replace = "and 34 more"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.check-cfg-trustverify-check-cfg-exhaustive-names-values-feature"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust registers cfg(trust_verify) as a well-known cfg name (used via #[cfg_attr(trust_verify, trust::...)]), so check-cfg's expected-names count is 34 vs upstream 33 — a deliberate, correct divergence (Trust has one more known cfg)."
+issue = "reports/env-var-audit-2026-07-11.md"
+reviewed_on = "2026-07-12"
+expires_on = "2026-10-01"
+path = "tests/ui/check-cfg/exhaustive-names-values.feature.stderr"
+kind = "string-replace"
+find = "and 33 more"
+replace = "and 34 more"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.check-cfg-trustverify-check-cfg-exhaustive-names-values-full"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust registers cfg(trust_verify) as a well-known cfg name (used via #[cfg_attr(trust_verify, trust::...)]), so check-cfg's expected-names count is 34 vs upstream 33 — a deliberate, correct divergence (Trust has one more known cfg)."
+issue = "reports/env-var-audit-2026-07-11.md"
+reviewed_on = "2026-07-12"
+expires_on = "2026-10-01"
+path = "tests/ui/check-cfg/exhaustive-names-values.full.stderr"
+kind = "string-replace"
+find = "and 33 more"
+replace = "and 34 more"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.check-cfg-trustverify-check-cfg-hrtb-crash"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust registers cfg(trust_verify) as a well-known cfg name (used via #[cfg_attr(trust_verify, trust::...)]), so check-cfg's expected-names count is 34 vs upstream 33 — a deliberate, correct divergence (Trust has one more known cfg)."
+issue = "reports/env-var-audit-2026-07-11.md"
+reviewed_on = "2026-07-12"
+expires_on = "2026-10-01"
+path = "tests/ui/check-cfg/hrtb-crash.stderr"
+kind = "string-replace"
+find = "and 33 more"
+replace = "and 34 more"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.check-cfg-trustverify-check-cfg-mix"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust registers cfg(trust_verify) as a well-known cfg name (used via #[cfg_attr(trust_verify, trust::...)]), so check-cfg's expected-names count is 34 vs upstream 33 — a deliberate, correct divergence (Trust has one more known cfg)."
+issue = "reports/env-var-audit-2026-07-11.md"
+reviewed_on = "2026-07-12"
+expires_on = "2026-10-01"
+path = "tests/ui/check-cfg/mix.stderr"
+kind = "string-replace"
+find = "and 33 more"
+replace = "and 34 more"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.check-cfg-trustverify-check-cfg-nested-cfg"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust registers cfg(trust_verify) as a well-known cfg name (used via #[cfg_attr(trust_verify, trust::...)]), so check-cfg's expected-names count is 34 vs upstream 33 — a deliberate, correct divergence (Trust has one more known cfg)."
+issue = "reports/env-var-audit-2026-07-11.md"
+reviewed_on = "2026-07-12"
+expires_on = "2026-10-01"
+path = "tests/ui/check-cfg/nested-cfg.stderr"
+kind = "string-replace"
+find = "and 33 more"
+replace = "and 34 more"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.check-cfg-trustverify-check-cfg-raw-keywords-edition2015"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust registers cfg(trust_verify) as a well-known cfg name (used via #[cfg_attr(trust_verify, trust::...)]), so check-cfg's expected-names count is 34 vs upstream 33 — a deliberate, correct divergence (Trust has one more known cfg)."
+issue = "reports/env-var-audit-2026-07-11.md"
+reviewed_on = "2026-07-12"
+expires_on = "2026-10-01"
+path = "tests/ui/check-cfg/raw-keywords.edition2015.stderr"
+kind = "string-replace"
+find = "and 33 more"
+replace = "and 34 more"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.check-cfg-trustverify-check-cfg-raw-keywords-edition2021"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust registers cfg(trust_verify) as a well-known cfg name (used via #[cfg_attr(trust_verify, trust::...)]), so check-cfg's expected-names count is 34 vs upstream 33 — a deliberate, correct divergence (Trust has one more known cfg)."
+issue = "reports/env-var-audit-2026-07-11.md"
+reviewed_on = "2026-07-12"
+expires_on = "2026-10-01"
+path = "tests/ui/check-cfg/raw-keywords.edition2021.stderr"
+kind = "string-replace"
+find = "and 33 more"
+replace = "and 34 more"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.check-cfg-trustverify-check-cfg-report-in-external-macros-cargo"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust registers cfg(trust_verify) as a well-known cfg name (used via #[cfg_attr(trust_verify, trust::...)]), so check-cfg's expected-names count is 34 vs upstream 33 — a deliberate, correct divergence (Trust has one more known cfg)."
+issue = "reports/env-var-audit-2026-07-11.md"
+reviewed_on = "2026-07-12"
+expires_on = "2026-10-01"
+path = "tests/ui/check-cfg/report-in-external-macros.cargo.stderr"
+kind = "string-replace"
+find = "and 33 more"
+replace = "and 34 more"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.check-cfg-trustverify-check-cfg-report-in-external-macros-rustc"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust registers cfg(trust_verify) as a well-known cfg name (used via #[cfg_attr(trust_verify, trust::...)]), so check-cfg's expected-names count is 34 vs upstream 33 — a deliberate, correct divergence (Trust has one more known cfg)."
+issue = "reports/env-var-audit-2026-07-11.md"
+reviewed_on = "2026-07-12"
+expires_on = "2026-10-01"
+path = "tests/ui/check-cfg/report-in-external-macros.rustc.stderr"
+kind = "string-replace"
+find = "and 33 more"
+replace = "and 34 more"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.check-cfg-trustverify-macros-cfg"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust registers cfg(trust_verify) as a well-known cfg name (used via #[cfg_attr(trust_verify, trust::...)]), so check-cfg's expected-names count is 34 vs upstream 33 — a deliberate, correct divergence (Trust has one more known cfg)."
+issue = "reports/env-var-audit-2026-07-11.md"
+reviewed_on = "2026-07-12"
+expires_on = "2026-10-01"
+path = "tests/ui/macros/cfg.stderr"
+kind = "string-replace"
+find = "and 33 more"
+replace = "and 34 more"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.check-cfg-trustverify-macros-cfg_select"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust registers cfg(trust_verify) as a well-known cfg name (used via #[cfg_attr(trust_verify, trust::...)]), so check-cfg's expected-names count is 34 vs upstream 33 — a deliberate, correct divergence (Trust has one more known cfg)."
+issue = "reports/env-var-audit-2026-07-11.md"
+reviewed_on = "2026-07-12"
+expires_on = "2026-10-01"
+path = "tests/ui/macros/cfg_select.stderr"
+kind = "string-replace"
+find = "and 33 more"
+replace = "and 34 more"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.check-cfg-trustverify-well-known-names"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust registers cfg(trust_verify) as a well-known cfg name; the exhaustive well-known-names list gains `trust_verify` (sorts between target_vendor and ub_checks). Deliberate, correct divergence."
+issue = "reports/env-var-audit-2026-07-11.md"
+reviewed_on = "2026-07-12"
+expires_on = "2026-10-01"
+path = "tests/ui/check-cfg/well-known-names.stderr"
+kind = "string-replace"
+find = """
+`target_vendor`
+`ub_checks`
+"""
+replace = """
+`target_vendor`
+`trust_verify`
+`ub_checks`
+"""
+expected_replacements = 1
+allow_missing = false

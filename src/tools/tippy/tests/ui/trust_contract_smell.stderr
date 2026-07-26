@@ -1,0 +1,52 @@
+error: this `ensures` predicate names no part of the output record
+  --> tests/ui/trust_contract_smell.rs:12:13
+   |
+LL |     ensures x <= 1000
+   |             ^^^^^^^^^
+   |
+   = help: parameter names here are entry values; the post-state is `result`, a primed output `x'`, or `out`
+   = note: `-D clippy::trust-contract-smell` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::trust_contract_smell)]`
+
+error: this `requires` predicate names no input
+  --> tests/ui/trust_contract_smell.rs:36:14
+   |
+LL |     requires true
+   |              ^^^^
+   |
+   = help: literals alone admit every call or forbid all of them; name the parameter this restricts
+
+error: this `requires` predicate names no input
+  --> tests/ui/trust_contract_smell.rs:45:14
+   |
+LL |     requires false
+   |              ^^^^^
+   |
+   = help: literals alone admit every call or forbid all of them; name the parameter this restricts
+
+error: no `invariant` on this loop names anything its body works with
+  --> tests/ui/trust_contract_smell.rs:57:9
+   |
+LL |         invariant n <= 100
+   |         ^^^^^^^^^^^^^^^^^^
+   |
+   = help: an invariant independent of the iteration carries no induction hypothesis into it
+
+error: this `decreases` measure names nothing the loop body works with
+  --> tests/ui/trust_contract_smell.rs:83:9
+   |
+LL |         decreases limit
+   |         ^^^^^^^^^^^^^^^
+   |
+   = help: a measure the body cannot change never decreases; measure what the iteration consumes
+
+error: this `decreases` measure names nothing the loop body works with
+  --> tests/ui/trust_contract_smell.rs:96:9
+   |
+LL |         decreases 3
+   |         ^^^^^^^^^^^
+   |
+   = help: a measure the body cannot change never decreases; measure what the iteration consumes
+
+error: aborting due to 6 previous errors
+

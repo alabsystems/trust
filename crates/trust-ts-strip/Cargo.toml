@@ -1,0 +1,25 @@
+# trust-ts-strip: the TrustTS front-end — TS→JS type eraser (TrustJS M1+)
+#
+# An UNTRUSTED, ZERO-AUTHORITY front-end (docs/DESIGN_PHILOSOPHY.md, the
+# two-language spec surface): it may only ELABORATE erasable TypeScript into
+# inspectable JavaScript, fail-closed. The accepted subset is EXACTLY the pure
+# type-erasure that `node <file>.ts` runs by default (type positions carry no
+# runtime semantics). Anything that is NOT pure erasure — enums, namespaces,
+# parameter properties, decorators, `export =`/`import =` — is a sound REFUSAL,
+# never a wrong strip. Erased spans are blanked with width-preserving
+# whitespace (newlines kept) so line/column stay faithful, exactly as Node's
+# native stripper does.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-ts-strip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+

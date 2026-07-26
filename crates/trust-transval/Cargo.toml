@@ -1,0 +1,35 @@
+# trust-transval: Translation validation for trust
+#
+# Proves that compiled code (post-optimization MIR or machine code) refines
+# the pre-optimization MIR semantics. Core theorem:
+#   forall inputs, not UB_MIR(inputs) => Behavior(target, inputs) in Behavior(source, inputs)
+#
+# Modules:
+#   refinement  - orchestrates per-function source/target comparison
+#   simulation  - builds simulation relations from MIR diff analysis
+#   equivalence - generates VCs proving target refines source
+#   optimization - validates known MIR optimization passes
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-transval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+trust-router = { workspace = true }
+trust-types = { workspace = true }
+trust-vcgen = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+proptest = { workspace = true }

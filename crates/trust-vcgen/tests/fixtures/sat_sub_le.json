@@ -1,0 +1,229 @@
+{
+  "name": "sat_sub_le",
+  "def_path": "sat_sub_le",
+  "span": {
+    "file": "<dump-root>/satspec.rs",
+    "line_start": 10,
+    "col_start": 0,
+    "line_end": 10,
+    "col_end": 64
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "__ret"
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "y"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "std::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Closure": {
+                    "name": "sat_sub_le::{closure#0}",
+                    "upvars": [
+                      {
+                        "Int": {
+                          "width": 32,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Closure": {
+                        "name": "sat_sub_le::{closure#0}",
+                        "upvars": [
+                          {
+                            "Int": {
+                              "width": 32,
+                              "signed": false
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true
+          }
+        },
+        "name": "__ensures_checker"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "std::option::Option",
+                      "variant": 0,
+                      "active_field": null
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/satspec.rs",
+                "line_start": 9,
+                "col_start": 0,
+                "line_end": 9,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl u32>::saturating_sub",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "<dump-root>/satspec.rs",
+              "line_start": 10,
+              "col_start": 43,
+              "line_end": 10,
+              "col_end": 62
+            },
+            "atomic": null,
+            "is_foreign": false
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "<dump-root>/satspec.rs",
+        "line_start": 9,
+        "col_start": 0,
+        "line_end": 9,
+        "col_end": 34
+      },
+      "body": "__trust_lowered_compiler_contract__:(result) <= (x)"
+    }
+  ],
+  "preconditions": [],
+  "postconditions": [
+    {
+      "Le": [
+        {
+          "Var": [
+            "_0",
+            "Int"
+          ]
+        },
+        {
+          "Var": [
+            "x",
+            "Int"
+          ]
+        }
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [],
+    "ensures": [
+      "(result) <= (x)"
+    ],
+    "invariants": []
+  }
+}

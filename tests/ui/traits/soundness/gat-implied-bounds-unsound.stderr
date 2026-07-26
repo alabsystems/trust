@@ -1,0 +1,40 @@
+error: lifetime may not live long enough
+  --> $DIR/gat-implied-bounds-unsound.rs:45:5
+   |
+LL | fn extend_lifetime_gat<'a, 'b>(s: &'a str) -> &'b str
+   |                        --  -- lifetime `'b` defined here
+   |                        |
+   |                        lifetime `'a` defined here
+...
+LL |     s
+   |     ^ function was supposed to return data with lifetime `'b` but it is returning data with lifetime `'a`
+   |
+   = help: consider adding the following bound: `'a: 'b`
+
+error[E0597]: `x` does not live long enough
+  --> $DIR/gat-implied-bounds-unsound.rs:52:33
+   |
+LL |         let x = String::from("use-after-free via GAT implied bounds");
+   |             - binding `x` declared here
+LL |         d = extend_lifetime_gat(&x);
+   |             --------------------^^-
+   |             |                   |
+   |             |                   borrowed value does not live long enough
+   |             argument requires that `x` is borrowed for `'static`
+LL |     }
+   |     - `x` dropped here while still borrowed
+   |
+note: due to a current limitation of the type system, this implies a `'static` lifetime
+  --> $DIR/gat-implied-bounds-unsound.rs:40:5
+   |
+LL |     for<'x> StringRef<'a>: LendingIterator<Item<'x> = &'x &'a str>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: requirement that the value outlives `'static` introduced here
+  --> $DIR/gat-implied-bounds-unsound.rs:40:44
+   |
+LL |     for<'x> StringRef<'a>: LendingIterator<Item<'x> = &'x &'a str>,
+   |                                            ^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 2 previous errors
+
+For more information about this error, try `trustc --explain E0597`.

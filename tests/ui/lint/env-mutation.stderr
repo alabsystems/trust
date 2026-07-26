@@ -1,0 +1,30 @@
+error: call to `std::env::set_var` mutates the process-global environment: process-global environment mutation races parallel threads and env-gated readers
+  --> $DIR/env-mutation.rs:12:9
+   |
+LL |         std::env::set_var("ENV_MUTATION_UI", "1");
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: route the mutation through a lock-scoped helper that sets and restores the variable under a global lock, and bless that single call site with `#[allow(env_mutation)]`
+note: the lint level is defined here
+  --> $DIR/env-mutation.rs:8:9
+   |
+LL | #![deny(env_mutation)]
+   |         ^^^^^^^^^^^^
+
+error: call to `std::env::remove_var` mutates the process-global environment: process-global environment mutation races parallel threads and env-gated readers
+  --> $DIR/env-mutation.rs:14:9
+   |
+LL |         std::env::remove_var("ENV_MUTATION_UI");
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: route the mutation through a lock-scoped helper that sets and restores the variable under a global lock, and bless that single call site with `#[allow(env_mutation)]`
+
+error: use of `std::env::set_var` as a function value: process-global environment mutation races parallel threads and env-gated readers
+  --> $DIR/env-mutation.rs:18:20
+   |
+LL |     let indirect = std::env::set_var::<&str, &str>;
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: route the mutation through a lock-scoped helper that sets and restores the variable under a global lock, and bless that single call site with `#[allow(env_mutation)]`
+
+error: aborting due to 3 previous errors

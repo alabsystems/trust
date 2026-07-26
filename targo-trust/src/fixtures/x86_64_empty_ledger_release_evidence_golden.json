@@ -1,0 +1,97 @@
+{
+  "artifact_release_gate": {
+    "accepted": false,
+    "blocker_codes": [
+      "binary-verification-missing",
+      "exact-source-provenance-missing"
+    ],
+    "status": "rejected"
+  },
+  "binary_artifact_digest_identity": {
+    "root_artifact_digest": {
+      "algorithm": "sha256",
+      "value": "56563acaca5b9f8590ad7513c7225c9fa85fffe192a0c9e2ed946e9bc6fb9eb0"
+    },
+    "selected_image": {
+      "file_offset": 0,
+      "file_size": 816,
+      "sha256": "56563acaca5b9f8590ad7513c7225c9fa85fffe192a0c9e2ed946e9bc6fb9eb0"
+    }
+  },
+  "decompile_report": {
+    "functions_decompiled": 1,
+    "output_kind": "trust_ir_json",
+    "output_trust_level": "partial",
+    "production_proof_grade_evidence": null,
+    "status": "ok",
+    "target": "trust_ir",
+    "unsupported": 0,
+    "unsupported_items": []
+  },
+  "empty_unsupported_ledgers": {
+    "binary_evidence_ledger": true,
+    "decompile_ledger": true,
+    "trust_ir_output_ledger_records": 0,
+    "verification_ledger": true
+  },
+  "fixture": "tests/fixtures/binary_decomp/x86_64-empty-ledger-nop-elf.hex",
+  "proof_grade_release_transcript_candidate": {
+    "aarch64_ordering_monitor_evidence": [],
+    "accepted": false,
+    "binary_digest": "sha256:56563acaca5b9f8590ad7513c7225c9fa85fffe192a0c9e2ed946e9bc6fb9eb0",
+    "blockers": [
+      "candidate_commit is missing",
+      "vc_digests must be a non-empty typed digest inventory",
+      "checked_certificate_digests must be a non-empty typed digest inventory",
+      "replay_transcript_digests must be a non-empty list",
+      "provenance_artifact_digests must be a non-empty list",
+      "target proof-consumer evidence digest is missing",
+      "target proof-consumer binding digest is missing",
+      "target_proof_consumer_artifact_digests must be a non-empty list",
+      "exact_source_ownership_evidence.digest is missing",
+      "type_ownership_evidence.digest is missing",
+      "release_transcript_binding_digest cannot be computed until all trust.proof-grade-row-binding.v1 inputs are accepted"
+    ],
+    "candidate_commit": null,
+    "checked_certificate_digests": [],
+    "evidence_origin": "targo_trust_release_export",
+    "exact_source_ownership_evidence": {
+      "status": "missing"
+    },
+    "proof_required_vc_count": 0,
+    "provenance_artifact_digests": [],
+    "rejection_reason": "candidate_commit is missing; vc_digests must be a non-empty typed digest inventory; checked_certificate_digests must be a non-empty typed digest inventory; replay_transcript_digests must be a non-empty list; provenance_artifact_digests must be a non-empty list; target proof-consumer evidence digest is missing; target proof-consumer binding digest is missing; target_proof_consumer_artifact_digests must be a non-empty list; exact_source_ownership_evidence.digest is missing; type_ownership_evidence.digest is missing; release_transcript_binding_digest cannot be computed until all trust.proof-grade-row-binding.v1 inputs are accepted",
+    "release_transcript_binding_digest": null,
+    "replay_transcript_digests": [],
+    "row_type": "binary-decompilation-proof-grade",
+    "schema_version": "trust.proof-grade-row.v1",
+    "selected_image": {
+      "digest": "sha256:56563acaca5b9f8590ad7513c7225c9fa85fffe192a0c9e2ed946e9bc6fb9eb0",
+      "identity": "file_offset=0:file_size=816"
+    },
+    "status": "blocked",
+    "target_proof_consumer_artifact_digests": [],
+    "type_ownership_evidence": {
+      "status": "missing"
+    },
+    "unsupported_ledgers_empty": true,
+    "vc_digests": []
+  },
+  "schema_version": "targo-trust-x86_64-empty-ledger-release-evidence.v1",
+  "selection": {
+    "entry": "0x400000",
+    "mode": "selected-address",
+    "symbol": "trust_fixture_x86_empty_ledger"
+  },
+  "trust_ir_output_identity": {
+    "root_artifact_digest": {
+      "algorithm": "sha256",
+      "value": "56563acaca5b9f8590ad7513c7225c9fa85fffe192a0c9e2ed946e9bc6fb9eb0"
+    },
+    "selected_image": {
+      "file_offset": 0,
+      "file_size": 816,
+      "sha256": "56563acaca5b9f8590ad7513c7225c9fa85fffe192a0c9e2ed946e9bc6fb9eb0"
+    }
+  }
+}

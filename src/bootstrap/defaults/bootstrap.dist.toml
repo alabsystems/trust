@@ -1,0 +1,41 @@
+# These defaults are meant for users and distro maintainers building from source, without intending to make multiple changes.
+[build]
+# When compiling from source, you almost always want a full stage 2 build,
+# which has all the latest optimizations from nightly.
+build-stage = 2
+test-stage = 2
+doc-stage = 2
+# When compiling from source, you usually want all tools.
+extended = true
+
+# Most users installing from source want to build all parts of the project from source.
+[llvm]
+download-ci-llvm = false
+
+[rust]
+# We have several defaults in bootstrap that depend on whether the channel is `dev` (e.g. `omit-git-hash` and `download-ci-llvm`).
+# Make sure they don't get set when installing from source.
+channel = "auto-detect"
+# Never download a rustc, distributions must build a fresh compiler.
+download-rustc = false
+# Build the llvm-bitcode-linker
+llvm-bitcode-linker = true
+# Required to make builds reproducible.
+remap-debuginfo = true
+# Compress debuginfo in generated artifacts to reduce their size
+compress-debuginfo = "zlib"
+# Trust: build-config parity with upstream's dist pipeline, which sets rust.lto=thin +
+# rust.codegen-units=1 for shipped toolchains. These are the
+# config-only compiler-speed wins that apply to any `./x.py dist` build with no source
+# change: ThinLTO across the rustc crate graph + a single codegen unit trade rustc's own
+# build time for a materially faster `trustc`. jemalloc and the PGO+BOLT profile that make
+# up the rest of upstream's ~20-40% dist speedup are opt-in on top (see
+# docs/BUILD_CONFIG_PARITY.md — jemalloc is per-target, PGO/BOLT need the `opt-dist`
+# harness). Set these to their non-optimized values in a local dev config if you want faster
+# Trust rebuilds at the cost of a slower produced compiler.
+lto = "thin"
+codegen-units = 1
+
+[dist]
+# Use better compression when preparing tarballs.
+compression-profile = "balanced"

@@ -1,0 +1,23 @@
+note: Clean island kernel-checked: 3 declaration(s) registered (Crate.lemmas.scale_bound, Crate.lemmas.dec, Crate.lemmas.acc_bound)
+  --> $DIR/native_clause_citation.rs:16:5
+   |
+LL | /     namespace Crate.lemmas
+LL | |     theorem scale_bound : 0 = 0 := rfl
+LL | |     theorem dec : 0 = 0 := rfl
+LL | |     theorem acc_bound : 0 = 0 := rfl
+LL | |     end Crate.lemmas
+   | |____________________^
+
+note: citation `Crate.lemmas.scale_bound` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `safe_sub`, with a clean certification audit
+  --> $DIR/native_clause_citation.rs:25:23
+   |
+LL |     ensures 0 == 0 by Crate /* identity ignores this */ . lemmas . scale_bound
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+
+note: citation `Crate.lemmas.acc_bound` has a Clean-kernel statement match with a clean certification audit; this is advisory only and does not discharge or grade the Rust/TrustIR VC
+  --> $DIR/native_clause_citation.rs:45:29
+   |
+LL |         invariant 0 == 0 by Crate /* kept */ . lemmas . acc_bound
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

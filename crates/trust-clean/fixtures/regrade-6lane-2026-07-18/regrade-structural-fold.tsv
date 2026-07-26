@@ -1,0 +1,17 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+all_leaves_pos	FULLY_FAITHFUL	true	true	false	false	false	false	true
+bad_acc_alias	SHAPE_GAP	false	false	false	false	false	false	false
+sink	SHAPE_GAP	false	false	false	false	false	false	false
+bad_acc_escape	SHAPE_GAP	false	false	false	false	false	false	false
+bad_acc_read	SHAPE_GAP	false	false	false	false	false	false	false
+pick	FULLY_FAITHFUL	true	true	true	true	true	false	true
+bad_nonsub	SHAPE_GAP	false	false	false	false	false	false	false
+bad_rebuilt	SHAPE_GAP	false	false	false	false	false	false	false
+bad_self	SHAPE_GAP	false	false	false	false	false	false	false
+collect_leaves	FULLY_FAITHFUL	true	true	false	false	false	false	true
+first_leaf	FULLY_FAITHFUL	true	true	false	false	false	false	true
+has_leaf_zero	FULLY_FAITHFUL	true	true	false	false	false	false	true
+size	SHAPE_GAP	false	false	false	false	false	false	false
+sum	SHAPE_GAP	false	false	false	false	false	false	false
+tag_xor	FULLY_FAITHFUL	true	true	false	false	false	false	true
+xor_all	FULLY_FAITHFUL	true	true	false	false	false	false	true

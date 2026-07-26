@@ -1,0 +1,8 @@
+{
+  "core": [
+    "bounds_non_negative",
+    "decrement_below_zero"
+  ],
+  "logic": "QF_LIA",
+  "result": "unsat"
+}

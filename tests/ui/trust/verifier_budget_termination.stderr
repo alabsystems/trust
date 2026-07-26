@@ -1,0 +1,12 @@
+error: Trust verification exceeded its per-function budget (120000 ms / 1 steps) during extraction of `stepped` — possible verifier non-termination. Raise `-Ztrust-verify-function-budget-ms` / `-steps` or simplify the function.
+  --> $DIR/verifier_budget_termination.rs:22:1
+   |
+LL | / pub fn stepped(mut n: u32) {
+LL | |     while n > 0 invariant n <= 100 {
+LL | |         n -= 1;
+LL | |     }
+LL | | }
+   | |_^
+
+error: aborting due to 1 previous error
+

@@ -1,0 +1,76 @@
+note: Clean island kernel-checked: 2 declaration(s) registered (min2_case, min2_le_left)
+  --> $DIR/e9_min2_case_split_undischarged.rs:11:5
+   |
+LL | /     theorem min2_case : forall (x y : UInt64) (d : Bool),
+LL | |         Eq Bool (Nat.ble (UInt64.toNat y) (UInt64.toNat x)) d ->
+LL | |         Nat.le (UInt64.toNat (Bool.rec (fun _ => UInt64) y x (Bool.not d))) (UInt64.toNat x) :=
+LL | |         fun x y d => Bool.rec
+...  |
+LL | |         fun x y => min2_case x y (Nat.ble (UInt64.toNat y) (UInt64.toNat x))
+LL | |             (Eq.refl Bool (Nat.ble (UInt64.toNat y) (UInt64.toNat x)))
+   | |______________________________________________________________________^
+
+
+=== Trust Verification Report (e9_min2_case_split_undischarged) ===
+
+note: Trust verification: 0 proved, 0 failed, 1 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
+  --> $DIR/e9_min2_case_split_undischarged.rs:30:1
+   |
+LL | / pub fn caller(x: u64, y: u64) -> u64
+LL | |
+LL | |
+LL | |     ensures min2(x, y) <= y by min2_le_left
+LL | |
+LL | | { x }
+   | |_____^
+   |
+   = note: [unknown] UNKNOWN (trust-full-verifier): native full verifier evidence status: Unsupported; no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `min2(x, y) <= y`
+
+error: Trust Level 0 safety verification incomplete for `caller`: 1 obligation(s) were not proved
+  --> $DIR/e9_min2_case_split_undischarged.rs:30:1
+   |
+LL | / pub fn caller(x: u64, y: u64) -> u64
+LL | |
+LL | |
+LL | |     ensures min2(x, y) <= y by min2_le_left
+LL | |
+LL | | { x }
+   | |_____^
+   |
+   = note: strict Trust verification requires every Level 0 obligation to be statically proved; failed, unknown, timed-out, runtime-checked, unsupported, and skipped outcomes are all build errors
+   = note: Level 0 summary: 0 failed, 1 unknown or timed out, 0 runtime-checked, 0 skipped
+   = note: native verifier status: Inconclusive; requested=1, proved=0, failed=0, unknown=0, timed_out=0, unsupported=1, skipped=0, insufficient_strength=0
+
+error: Trust strict verification failed for `caller`: 3 obligation(s) were not fully verified
+  --> $DIR/e9_min2_case_split_undischarged.rs:30:1
+   |
+LL | / pub fn caller(x: u64, y: u64) -> u64
+LL | |
+LL | |
+LL | |     ensures min2(x, y) <= y by min2_le_left
+LL | |
+LL | | { x }
+   | |_____^
+   |
+   = note: summary: 0 trusted, 0 certified, 0 failed, 1 unknown, 0 runtime-checked, 0 skipped out of 1
+   = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
+   = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
+   = note: native full verifier status: Inconclusive; requested=1, proved=0, failed=0, unknown=0, timed_out=0, unsupported=1, skipped=0, insufficient_strength=0
+   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:b48650c455214e00310db5b5b24f8813265abf91311d0e54158a0a0b9666942e requests=1
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:f22e4261e6e621fed0b9370f5175f871f58522645fc51ac772b384ca99e281d4
+   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@0.1.0+native-trust-ir-bundle obligations=1 elapsed_ms=$TIME worker_threads=unbounded
+   = note: native full verifier evidence `vc:caller:custom:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecEnsuresUnparseable`: unparseable `#[ensures]` predicate (fail-closed Unknown): __trust_unsupported_compiler_contract__:unsupported contract predicate expression `min2(x, y) <= y`
+   = note: native full verifier evidence `vc:caller:trust_mc_default_function:0`: native trust_mc typed CHC/PDR proof transport accepted with public typed-CHC binding, structured proof status, proof strength, native id, and digest-backed replay/check artifacts
+   = note: native full verifier evidence `vc:caller:trust_mc_default_function:0`: native typed CHC/PDR proof transport: schema=1, suite=trust_ir, backend=trust_mc::typed-chc-pdr::chc::trivial-safe, request_id=0, proof_id=Some(0), native_id=trust_ir-native-trust_mc-request-0-proof-0, status=Proved, strength=ChcValidity, solver_artifacts=1, replay_artifacts=1, check_artifacts=1
+   = note: native full verifier evidence `vc:caller:trust_mc_default_function:0`: no Horn rule derives typed CHC query target `error`
+
+error: citation `min2_le_left` cannot be validated because this clause is outside the exact statement fragment: clause variable bindings are not exact (missing: []; extra: [result])
+  --> $DIR/e9_min2_case_split_undischarged.rs:33:32
+   |
+LL |     ensures min2(x, y) <= y by min2_le_left
+   |                                ^^^^^^^^^^^^
+   |
+   = note: authored citations are fail-closed; free-variable citations remain blocked until exact source types and the typed TrustIR obligation are bound end-to-end
+
+error: aborting due to 3 previous errors
+

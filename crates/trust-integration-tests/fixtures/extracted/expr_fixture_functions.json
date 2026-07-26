@@ -1,0 +1,2005 @@
+{
+  "build_sort": {
+    "name": "build_sort",
+    "def_path": "clean_kernel::build_sort",
+    "span": {
+      "file": "expr_fixture.rs",
+      "line_start": 92,
+      "col_start": 0,
+      "line_end": 94,
+      "col_end": 1
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": {
+            "Datatype": {
+              "name": "clean_kernel::expr::kind::ExprKind",
+              "variants": [
+                [
+                  "BVar",
+                  [
+                    [
+                      "0",
+                      {
+                        "Int": {
+                          "width": 32,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Sort",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::level::Level",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Const",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::name::Name",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "App",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Lam",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::binder::BinderData",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "2",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Let",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "2",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "3",
+                      "Bool"
+                    ]
+                  ]
+                ],
+                [
+                  "Lit",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::lit::Literal",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Proj",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::name::Name",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Int": {
+                          "width": 32,
+                          "signed": false
+                        }
+                      }
+                    ],
+                    [
+                      "2",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "SProp",
+                  []
+                ],
+                [
+                  "CubicalPath",
+                  [
+                    [
+                      "ty",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "left",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "right",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ]
+              ]
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 1,
+          "ty": {
+            "Datatype": {
+              "name": "clean_kernel::level::Level",
+              "variants": [
+                [
+                  "Zero",
+                  []
+                ],
+                [
+                  "Succ",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::level::Level",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Max",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::level::Level",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::level::Level",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "IMax",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::level::Level",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::level::Level",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Param",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::name::Name",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ]
+              ]
+            }
+          },
+          "name": "l"
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 0,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "clean_kernel::expr::kind::ExprKind",
+                        "variant": 1,
+                        "active_field": null
+                      }
+                    },
+                    [
+                      {
+                        "Copy": {
+                          "local": 1,
+                          "projections": []
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "expr_fixture.rs",
+                  "line_start": 93,
+                  "col_start": 4,
+                  "line_end": 93,
+                  "col_end": 33
+                }
+              }
+            }
+          ],
+          "terminator": "Return"
+        }
+      ],
+      "arg_count": 1,
+      "return_ty": {
+        "Datatype": {
+          "name": "clean_kernel::expr::kind::ExprKind",
+          "variants": [
+            [
+              "BVar",
+              [
+                [
+                  "0",
+                  {
+                    "Int": {
+                      "width": 32,
+                      "signed": false
+                    }
+                  }
+                ]
+              ]
+            ],
+            [
+              "Sort",
+              [
+                [
+                  "0",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::level::Level",
+                      "variants": []
+                    }
+                  }
+                ]
+              ]
+            ],
+            [
+              "Const",
+              [
+                [
+                  "0",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::name::Name",
+                      "variants": []
+                    }
+                  }
+                ]
+              ]
+            ],
+            [
+              "App",
+              [
+                [
+                  "0",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "1",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ]
+              ]
+            ],
+            [
+              "Lam",
+              [
+                [
+                  "0",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::binder::BinderData",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "1",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "2",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ]
+              ]
+            ],
+            [
+              "Let",
+              [
+                [
+                  "0",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "1",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "2",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "3",
+                  "Bool"
+                ]
+              ]
+            ],
+            [
+              "Lit",
+              [
+                [
+                  "0",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::lit::Literal",
+                      "variants": []
+                    }
+                  }
+                ]
+              ]
+            ],
+            [
+              "Proj",
+              [
+                [
+                  "0",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::name::Name",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "1",
+                  {
+                    "Int": {
+                      "width": 32,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "2",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ]
+              ]
+            ],
+            [
+              "SProp",
+              []
+            ],
+            [
+              "CubicalPath",
+              [
+                [
+                  "ty",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "left",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "right",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ]
+              ]
+            ]
+          ]
+        }
+      }
+    },
+    "contracts": [],
+    "preconditions": [],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  },
+  "build_sort_expr": {
+    "name": "build_sort_expr",
+    "def_path": "clean_kernel::build_sort_expr",
+    "span": {
+      "file": "expr_fixture.rs",
+      "line_start": 96,
+      "col_start": 0,
+      "line_end": 98,
+      "col_end": 1
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": {
+            "Datatype": {
+              "name": "clean_kernel::expr::Expr",
+              "variants": [
+                [
+                  "Expr",
+                  [
+                    [
+                      "kind",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::kind::ExprKind",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "meta",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::meta::ExprMeta",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ]
+              ]
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 1,
+          "ty": {
+            "Datatype": {
+              "name": "clean_kernel::level::Level",
+              "variants": [
+                [
+                  "Zero",
+                  []
+                ],
+                [
+                  "Succ",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::level::Level",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Max",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::level::Level",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::level::Level",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "IMax",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::level::Level",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::level::Level",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Param",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::name::Name",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ]
+              ]
+            }
+          },
+          "name": "l"
+        },
+        {
+          "index": 2,
+          "ty": {
+            "Adt": {
+              "name": "clean_kernel::expr::meta::ExprMeta",
+              "fields": [
+                [
+                  "0",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [],
+              "disc_index_safe": false,
+              "faithful_enum_repr": null
+            }
+          },
+          "name": "m"
+        },
+        {
+          "index": 3,
+          "ty": {
+            "Datatype": {
+              "name": "clean_kernel::expr::kind::ExprKind",
+              "variants": [
+                [
+                  "BVar",
+                  [
+                    [
+                      "0",
+                      {
+                        "Int": {
+                          "width": 32,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Sort",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::level::Level",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Const",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::name::Name",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "App",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Lam",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::binder::BinderData",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "2",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Let",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "2",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "3",
+                      "Bool"
+                    ]
+                  ]
+                ],
+                [
+                  "Lit",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::lit::Literal",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Proj",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::name::Name",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Int": {
+                          "width": 32,
+                          "signed": false
+                        }
+                      }
+                    ],
+                    [
+                      "2",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "SProp",
+                  []
+                ],
+                [
+                  "CubicalPath",
+                  [
+                    [
+                      "ty",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "left",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "right",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ]
+              ]
+            }
+          },
+          "name": null
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 3,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "clean_kernel::expr::kind::ExprKind",
+                        "variant": 1,
+                        "active_field": null
+                      }
+                    },
+                    [
+                      {
+                        "Copy": {
+                          "local": 1,
+                          "projections": []
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "expr_fixture.rs",
+                  "line_start": 97,
+                  "col_start": 23,
+                  "line_end": 97,
+                  "col_end": 52
+                }
+              }
+            },
+            {
+              "Assign": {
+                "place": {
+                  "local": 0,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "clean_kernel::expr::Expr",
+                        "variant": 0,
+                        "active_field": null
+                      }
+                    },
+                    [
+                      {
+                        "Move": {
+                          "local": 3,
+                          "projections": []
+                        }
+                      },
+                      {
+                        "Copy": {
+                          "local": 2,
+                          "projections": []
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "expr_fixture.rs",
+                  "line_start": 97,
+                  "col_start": 4,
+                  "line_end": 97,
+                  "col_end": 63
+                }
+              }
+            }
+          ],
+          "terminator": "Return"
+        }
+      ],
+      "arg_count": 2,
+      "return_ty": {
+        "Datatype": {
+          "name": "clean_kernel::expr::Expr",
+          "variants": [
+            [
+              "Expr",
+              [
+                [
+                  "kind",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::kind::ExprKind",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "meta",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::meta::ExprMeta",
+                      "variants": []
+                    }
+                  }
+                ]
+              ]
+            ]
+          ]
+        }
+      }
+    },
+    "contracts": [],
+    "preconditions": [],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  },
+  "make_exprkind": {
+    "name": "make_exprkind",
+    "def_path": "clean_kernel::make_exprkind",
+    "span": {
+      "file": "expr_fixture.rs",
+      "line_start": 84,
+      "col_start": 0,
+      "line_end": 86,
+      "col_end": 1
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": {
+            "Datatype": {
+              "name": "clean_kernel::expr::kind::ExprKind",
+              "variants": [
+                [
+                  "BVar",
+                  [
+                    [
+                      "0",
+                      {
+                        "Int": {
+                          "width": 32,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Sort",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::level::Level",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Const",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::name::Name",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "App",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Lam",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::binder::BinderData",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "2",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Let",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "2",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "3",
+                      "Bool"
+                    ]
+                  ]
+                ],
+                [
+                  "Lit",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::lit::Literal",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Proj",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::name::Name",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Int": {
+                          "width": 32,
+                          "signed": false
+                        }
+                      }
+                    ],
+                    [
+                      "2",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "SProp",
+                  []
+                ],
+                [
+                  "CubicalPath",
+                  [
+                    [
+                      "ty",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "left",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "right",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ]
+              ]
+            }
+          },
+          "name": null
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 0,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "clean_kernel::expr::kind::ExprKind",
+                        "variant": 8,
+                        "active_field": null
+                      }
+                    },
+                    []
+                  ]
+                },
+                "span": {
+                  "file": "expr_fixture.rs",
+                  "line_start": 85,
+                  "col_start": 4,
+                  "line_end": 85,
+                  "col_end": 31
+                }
+              }
+            }
+          ],
+          "terminator": "Return"
+        }
+      ],
+      "arg_count": 0,
+      "return_ty": {
+        "Datatype": {
+          "name": "clean_kernel::expr::kind::ExprKind",
+          "variants": [
+            [
+              "BVar",
+              [
+                [
+                  "0",
+                  {
+                    "Int": {
+                      "width": 32,
+                      "signed": false
+                    }
+                  }
+                ]
+              ]
+            ],
+            [
+              "Sort",
+              [
+                [
+                  "0",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::level::Level",
+                      "variants": []
+                    }
+                  }
+                ]
+              ]
+            ],
+            [
+              "Const",
+              [
+                [
+                  "0",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::name::Name",
+                      "variants": []
+                    }
+                  }
+                ]
+              ]
+            ],
+            [
+              "App",
+              [
+                [
+                  "0",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "1",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ]
+              ]
+            ],
+            [
+              "Lam",
+              [
+                [
+                  "0",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::binder::BinderData",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "1",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "2",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ]
+              ]
+            ],
+            [
+              "Let",
+              [
+                [
+                  "0",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "1",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "2",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "3",
+                  "Bool"
+                ]
+              ]
+            ],
+            [
+              "Lit",
+              [
+                [
+                  "0",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::lit::Literal",
+                      "variants": []
+                    }
+                  }
+                ]
+              ]
+            ],
+            [
+              "Proj",
+              [
+                [
+                  "0",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::name::Name",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "1",
+                  {
+                    "Int": {
+                      "width": 32,
+                      "signed": false
+                    }
+                  }
+                ],
+                [
+                  "2",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ]
+              ]
+            ],
+            [
+              "SProp",
+              []
+            ],
+            [
+              "CubicalPath",
+              [
+                [
+                  "ty",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "left",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "right",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::Expr",
+                      "variants": []
+                    }
+                  }
+                ]
+              ]
+            ]
+          ]
+        }
+      }
+    },
+    "contracts": [],
+    "preconditions": [],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  },
+  "wrap_expr": {
+    "name": "wrap_expr",
+    "def_path": "clean_kernel::wrap_expr",
+    "span": {
+      "file": "expr_fixture.rs",
+      "line_start": 88,
+      "col_start": 0,
+      "line_end": 90,
+      "col_end": 1
+    },
+    "body": {
+      "locals": [
+        {
+          "index": 0,
+          "ty": {
+            "Datatype": {
+              "name": "clean_kernel::expr::Expr",
+              "variants": [
+                [
+                  "Expr",
+                  [
+                    [
+                      "kind",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::kind::ExprKind",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "meta",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::meta::ExprMeta",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ]
+              ]
+            }
+          },
+          "name": null
+        },
+        {
+          "index": 1,
+          "ty": {
+            "Datatype": {
+              "name": "clean_kernel::expr::kind::ExprKind",
+              "variants": [
+                [
+                  "BVar",
+                  [
+                    [
+                      "0",
+                      {
+                        "Int": {
+                          "width": 32,
+                          "signed": false
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Sort",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::level::Level",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Const",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::name::Name",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "App",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Lam",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::binder::BinderData",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "2",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Let",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "2",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "3",
+                      "Bool"
+                    ]
+                  ]
+                ],
+                [
+                  "Lit",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::lit::Literal",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "Proj",
+                  [
+                    [
+                      "0",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::name::Name",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "Int": {
+                          "width": 32,
+                          "signed": false
+                        }
+                      }
+                    ],
+                    [
+                      "2",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ],
+                [
+                  "SProp",
+                  []
+                ],
+                [
+                  "CubicalPath",
+                  [
+                    [
+                      "ty",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "left",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ],
+                    [
+                      "right",
+                      {
+                        "Datatype": {
+                          "name": "clean_kernel::expr::Expr",
+                          "variants": []
+                        }
+                      }
+                    ]
+                  ]
+                ]
+              ]
+            }
+          },
+          "name": "k"
+        },
+        {
+          "index": 2,
+          "ty": {
+            "Adt": {
+              "name": "clean_kernel::expr::meta::ExprMeta",
+              "fields": [
+                [
+                  "0",
+                  {
+                    "Int": {
+                      "width": 64,
+                      "signed": false
+                    }
+                  }
+                ]
+              ],
+              "variants": [],
+              "disc_index_safe": false,
+              "faithful_enum_repr": null
+            }
+          },
+          "name": "m"
+        }
+      ],
+      "blocks": [
+        {
+          "id": 0,
+          "stmts": [
+            {
+              "Assign": {
+                "place": {
+                  "local": 0,
+                  "projections": []
+                },
+                "rvalue": {
+                  "Aggregate": [
+                    {
+                      "Adt": {
+                        "name": "clean_kernel::expr::Expr",
+                        "variant": 0,
+                        "active_field": null
+                      }
+                    },
+                    [
+                      {
+                        "Copy": {
+                          "local": 1,
+                          "projections": []
+                        }
+                      },
+                      {
+                        "Copy": {
+                          "local": 2,
+                          "projections": []
+                        }
+                      }
+                    ]
+                  ]
+                },
+                "span": {
+                  "file": "expr_fixture.rs",
+                  "line_start": 89,
+                  "col_start": 4,
+                  "line_end": 89,
+                  "col_end": 35
+                }
+              }
+            }
+          ],
+          "terminator": "Return"
+        }
+      ],
+      "arg_count": 2,
+      "return_ty": {
+        "Datatype": {
+          "name": "clean_kernel::expr::Expr",
+          "variants": [
+            [
+              "Expr",
+              [
+                [
+                  "kind",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::kind::ExprKind",
+                      "variants": []
+                    }
+                  }
+                ],
+                [
+                  "meta",
+                  {
+                    "Datatype": {
+                      "name": "clean_kernel::expr::meta::ExprMeta",
+                      "variants": []
+                    }
+                  }
+                ]
+              ]
+            ]
+          ]
+        }
+      }
+    },
+    "contracts": [],
+    "preconditions": [],
+    "postconditions": [],
+    "spec": {
+      "requires": [],
+      "ensures": [],
+      "invariants": []
+    }
+  }
+}

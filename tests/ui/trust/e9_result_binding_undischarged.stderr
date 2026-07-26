@@ -1,0 +1,63 @@
+note: Clean island kernel-checked: 1 declaration(s) registered (u64_ge_refl)
+  --> $DIR/e9_result_binding_undischarged.rs:11:5
+   |
+LL | /     theorem u64_ge_refl : forall (x : UInt64),
+LL | |         Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
+LL | |         fun x => Nat.le.refl (UInt64.toNat x)
+   | |_____________________________________________^
+
+
+=== Trust Verification Report (e9_result_binding_undischarged) ===
+
+note: Trust verification: 0 proved, 2 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_result_binding_undischarged.rs:16:1
+   |
+LL | / pub fn identity(x: u64) -> u64
+LL | |
+LL | |     ensures result > x by u64_ge_refl
+LL | |
+LL | | { x }
+   | |_____^
+   |
+   = note: 2× [postcond] FAILED (trust-full-verifier); counterexample: verified_counterexample = true
+
+error: Trust strict verification failed for `identity`: 5 obligation(s) were not fully verified
+  --> $DIR/e9_result_binding_undischarged.rs:16:1
+   |
+LL | / pub fn identity(x: u64) -> u64
+LL | |
+LL | |     ensures result > x by u64_ge_refl
+LL | |
+LL | | { x }
+   | |_____^
+   |
+   = note: summary: 0 trusted, 0 certified, 2 failed, 0 unknown, 0 runtime-checked, 0 skipped out of 2
+   = note: failed obligations, including declared contract panics, are refutations and are not permitted under strict verification; select -Ztrust-policy=advisory to record contract-panic conditional evidence
+   = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
+   = note: native full verifier status: Failed; requested=2, proved=0, failed=2, unknown=0, timed_out=0, unsupported=0, skipped=0, insufficient_strength=0
+   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:783135592d7adf1d33f7c4fe6368fddcba6aef648d87de2af74191c0957630a0 requests=3
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[1] request_digest=sha256:436cd987991278f7c1980c1ac3b37e36874e05db0b61b25d428e7515a27f57ff
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=1 proof_obligations=[2] request_digest=sha256:ce4e65d73ff8174d83a8a85c6a11d780d6e99e11164de6920756d61761fb551b
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-wp request_id=2 proof_obligations=[0] request_digest=sha256:c19780a71d465297568ff6cf8d6c71ccf44b3a11a0f149f79b2469443de271b4
+   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-wp@0.1.0 obligations=1 elapsed_ms=$TIME worker_threads=unbounded
+   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@0.1.0+native-trust-ir-bundle obligations=2 elapsed_ms=$TIME worker_threads=unbounded
+   = note: native full verifier evidence `obligation:identity:postcondition:0`: trust-wp native pure verifier refuted obligation `obligation:identity:postcondition:0`: typed predicate is false by native pure replay rule `irreflexive-comparison`
+   = note: native full verifier evidence `obligation:identity:postcondition:0`: native trust_wp contract lowering reached a typed trust_wp predicate, but replay did not prove it; proof strength is intentionally omitted
+   = note: native full verifier evidence `obligation:identity:postcondition:0`: trust-wp native TrustIr bundle request consumed: request_id=2 proof_obligation_id=0
+   = note: native full verifier evidence `vc:identity:postcondition:0`: constructed typed trust_mc ChcVc from trust-verifier-api data: obligation=trust_ir-native-trust_mc-request-0-proof-1, function=identity, kind=Assertion, relations=1, clauses=1
+   = note: native full verifier evidence `vc:identity:postcondition:0`: native trust_mc typed CHC/PDR full-verification runner selected PdrProof for obligation trust_ir-native-trust_mc-request-0-proof-1
+   = note: native full verifier evidence `vc:identity:postcondition:0`: native trust_mc typed CHC/PDR full-verification runner refuted obligation trust_ir-native-trust_mc-request-0-proof-1; refusing to emit proof evidence
+   = note: native full verifier evidence `vc:identity:trust_mc_default_function:0`: native trust_mc typed CHC/PDR proof transport accepted with public typed-CHC binding, structured proof status, proof strength, native id, and digest-backed replay/check artifacts
+   = note: native full verifier evidence `vc:identity:trust_mc_default_function:0`: native typed CHC/PDR proof transport: schema=1, suite=trust_ir, backend=trust_mc::typed-chc-pdr::chc::trivial-safe, request_id=1, proof_id=Some(2), native_id=trust_ir-native-trust_mc-request-1-proof-2, status=Proved, strength=ChcValidity, solver_artifacts=1, replay_artifacts=1, check_artifacts=1
+   = note: native full verifier evidence `vc:identity:trust_mc_default_function:0`: no Horn rule derives typed CHC query target `error`
+
+error: citation `u64_ge_refl` failed the strict Clean statement/certification audit: strict certification audit failed: [TermRejected { error: "TypeMismatch { expected: Pi(BinderData { info: Default, mult: Many }, Const(Name { inner: Str(Name { inner: Anon, cached_hash: 1723 }, \"UInt64\"), cached_hash: 2954612489107370298 }, []), Pi(BinderData { info: Default, mult: Many }, Const(Name { inner: Str(Name { inner: Anon, cached_hash: 1723 }, \"UInt64\"), cached_hash: 2954612489107370298 }, []), App(App(Const(Name { inner: Str(Name { inner: Str(Name { inner: Anon, cached_hash: 1723 }, \"Nat\"), cached_hash: 11442535297760353691 }, \"lt\"), cached_hash: 17284123358135039274 }, []), App(Const(Name { inner: Str(Name { inner: Str(Name { inner: Anon, cached_hash: 1723 }, \"UInt64\"), cached_hash: 2954612489107370298 }, \"toNat\"), cached_hash: 7600578240566550400 }, []), BVar(0))), App(Const(Name { inner: Str(Name { inner: Str(Name { inner: Anon, cached_hash: 1723 }, \"UInt64\"), cached_hash: 2954612489107370298 }, \"toNat\"), cached_hash: 7600578240566550400 }, []), BVar(1))))), inferred: Pi(BinderData { info: Default, mult: Many }, Const(Name { inner: Str(Name { inner: Anon, cached_hash: 1723 }, \"UInt64\"), cached_hash: 2954612489107370298 }, []), App(App(Const(Name { inner: Str(Name { inner: Str(Name { inner: Anon, cached_hash: 1723 }, \"Nat\"), cached_hash: 11442535297760353691 }, \"le\"), cached_hash: 10778933377320331970 }, []), App(Const(Name { inner: Str(Name { inner: Str(Name { inner: Anon, cached_hash: 1723 }, \"UInt64\"), cached_hash: 2954612489107370298 }, \"toNat\"), cached_hash: 7600578240566550400 }, []), BVar(0))), App(Const(Name { inner: Str(Name { inner: Str(Name { inner: Anon, cached_hash: 1723 }, \"UInt64\"), cached_hash: 2954612489107370298 }, \"toNat\"), cached_hash: 7600578240566550400 }, []), BVar(0)))), location: None }" }]
+  --> $DIR/e9_result_binding_undischarged.rs:18:27
+   |
+LL |     ensures result > x by u64_ge_refl
+   |                           ^^^^^^^^^^^
+   |
+   = note: statement drift and authority/provenance failures are hard citation errors; there is no router fallback (E9)
+
+error: aborting due to 2 previous errors
+

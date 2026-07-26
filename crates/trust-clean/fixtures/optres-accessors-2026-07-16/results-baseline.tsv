@@ -1,0 +1,7 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+std::option::Option::<i32>::is_none	SHAPE_GAP	false	false	false	false	false	false	false
+std::option::Option::<i32>::is_some	SHAPE_GAP	false	false	false	false	false	false	false
+std::option::Option::<i32>::unwrap_or	SHAPE_GAP	false	false	false	false	false	false	false
+std::option::Option::<i32>::unwrap_or_default	SHAPE_GAP	false	false	false	false	false	false	false
+std::result::Result::<i32, u8>::is_err	SHAPE_GAP	false	false	false	false	false	false	false
+std::result::Result::<i32, u8>::is_ok	SHAPE_GAP	false	false	false	false	false	false	false

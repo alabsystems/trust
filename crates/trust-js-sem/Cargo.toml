@@ -1,0 +1,36 @@
+# trust-js-sem: the independent ECMA-262 reference semantics (S0 surface)
+#
+# The third oracle head: an independent semantics of what JavaScript is
+# SUPPOSED to mean, evaluating the S0 slice (statements/expressions incl.
+# for-in/for-of and template literals, the property-descriptor machinery,
+# the arguments object, wrappers, call/apply/bind, the exact Math subset,
+# Array/String prototype methods) and emitting the same ObservableTrace
+# every other head emits. Anything outside the implemented slice — or inside
+# engine/spec latitude — is a sound `NoCoverage`, never a false divergence
+# and never a silent pass. FULL S0 coverage is not claimed; the Clean
+# denotation is RESEARCH.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-js-sem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+trust-js-trace = { workspace = true }
+trust-js-regexp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+indexmap = { workspace = true }
+num-bigint = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,19 @@
+# Seed fixture for narrow reviewed upstream Rust compatibility exceptions.
+
+schema = "trust.upstream-rust.exceptions.v1"
+
+[[exception]]
+id = "TRUST-UPSTREAM-0001"
+suite = "rustdoc-ui"
+path = "tests/rustdoc-ui/diagnostic-url-branding.rs"
+revision = "base"
+kind = "changed-diagnostic"
+reason = "intentional-trust-product-naming"
+owner = "@trust-release"
+issue = "https://github.com/alabsystems/Trust/issues/1"
+introduced_by = "fedcba9876543210fedcba9876543210fedcba98"
+reviewed_at = "2026-04-26"
+expires_at = "2026-05-26"
+allowed_patterns = [
+  "expected upstream URL differs from Trust-owned diagnostic URL",
+]

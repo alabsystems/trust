@@ -1,0 +1,17 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+<core::slice::iter::Iter<'_, i32> as core::iter::traits::iterator::Iterator>::count	SHAPE_GAP	false	false	false	false	false	false	false
+<core::slice::iter::Iter<'_, i32> as core::iter::traits::iterator::Iterator>::fold::<i32, {closure@<i32 as core::iter::traits::accum::Sum<&i32>>::sum<core::slice::iter::Iter<'_, i32>>::{closure#0}}>	SHAPE_GAP	false	false	false	false	false	false	false
+<core::slice::iter::Iter<'_, i32> as core::iter::traits::iterator::Iterator>::next	SHAPE_GAP	false	false	false	false	false	false	false
+<i32 as core::iter::traits::accum::Sum<&i32>>::sum::<core::slice::iter::Iter<'_, i32>>	SHAPE_GAP	false	false	false	false	false	false	false
+<core::slice::iter::Iter<'_, i32> as core::iter::traits::iterator::Iterator>::sum::<i32>	SHAPE_GAP	false	false	false	false	false	false	false
+<i32 as core::iter::traits::accum::Sum<&i32>>::sum::<core::slice::iter::Iter<'_, i32>>::{closure#0}	SAFETY_GAP	false	false	true	false	false	false	false
+core::option::Option::<&i32>::unwrap_or	SHAPE_GAP	false	false	false	false	false	false	false
+core::slice::iter::<impl core::iter::traits::collect::IntoIterator for &[i32]>::into_iter	SHAPE_GAP	false	false	false	false	false	false	false
+core::slice::iter::Iter::<'_, i32>::new	SHAPE_GAP	false	false	false	false	false	false	false
+main::count_pos	SHAPE_GAP	false	false	false	false	false	false	false
+main::first_or	SHAPE_GAP	false	false	false	false	false	false	false
+main::len_via_count	SHAPE_GAP	false	false	false	false	false	false	false
+main::sum_iter	SHAPE_GAP	false	false	false	false	false	false	false
+main::sum_loop	SHAPE_GAP	false	false	false	false	false	false	false
+main::while_idx	SAFETY_GAP	false	false	true	false	false	false	false
+std::rt::lang_start::<()>::{closure#0}	SHAPE_GAP	false	false	false	false	false	false	false

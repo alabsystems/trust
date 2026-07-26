@@ -1,0 +1,14 @@
+error: contract clauses are not supported on required trait method declarations; bodyless contract metadata cannot be preserved for verification
+  --> $DIR/bodyless_contract_rejected.rs:9:17
+   |
+LL |         ensures result == x by bodyless_bound;
+   |                 ^^^^^^^^^^^
+
+error: contract clauses are not supported on foreign function declarations; bodyless contract metadata cannot be preserved for verification
+  --> $DIR/bodyless_contract_rejected.rs:15:17
+   |
+LL |         ensures result == x by bodyless_bound;
+   |                 ^^^^^^^^^^^
+
+error: aborting due to 2 previous errors
+

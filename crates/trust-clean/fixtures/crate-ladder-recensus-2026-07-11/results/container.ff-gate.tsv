@@ -1,0 +1,9 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+Stack::len	FULLY_FAITHFUL	true	true	true	true	true	false	true
+Stack::at_least	FULLY_FAITHFUL	true	true	true	true	true	false	true
+Stack::capacity	FULLY_FAITHFUL	true	true	true	true	true	false	true
+Stack::double_len	SAFETY_GAP	false	false	true	false	false	false	false
+Stack::has_len	FULLY_FAITHFUL	true	true	true	true	true	false	true
+Stack::is_empty	FULLY_FAITHFUL	true	true	true	true	true	false	true
+Stack::is_full	FULLY_FAITHFUL	true	true	true	true	true	false	true
+Stack::remaining	SAFETY_GAP	false	false	true	false	false	false	false

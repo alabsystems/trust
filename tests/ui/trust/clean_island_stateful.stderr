@@ -1,0 +1,23 @@
+note: Clean island kernel-checked: 1 declaration(s) registered (Shared.zero_eq)
+  --> $DIR/clean_island_stateful.rs:9:5
+   |
+LL | /     namespace Shared
+LL | |     theorem zero_eq : 0 = 0 := rfl
+LL | |     end Shared
+   | |______________^
+
+note: Clean island kernel-checked: 1 declaration(s) registered (reused)
+  --> $DIR/clean_island_stateful.rs:15:5
+   |
+LL | /     open Shared
+LL | |     theorem reused : 0 = 0 := zero_eq
+   | |_____________________________________^
+
+note: citation `reused` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `f`, with a clean certification audit
+  --> $DIR/clean_island_stateful.rs:21:12
+   |
+LL |         by reused
+   |            ^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+

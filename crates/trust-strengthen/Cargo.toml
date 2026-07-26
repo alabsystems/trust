@@ -1,0 +1,32 @@
+# trust-strengthen: AI-driven spec inference for the prove-strengthen-backprop loop
+#
+# Reads proof reports (which VCs failed), analyzes failure patterns, and proposes
+# specifications (preconditions, postconditions, invariants) that would make the
+# code provable. Part of Idea 2 from VISION.md.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-strengthen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+trust-wp = ["dep:trust-router", "dep:trust-vcgen"]
+
+[dependencies]
+trust-types = { workspace = true }
+trust-router = { workspace = true, optional = true }
+trust-vcgen = { workspace = true, optional = true }
+trust-wp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }

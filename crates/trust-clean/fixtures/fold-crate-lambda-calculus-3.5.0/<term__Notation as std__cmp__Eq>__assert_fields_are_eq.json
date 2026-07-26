@@ -1,0 +1,75 @@
+{
+  "name": "assert_fields_are_eq",
+  "def_path": "<term::Notation as std::cmp::Eq>::assert_fields_are_eq",
+  "span": {
+    "file": "<dump-root>/term.rs",
+    "line_start": 33,
+    "col_start": 27,
+    "line_end": 33,
+    "col_end": 29
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "term::Notation",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "Classic",
+                    "discriminant": 0,
+                    "fields": []
+                  },
+                  {
+                    "name": "DeBruijn",
+                    "discriminant": 1,
+                    "fields": []
+                  }
+                ],
+                "disc_index_safe": true
+              }
+            }
+          }
+        },
+        "name": "self"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

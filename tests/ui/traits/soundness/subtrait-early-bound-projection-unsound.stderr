@@ -1,0 +1,38 @@
+error: implementation of `Sub` is not general enough
+  --> $DIR/subtrait-early-bound-projection-unsound.rs:63:18
+   |
+LL |         result = extend_via_subtrait::<MyType<'_>>(&local);
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ implementation of `Sub` is not general enough
+   |
+   = note: `Sub<'0>` would have to be implemented for the type `MyType<'_>`, for any lifetime `'0`...
+   = note: ...but `Sub<'1>` is actually implemented for the type `MyType<'1>`, for some specific lifetime `'1`
+
+error[E0597]: `local` does not live long enough
+  --> $DIR/subtrait-early-bound-projection-unsound.rs:63:52
+   |
+LL |         let local = String::from("unsound subtrait projection");
+   |             ----- binding `local` declared here
+...
+LL |         result = extend_via_subtrait::<MyType<'_>>(&local);
+   |                  ----------------------------------^^^^^^-
+   |                  |                                 |
+   |                  |                                 borrowed value does not live long enough
+   |                  argument requires that `local` is borrowed for `'static`
+...
+LL |     }
+   |     - `local` dropped here while still borrowed
+   |
+note: due to a current limitation of the type system, this implies a `'static` lifetime
+  --> $DIR/subtrait-early-bound-projection-unsound.rs:42:8
+   |
+LL |     T: for<'a> Sub<'a>,
+   |        ^^^^^^^^^^^^^^^
+note: requirement that the value outlives `'static` introduced here
+  --> $DIR/subtrait-early-bound-projection-unsound.rs:42:8
+   |
+LL |     T: for<'a> Sub<'a>,
+   |        ^^^^^^^^^^^^^^^
+
+error: aborting due to 2 previous errors
+
+For more information about this error, try `trustc --explain E0597`.

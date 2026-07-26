@@ -1,0 +1,37 @@
+# trust-proof-cert: Machine-checkable proof certificates for trust
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-proof-cert"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+trust-types = { workspace = true }
+# trust-ir carries the kernel-checkable `ProofEvidence::CleanCic` term the cold
+# packaging path embeds (M-Pkg). Leaf data crate, zero required runtime deps.
+trust-ir = { workspace = true, features = ["serde"] }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+bincode = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+
+# trust #879: ay-proof-common shared types for proof checker integration
+ay-proof-common = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+# M-Pkg roundtrip test: mints a real QF_LIA CleanCic and kernel-rechecks the
+# carried term offline. Dev-only so the kernel/solver stay out of the runtime
+# dep graph of this lightweight cert crate.
+trust-certify = { workspace = true }

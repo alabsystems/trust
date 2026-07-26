@@ -1,0 +1,401 @@
+{
+  "schema": "trust.frontend.fidelity-manifest.v1",
+  "id": "trustjs.autoform.fidelity.v1",
+  "language": "JavaScript",
+  "entries": [
+    {
+      "axis": "Oracle",
+      "name": "trust-js-interp",
+      "description": "the tier-0 faithful JS interpreter, the independent semantics this floor is judged against; it shares no code with the lowering",
+      "payload": null
+    },
+    {
+      "axis": "InputDomain",
+      "name": "ieee754-edge-corners",
+      "description": "the fixed scalar sample set, priority-ordered so a reduced per-parameter prefix still covers the corners: both zeros, both infinities, NaN, the widest finite and the smallest normal, and a few everyday values",
+      "payload": {
+        "samples": [
+          {
+            "repr": "0",
+            "bits": "0000000000000000"
+          },
+          {
+            "repr": "-0",
+            "bits": "8000000000000000"
+          },
+          {
+            "repr": "1",
+            "bits": "3ff0000000000000"
+          },
+          {
+            "repr": "-1",
+            "bits": "bff0000000000000"
+          },
+          {
+            "repr": "NaN",
+            "bits": "7ff8000000000000"
+          },
+          {
+            "repr": "Infinity",
+            "bits": "7ff0000000000000"
+          },
+          {
+            "repr": "-Infinity",
+            "bits": "fff0000000000000"
+          },
+          {
+            "repr": "2",
+            "bits": "4000000000000000"
+          },
+          {
+            "repr": "3",
+            "bits": "4008000000000000"
+          },
+          {
+            "repr": "0.5",
+            "bits": "3fe0000000000000"
+          },
+          {
+            "repr": "-0.5",
+            "bits": "bfe0000000000000"
+          },
+          {
+            "repr": "7",
+            "bits": "401c000000000000"
+          },
+          {
+            "repr": "-13",
+            "bits": "c02a000000000000"
+          },
+          {
+            "repr": "0.1",
+            "bits": "3fb999999999999a"
+          },
+          {
+            "repr": "0.2",
+            "bits": "3fc999999999999a"
+          },
+          {
+            "repr": "100",
+            "bits": "4059000000000000"
+          },
+          {
+            "repr": "1.7976931348623157e+308",
+            "bits": "7fefffffffffffff"
+          },
+          {
+            "repr": "2.2250738585072014e-308",
+            "bits": "0010000000000000"
+          }
+        ],
+        "max_samples": 4096
+      }
+    },
+    {
+      "axis": "InputDomain",
+      "name": "fold-array-shapes",
+      "description": "the array shapes the for-of reduction lane is checked over: the empty array, a singleton of every scalar corner, all-same/ascending/NaN-bearing/signed-zero-bearing/infinity-bearing shapes, and two everyday arrays",
+      "payload": {
+        "shapes": [
+          [],
+          [
+            {
+              "repr": "0",
+              "bits": "0000000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "-0",
+              "bits": "8000000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "1",
+              "bits": "3ff0000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "-1",
+              "bits": "bff0000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "NaN",
+              "bits": "7ff8000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "Infinity",
+              "bits": "7ff0000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "-Infinity",
+              "bits": "fff0000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "2",
+              "bits": "4000000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "3",
+              "bits": "4008000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "0.5",
+              "bits": "3fe0000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "-0.5",
+              "bits": "bfe0000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "7",
+              "bits": "401c000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "-13",
+              "bits": "c02a000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "0.1",
+              "bits": "3fb999999999999a"
+            }
+          ],
+          [
+            {
+              "repr": "0.2",
+              "bits": "3fc999999999999a"
+            }
+          ],
+          [
+            {
+              "repr": "100",
+              "bits": "4059000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "1.7976931348623157e+308",
+              "bits": "7fefffffffffffff"
+            }
+          ],
+          [
+            {
+              "repr": "2.2250738585072014e-308",
+              "bits": "0010000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "2",
+              "bits": "4000000000000000"
+            },
+            {
+              "repr": "2",
+              "bits": "4000000000000000"
+            },
+            {
+              "repr": "2",
+              "bits": "4000000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "-1",
+              "bits": "bff0000000000000"
+            },
+            {
+              "repr": "-1",
+              "bits": "bff0000000000000"
+            },
+            {
+              "repr": "-1",
+              "bits": "bff0000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "0.5",
+              "bits": "3fe0000000000000"
+            },
+            {
+              "repr": "0.5",
+              "bits": "3fe0000000000000"
+            },
+            {
+              "repr": "0.5",
+              "bits": "3fe0000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "-2",
+              "bits": "c000000000000000"
+            },
+            {
+              "repr": "-1",
+              "bits": "bff0000000000000"
+            },
+            {
+              "repr": "0",
+              "bits": "0000000000000000"
+            },
+            {
+              "repr": "1",
+              "bits": "3ff0000000000000"
+            },
+            {
+              "repr": "2",
+              "bits": "4000000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "1",
+              "bits": "3ff0000000000000"
+            },
+            {
+              "repr": "2",
+              "bits": "4000000000000000"
+            },
+            {
+              "repr": "3",
+              "bits": "4008000000000000"
+            },
+            {
+              "repr": "4",
+              "bits": "4010000000000000"
+            },
+            {
+              "repr": "5",
+              "bits": "4014000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "1",
+              "bits": "3ff0000000000000"
+            },
+            {
+              "repr": "NaN",
+              "bits": "7ff8000000000000"
+            },
+            {
+              "repr": "2",
+              "bits": "4000000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "0",
+              "bits": "0000000000000000"
+            },
+            {
+              "repr": "-0",
+              "bits": "8000000000000000"
+            },
+            {
+              "repr": "1",
+              "bits": "3ff0000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "Infinity",
+              "bits": "7ff0000000000000"
+            },
+            {
+              "repr": "-Infinity",
+              "bits": "fff0000000000000"
+            },
+            {
+              "repr": "1",
+              "bits": "3ff0000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "0",
+              "bits": "0000000000000000"
+            },
+            {
+              "repr": "-0",
+              "bits": "8000000000000000"
+            },
+            {
+              "repr": "1",
+              "bits": "3ff0000000000000"
+            },
+            {
+              "repr": "-1",
+              "bits": "bff0000000000000"
+            },
+            {
+              "repr": "NaN",
+              "bits": "7ff8000000000000"
+            },
+            {
+              "repr": "Infinity",
+              "bits": "7ff0000000000000"
+            },
+            {
+              "repr": "-Infinity",
+              "bits": "fff0000000000000"
+            },
+            {
+              "repr": "1.7976931348623157e+308",
+              "bits": "7fefffffffffffff"
+            }
+          ],
+          [
+            {
+              "repr": "3",
+              "bits": "4008000000000000"
+            },
+            {
+              "repr": "4",
+              "bits": "4010000000000000"
+            }
+          ],
+          [
+            {
+              "repr": "0.1",
+              "bits": "3fb999999999999a"
+            },
+            {
+              "repr": "0.2",
+              "bits": "3fc999999999999a"
+            },
+            {
+              "repr": "0.3",
+              "bits": "3fd3333333333333"
+            }
+          ]
+        ],
+        "max_samples": 4096
+      }
+    }
+  ],
+  "manifest_sha256": "37ddbe1f85f844bc69daa1ae010c2a73ecd51eb9ecba5eabdc9cbcfb7fc1d7bb"
+}

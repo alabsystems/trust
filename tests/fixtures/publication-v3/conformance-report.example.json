@@ -1,0 +1,13 @@
+{
+  "schema_version": "trust-conformance-report/v1",
+  "generated_at": "2026-04-25T00:00:00Z",
+  "manifest": {"path": "trust-conformance/manifest.json", "schema_version": "trust-conformance-manifest/v1", "suite": "publication-v3-initial", "issue": 1053},
+  "summary": {"total": 3, "pass": 1, "fail": 0, "blocked": 1, "waived": 1},
+  "results": [
+    {"id": "deductive.loop_invariant_vc", "category": "deductive", "title": "Loop invariant verification condition", "status": "pass", "evidence": ["trust-conformance/cases/deductive/loop_invariant_vc/input.trust"], "checks": [{"kind": "file_exists", "status": "pass", "path": "trust-conformance/cases/deductive/loop_invariant_vc/input.trust"}]},
+    {"id": "trust_integration.targo_trust_publication_json", "category": "trust-integration", "title": "targo-trust publication JSON contract", "status": "blocked", "reason": "Stable targo-trust Publication V3 JSON output is owned by another worker.", "evidence": [], "checks": []},
+    {"id": "proof_calculus.lean5_replay_roundtrip", "category": "proof-calculus", "title": "Lean5 replay round-trip", "status": "waived", "reason": "Lean5 replay binary packaging is not part of the initial conformance skeleton.", "evidence": [], "checks": []}
+  ],
+  "blocked": ["trust_integration.targo_trust_publication_json"],
+  "waived": ["proof_calculus.lean5_replay_roundtrip"]
+}

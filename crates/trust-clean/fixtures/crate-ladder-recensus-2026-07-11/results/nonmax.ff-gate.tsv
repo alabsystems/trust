@@ -1,0 +1,36 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+NonMaxU8::get	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxI128 as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxI16 as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxI32 as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxI64 as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxIsize as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU128 as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU16 as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU32 as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU64 as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU8 as core::clone::Clone>::clone	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU8 as core::cmp::Eq>::assert_fields_are_eq	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU8 as core::cmp::Ord>::cmp	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU8 as core::cmp::PartialEq>::eq	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU8 as core::cmp::PartialOrd>::partial_cmp	SHAPE_GAP	false	false	false	false	false	false	false
+NonMaxU8::new	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU8 as core::convert::TryFrom<u8>>::try_from	SHAPE_GAP	false	false	false	false	false	false	false
+NonMaxU8::new_unchecked	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU8 as core::default::Default>::default	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU8 as core::fmt::Binary>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU8 as core::fmt::Debug>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU8 as core::fmt::Display>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU8 as core::fmt::LowerHex>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU8 as core::fmt::Octal>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU8 as core::fmt::UpperHex>::fmt	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU8 as core::hash::Hash>::hash	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU8 as core::ops::BitAnd<u8>>::bitand	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU8 as core::ops::BitAnd>::bitand	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU8 as core::ops::BitAndAssign<u8>>::bitand_assign	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU8 as core::ops::BitAndAssign>::bitand_assign	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxU8 as core::str::FromStr>::from_str	SHAPE_GAP	false	false	false	false	false	false	false
+<NonMaxUsize as core::convert::From<NonMaxU8>>::from	SHAPE_GAP	false	false	false	false	false	false	false
+<impl core::convert::From<NonMaxU8> for u8>::from	SHAPE_GAP	false	false	false	false	false	false	false
+<impl core::ops::BitAnd<NonMaxU8> for u8>::bitand	SHAPE_GAP	false	false	false	false	false	false	false
+<impl core::ops::BitAndAssign<NonMaxU8> for u8>::bitand_assign	SHAPE_GAP	false	false	false	false	false	false	false

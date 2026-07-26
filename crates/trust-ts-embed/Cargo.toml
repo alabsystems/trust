@@ -1,0 +1,30 @@
+# trust-ts-embed: the TypeScript front end of the autoformalization pipeline.
+#
+# Lowers a deterministic TypeScript fragment to a single TsCore calculus, then
+# derives a trust_types::VerifiableFunction from it (the "TS image") that the
+# refinement toolchain (trust-transval -> trust-router -> ay) compares against a
+# Rust port's image. TsCore is the ONE intermediate (single-image discipline): the
+# same TsCore later derives a Clean term for the Certified path. Anything outside
+# the fragment fails closed as a typed FragmentEscape — never a partial image.
+#
+# This crate produces images only; it has no solver/router dependency, and no
+# in-tree consumer — see the `## Standing` section in src/lib.rs.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-ts-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+trust-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

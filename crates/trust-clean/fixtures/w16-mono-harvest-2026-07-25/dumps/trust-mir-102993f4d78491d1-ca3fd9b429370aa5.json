@@ -1,0 +1,395 @@
+{
+  "name": "lang_start",
+  "def_path": "std::rt::lang_start::<()>",
+  "span": {
+    "file": "std/src/rt.rs",
+    "line_start": 199,
+    "col_start": 0,
+    "line_end": 211,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "FnPtr": {
+            "sig": {
+              "params": [],
+              "ret": "Unit"
+            }
+          }
+        },
+        "name": "main"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": "argc"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "RawPtr": {
+            "mutable": false,
+            "pointee": {
+              "RawPtr": {
+                "mutable": false,
+                "pointee": {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": "argv"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "sigpipe"
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Dynamic": {
+                "trait_name": "core::ops::function::Fn"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Closure": {
+                "name": "std::rt::lang_start::{closure#0}",
+                "upvars": [
+                  {
+                    "FnPtr": {
+                      "sig": {
+                        "params": [],
+                        "ret": "Unit"
+                      }
+                    }
+                  }
+                ],
+                "call": {
+                  "kind": "Fn",
+                  "params": [],
+                  "ret": {
+                    "Int": {
+                      "width": 32,
+                      "signed": true
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Closure": {
+            "name": "std::rt::lang_start::{closure#0}",
+            "upvars": [
+              {
+                "FnPtr": {
+                  "sig": {
+                    "params": [],
+                    "ret": "Unit"
+                  }
+                }
+              }
+            ],
+            "call": {
+              "kind": "Fn",
+              "params": [],
+              "ret": {
+                "Int": {
+                  "width": 32,
+                  "signed": true
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 5
+          },
+          {
+            "StorageLive": 6
+          },
+          {
+            "StorageLive": 7
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Closure": {
+                      "name": "std::rt::lang_start::{closure#0}",
+                      "captures": [
+                        {
+                          "FnPtr": {
+                            "sig": {
+                              "params": [],
+                              "ret": "Unit"
+                            }
+                          }
+                        }
+                      ],
+                      "call_kind": "Fn"
+                    }
+                  },
+                  [
+                    {
+                      "Copy": {
+                        "local": 1,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "std/src/rt.rs",
+                "line_start": 206,
+                "col_start": 9,
+                "line_end": 206,
+                "col_end": 92
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 7,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "std/src/rt.rs",
+                "line_start": 206,
+                "col_start": 8,
+                "line_end": 206,
+                "col_end": 92
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": "OpaqueConst"
+                }
+              },
+              "span": {
+                "file": "std/src/rt.rs",
+                "line_start": 206,
+                "col_start": 8,
+                "line_end": 206,
+                "col_end": 92
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "std::rt::lang_start_internal",
+            "args": [
+              {
+                "Move": {
+                  "local": 5,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 2,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 3,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 4,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "std/src/rt.rs",
+              "line_start": 205,
+              "col_start": 4,
+              "line_end": 210,
+              "col_end": 5
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageDead": 7
+          },
+          {
+            "StorageDead": 6
+          },
+          {
+            "StorageDead": 5
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 4,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "argc",
+                "Int"
+              ]
+            },
+            {
+              "Int": -9223372036854775808
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "argc",
+                "Int"
+              ]
+            },
+            {
+              "Int": 9223372036854775807
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "sigpipe",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "sigpipe",
+                "Int"
+              ]
+            },
+            {
+              "Int": 255
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

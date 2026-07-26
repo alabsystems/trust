@@ -1,0 +1,26 @@
+# trust-js-value: the TrustJS value model — M1 D2
+#
+# WTF-16 strings, ECMA-262 number conversions, ordinary objects with the full
+# property-descriptor model (data + accessor, spec own-key order, prototype
+# chains, extensibility), environment records (declarative/function; TDZ), and
+# the realm intrinsics table with per-intrinsic miss-danger sets: the real
+# value model of the faithful tier
+# (docs/design/2026-07-21-trustjs-m1-scope.md D2). Consumed by trust-js-interp.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-js-value"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+indexmap = { workspace = true }
+num-bigint = { workspace = true }
+trust-js-parse = { workspace = true }

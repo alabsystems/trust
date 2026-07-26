@@ -1,0 +1,237 @@
+# Production-shaped seed baseline for upstream Rust compatibility accounting.
+# This file follows crates/trust-upstream-compat schema_version 0.1.0.
+
+schema_version = "0.1.0"
+id = "upstream-rust.toolchain-baseline.2026-07-09"
+
+[upstream]
+channel = "nightly"
+# Trust: re-pinned by the rust-1.96->1.99 content migration (branch
+# migrate/rust-2026-07): compiler/, library/, src/, and tests/ are ported to
+# this revision (3-way against the previous pin 0d4eb098). The per-surface
+# statuses below remain the honest seed state until a full domination
+# scorecard runs against THIS revision — the tests/ui vanilla replay evidence
+# (20779/393/593, 2026-07-09) lives in tests/trust-comprehensive/
+# divergences.toml#ui-diagnostic-drift, not here.
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+snapshot_date = "2026-07-08"
+
+[local]
+revision = "trust:migrate/rust-2026-07"
+branch = "migrate/rust-2026-07"
+workspace = "tRust"
+
+# Trust: how to populate the 13 surface `status` fields below.
+#
+# Every entry currently carries `status = "unknown"` — i.e. "not yet
+# classified". These are seed placeholders, NOT a claim of compatibility.
+# Do NOT hand-edit them to "compatible"/"diverged" from intuition; that
+# would fabricate a drop-in-parity claim. Each value must come from a real
+# stage2 scorecard run against the pinned [upstream] revision above.
+#
+# Valid values are exactly the BaselineStatus enum
+# (crates/trust-upstream-compat/src/model.rs, serde snake_case):
+#   compatible       local behavior matches upstream for the surface
+#   diverged         local behavior differs (must be ledger-accounted)
+#   missing_local    upstream surface exists, no local support yet
+#   missing_upstream local surface exists, upstream anchor is gone
+#   unknown          not yet classified (the current seed state)
+#
+# Procedure to populate honestly:
+#   1. Build a coherent stage2 vanilla Trust sysroot (./x.py build --stage 2),
+#      then run the canonical scorecard for the adopted baseline revision:
+#        targo trust domination upstream-tests --release --proof-mode full \
+#          --upstream-revision rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0 \
+#          --out-dir reports/upstream-rust/<run-id>/adopted_baseline_release_full
+#      (see scripts/run_upstream_rust_adopted_evidence.py:full_suite_commands).
+#   2. Read the emitted scorecard.json. Per-surface outcomes there map onto a
+#      BaselineStatus: an all-passing surface (or one whose only failures are
+#      covered by active tests/upstream-rust/test-exceptions.toml rows) becomes
+#      `compatible`; a surface with unaccounted failures becomes `diverged` and
+#      requires a ledger entry before any release claim; absent upstream/local
+#      anchors map to `missing_upstream`/`missing_local`.
+#   3. Bump `id` (date suffix) and refresh [upstream]/[local] revisions if the
+#      run pinned different commits, then commit the scorecard alongside as the
+#      evidence backing each status. Until a run exists, leave these `unknown`.
+
+[[entries]]
+id = "toolchain.rustc"
+title = "rustc compiler compatibility"
+surface = "cli"
+upstream_artifact = "compiler/rustc_driver; compiler/rustc_interface; tests/ui; tests/codegen; tests/incremental; tests/crashes"
+local_artifact = "compiler/rustc_driver; compiler/rustc_interface; tests/ui; tests/codegen; tests/incremental; tests/crashes"
+status = "unknown"
+labels = ["upstream-rust", "toolchain", "rustc", "release-blocking"]
+
+[entries.expectation]
+upstream_behavior = "upstream rustc accepts the upstream command-line contract, diagnostics, codegen behavior, and suite metadata for the adopted snapshot"
+local_behavior = "tRust stage2 compiler in vanilla mode accepts the same contract without Trust-only verification effects"
+compatibility_rule = "host-applicable upstream rustc suites and command-line behaviors must match unless a result is accounted for by an active exception or tracked upstream fix"
+
+[[entries]]
+id = "toolchain.rustdoc"
+title = "rustdoc compatibility"
+surface = "cli"
+upstream_artifact = "src/librustdoc; tests/rustdoc; tests/rustdoc-ui; tests/rustdoc-json; tests/rustdoc-js"
+local_artifact = "src/librustdoc; tests/rustdoc; tests/rustdoc-ui; tests/rustdoc-json; tests/rustdoc-js"
+status = "unknown"
+labels = ["upstream-rust", "toolchain", "rustdoc", "release-blocking"]
+
+[entries.expectation]
+upstream_behavior = "upstream rustdoc renders documentation, diagnostics, JSON output, search index data, and doctest wiring for the adopted snapshot"
+local_behavior = "tRust rustdoc in vanilla mode renders and reports the same externally visible behavior"
+compatibility_rule = "host-applicable upstream rustdoc suites must pass with matching output, diagnostics, and emitted artifacts unless ledger-accounted"
+
+[[entries]]
+id = "toolchain.cargo"
+title = "cargo compatibility"
+surface = "cargo"
+upstream_artifact = "src/tools/cargo; src/tools/cargo/tests; tests/run-make"
+local_artifact = "src/tools/cargo; src/tools/cargo/tests; tests/run-make"
+status = "unknown"
+labels = ["upstream-rust", "toolchain", "cargo", "release-blocking"]
+
+[entries.expectation]
+upstream_behavior = "upstream Cargo preserves package resolution, build orchestration, rustc invocation, and distribution-facing integration behavior"
+local_behavior = "tRust Cargo preserves the same behavior when driving the tRust compiler in vanilla compatibility mode"
+compatibility_rule = "upstream Cargo tests and run-make integration cases must match unless ledger-accounted"
+
+[[entries]]
+id = "toolchain.rustfmt"
+title = "rustfmt compatibility"
+surface = "cli"
+upstream_artifact = "src/tools/rustfmt; src/tools/rustfmt/tests"
+local_artifact = "src/tools/rustfmt; src/tools/rustfmt/tests"
+status = "unknown"
+labels = ["upstream-rust", "toolchain", "rustfmt", "release-blocking"]
+
+[entries.expectation]
+upstream_behavior = "upstream rustfmt applies formatting, configuration, and edition behavior for the adopted snapshot"
+local_behavior = "tRust rustfmt applies matching formatting, configuration, and edition behavior"
+compatibility_rule = "upstream rustfmt tests must pass with matching formatted output and configuration handling unless ledger-accounted"
+
+[[entries]]
+id = "toolchain.clippy"
+title = "clippy compatibility"
+surface = "compiler_diagnostic"
+upstream_artifact = "src/tools/clippy; src/tools/clippy/tests"
+local_artifact = "src/tools/tippy; src/tools/tippy/tests"
+status = "unknown"
+labels = ["upstream-rust", "toolchain", "clippy", "release-blocking"]
+
+[entries.expectation]
+upstream_behavior = "upstream clippy emits lint diagnostics, suggestions, and configuration behavior for the adopted snapshot"
+local_behavior = "tRust clippy emits matching lint diagnostics, suggestions, and configuration behavior in vanilla mode"
+compatibility_rule = "upstream clippy tests must pass with matching lint classifications and diagnostics unless ledger-accounted"
+
+[[entries]]
+id = "toolchain.miri"
+title = "miri compatibility"
+surface = "verification"
+upstream_artifact = "src/tools/miri; src/tools/miri/tests"
+local_artifact = "src/tools/miri; src/tools/miri/tests"
+status = "unknown"
+labels = ["upstream-rust", "toolchain", "miri", "release-blocking"]
+
+[entries.expectation]
+upstream_behavior = "upstream miri interprets supported programs and isolation-sensitive tests according to the adopted snapshot"
+local_behavior = "tRust miri preserves upstream interpreter behavior on supported hosts"
+compatibility_rule = "upstream miri tests must pass with matching interpreter outcomes unless ledger-accounted"
+
+[[entries]]
+id = "toolchain.rust-analyzer"
+title = "rust-analyzer compatibility"
+surface = "other"
+upstream_artifact = "src/tools/rust-analyzer; src/tools/rust-analyzer/crates"
+local_artifact = "src/tools/rust-analyzer; src/tools/rust-analyzer/crates"
+status = "unknown"
+labels = ["upstream-rust", "toolchain", "rust-analyzer", "release-blocking"]
+
+[entries.expectation]
+upstream_behavior = "upstream rust-analyzer provides analysis, completion, proc-macro integration, and project-model behavior for the adopted snapshot"
+local_behavior = "tRust rust-analyzer preserves the same externally visible analysis behavior"
+compatibility_rule = "upstream rust-analyzer tests must pass with matching analysis results unless ledger-accounted"
+
+[[entries]]
+id = "toolchain.bootstrap-x.py"
+title = "bootstrap and x.py compatibility"
+surface = "cli"
+upstream_artifact = "x.py; src/bootstrap; tests/run-make"
+local_artifact = "x.py; src/bootstrap; tests/run-make"
+status = "unknown"
+labels = ["upstream-rust", "toolchain", "bootstrap", "x.py", "release-blocking"]
+
+[entries.expectation]
+upstream_behavior = "upstream bootstrap and x.py build, test, profile, and stage wiring behave according to the adopted snapshot"
+local_behavior = "tRust bootstrap and x.py preserve upstream-compatible build, test, profile, and stage wiring"
+compatibility_rule = "upstream bootstrap smoke tests and stage wiring checks must match unless ledger-accounted"
+
+[[entries]]
+id = "toolchain.compiletest-run-make"
+title = "compiletest and run-make compatibility"
+surface = "other"
+upstream_artifact = "src/tools/compiletest; tests/run-make"
+local_artifact = "src/tools/compiletest; tests/run-make"
+status = "unknown"
+labels = ["upstream-rust", "toolchain", "compiletest", "run-make", "release-blocking"]
+
+[entries.expectation]
+upstream_behavior = "upstream compiletest executes suite metadata, revisions, compare modes, directives, and run-make tests for the adopted snapshot"
+local_behavior = "tRust compiletest executes the same upstream inputs and expectations in vanilla compatibility mode"
+compatibility_rule = "host-applicable upstream compiletest and run-make behavior must match unless ledger-accounted"
+
+[[entries]]
+id = "toolchain.standard-library"
+title = "standard library compatibility"
+surface = "standard_library"
+upstream_artifact = "library; tests/ui; tests/run-make"
+local_artifact = "library; tests/ui; tests/run-make"
+status = "unknown"
+labels = ["upstream-rust", "toolchain", "standard-library", "release-blocking"]
+
+[entries.expectation]
+upstream_behavior = "upstream core, alloc, std, and test-visible library behavior match the adopted snapshot on supported hosts"
+local_behavior = "tRust core, alloc, std, and test-visible library behavior preserve upstream semantics on supported hosts"
+compatibility_rule = "upstream library, UI, and run-make coverage for standard-library behavior must match unless ledger-accounted"
+
+[[entries]]
+id = "toolchain.proc-macro"
+title = "proc-macro compatibility"
+surface = "type_system"
+upstream_artifact = "library/proc_macro; tests/ui/proc-macro; tests/run-make"
+local_artifact = "library/proc_macro; tests/ui/proc-macro; tests/run-make"
+status = "unknown"
+labels = ["upstream-rust", "toolchain", "proc-macro", "release-blocking"]
+
+[entries.expectation]
+upstream_behavior = "upstream proc-macro ABI, expansion, diagnostics, spans, and token behavior match the adopted snapshot"
+local_behavior = "tRust proc-macro behavior preserves upstream ABI, expansion, diagnostics, spans, and token behavior"
+compatibility_rule = "upstream proc-macro UI and run-make cases must match unless ledger-accounted"
+
+[[entries]]
+id = "toolchain.test-harness"
+title = "test harness compatibility"
+surface = "standard_library"
+upstream_artifact = "library/test; tests/ui/test-attrs; tests/run-make"
+local_artifact = "library/test; tests/ui/test-attrs; tests/run-make"
+status = "unknown"
+labels = ["upstream-rust", "toolchain", "test-harness", "release-blocking"]
+
+[entries.expectation]
+upstream_behavior = "upstream libtest and rustc --test behavior match the adopted snapshot"
+local_behavior = "tRust libtest and rustc --test behavior preserve upstream harness behavior"
+compatibility_rule = "upstream libtest, test-attrs, and run-make cases must match unless ledger-accounted"
+
+[[entries]]
+id = "toolchain.bench-harness"
+title = "bench harness compatibility"
+surface = "standard_library"
+upstream_artifact = "library/test; library/test/benches; tests/ui/feature-gates; tests/run-make"
+local_artifact = "library/test; library/test/benches; tests/ui/feature-gates; tests/run-make"
+status = "unknown"
+labels = ["upstream-rust", "toolchain", "bench-harness", "release-blocking"]
+
+[entries.expectation]
+upstream_behavior = "upstream unstable bench harness behavior and feature gating match the adopted snapshot where enabled"
+local_behavior = "tRust bench harness behavior and feature gating preserve upstream behavior where enabled"
+compatibility_rule = "upstream bench harness and feature-gate coverage must match unless ledger-accounted"

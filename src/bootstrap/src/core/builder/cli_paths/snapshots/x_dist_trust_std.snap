@@ -1,0 +1,7 @@
+---
+source: src/core/builder/cli_paths/tests.rs
+expression: dist trust-std
+---
+[Dist] dist::Std
+    targets: [aarch64-unknown-linux-gnu]
+    - Set({dist::trust-std})

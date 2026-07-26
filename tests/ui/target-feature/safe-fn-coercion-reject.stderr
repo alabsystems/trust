@@ -1,0 +1,53 @@
+error[E0308]: mismatched types
+  --> $DIR/safe-fn-coercion-reject.rs:18:20
+   |
+LL | #[target_feature(enable = "sse2")]
+   | ---------------------------------- `#[target_feature]` added here
+...
+LL |     let _: fn() = requires_sse2;
+   |            ----   ^^^^^^^^^^^^^ cannot coerce functions with `#[target_feature]` to safe function pointers
+   |            |
+   |            expected due to this
+   |
+   = note: expected fn pointer `fn()`
+                 found fn item `#[target_features] fn() {requires_sse2}`
+   = note: functions with `#[target_feature]` can only be coerced to `unsafe` function pointers
+
+error[E0308]: mismatched types
+  --> $DIR/safe-fn-coercion-reject.rs:24:20
+   |
+LL | #[target_feature(enable = "sse2")]
+   | ---------------------------------- `#[target_feature]` added here
+...
+LL |     let _: fn() = requires_sse2;
+   |            ----   ^^^^^^^^^^^^^ cannot coerce functions with `#[target_feature]` to safe function pointers
+   |            |
+   |            expected due to this
+   |
+   = note: expected fn pointer `fn()`
+                 found fn item `#[target_features] fn() {requires_sse2}`
+   = note: functions with `#[target_feature]` can only be coerced to `unsafe` function pointers
+
+error[E0308]: mismatched types
+  --> $DIR/safe-fn-coercion-reject.rs:25:19
+   |
+LL | #[target_feature(enable = "sse2")]
+   | ---------------------------------- `#[target_feature]` added here
+...
+LL |     takes_safe_fn(requires_sse2);
+   |     ------------- ^^^^^^^^^^^^^ expected fn pointer, found fn item
+   |     |
+   |     arguments to this function are incorrect
+   |
+   = note: expected fn pointer `fn()`
+                 found fn item `#[target_features] fn() {requires_sse2}`
+   = note: functions with `#[target_feature]` can only be coerced to `unsafe` function pointers
+note: function defined here
+  --> $DIR/safe-fn-coercion-reject.rs:21:4
+   |
+LL | fn takes_safe_fn(_f: fn()) {}
+   |    ^^^^^^^^^^^^^ --------
+
+error: aborting due to 3 previous errors
+
+For more information about this error, try `trustc --explain E0308`.

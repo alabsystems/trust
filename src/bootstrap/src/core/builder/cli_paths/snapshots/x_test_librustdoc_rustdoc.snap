@@ -1,0 +1,11 @@
+---
+source: src/core/builder/cli_paths/tests.rs
+assertion_line: 68
+expression: test librustdoc rustdoc
+---
+[Test] test::CrateRustdoc
+    targets: [x86_64-unknown-linux-gnu]
+    - Set({test::src/librustdoc})
+[Test] test::RustdocBook
+    targets: [x86_64-unknown-linux-gnu]
+    - Set({test::src/doc/rustdoc})

@@ -1,0 +1,10 @@
+error: the option `Z` is only accepted on the nightly compiler
+
+help: consider switching to the Trust toolchain: `rustup default trust`
+
+note: selecting a toolchain with `+toolchain` arguments require a rustup proxy; see <https://rust-lang.github.io/rustup/concepts/index.html>
+
+note: Trust keeps the inherited unstable option model; use the Trust toolchain for `-Z` workflows.
+
+error: 1 nightly option were parsed
+

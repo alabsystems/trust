@@ -1,0 +1,79 @@
+# S0 — the frozen "modern sync core" Test262 slice for TrustJS M0 calibration.
+# The slice is payload-external: the full path list is NOT embedded here. It is
+# re-derived from the pinned corpus (tests/js262/corpus-pin.json) by applying
+# the [rules] below exactly as specified in the S0 slice selection contract
+# (docs/design/2026-07-20-trustjs-m0-scope.md, D3), then checked against
+# [derived]: the sorted list must have exactly `count` entries and hash to
+# `list_sha256` (sha256 over the UTF-8 concatenation of each relative path +
+# "\n", paths sorted bytewise ascending). Any mismatch is drift — fail closed.
+#
+# Selection contract (a file is IN iff ALL hold):
+#   1. path (relative to corpus root, forward slashes) starts with one of
+#      [rules].include_prefixes;
+#   2. path does NOT start with any of [rules].exclude_prefixes;
+#   3. filename ends ".js" and does NOT end with any of
+#      [rules].exclude_suffixes;
+#   4. frontmatter flags (the YAML "flags: [...]" list between the FIRST
+#      "/*---" and the following "---*/"; block-style "- item" lists are also
+#      valid; a file with no such block has empty flags/features) contain NONE
+#      of [rules].exclude_flags;
+#   5. the raw file content does NOT contain any of
+#      [rules].exclude_content_substrings;
+#   6. frontmatter features contain NONE of [rules].exclude_features and NO
+#      feature containing any of [rules].exclude_feature_substrings;
+#   7. frontmatter features contain NO proposal-stage feature, where the
+#      proposal set is read from the pinned corpus's own features.txt
+#      "## Proposed language features" section ([rules].
+#      exclude_proposal_features_from) — pin-derived, so the rule can never
+#      be tuned to observed engine agreement;
+#   8. frontmatter includes name NO harness file whose content contains any
+#      of [rules].exclude_include_content_substrings (e.g.
+#      detachArrayBuffer.js, atomicsHelper.js): assembling those would test
+#      the harness stub, not the engines — their "equal" runs are vacuous.
+#
+# Author: Andrew Yates
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+schema_version = "0.1.0"
+id = "js262.s0.2026-07-21-v2"
+
+[corpus]
+revision = "tc39/test262:9e61c12835c5e4a3bdba93850427e6742c4f64c4"
+
+[rules]
+include_prefixes = ["test/language/", "test/built-ins/"]
+exclude_prefixes = [
+    "test/intl402/",
+    "test/staging/",
+    "test/annexB/",
+    "test/built-ins/Temporal/",
+]
+exclude_suffixes = ["_FIXTURE.js"]
+exclude_flags = ["async", "module", "CanBlockIsTrue", "CanBlockIsFalse"]
+exclude_content_substrings = ["$262."]
+exclude_features = [
+    "Atomics",
+    "SharedArrayBuffer",
+    "Temporal",
+    "tail-call-optimization",
+    "IsHTMLDDA",
+    "cross-realm",
+    "host-gc-required",
+]
+exclude_feature_substrings = ["Intl"]
+exclude_proposal_features_from = "features.txt#Proposed language features"
+exclude_include_content_substrings = ["$262."]
+
+[derived]
+# 2026-07-23: count 35346 -> 34914, list_sha256 refreshed after fixing the
+# proposal-feature reader (crates/trust-js-differential/src/slice.rs
+# load_slice_context): the pinned features.txt lists 10 proposals — source-phase
+# -imports, import-defer, export-defer, import-text, immutable-arraybuffer,
+# import-bytes, nonextensible-applies-to-private, await-dictionary,
+# error-stack-accessor, source-phase-imports-module-source — after two rows that
+# erroneously begin `## ` inside the "Proposed language features" section; the
+# old reader treated those typo rows as section boundaries and silently admitted
+# those proposals' tests. Rule 7 always meant "exclude the whole proposal
+# section"; the fix makes the derived list match the stated contract (-432 files).
+count = 34914
+list_sha256 = "a8ee2a3fac84c4a5f350aa545fee14dfa09adf764fd63c40a0972f0570d78224"

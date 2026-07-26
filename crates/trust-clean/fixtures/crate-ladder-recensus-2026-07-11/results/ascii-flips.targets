@@ -1,0 +1,4 @@
+<char as Check>::is_control
+<char as Check>::is_extended
+<char as Check>::is_printable
+<char as Check>::is_us_ascii

@@ -1,0 +1,12 @@
+trustc version: rustc 1.99.0-nightly (3f0eb9e6f 2026-07-16) (trustc)
+trustc binary sha256: 0d1a627d1d6074c232219198b574dc47aee7d347907566b2a67666140da38f93
+rustc_driver dylib: librustc_driver-222b42be0a0fefe1.dylib
+rustc_driver sha256: bfad95164c6eadc841d0c2d904e0c0a8da2cc63aa1eb494131ebfdbdfb8ac35b
+trustc path: build/host/stage1/bin/trustc (regenerate.sh default; TRUSTC may select an exact relocated copy)
+repo HEAD encoded by trustc: 3f0eb9e6f313fa3e07cee021fa7359ef53d560d0
+host: aarch64-apple-darwin
+expected recursive core dump count: 27547
+expected recursive SOURCE dump count: 12
+expected core survey warning count: 27553
+expected SOURCE survey warning count: 12
+validation tools: regenerate.sh builds release ff-gate-diagnose-2026-07-10 and census-2026-07-06 from the current checkout and checks every output field

@@ -1,0 +1,32 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful
+<i32 as std::cmp::Ord>::max	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<i32 as std::cmp::Ord>::min	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<i64 as std::cmp::Ord>::max	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<i64 as std::cmp::Ord>::min	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<u8 as std::cmp::Ord>::max	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<u8 as std::cmp::Ord>::min	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<usize as std::cmp::Ord>::max	FULLY_FAITHFUL	true	true	false	false	false	false	true
+<usize as std::cmp::Ord>::min	FULLY_FAITHFUL	true	true	false	false	false	false	true
+clamp_i32	SHAPE_GAP	false	false	false	false	false	false	false
+clamp_i64	SHAPE_GAP	false	false	false	false	false	false	false
+clamp_u8	SHAPE_GAP	false	false	false	false	false	false	false
+clamp_usize	SHAPE_GAP	false	false	false	false	false	false	false
+field_min_i32	FULLY_FAITHFUL	true	true	true	true	true	false	true
+field_min_usize	FULLY_FAITHFUL	true	true	true	true	true	false	true
+max_i32	FULLY_FAITHFUL	true	true	true	true	true	false	true
+max_i64	FULLY_FAITHFUL	true	true	true	true	true	false	true
+max_u8	FULLY_FAITHFUL	true	true	true	true	true	false	true
+max_usize	FULLY_FAITHFUL	true	true	true	true	true	false	true
+min_i32	FULLY_FAITHFUL	true	true	true	true	true	false	true
+min_i64	FULLY_FAITHFUL	true	true	true	true	true	false	true
+min_max_i32	SHAPE_GAP	false	false	false	false	false	false	false
+min_u8	FULLY_FAITHFUL	true	true	true	true	true	false	true
+min_usize	FULLY_FAITHFUL	true	true	true	true	true	false	true
+std::cmp::impls::<impl std::cmp::Ord for i32>::clamp	SHAPE_GAP	false	false	false	false	false	false	false
+std::cmp::impls::<impl std::cmp::Ord for i64>::clamp	SHAPE_GAP	false	false	false	false	false	false	false
+std::cmp::impls::<impl std::cmp::Ord for u8>::clamp	SHAPE_GAP	false	false	false	false	false	false	false
+std::cmp::impls::<impl std::cmp::Ord for usize>::clamp	SHAPE_GAP	false	false	false	false	false	false	false
+std::cmp::impls::<impl std::cmp::PartialOrd for i32>::lt	SHAPE_GAP	false	false	false	false	false	false	false
+std::cmp::impls::<impl std::cmp::PartialOrd for i64>::lt	SHAPE_GAP	false	false	false	false	false	false	false
+std::cmp::impls::<impl std::cmp::PartialOrd for u8>::lt	SHAPE_GAP	false	false	false	false	false	false	false
+std::cmp::impls::<impl std::cmp::PartialOrd for usize>::lt	SHAPE_GAP	false	false	false	false	false	false	false

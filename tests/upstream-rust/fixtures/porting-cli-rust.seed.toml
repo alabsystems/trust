@@ -1,0 +1,239 @@
+# Seed fixture for Rust tests of the unified upstream Rust porting CLI.
+#
+# These fixtures mirror the high-value upstream porting behaviors in Rust
+# without depending on Python as the canonical implementation.
+
+schema = "trust.upstream-rust.porting-cli-rust-tests.v1"
+canonical_path = "targo trust domination upstream-tests"
+
+[[case]]
+id = "remote-qualified-head-fetch-failure"
+category = "revision-resolution"
+request = "rust-lang/rust:HEAD"
+remote = "missing-upstream.git"
+fetch_enabled = true
+local_readme = "local tRust checkout"
+expected_error_contains = [
+  "remote-qualified",
+  "not resolved against local repository refs",
+]
+
+[[case]]
+id = "remote-qualified-head-no-fetch"
+category = "revision-resolution"
+request = "rust-lang/rust:HEAD"
+remote = "missing-upstream.git"
+fetch_enabled = false
+local_readme = "local tRust checkout"
+expected_error_contains = [
+  "fetch disabled",
+  "symbolic",
+]
+
+[[case]]
+id = "revision-drift-reviewed-empty-ledger"
+category = "upstream-fix-accounting"
+baseline_revision = "rust-lang/rust:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+current_revision = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+requested_revision = "rust-lang/rust:HEAD"
+requested_ref = "HEAD"
+upstream_remote = "https://github.com/rust-lang/rust.git"
+resolution_source = "remote-fetch"
+ledger_toml = '''
+schema_version = "0.1.0"
+tracked_until_revision = "rust-lang/rust:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+fixes = []
+'''
+expected_drifted_from_baseline = true
+expected_requires_upstream_fix_review = true
+expected_reviewed_through_current_revision = true
+expected_unreviewed_revision_drift = false
+expected_default_latest_upstream_request = true
+expected_claim = "ledger reviewed through current upstream revision"
+
+[[case]]
+id = "pending-local-actions"
+category = "upstream-fix-accounting"
+baseline_revision = "rust-lang/rust:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+current_revision = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+ledger_toml = '''
+schema_version = "0.1.0"
+tracked_until_revision = "rust-lang/rust:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[[fixes]]
+id = "fix.compiletest.directive"
+baseline_entry_id = "toolchain.compiletest-run-make"
+title = "compiletest directive drift"
+upstream_reference = "https://github.com/rust-lang/rust/commit/bbbb"
+status = "landed"
+local_action = "port_fix"
+landed_in_revision = "rust-lang/rust:bbbb"
+
+[[fixes]]
+id = "fix.codegen.audit-only"
+baseline_entry_id = "toolchain.rustc"
+title = "codegen drift audit"
+upstream_reference = "https://github.com/rust-lang/rust/commit/cccc"
+status = "landed"
+local_action = "track_only"
+landed_in_revision = "rust-lang/rust:cccc"
+'''
+expected_fixes_count = 2
+expected_status_counts = ["landed=2"]
+expected_local_action_counts = ["port_fix=1", "track_only=1"]
+expected_pending_local_actions_count = 1
+expected_pending_action_id = "fix.compiletest.directive"
+expected_pending_action_title = "compiletest directive drift"
+expected_claim = "ledger reviewed through current upstream revision with pending local actions"
+
+[adapter_branding]
+audit_path = "adapter-audit.jsonl"
+expected_digest_rule = "file_digest"
+
+[[adapter_branding.file]]
+path = "tests/rustdoc-html/description_default.rs"
+input = '''
+//@ has foo/index.html '//head/title' 'foo - Rust'
+//   'API documentation for the Rust `foo` crate.'
+pub fn unchanged_rust_word() -> &'static str { "Rust" }
+'''
+expected_contains = [
+  "'foo - Trust'",
+  "API documentation for the Trust `foo` crate",
+  "unchanged_rust_word() -> &'static str { \"Rust\" }",
+]
+expected_rules = [
+  "rustdoc_title_brand",
+  "rustdoc_description_brand",
+  "file_digest",
+]
+
+[[adapter_branding.file]]
+path = "tests/rustdoc-gui/search-title.goml"
+input = '''
+store-value: (title, "test_docs - Rust")
+assert-document-property: {"title": "\"test\" Search - Rust"}
+# comment mentioning Rust should not change
+'''
+expected_contains = [
+  "\"test_docs - Trust\"",
+  "\"\\\"test\\\" Search - Trust\"",
+  "# comment mentioning Rust should not change",
+]
+expected_rules = [
+  "rustdoc_gui_title_brand",
+  "file_digest",
+]
+
+[[adapter_branding.file]]
+path = "tests/run-make/print-request-help-stable-unstable/unstable-invalid-print-request-help.err"
+input = '''
+error: unknown print request: `xxx`
+  = help: for more information, see the rustc book: https://doc.rust-lang.org/rustc/command-line-arguments.html#--print-print-compiler-information
+'''
+expected_contains = [
+  "for more information, see the Trust compiler documentation for `trustc --print`",
+]
+expected_rules = [
+  "print_request_docs_help",
+  "file_digest",
+]
+
+[[adapter_branding.file]]
+path = "tests/run-make/print-request-help-stable-unstable/help-diff.diff"
+input = '''
+@@ -1,4 +1,4 @@
+ error: unknown print request: `xxx`
+  = help: for more information, see the rustc book: https://doc.rust-lang.org/rustc/command-line-arguments.html#--print-print-compiler-information
+'''
+expected_contains = [
+  "for more information, see the Trust compiler documentation for `trustc --print`",
+]
+expected_rules = [
+  "print_request_docs_help",
+  "file_digest",
+]
+
+[overlay_removal]
+tracked_at_baseline = [
+  "tests/ui/stale-upstream.rs",
+  "tests/ui/trust-added.rs",
+]
+ported_paths = [
+  "tests/ui/current-upstream.rs",
+]
+stale_paths = [
+  "tests/ui/stale-upstream.rs",
+]
+expected_applied = [
+  "tests/ui/current-upstream.rs",
+]
+expected_removed = [
+  "tests/ui/stale-upstream.rs",
+]
+expected_preserved = [
+  "tests/ui/trust-added.rs",
+]
+current_upstream_contents = "fn current() {}\n"
+trust_added_contents = "fn trust_added() {}\n"
+
+[scorecard_log_parse]
+log = '''
+[ui] tests/ui/demo.rs ... F
+
+failures:
+
+---- [ui] tests/ui/demo.rs stdout ----
+Saved the actual stderr to `/tmp/build/demo.stderr`
+diff of stderr:
+-	error: expected diagnostic
++	error: actual diagnostic
+
+The actual stderr differed from the expected stderr
+To update references, rerun the tests and pass the `--bless` flag
+To only update this specific test, also pass `--test-args demo.rs`
+command: rustc tests/ui/demo.rs
+--- stderr -------------------------------
+error: actual diagnostic
+------------------------------------------
+---- [ui] tests/ui/demo.rs stdout end ----
+
+failures:
+    [ui] tests/ui/demo.rs
+
+tidy [deps]: FAIL
+error: could not compile `rustdoc` (lib) due to 2 previous errors
+'''
+expected_failed_count = 1
+expected_failure_suite = "ui"
+expected_failure_path = "tests/ui/demo.rs"
+expected_failure_category = "diagnostic-drift"
+expected_failure_detail_available = true
+expected_failure_snippet_start_line = 5
+expected_snippet_contains = "+\terror: actual diagnostic"
+expected_actual_artifact = "stderr:/tmp/build/demo.stderr"
+expected_comparison = "stderr -> stderr"
+expected_tool_kinds = [
+  "cargo-compile",
+  "tidy",
+]
+
+[scorecard_markdown]
+expected_lines = [
+  "Requested upstream revision: rust-lang/rust:HEAD",
+  "Requested upstream ref: HEAD",
+  "Upstream remote: https://github.com/rust-lang/rust.git",
+  "Resolution source: remote-fetch",
+  "Local repository revision: cccccccccccccccccccccccccccccccccccccccc",
+  "## Revision Drift",
+  "- requested revision: rust-lang/rust:HEAD",
+  "- drifted from baseline: true",
+  "- fix statuses: landed=1",
+  "- local actions: port_fix=1",
+  "- pending local actions: 1",
+  "- fix.compiletest.directive [port_fix]: compiletest directive drift",
+  "## Validation Failures",
+  "- unreviewed-upstream-revision-drift:",
+  "actual artifacts: stderr:/tmp/build/demo.stderr",
+  "expected-vs-actual: stderr -> stderr at log line 11",
+]

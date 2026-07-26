@@ -1,0 +1,80 @@
+# tRust-added proof manifest for `trust-upstream-compat prove`.
+#
+# This file names the canonical tRust-specific test commands that must be
+# covered by the per-test inventory/results artifact. The `covers` ids are
+# stable inventory ids; the proof validator rejects tRust-added inventory rows
+# that are not covered by one of these commands.
+
+schema_version = "0.1.0"
+
+[[commands]]
+id = "trust.added.quick"
+command = "targo trust domination trust-added --release quick"
+covers = ["trust.added.quick"]
+required = true
+
+[[commands]]
+id = "trust.added.native"
+command = "targo trust domination trust-added --release trustc-native"
+covers = ["trust.added.native"]
+required = true
+
+[[commands]]
+id = "trust.added.compiletest"
+command = "targo trust domination trust-added --release trust-added-compiletest"
+covers = ["trust.added.compiletest"]
+required = true
+
+[[commands]]
+id = "trust.added.extra"
+command = "targo trust domination trust-added --release trust-extra"
+covers = ["trust.added.extra"]
+required = true
+
+[[commands]]
+id = "trust.added.binary-decompilation-golden"
+command = "targo trust domination trust-added --release binary-decompilation-golden"
+covers = ["trust.added.binary-decompilation-golden"]
+required = true
+
+[[commands]]
+id = "trust.added.native-contracts-pipeline-v2"
+command = "targo trust domination trust-added --release native-contracts-pipeline-v2"
+covers = ["trust.added.native-contracts-pipeline-v2"]
+required = true
+
+[[commands]]
+id = "trust.added.launch"
+command = "targo trust domination trust-added --release launch"
+covers = ["trust.added.launch"]
+required = true
+
+[[commands]]
+id = "trust.added.public-distribution"
+command = "targo trust domination trust-added --release public-distribution"
+covers = ["trust.added.public-distribution"]
+required = true
+
+[[commands]]
+id = "trust.added.prepublish"
+command = "targo trust domination trust-added --release prepublish"
+covers = ["trust.added.prepublish"]
+required = true
+
+[[commands]]
+id = "trust.added.installed"
+command = "targo trust domination trust-added --release installed"
+covers = ["trust.added.installed"]
+required = true
+
+[[commands]]
+id = "trust.added.installed-default"
+command = "targo trust domination trust-added --release installed-default"
+covers = ["trust.added.installed-default"]
+required = true
+
+[[commands]]
+id = "trust.added.stage0-lineage"
+command = "targo trust domination trust-added --release stage0-lineage"
+covers = ["trust.added.stage0-lineage"]
+required = true

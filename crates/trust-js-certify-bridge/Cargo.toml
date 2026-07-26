@@ -1,0 +1,40 @@
+# trust-js-certify-bridge: TrustJS M3 D2 — the first kernel-certified JS builtin.
+#
+# Bridges ONE pure, finite-table-shaped JavaScript builtin
+# (`String.prototype.toLowerCase` over the ASCII domain) from the tier-0
+# interpreter, through the `trust-certify` finite-table lane, to a Clean-kernel
+# `ProofEvidence::CleanCic` receipt.
+#
+# HONESTY BOUNDARY (design 2026-07-22-trustjs-m3-scope.md §D2 / spec surface §9
+# item 5): the certificate proves EXACTLY "the interpreter's builtin refines OUR
+# TRANSCRIPTION of the ECMA-262 table, kernel-checked" — NOT "refines ECMA-262".
+# A pinned, checksummed transcription is our fallible reading of the standard;
+# the kernel checks the interpreter's extracted behaviour against THAT table.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0 OR MIT
+
+[package]
+name = "trust-js-certify-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The tier-0 interpreter whose builtin behaviour is extracted and certified.
+trust-js-interp = { workspace = true }
+trust-js-trace = { workspace = true }
+# The kernel-checked finite-table lane (`finite_dfa::EnumCases`).
+trust-certify = { workspace = true }
+trust-ir = { workspace = true, features = ["serde"] }
+# Kernel term construction (the ASCII domain inductive + the two transition
+# bodies + the casesOn refinement proof) and the clean-auto term codec.
+clean-kernel = { workspace = true }
+clean-auto = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

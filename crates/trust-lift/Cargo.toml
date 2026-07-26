@@ -1,0 +1,47 @@
+# trust-lift: Proof-producing binary lifter
+#
+# Lifts binary code into TrustIr functions with CFG recovery and SSA construction.
+# Each lifted statement links back to its binary offset for proof annotation.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-lift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Enable Mach-O binary loading via trust-binary-parse.
+# Disabled by default because trust-binary-parse has pre-existing compile issues.
+macho = ["dep:trust-binary-parse"]
+# Enable ELF binary loading via trust-binary-parse.
+elf = ["dep:trust-binary-parse"]
+# Enable ay solver integration for verification of lifted code.
+ay-verify = ["dep:ay"]
+
+[dependencies]
+trust-binary-parse = { workspace = true, optional = true }
+trust-disasm = { workspace = true }
+trust-machine-sem = { workspace = true }
+# Pure data layer over trust-types (LiftedFunction -> VerifiableFunction);
+# trust-lift never uses the `Discharge` `?`-sugar, so it must not transitively
+# re-enable trust-types' nightly `try-sugar` feature. Depend with
+# default-features = false (instead of `{ workspace = true }`) so trust-lift
+# and its production consumers (trust-vcgen, hence the `clean` workspace) build
+# on the stable release channel. See trust-vcgen/Cargo.toml for the rationale.
+trust-types = { path = "../trust-types", default-features = false }
+thiserror = { workspace = true }
+ay = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[[example]]
+name = "reverse_compile_poc"
+required-features = ["macho", "ay-verify"]

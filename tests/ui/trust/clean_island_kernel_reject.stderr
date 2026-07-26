@@ -1,0 +1,10 @@
+error: Clean island declaration rejected: TypeMismatch { expected: "Nat", actual: "Prop" }
+  --> $DIR/clean_island_kernel_reject.rs:9:5
+   |
+LL |     def bad : Nat := True
+   |     ^^^
+   |
+   = note: the island was parsed by the Clean parser and checked by the Clean CIC kernel during this build (two-language design E10)
+
+error: aborting due to 1 previous error
+

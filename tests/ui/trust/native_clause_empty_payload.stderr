@@ -1,0 +1,8 @@
+error: expected a predicate expression after the contract clause keyword
+  --> $DIR/native_clause_empty_payload.rs:8:1
+   |
+LL | {
+   | ^
+
+error: aborting due to 1 previous error
+

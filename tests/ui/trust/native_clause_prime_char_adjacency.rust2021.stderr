@@ -1,0 +1,50 @@
+error: prefix `x` is unknown
+  --> $DIR/native_clause_prime_char_adjacency.rs:15:27
+   |
+LL |     assert_eq!(stringify!(x' '), "x' '");
+   |                           ^ unknown prefix
+   |
+   = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+   |
+LL |     assert_eq!(stringify!(x ' '), "x' '");
+   |                            +
+
+error: prefix `x` is unknown
+  --> $DIR/native_clause_prime_char_adjacency.rs:17:27
+   |
+LL |     assert_eq!(stringify!(x'\n'), "x'\n'");
+   |                           ^ unknown prefix
+   |
+   = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+   |
+LL |     assert_eq!(stringify!(x '\n'), "x'\n'");
+   |                            +
+
+error: prefix `x` is unknown
+  --> $DIR/native_clause_prime_char_adjacency.rs:19:27
+   |
+LL |     assert_eq!(stringify!(x'💩'), "x'💩'");
+   |                           ^ unknown prefix
+   |
+   = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+   |
+LL |     assert_eq!(stringify!(x '💩'), "x'💩'");
+   |                            +
+
+error: prefix `x` is unknown
+  --> $DIR/native_clause_prime_char_adjacency.rs:21:27
+   |
+LL |     assert_eq!(stringify!(x'\''), "x'\''");
+   |                           ^ unknown prefix
+   |
+   = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+   |
+LL |     assert_eq!(stringify!(x '\''), "x'\''");
+   |                            +
+
+error: aborting due to 4 previous errors
+

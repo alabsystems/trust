@@ -1,0 +1,12 @@
+{
+  "fixture_family": "unresolved_indirect_branch",
+  "symbol": "trust_fixture_unresolved",
+  "expected_verify_binary_status": "incomplete",
+  "expected_verification_status": "not_run",
+  "expected_trust_level": "partial",
+  "expected_unsupported_fragments": [
+    "CFG proof mode",
+    "has no direct CFG target"
+  ],
+  "proof_grade_allowed": false
+}

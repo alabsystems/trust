@@ -1,0 +1,166 @@
+{
+  "name": "min",
+  "def_path": "std::cmp::min::<i16>",
+  "span": {
+    "file": "core/src/cmp.rs",
+    "line_start": 1574,
+    "col_start": 0,
+    "line_end": 1576,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": true
+          }
+        },
+        "name": "v1"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": true
+          }
+        },
+        "name": "v2"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<i16 as std::cmp::Ord>::min",
+            "args": [
+              {
+                "Move": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 2,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "core/src/cmp.rs",
+              "line_start": 1575,
+              "col_start": 4,
+              "line_end": 1575,
+              "col_end": 14
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": {
+      "Int": {
+        "width": 16,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "v1",
+                "Int"
+              ]
+            },
+            {
+              "Int": -32768
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "v1",
+                "Int"
+              ]
+            },
+            {
+              "Int": 32767
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "v2",
+                "Int"
+              ]
+            },
+            {
+              "Int": -32768
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "v2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 32767
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

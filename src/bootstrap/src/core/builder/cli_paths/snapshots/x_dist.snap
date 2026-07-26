@@ -1,0 +1,40 @@
+---
+source: src/core/builder/cli_paths/tests.rs
+expression: dist
+---
+[Dist] dist::Docs
+    targets: [aarch64-unknown-linux-gnu]
+    - Set({dist::trust-docs})
+[Dist] dist::JsonDocs
+    targets: [aarch64-unknown-linux-gnu]
+    - Set({dist::trust-docs-json})
+[Dist] dist::Mingw
+    targets: [aarch64-unknown-linux-gnu]
+    - Set({dist::rust-mingw})
+    - Set({dist::trust-mingw})
+[Dist] dist::Rustc
+    targets: [x86_64-unknown-linux-gnu]
+    - Set({dist::compiler/rustc})
+    - Set({dist::rustc})
+    - Set({dist::trustc})
+[Dist] dist::Std
+    targets: [aarch64-unknown-linux-gnu]
+    - Set({dist::library/std})
+    - Set({dist::rust-std})
+    - Set({dist::trust-std})
+[Dist] dist::RustcDev
+    targets: [x86_64-unknown-linux-gnu]
+    - Set({dist::rustc-dev})
+    - Set({dist::trustc-dev})
+[Dist] dist::Src
+    targets: [x86_64-unknown-linux-gnu]
+    - Set({dist::trust-src})
+[Dist] dist::RustDev
+    targets: [x86_64-unknown-linux-gnu]
+    - Set({dist::rust-dev})
+[Dist] dist::PlainSourceTarball
+    targets: [x86_64-unknown-linux-gnu]
+    - Set({dist::trust-source})
+[Dist] dist::ReproducibleArtifacts
+    targets: [x86_64-unknown-linux-gnu]
+    - Set({dist::reproducible-artifacts})

@@ -1,0 +1,13 @@
+[package]
+name = "basic-contracts"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[trust]
+enabled = true
+level = "L2"
+timeout_ms = 5000
+skip_functions = []

@@ -1,0 +1,15 @@
+note: Clean island kernel-checked: 1 declaration(s) registered (nat_zero)
+  --> $DIR/native_clause_citation_outside_fragment.rs:11:5
+   |
+LL |     theorem nat_zero : forall (x : Nat), x + 0 = x := fun x => rfl
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: citation `nat_zero` cannot be validated because this clause is outside the exact statement fragment: missing supported type for clause variable `x`
+  --> $DIR/native_clause_citation_outside_fragment.rs:16:12
+   |
+LL |         by nat_zero
+   |            ^^^^^^^^
+   |
+   = note: authored citations are fail-closed; missing or unsupported source bindings are never guessed, and a statement match remains non-authoritative until it is bound to the exact typed TrustIR obligation end-to-end
+
+error: aborting due to 1 previous error

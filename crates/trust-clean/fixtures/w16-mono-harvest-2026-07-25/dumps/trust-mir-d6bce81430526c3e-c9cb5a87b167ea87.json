@@ -1,0 +1,119 @@
+{
+  "name": "__rust_begin_short_backtrace",
+  "def_path": "std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>",
+  "span": {
+    "file": "std/src/sys/backtrace.rs",
+    "line_start": 162,
+    "col_start": 0,
+    "line_end": 172,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "FnPtr": {
+            "sig": {
+              "params": [],
+              "ret": "Unit"
+            }
+          }
+        },
+        "name": "f"
+      },
+      {
+        "index": 2,
+        "ty": "Unit",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<fn() as core::ops::function::FnOnce<()>>::call_once",
+            "args": [
+              {
+                "Move": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": "Unit"
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "std/src/sys/backtrace.rs",
+              "line_start": 166,
+              "col_start": 17,
+              "line_end": 166,
+              "col_end": 20
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::intrinsics::black_box::<()>",
+            "args": [
+              {
+                "Constant": "Unit"
+              }
+            ],
+            "dest": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "core/src/hint.rs",
+              "line_start": 491,
+              "col_start": 4,
+              "line_end": 491,
+              "col_end": 39
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

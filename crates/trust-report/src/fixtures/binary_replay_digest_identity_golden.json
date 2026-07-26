@@ -1,0 +1,72 @@
+{
+  "proof_grade_gate": {
+    "accepted": false,
+    "replayed_vcs": 2,
+    "blocker_group_counts": {
+      "replay": 1
+    },
+    "rejection_kinds": [
+      "ReplayArtifactDigestIdentityNotExact"
+    ]
+  },
+  "unresolved_blockers": {
+    "total_blockers": 2,
+    "replay_digest_identity": 1,
+    "entries": [
+      {
+        "family": "replay_digest_identity",
+        "stage": "replay",
+        "feature": "replay_artifact_digest_identity_not_exact",
+        "dispatch_id": "main:vc1",
+        "location": "0x401014",
+        "reason": "missing dispatch binary artifact digest identity"
+      }
+    ]
+  },
+  "dispatches": [
+    {
+      "id": "main:vc0",
+      "replay": "Replayed",
+      "required": true,
+      "proof_grade_ready": true,
+      "root_digest": "000000000000000000000000000000000000000000000000aefe5a1e579a9dab",
+      "root_digest_report": "000000000000000000000000000000000000000000000000aefe5a1e579a9dab",
+      "selected_image_range": {
+        "file_offset": 0,
+        "file_size": 16,
+        "end_offset": 16
+      },
+      "selected_image_sha256": "000000000000000000000000000000000000000000000000aefe5a1e579a9dab",
+      "selected_image_sha256_report": "000000000000000000000000000000000000000000000000aefe5a1e579a9dab",
+      "blockers": null
+    },
+    {
+      "id": "main:vc1",
+      "replay": "Replayed",
+      "required": true,
+      "proof_grade_ready": false,
+      "root_digest": null,
+      "root_digest_report": null,
+      "selected_image_range": {
+        "file_offset": null,
+        "file_size": null,
+        "end_offset": null
+      },
+      "selected_image_sha256": null,
+      "selected_image_sha256_report": null,
+      "blockers": [
+        "missing dispatch binary artifact digest identity"
+      ]
+    }
+  ],
+  "text_markers": [
+    "replay artifact digest identity not exact: 1/2 replayed dispatches ready, 1 blocked",
+    "main:vc0 @0x401010: Unsat",
+    "replay digest identity: accepted | required=true, root_digest=sha256:000000000000000000000000000000000000000000000000aefe5a1e579a9dab",
+    "selected_image=range=[0, 16), size=16, sha256=000000000000000000000000000000000000000000000000aefe5a1e579a9dab",
+    "main:vc1 @0x401014: Unsat",
+    "replay digest identity: rejected | required=true, root_digest=missing, selected_image=missing, blockers=1",
+    "replay digest blocker: missing dispatch binary artifact digest identity",
+    "replay_digest_identity/replay_artifact_digest_identity_not_exact stage=replay dispatch=main:vc1 @0x401014"
+  ]
+}

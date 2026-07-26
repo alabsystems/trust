@@ -1,0 +1,445 @@
+[workspace]
+resolver = "2"
+members = [
+# tidy-alphabetical-start
+  "compiler/rustc",
+  "src/build_helper",
+  "src/rustc-std-workspace/rustc-std-workspace-alloc",
+  "src/rustc-std-workspace/rustc-std-workspace-core",
+  "src/rustc-std-workspace/rustc-std-workspace-std",
+  "src/rustdoc-json-types",
+  "src/tools/build-manifest",
+  "src/tools/bump-stage0",
+  "src/tools/cargotest",
+  "src/tools/collect-license-metadata",
+  "src/tools/compiletest",
+  "src/tools/coverage-dump",
+  "src/tools/features-status-dump",
+  "src/tools/generate-copyright",
+  "src/tools/generate-windows-sys",
+  "src/tools/html-checker",
+  "src/tools/jsondocck",
+  "src/tools/jsondoclint",
+  "src/tools/linkchecker",
+  "src/tools/lint-docs",
+  "src/tools/lld-wrapper",
+  "src/tools/llvm-bitcode-linker",
+  "src/tools/miri",
+  "src/tools/miri/cargo-miri",
+  "src/tools/miropt-test-tools",
+  "src/tools/opt-dist",
+  "src/tools/remote-test-client",
+  "src/tools/remote-test-server",
+  "src/tools/replace-version-placeholder",
+  "src/tools/run-make-support",
+  "src/tools/rust-installer",
+  "src/tools/rustdoc-gui-test",
+  "src/tools/rustdoc-themes",
+  "src/tools/test-float-parse",
+  "src/tools/tidy",
+  "src/tools/tier-check",
+  "src/tools/tippy",
+  "src/tools/tippy/clippy_dev",
+  "src/tools/trustdoc",
+  "src/tools/trustfmt",
+  "src/tools/trustup",
+  "src/tools/unicode-table-generator",
+  "src/tools/unstable-book-gen",
+  "src/tools/wasm-component-ld",
+  "src/tools/x",
+# tidy-alphabetical-end
+# trust: verification pipeline crates.
+#
+# These are members here because the compiler links them: rustc_mir_transform
+# depends on trust-router/trust-vcgen/trust-types/..., so their resolution IS
+# the compiler's resolution and this lockfile is what ships inside trustc.
+#
+# They are ALSO members of crates/Cargo.toml, which resolves them a second time
+# against its own lockfile for the dev/test lane. That duplication is the price
+# of keeping a `cargo test` lane that does not have to load the rustc graph; it
+# is not free — the two lockfiles currently disagree on the patch version of
+# ~89 third-party packages, so a unit test proves something about a slightly
+# different build than the one that ships. Anything whose verdict could depend
+# on a dependency version must therefore be gated from the compiler lane, not
+# from `cargo test`.
+#
+# Collapsing the two into this workspace resolves cleanly (measured: adding
+# every crates/ member here pulls in exactly two new packages, ny-cert and
+# ny-contracts, and no version disagreement) — the blocker is not the version
+# graph. It is that `crates/Cargo.toml` is named as a manifest path by 39
+# files — gate rows, harness lanes, fixture regenerators, targo-trust source —
+# and that this workspace cannot answer `cargo check --workspace` at all,
+# because rustc-main is a member and that means "build the compiler". Do not
+# start that migration without moving those call sites in the same change.
+  "crates/trust-backprop",
+  "crates/trust-binary-parse",
+  "crates/trust-bmc",
+  "crates/trust-buildcache",
+  "crates/trust-cache",
+  "crates/trust-cg-bridge",
+  "crates/trust-convergence",
+  "crates/trust-decompile",
+  "crates/trust-deps",
+  "crates/trust-disasm",
+  "crates/trust-integration-tests",
+  "crates/trust-ir-bridge",
+  "crates/trust-lift",
+  "crates/trust-loop",
+  "crates/trust-machine-sem",
+  # trust: rustc_private MIR/THIR frontends — need the bootstrap/RUSTC_BOOTSTRAP
+  # env (build only via the staged rustc; a plain stable
+  # `cargo build --workspace` cannot compile their rustc_private path deps).
+  # Workspace membership keeps their unit suites addressable by `./x test`.
+  "crates/trust-mir-extract",
+  "crates/trust-os",
+  "crates/trust-proof-cert",
+  "crates/trust-release",
+  "crates/trust-report",
+  "crates/trust-router",
+  "crates/trust-spec",
+  "crates/trust-strengthen",
+  "crates/trust-certify",
+  "crates/trust-symex",
+  "crates/trust-temporal",
+  "crates/trust-thir-lower",
+  "crates/trust-transval",
+  "crates/trust-types",
+  "crates/trust-vc-bridge",
+  "crates/trust-vcgen",
+  "crates/trust-verifier-api",
+  "crates/trust-version",
+  "crates/trust-wasm-bridge",
+  "crates/trust-witness",
+  "crates/trust-wp",
+]
+
+exclude = [
+  "build",
+  "src/bootstrap",
+  "tests/rustdoc-gui",
+  # HACK(eddyb) This hardcodes the fact that our CI uses `/checkout/obj`.
+  "obj",
+  # trust: benchmark crates (criterion dependency, run separately)
+  "benchmarks/verify_overhead",
+  # trust: first-party sibling repos (git submodules); each is its own workspace.
+  # Every sibling belongs here, whether or not a member currently reaches into
+  # it: a sibling omitted from this list is claimed by *this* workspace for
+  # manifest inheritance the moment something depends on one of its crates, and
+  # then `version.workspace`/`rust-version.workspace` in the sibling's own
+  # manifest resolve against the wrong root and hard-error.
+  "first-party/ay",
+  "first-party/clean",
+  "first-party/ny",
+  "first-party/trust-cg",
+  "first-party/trust-ir",
+  "first-party/trust-mc",
+  "first-party/trust-vc",
+  "first-party/trust-wp",
+  "first-party/ty",
+  # trust: vendored foreign deps that carry their own workspaces.
+  # (vendor/rustc_version_0_4_1 is a [patch.crates-io] source below, not a member.)
+]
+
+[profile.release.package.rustc_thread_pool]
+# The rustc fork of Rayon has deadlock detection code which intermittently
+# causes overflows in the CI (see https://github.com/rust-lang/rust/issues/90227)
+# so we turn overflow checks off for now.
+# FIXME: This workaround should be removed once #90227 is fixed.
+overflow-checks = false
+
+# These are very thin wrappers around executing lld with the right binary name.
+# Basically nothing within them can go wrong without having been explicitly logged anyway.
+# We ship these in every rustc tarball and even after compression they add up
+# to around 0.6MB of data every user needs to download (and 15MB on disk).
+[profile.release.package.lld-wrapper]
+debug = 0
+strip = true
+[profile.release.package.wasm-component-ld-wrapper]
+debug = 0
+strip = true
+
+# Bigint libraries are slow without optimization, speed up testing
+[profile.dev.package.test-float-parse]
+opt-level = 3
+
+# Trust local iteration profile.
+#
+# Match the standalone `crates/` workspace defaults so root-workspace cargo
+# checks/builds do less debug-info work while preserving useful backtraces.
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false
+
+# Keep root-workspace `cargo test` aligned with faster local iteration
+# defaults without changing enabled features or optimization levels.
+[profile.test]
+debug = "line-tables-only"
+incremental = true
+split-debuginfo = "unpacked"
+
+[profile.test.package."*"]
+debug = false
+
+# Speed up the binary as much as possible
+[profile.release.package.test-float-parse]
+opt-level = 3
+codegen-units = 1
+# FIXME: LTO cannot be enabled for binaries in a workspace
+# <https://github.com/rust-lang/cargo/issues/9330>
+# lto = true
+
+# If you want to use a crate with local modifications, you can set a path or git dependency here.
+# For git dependencies, also add your source to ALLOWED_SOURCES in src/tools/tidy/src/extdeps.rs.
+[patch.crates-io]
+rustc-hash = { path = "first-party/ty/crates/tla-hash-fx" }
+rustc_version = { path = "vendor/rustc_version_0_4_1" }
+
+[patch."https://github.com/alabsystems/trust-ir"]
+trust-ir = { path = "first-party/trust-ir/crates/trust-ir" }
+trust-ir-build = { path = "first-party/trust-ir/crates/trust-ir-build" }
+
+# HTTPS *with* .git — the exact source `first-party/ty` and `first-party/trust-cg`
+# declare. Without this entry their trust-ir escapes the patch and re-resolves to
+# the live, mutable remote branch=main (which lagged behind FMin/FMax), causing
+# tla-trust-cg to flip between compiling and E0599 across builds. Pin it local.
+[patch."https://github.com/alabsystems/trust-ir.git"]
+trust-ir = { path = "first-party/trust-ir/crates/trust-ir" }
+trust-ir-build = { path = "first-party/trust-ir/crates/trust-ir-build" }
+
+[patch."ssh://git@github.com/alabsystems/trust-ir.git"]
+trust-ir = { path = "first-party/trust-ir/crates/trust-ir" }
+trust-ir-build = { path = "first-party/trust-ir/crates/trust-ir-build" }
+
+[patch."ssh://git@github.com:22/alabsystems/trust-ir.git"]
+trust-ir = { path = "first-party/trust-ir/crates/trust-ir" }
+trust-ir-build = { path = "first-party/trust-ir/crates/trust-ir-build" }
+
+# trust-ir(-build) declare their clean-kernel dep as a git dependency on
+# clean.git (pinned rev) so they stay consumable as plain cargo git
+# dependencies (a `../../../clean/...` path dep escapes the git checkout and
+# broke every git consumer). Redirect that URL to the vendored
+# first-party/clean so this workspace keeps building the SAME single
+# clean-kernel instance as its own path deps above — no network, no second
+# instance. Only clean-kernel is patched: trust-ir-build's clean-mathverse /
+# clean-olean git deps are optional behind its default-off `slackcertz-anchor`
+# feature, which nothing here activates — patching them would only produce
+# unused-patch warnings. Add them if that feature is ever turned on.
+[patch."https://github.com/alabsystems/clean.git"]
+clean-kernel = { path = "first-party/clean/crates/clean-kernel" }
+
+[patch."https://github.com/alabsystems/ay"]
+ay = { path = "first-party/ay/crates/ay" }
+ay-core = { path = "first-party/ay/crates/ay-core" }
+ay-dpll = { path = "first-party/ay/crates/ay-dpll" }
+ay-frontend = { path = "first-party/ay/crates/ay-frontend" }
+ay-proof = { path = "first-party/ay/crates/ay-proof" }
+ay-translate = { path = "first-party/ay/crates/ay-translate" }
+ay-chc = { path = "first-party/ay/crates/ay-chc" }
+ay-allsat = { path = "first-party/ay/crates/ay-allsat" }
+ay-sat = { path = "first-party/ay/crates/ay-sat" }
+# ay-trust-mc-native-bundle: phantom path dep — crate doesn't exist in
+# first-party/ay/crates/. Removed pending its actual creation or
+# substitution with the right crate name.
+ay-bindings = { path = "first-party/ay/crates/ay-bindings" }
+# Trust(whole-stage2-determinism): ay-sys MUST be patched in BOTH this non-.git
+# table and the `.git` table below. trust-vc and trust-mc consume ay-sys through
+# Git source IDs; their child-repository coherence gates require immutable revs,
+# while this root patch separately unifies those Git edges with the checked-out
+# submodule. With the patch present only under `.git`, cargo's resolver can
+# nondeterministically canonicalize the ay.git source-id and on some
+# re-resolutions fail to collapse
+# trust-vc-core's direct ay-sys edge — yielding a SECOND ay-sys instance with a
+# distinct -Cmetadata. That bistable 1-vs-2-instance toggle (reproduced: 6
+# successive `cargo metadata` passes gave 1,1,1,1,2,2) is the duplicate ay_sys
+# crate that flips librustc_driver/bin/trustc between SVH states, defeating
+# whole-stage2 byte-reproducibility. Patching ay-sys in BOTH tables pins it to
+# the submodule path through every re-resolution (verified durable: 30 passes,
+# all 1 instance; a seeded 2-instance lock collapses to 1 and holds).
+ay-sys = { path = "first-party/ay/crates/ay-sys" }
+# Trust(whole-stage2-determinism): ay-encode is a Git-sourced dependency of
+# first-party/trust-mc and first-party/ty. Their manifests must use immutable
+# revs, but without this root redirect a stale or mismatched downstream pin can
+# still introduce a second source identity whose `-Cmetadata`/`StableCrateId`
+# differs from the checked-out ay submodule. That split cascades up
+# ay-bindings -> trust-mc-driver -> trust-bmc -> trust-router -> rustc_mir_transform
+# -> rustc_driver_impl -> librustc_driver + bin/trustc, which is the measured cause
+# of those two artifacts failing whole-stage2 byte-reproducibility. Pin it to the
+# checksum-pinned ay submodule like every other ay crate.
+ay-encode = { path = "first-party/ay/crates/ay-encode" }
+
+[patch."https://github.com/alabsystems/ay.git"]
+ay = { path = "first-party/ay/crates/ay" }
+ay-core = { path = "first-party/ay/crates/ay-core" }
+ay-dpll = { path = "first-party/ay/crates/ay-dpll" }
+ay-frontend = { path = "first-party/ay/crates/ay-frontend" }
+ay-proof = { path = "first-party/ay/crates/ay-proof" }
+ay-translate = { path = "first-party/ay/crates/ay-translate" }
+ay-chc = { path = "first-party/ay/crates/ay-chc" }
+ay-bindings = { path = "first-party/ay/crates/ay-bindings" }
+# ay-sys is pulled via this Git URL by first-party/trust-mc and trust-vc. Their
+# manifests pin immutable revs; this redirect additionally prevents a distinct
+# Git-source instance from escaping the local submodule type universe.
+ay-sys = { path = "first-party/ay/crates/ay-sys" }
+# Trust(whole-stage2-determinism): same source-identity escape as ay-sys, via
+# this .git URL. Child manifests enforce immutable revs; the root patch binds
+# those edges to the exact checked-out ay submodule used by the whole toolchain.
+ay-encode = { path = "first-party/ay/crates/ay-encode" }
+
+[patch."ssh://git@github.com/alabsystems/ay.git"]
+ay = { path = "first-party/ay/crates/ay" }
+ay-chc = { path = "first-party/ay/crates/ay-chc" }
+
+[patch."ssh://git@github.com/alabsystems/trust-cg.git"]
+trust-cg-codegen = { path = "first-party/trust-cg/crates/trust-cg-codegen" }
+trust-cg-ir = { path = "first-party/trust-cg/crates/trust-cg-ir" }
+trust-cg-lower = { path = "first-party/trust-cg/crates/trust-cg-lower" }
+trust-cg-opt = { path = "first-party/trust-cg/crates/trust-cg-opt" }
+
+[patch."ssh://git@github.com/alabsystems/trust-vc"]
+trust-vc-merge-contract = { path = "first-party/trust-vc/crates/trust-vc-merge-contract" }
+
+# trust: Carcara (the second, independent Alethe proof checker behind
+# clean-auto's `carcara-verify` N-version UNSAT cross-check) pinned at
+# ufmg-smite/carcara rev fecb4224def3c26f93a5d4f1804ecf58eb979650 (v1.1.0),
+# vendored byte-identical under vendor/carcara_1_1_0 (minus .git and the inert
+# benchmarks.zip) so full-verify seed caches stay registry-only: a git source
+# in any lockfile materializes cargo git checkout/db state, which the
+# cargo-cache materialization gate rejects.
+[patch."https://github.com/ufmg-smite/carcara"]
+carcara = { path = "vendor/carcara_1_1_0/carcara" }
+
+# trust: workspace-level lint policy
+[workspace.lints.rust]
+warnings = "warn"
+
+# trust: workspace-level package metadata for verification pipeline crates
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alabsystems/trust"
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+
+# trust: workspace-level dependencies shared by verification pipeline crates
+[workspace.dependencies]
+trust-types = { path = "crates/trust-types" }
+trust-verifier-api = { path = "crates/trust-verifier-api" }
+# trust: cross-repo shared verification vocabulary, re-exported by
+# trust-types/trust-verifier-api (see first-party/trust-ir/crates/trust-ir-contract).
+trust-ir-contract = { path = "first-party/trust-ir/crates/trust-ir-contract" }
+# trust (#2c/#2d): in-process Certified-tier bridge + the clean crates it drives.
+# trust-certify links into rustc_mir_transform so the live verify path can mint
+# kernel-CHECKED CleanCic certificates (de Bruijn criterion). clean-auto/clean-kernel
+# are NOT in the TCB — their output is re-checked by the clean kernel; a bad
+# reconstruction fails closed to Trusted.
+trust-certify = { path = "crates/trust-certify" }
+trust-cert-meter = { path = "crates/trust-cert-meter" }
+trust-spec-elab = { path = "crates/trust-spec-elab" }
+clean-kernel = { path = "first-party/clean/crates/clean-kernel", features = ["math-overlays"] }
+clean-auto = { path = "first-party/clean/crates/clean-auto" }
+clean-verify = { path = "first-party/clean/crates/clean-verify" }
+clean-parser = { path = "first-party/clean/crates/clean-parser" }
+clean-elab = { path = "first-party/clean/crates/clean-elab" }
+trust-cache = { path = "crates/trust-cache" }
+trust-vcgen = { path = "crates/trust-vcgen" }
+trust-os = { path = "crates/trust-os" }
+trust-router = { path = "crates/trust-router" }
+trust-report = { path = "crates/trust-report" }
+trust-semantics = { path = "crates/trust-semantics" }
+trust-release = { path = "crates/trust-release" }
+trust-temporal = { path = "crates/trust-temporal" }
+trust-convergence = { path = "crates/trust-convergence" }
+trust-proof-cert = { path = "crates/trust-proof-cert" }
+trust-version = { path = "crates/trust-version" }
+trust-decompile = { path = "crates/trust-decompile" }
+trust-strengthen = { path = "crates/trust-strengthen" }
+trust-spec = { path = "crates/trust-spec" }
+trust-symex = { path = "crates/trust-symex" }
+trust-mir-extract = { path = "crates/trust-mir-extract" }
+trust-thir-lower = { path = "crates/trust-thir-lower" }
+trust-witness = { path = "crates/trust-witness" }
+trust-lift = { path = "crates/trust-lift" }
+trust-binary-parse = { path = "crates/trust-binary-parse" }
+trust-disasm = { path = "crates/trust-disasm" }
+trust-machine-sem = { path = "crates/trust-machine-sem" }
+trust-backprop = { path = "crates/trust-backprop" }
+trust-bmc = { path = "crates/trust-bmc" }
+trust-wp = { path = "crates/trust-wp" }
+trust-vc-bridge = { path = "crates/trust-vc-bridge" }
+trust-loop = { path = "crates/trust-loop" }
+trust-transval = { path = "crates/trust-transval" }
+fs2 = "0.4"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+syn = { version = "2", features = ["full", "visit", "extra-traits"] }
+rayon = "1.10"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+# trust #837: Deterministic hashing for compilation reproducibility
+rustc-hash = "2.0.0"
+indexmap = "2.7"
+hmac = "0.12"
+toml = "0.8"
+num-bigint = "0.4"
+bincode = "1.3"
+proptest = "1.11"
+ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
+rand = "0.8"
+reqwest = { version = "0.12", features = ["json", "blocking"], default-features = false }
+libc = "0.2"
+# Trust: inherited by crates/trust-router (`tracing.workspace = true`, optional,
+# feature `ay-backend`) — the in-process ay backend scopes a no-op thread-local
+# tracing subscriber around each solve so ay's solver-internal WARN diagnostics
+# never leak onto trustc's stderr (rustc_log's default filter is a bare
+# LevelFilter::WARN). Without this entry the root workspace fails to load
+# trust-router's manifest. Unifies with the compiler's existing tracing 0.1.
+tracing = "0.1"
+# trust: repo-owned core verification stack snapshots.
+tla-mc-core = { path = "first-party/ty/crates/tla-mc-core" }
+ay = { path = "first-party/ay/crates/ay" }
+ay-bindings = { path = "first-party/ay/crates/ay-bindings" }
+# trust: ay-core (ay's structured proof data structures) — inherited by
+# crates/trust-router (`ay-core.workspace = true`, optional, feature `ay_certify`),
+# which the ROOT/compiler workspace pulls in transitively via rustc_codegen_trust_cg.
+# Without this entry the root workspace fails to load trust-router's manifest
+# (`dependency.ay-core was not found in workspace.dependencies`). crates/Cargo.toml
+# already defines it for the crates/ sub-workspace; the root needs its own copy.
+ay-core = { path = "first-party/ay/crates/ay-core" }
+# trust: ay-proof zero-trust bit-blast proof exporter — inherited by
+# crates/trust-cg-bridge (`ay-proof.workspace = true`, optional), which the root
+# build pulls in via rustc_codegen_trust_cg's `ay-proofs` feature. Without this
+# entry the root workspace manifest fails to load (`error inheriting ay-proof`).
+ay-proof = { path = "first-party/ay/crates/ay-proof" }
+ay-proof-common = { path = "first-party/ay/crates/ay-proof-common" }
+# trust: sealed-authority S3 replay oracle — inherited by crates/trust-bmc
+# (ay-chc.workspace = true, optional, feature trust-mc-native-solver). Same
+# root-workspace-copy rule as ay-core/ay-proof above.
+ay-chc = { path = "first-party/ay/crates/ay-chc" }
+trust-mc-verifier = { path = "first-party/trust-mc", package = "trust-mc" }
+trust-mc-core = { path = "first-party/trust-mc/trust-mc-core" }
+trust-mc-trust-bmc = { path = "first-party/trust-mc/trust-mc-trust-bmc" }
+trust-wp-core = { path = "first-party/trust-wp/crates/trust-wp-core" }
+trust-wp-ay = { path = "first-party/trust-wp/crates/trust-wp-ay" }
+trust-vc-core = { path = "first-party/trust-vc/crates/trust-vc-core" }
+trust-cg-ir = { path = "first-party/trust-cg/crates/trust-cg-ir" }
+trust-cg-dialect = { path = "first-party/trust-cg/crates/trust-cg-dialect" }
+trust-cg-lower = { path = "first-party/trust-cg/crates/trust-cg-lower" }
+trust-cg-opt = { path = "first-party/trust-cg/crates/trust-cg-opt" }
+trust-cg-regalloc = { path = "first-party/trust-cg/crates/trust-cg-regalloc" }
+trust-cg-verify = { path = "first-party/trust-cg/crates/trust-cg-verify", default-features = false }
+trust-cg-codegen = { path = "first-party/trust-cg/crates/trust-cg-codegen" }
+trust-cg-bridge = { path = "crates/trust-cg-bridge" }
+trust-ir-bridge = { path = "crates/trust-ir-bridge" }
+trust-wasm-bridge = { path = "crates/trust-wasm-bridge" }
+# Trust: clean-expr = CleanCic kernel-replay proof authority (native TrustVc
+# bundle validation requires in-process certificate recheck; see trust-ir
+# NativeProofAuthority).
+trust-ir = { path = "first-party/trust-ir/crates/trust-ir", features = ["clean-expr"] }
+trust-ir-build = { path = "first-party/trust-ir/crates/trust-ir-build" }

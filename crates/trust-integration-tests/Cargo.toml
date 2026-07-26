@@ -1,0 +1,51 @@
+# trust-integration-tests: Cross-crate integration tests for the verification pipeline
+#
+# Exercises the full pipeline: vcgen -> router -> report, plus cache and symex.
+# Test-only crate — not included in workspace default-members.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-integration-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# This crate has no library code — only integration tests.
+[lib]
+name = "trust_integration_tests"
+path = "src/lib.rs"
+
+[dependencies]
+trust-types = { workspace = true }
+trust-vcgen = { workspace = true }
+trust-router = { workspace = true }
+trust-report = { workspace = true }
+trust-cache = { workspace = true }
+trust-symex = { workspace = true }
+trust-strengthen = { workspace = true }
+trust-backprop = { workspace = true }
+trust-convergence = { workspace = true }
+trust-transval = { workspace = true }
+trust-loop = { workspace = true }
+trust-lift = { workspace = true, features = ["elf"] }
+trust-disasm = { workspace = true }
+trust-binary-parse = { workspace = true }
+trust-proof-cert = { workspace = true }
+trust-certify = { workspace = true }
+trust-ir = { workspace = true, features = ["serde"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+trust-certify = { workspace = true }
+trust-ir = { workspace = true, features = ["serde"] }
+
+[features]
+default = []
+ay-backend = []

@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright 2026 Andrew Yates
+[package]
+name = "trust-spec-temporal-macros"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "Deprecated Trust temporal-model compatibility macros; new models use the Clean scalar surface."
+
+[lints]
+workspace = true
+
+# Its own workspace root so that neither `crates/` nor the repository root
+# claims it: it is reached only as a path dependency of trust-spec-temporal,
+# which is itself isolated.
+[workspace]
+
+# Mirrors the root/crates/targo-trust tables so the `[lints] workspace = true`
+# above resolves. A workspace root that omits it turns the opt-in into a
+# manifest-load error rather than a no-op.
+[workspace.lints.rust]
+warnings = "warn"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"

@@ -1,0 +1,50 @@
+{
+  "admission": "internal",
+  "date": "2026-07-13",
+  "dist_payload_mode": "full",
+  "git_commit_hash": "629729f69eefb1cfe6ed766c6c01ee38aa7b0484",
+  "manifest_hash": "876835aa7f809338a2658e9c16beb4bd6b748d4ec2eae23468aa962e7fa4c22f",
+  "owned_channel": "trust",
+  "payloads": [
+    {
+      "relative_path": "dist/2026-07-13/targo-1.99.0-trust-aarch64-apple-darwin.tar.xz",
+      "sha256": "c675e2794d8da514d44f07d4bc397a5ff973ab5e018c244d1d1493b57bed19c0"
+    },
+    {
+      "relative_path": "dist/2026-07-13/targo-trust-1.99.0-trust-aarch64-apple-darwin.tar.xz",
+      "sha256": "8798cb9d256cb5c9180add71abbed6e98be872fae1b4fa22d0198a8754c00f6d"
+    },
+    {
+      "relative_path": "dist/2026-07-13/tippy-1.99.0-trust-aarch64-apple-darwin.tar.xz",
+      "sha256": "ac00018177911a2583cbea7ddeef54e9e46278bb15127c783920b9f46cb563f9"
+    },
+    {
+      "relative_path": "dist/2026-07-13/trust-analyzer-1.99.0-trust-aarch64-apple-darwin.tar.xz",
+      "sha256": "a2ef4ff50c5136e94a9a1899b59fb4fd4cd1b5f613077ce0b976142551ef96d0"
+    },
+    {
+      "relative_path": "dist/2026-07-13/trust-src-1.99.0-trust.tar.xz",
+      "sha256": "d5c82aee2b2fe233aa0ec8178a8f0eb8fe0f0a1d8b78302ce5ad31294e56ed48"
+    },
+    {
+      "relative_path": "dist/2026-07-13/trust-std-1.99.0-trust-aarch64-apple-darwin.tar.xz",
+      "sha256": "d49c16dfdbf90f89b2866b959a25cfe5e3feee652a2fec21b2c9eafe34b928dd"
+    },
+    {
+      "relative_path": "dist/2026-07-13/trustc-1.99.0-trust-aarch64-apple-darwin.tar.xz",
+      "sha256": "fb1303066c27a852c05d61b8aaa38b483367f5b9597f5b0714e02530bb002cf5"
+    },
+    {
+      "relative_path": "dist/2026-07-13/trustc-dev-1.99.0-trust-aarch64-apple-darwin.tar.xz",
+      "sha256": "e61176cb5a62ca57a6352591c4b67928ed26625fcd4532d71fb2274996f46c83"
+    },
+    {
+      "relative_path": "dist/2026-07-13/trustfmt-1.99.0-trust-aarch64-apple-darwin.tar.xz",
+      "sha256": "f53edb54fdcfbb6cac19d0e79ace88aef4ffd3a177b7e6fa7ad842e930dbce55"
+    }
+  ],
+  "promotion_decision": "admit-internal",
+  "public_upload": false,
+  "schema": "trust.stage0-payload-root-admission.v1",
+  "source_channel": "trust"
+}

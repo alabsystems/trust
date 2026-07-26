@@ -1,0 +1,89 @@
+{
+  "formula_summaries": [
+    {
+      "debug": "Eq(BvAdd(Var(\"z\", BitVec(64)), Var(\"a\", BitVec(64)), 64), BitVec { value: 1, width: 64 })",
+      "free_variables": [
+        "a",
+        "z"
+      ],
+      "sort_declarations": [
+        {
+          "name": "a",
+          "smtlib_declaration": "(declare-fun a () (_ BitVec 64))",
+          "smtlib_sort": "(_ BitVec 64)",
+          "sort": {
+            "BitVec": 64
+          }
+        },
+        {
+          "name": "z",
+          "smtlib_declaration": "(declare-fun z () (_ BitVec 64))",
+          "smtlib_sort": "(_ BitVec 64)",
+          "sort": {
+            "BitVec": 64
+          }
+        }
+      ],
+      "function": "entry",
+      "has_arrays": false,
+      "has_bitvectors": true,
+      "id": "entry:vc0",
+      "kind": "assertion: release formula",
+      "location_file": "binary:0x401010",
+      "node_count": 5,
+      "smtlib": "(= (bvadd z a) (_ bv1 64))"
+    },
+    {
+      "debug": "Bool(false)",
+      "free_variables": [],
+      "sort_declarations": [],
+      "function": "entry",
+      "has_arrays": false,
+      "has_bitvectors": false,
+      "id": "entry:vc1",
+      "kind": "assertion: raw candidate",
+      "location_file": "binary:0x401014",
+      "node_count": 1,
+      "smtlib": "false"
+    }
+  ],
+  "proof_grade_gate": {
+    "accepted": false,
+    "blocker_group_counts": {
+      "certificate": 2,
+      "raw_solver_proofs": 1,
+      "reconstruction": 1,
+      "replay": 2,
+      "source_provenance": 2,
+      "trust_level": 0,
+      "unsupported_ledger": 1,
+      "verification": 2
+    },
+    "checked_certificates": 1,
+    "proved_vcs": 2,
+    "raw_solver_proof_byte_count": 22,
+    "raw_solver_proof_bytes": 1,
+    "rejection_kinds": [
+      "UnsupportedRecordsPresent",
+      "RequiredVcCoverageIncomplete",
+      "NonProvedVerificationConditions",
+      "MissingCheckedProofCertificates",
+      "CheckedCertificateProductionManifestIncomplete",
+      "ReplayCoverageIncomplete",
+      "ReplayStatusUnknown",
+      "RawSolverProofBytesPresent",
+      "ReconstructionValidationNotValidated",
+      "SourceProvenanceNotExact",
+      "DigestIdentityNotExact"
+    ],
+    "replay_semantics_satisfied_vcs": 1,
+    "replayed_vcs": 1,
+    "required_vcs": 3,
+    "solver_dispatches": 2
+  },
+  "text_markers": [
+    "Proof-grade blocker groups for artifact: unsupported_ledger=1, verification=2, certificate=2, replay=2, reconstruction=1, source_provenance=2, raw_solver_proofs=1",
+    "formula: kind=assertion: release formula, nodes=5, free_vars=[a, z], sorts=[a:(_ BitVec 64), z:(_ BitVec 64)], bitvectors=true, arrays=false, smtlib=(= (bvadd z a) (_ bv1 64))",
+    "formula: kind=assertion: raw candidate, nodes=1, free_vars=[], sorts=[], bitvectors=false, arrays=false, smtlib=false"
+  ]
+}

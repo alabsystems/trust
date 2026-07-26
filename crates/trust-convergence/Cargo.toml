@@ -1,0 +1,28 @@
+# trust-convergence: Fixed-point detection for the prove-strengthen-backprop loop
+#
+# Tracks iteration-to-iteration proof frontier changes and decides whether the
+# loop is still making progress, has converged, or has regressed.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache 2.0
+
+[package]
+name = "trust-convergence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Trust (flywheel backprop): contract attributes — asserts lifted to #[trust::requires].
+trust = { path = "../trust-spec", package = "trust-spec" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+trust-types = { workspace = true }
+
+[dev-dependencies]
+trust-strengthen = { workspace = true }
