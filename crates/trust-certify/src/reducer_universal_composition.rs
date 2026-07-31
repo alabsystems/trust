@@ -1395,6 +1395,12 @@ mod tests {
         );
     }
 
+    // Re-pinned 2026-07-28: the clean kernel pin advance (db9fd6fa2) changed the
+    // `Name` representation (`inner`/`cached_hash` -> `depth`/`suffix`/`lean4_hash`),
+    // which is encoding-visible, so every programmatic goal digest moved. The goals'
+    // SEMANTICS are unchanged: they are built by the same constructors, and the
+    // sibling kernel-check tests in this module accepted them at the new pin in the
+    // same run these digests were harvested from.
     #[test]
     fn programmatic_reflection_goals_are_digest_pinned() {
         let dispatch = dispatch_reflection_goal().expect("dispatch goal encodes");
@@ -1407,42 +1413,42 @@ mod tests {
         let proj = proj_interior_goal().expect("proj-interior goal encodes");
         assert_eq!(
             goal_digest(&dispatch),
-            "78f79ed11667f12b95f8e9fb018ee0010830a74de9bbf6b915e4003a32d71881",
+            "2749161d0c8a9a93f4039de96d02ad0587e8e613c64b82a632ae37f643db6aad",
             "dispatch goal drifted"
         );
         assert_eq!(
             goal_digest(&cached),
-            "4c8297f9f5b50d1d333ebfdce24b69944bb63e4034131a19e60ec87b64cf0739",
+            "9539ea58027738a7d4b4db8965099bba308d5667e74a0c912d0061b427a300ec",
             "cached-reducer goal drifted"
         );
         assert_eq!(
             goal_digest(&fixpoint),
-            "7df22fd2f90b69d4b6ba55496ef1230d33dfc0a8fcd9ad834e4eb8ef799efe94",
+            "dafe40e38577ae429f7894f267452ded35aad473ed36eb03688e83f246a0507e",
             "fixpoint-exit goal drifted"
         );
         assert_eq!(
             goal_digest(&core_routing),
-            "455f6441bb417cda63b4e98cbf178f5791ef2b1b02859f84ebefe40d09885e76",
+            "f32d17fcb9ed296202d4844389c0eecb136c15e6c919ef98b44fe1fea5c6dc6e",
             "core-routing goal drifted"
         );
         assert_eq!(
             goal_digest(&beta_iota),
-            "28aead612d2f1d6e5a5ed0aabb1e51dd5455e3c6e82910969ac65da64297aa14",
+            "223c1e8541dec5c0047c1eedbbf8890fabd5725e9ffae1450109a72ea6d331c1",
             "beta-iota goal drifted"
         );
         assert_eq!(
             goal_digest(&recurse),
-            "6e171bcb2abdfc04389cb8b2ef9090c258e7349bc22b0ea0e51d21569837aa3e",
+            "16049cfecc28df7efd0cc7cb3d1ac158c64f2c32e80a92c63b2c4965a6035e20",
             "recurse-mode goal drifted"
         );
         assert_eq!(
             goal_digest(&delta),
-            "001bfb4ca9d39bb29c5283dfd1dae5867cba34a3647843bb3eb96d0194b90983",
+            "848a3b030419ee0cf59c1bc1edaf1b09d3cc50ccc9cdc8aba266e3120add65c4",
             "delta-interior goal drifted"
         );
         assert_eq!(
             goal_digest(&proj),
-            "bba5aff7118299755c91b06e639cec1d8466cf304204206b006055f181ed0439",
+            "cc7f85b4418bffab5933e0b8d5ca32e14cc3fbe9486a9cbcda917ee36c79c78d",
             "proj-interior goal drifted"
         );
     }

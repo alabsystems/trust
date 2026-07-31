@@ -1,20 +1,19 @@
 // Trust test: float addition overflow to infinity
 // VcKind: FloatOverflowToInfinity { op: BinOp::Add, operand_ty: Ty::Float { width: 64 } }
-// Expected: FloatOverflowToInfinity(Add) UNKNOWN
-// Current expectation: fail-closed unknown, exit 1.
-//   The trust-mc typed-CHC lane still REFUTES this VC (a and b near f64::MAX),
-//   but the fieldless ChcPdrSolveStatus::Refuted is demoted to unknown at tip:
-//   the 47ffee63479 merge resolved trust-bmc to the strict side and dropped the
-//   b62 `bundle_is_certified_havoc_free` Refuted->Failed arm (a bundle-level
-//   producer flag is forgeable; pinned by trust-bmc's
-//   direct_typed_chc_reachable_error_refutation_is_demoted_to_unknown), and no
-//   other lane can refute float kinds (`InProcessAyBackend::can_handle` never
-//   admitted FloatOverflowToInfinity, so the v1/ay bridge dispatch returns
-//   "no backend can handle this VC" even though a direct ay solve is SAT with
-//   a model). "FloatOverflowToInfinity(Add) FAILED" becomes assertable again
-//   once a sound refutation lane lands: trust-mc-core Refuted{model} + replay
-//   validation, or the per-obligation bound concreteness certificate
-//   (trust-bmc extension-path note at the refutation soundness gate).
+// Expected: FloatOverflowToInfinity(Add) FAILED
+// The refutation is a witnessed counterexample, exit 1.
+//   This example previously asserted a fail-closed unknown: the fieldless
+//   `ChcPdrSolveStatus::Refuted` was demoted to unknown, and no other lane could
+//   refute float kinds (`InProcessAyBackend::can_handle` never admitted
+//   FloatOverflowToInfinity). The sound refutation lane that header named as its
+//   precondition has since landed — trust-mc's `acyclic_direct_smt_decision`
+//   composes a concrete satisfiable derivation of `error` and returns
+//   `refuted_with_witness(ChcPdrCexVerification::DirectSmtModel)`, guarded by
+//   `fail_closed_lowering_sites` so an admission failure can never masquerade as
+//   a program trap (first-party/trust-mc/trust-mc-driver/src/native.rs). The row
+//   now carries solver `trust-full-verifier`, a `Counterexample` artifact digest,
+//   and the diagnostic "direct SMT confirmed a satisfiable typed query fact;
+//   refuted obligation via acyclic error derivation before PDR".
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0

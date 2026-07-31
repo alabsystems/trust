@@ -1248,9 +1248,11 @@ fn product_proof_targo_identity_rejects_absolute_tool_path() {
 }
 
 #[test]
-fn product_proof_version_identity_rejects_label_only_proof_counts() {
+fn product_proof_version_identity_label_only_cannot_satisfy_daemon_binding() {
     let root = temp_root("product-proof-version-identity-label-only");
     let candidate = "0123456789abcdef0123456789abcdef01234567";
+    let daemon_identity = materialized_trust_tool_identity_json(&root, "trustd", Some(candidate));
+    let candidate_daemon = candidate_daemon_from_json(&root, &daemon_identity);
     let evidence = serde_json::json!({
         "schema_version": "trust.product-proof.v1",
         "evidence_kind": "version identity",
@@ -1272,14 +1274,18 @@ fn product_proof_version_identity_rejects_label_only_proof_counts() {
         &evidence_path,
     );
 
-    let report = check_product_proof_coverage(&root, Some(candidate), None);
+    let report = check_product_proof_coverage(&root, Some(candidate), Some(&candidate_daemon));
     assert_eq!(report.status, GateStatus::Blocked);
     let finding = report
         .findings
         .iter()
-        .find(|finding| finding.code == "product-proof-version-identity-materialization-missing")
-        .expect("missing version identity materialization blocker");
-    assert!(finding.message.contains("version_identity"), "{}", finding.message);
+        .find(|finding| finding.code == "product-proof-daemon-candidate-binding-missing")
+        .expect("missing canonical daemon-binding blocker");
+    assert!(
+        finding.message.contains("lacks daemon tool identity"),
+        "{}",
+        finding.message
+    );
     assert!(report.evidence_refs.is_empty());
 
     let _ = std::fs::remove_dir_all(root);
@@ -1294,6 +1300,7 @@ fn product_proof_version_identity_materializes_but_requires_registered_collector
     let extension_identity = materialized_trust_tool_identity_json(&root, "targo-trust", None);
     let compiler_identity = materialized_trust_tool_identity_json(&root, "trustc", Some(candidate));
     let daemon_identity = materialized_trust_tool_identity_json(&root, "trustd", Some(candidate));
+    let candidate_daemon = candidate_daemon_from_json(&root, &daemon_identity);
     let evidence = serde_json::json!({
         "schema_version": "trust.product-proof.v1",
         "evidence_kind": "version identity",
@@ -1321,7 +1328,7 @@ fn product_proof_version_identity_materializes_but_requires_registered_collector
         &evidence_path,
     );
 
-    let report = check_product_proof_coverage(&root, Some(candidate), None);
+    let report = check_product_proof_coverage(&root, Some(candidate), Some(&candidate_daemon));
     assert!(
         !report
             .findings
@@ -1342,6 +1349,7 @@ fn product_proof_version_identity_rejects_tool_hash_mismatch() {
     let extension_identity = materialized_trust_tool_identity_json(&root, "targo-trust", None);
     let compiler_identity = materialized_trust_tool_identity_json(&root, "trustc", Some(candidate));
     let daemon_identity = materialized_trust_tool_identity_json(&root, "trustd", Some(candidate));
+    let candidate_daemon = candidate_daemon_from_json(&root, &daemon_identity);
     let evidence = serde_json::json!({
         "schema_version": "trust.product-proof.v1",
         "evidence_kind": "version identity",
@@ -1369,7 +1377,7 @@ fn product_proof_version_identity_rejects_tool_hash_mismatch() {
         &evidence_path,
     );
 
-    let report = check_product_proof_coverage(&root, Some(candidate), None);
+    let report = check_product_proof_coverage(&root, Some(candidate), Some(&candidate_daemon));
     assert_eq!(report.status, GateStatus::Blocked);
     let finding = report
         .findings
@@ -1427,8 +1435,8 @@ fn product_proof_binary_identity_rejects_label_only_proof_counts() {
 }
 
 #[test]
-fn product_proof_trustd_identity_rejects_label_only_proof_counts() {
-    let root = temp_root("product-proof-trustd-identity-label-only");
+fn product_proof_rejects_obsolete_trustd_binary_identity_evidence() {
+    let root = temp_root("product-proof-obsolete-trustd-binary-identity");
     let candidate = "0123456789abcdef0123456789abcdef01234567";
     let evidence = serde_json::json!({
         "schema_version": "trust.product-proof.v1",
@@ -1448,48 +1456,23 @@ fn product_proof_trustd_identity_rejects_label_only_proof_counts() {
 
     let report = check_product_proof_coverage(&root, Some(candidate), None);
     assert_eq!(report.status, GateStatus::Blocked);
-    let finding = report
-        .findings
-        .iter()
-        .find(|finding| finding.code == "product-proof-binary-identity-materialization-missing")
-        .expect("missing trustd binary identity materialization blocker");
-    assert!(finding.message.contains("Trust daemon binary identity"));
-    assert!(finding.message.contains("tool_identity"));
-    assert!(report.evidence_refs.is_empty());
-
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn product_proof_trustd_identity_rejects_wrong_candidate_commit() {
-    let root = temp_root("product-proof-trustd-identity-wrong-commit");
-    let candidate = "0123456789abcdef0123456789abcdef01234567";
-    let tool_identity = materialized_trust_tool_identity_json(
-        &root,
-        "trustd",
-        Some("abcdef0123456789abcdef0123456789abcdef01"),
+    assert!(
+        report.findings.iter().any(|finding| {
+            finding.code == "product-proof-evidence-kind"
+                && finding.message.contains("Trust daemon binary identity")
+                && finding.message.contains("Trust daemon protocol smoke")
+        }),
+        "the retired self-declared daemon identity kind must not re-enter the production matrix: {:?}",
+        report.findings
     );
-    let evidence = serde_json::json!({
-        "schema_version": "trust.product-proof.v1",
-        "evidence_kind": "Trust daemon binary identity",
-        "candidate_commit": candidate,
-        "proof_results": product_proof_results_json(),
-        "tool_identity": tool_identity,
-    });
-    let evidence_path =
-        write_product_proof_evidence(&root, "trustd-binary-wrong-commit.json", &evidence);
-    write_single_evidence_product_proof_manifest(
-        &root,
-        "trustd",
-        "Trust daemon binary identity",
-        &evidence_path,
+    assert!(
+        report.findings.iter().any(|finding| {
+            finding.code == "product-proof-evidence-kind-missing"
+                && finding.message.contains("Trust daemon protocol smoke")
+        }),
+        "retired identity evidence must not satisfy the live protocol requirement: {:?}",
+        report.findings
     );
-
-    let report = check_product_proof_coverage(&root, Some(candidate), None);
-    assert!(report.findings.iter().any(|finding| {
-        finding.code == "product-proof-binary-identity-materialization-missing"
-            && finding.message.contains("commit_hash")
-    }));
     assert!(report.evidence_refs.is_empty());
 
     let _ = std::fs::remove_dir_all(root);
@@ -1633,19 +1616,20 @@ fn product_proof_rejects_repo_local_fake_trustd_even_when_bytes_match_candidate(
         rejected_inherited_name: None,
         rejected_path: None,
     };
+    let version_identity = materialized_version_identity_json(&root, candidate, fake_identity);
     let evidence = serde_json::json!({
         "schema_version": "trust.product-proof.v1",
-        "evidence_kind": "Trust daemon binary identity",
+        "evidence_kind": "version identity",
         "candidate_commit": candidate,
         "proof_results": product_proof_results_json(),
-        "tool_identity": fake_identity,
+        "version_identity": version_identity,
     });
     let evidence_path =
-        write_product_proof_evidence(&root, "fake-trustd-binary-identity.json", &evidence);
+        write_product_proof_evidence(&root, "fake-trustd-version-identity.json", &evidence);
     write_single_evidence_product_proof_manifest(
         &root,
-        "trustd",
-        "Trust daemon binary identity",
+        PRODUCT_COMPONENT_TARGO_TRUST,
+        "version identity",
         &evidence_path,
     );
 
@@ -1832,32 +1816,36 @@ fn product_proof_trustd_protocol_rejects_reservation_token_mismatch() {
 
 #[cfg(unix)]
 #[test]
-fn product_proof_trustd_identity_rejects_repeated_brand_prefix() {
+fn product_proof_version_identity_rejects_repeated_trustd_brand_prefix() {
     let root = temp_root("product-proof-trustd-repeated-prefix");
     let candidate = "0123456789abcdef0123456789abcdef01234567";
     let mut tool_identity = materialized_trust_tool_identity_json(&root, "trustd", Some(candidate));
     tool_identity["version"] = "trustd trustd 1.96.0-trust".into();
     let candidate_daemon = candidate_daemon_from_json(&root, &tool_identity);
+    let version_identity = materialized_version_identity_json(&root, candidate, tool_identity);
     let evidence = serde_json::json!({
         "schema_version": "trust.product-proof.v1",
-        "evidence_kind": "Trust daemon binary identity",
+        "evidence_kind": "version identity",
         "candidate_commit": candidate,
         "proof_results": product_proof_results_json(),
-        "tool_identity": tool_identity,
+        "version_identity": version_identity,
     });
-    let evidence_path =
-        write_product_proof_evidence(&root, "trustd-repeated-prefix.json", &evidence);
+    let evidence_path = write_product_proof_evidence(
+        &root,
+        "version-identity-repeated-trustd-prefix.json",
+        &evidence,
+    );
     write_single_evidence_product_proof_manifest(
         &root,
-        "trustd",
-        "Trust daemon binary identity",
+        PRODUCT_COMPONENT_TARGO_TRUST,
+        "version identity",
         &evidence_path,
     );
 
     let report = check_product_proof_coverage(&root, Some(candidate), Some(&candidate_daemon));
     assert!(
         report.findings.iter().any(|finding| {
-            finding.code == "product-proof-binary-identity-materialization-missing"
+            finding.code == "product-proof-version-identity-materialization-missing"
                 && finding.message.contains("invalid identity/protocol fields")
         }),
         "repeating the `trustd ` brand prefix must not normalize to a valid release: {:?}",
@@ -1910,40 +1898,37 @@ fn product_proof_identity_probe_clears_ambient_loader_environment_child() {
     let path = root.join(path_text);
     std::fs::create_dir_all(path.parent().expect("guarded trustd parent"))
         .expect("create guarded trustd parent");
-    let script = format!(
-        "#!/bin/sh\ncase \"${{LD_LIBRARY_PATH-}}:${{DYLD_LIBRARY_PATH-}}\" in\n  *attacker-controlled*) echo 'ambient loader path inherited' >&2; exit 97 ;;\nesac\nprintf '%s\\n' 'trustd 1.96.0-trust' 'trust.identity=trustd' 'trust.protocol={}' 'commit-hash: {candidate}'\n",
-        trust_router::coordinator::STATUS_VERSION,
-    );
-    write_executable_test_file(&path, script.as_bytes());
+    write_native_trustd_test_file(&path, candidate, true);
     let digest = file_sha256(&path).expect("guarded trustd digest");
     let tool_identity = trust_tool_identity_json("trustd", path_text, &digest, Some(candidate));
     let candidate_daemon = candidate_daemon_from_json(&root, &tool_identity);
+    let version_identity = materialized_version_identity_json(&root, candidate, tool_identity);
     let evidence = serde_json::json!({
         "schema_version": "trust.product-proof.v1",
-        "evidence_kind": "Trust daemon binary identity",
+        "evidence_kind": "version identity",
         "candidate_commit": candidate,
         "proof_results": product_proof_results_json(),
-        "tool_identity": tool_identity,
+        "version_identity": version_identity,
     });
     let evidence_path =
-        write_product_proof_evidence(&root, "trustd-loader-environment.json", &evidence);
+        write_product_proof_evidence(&root, "version-identity-loader-environment.json", &evidence);
     write_single_evidence_product_proof_manifest(
         &root,
-        "trustd",
-        "Trust daemon binary identity",
+        PRODUCT_COMPONENT_TARGO_TRUST,
+        "version identity",
         &evidence_path,
     );
 
     let report = check_product_proof_coverage(&root, Some(candidate), Some(&candidate_daemon));
     assert!(
         !report.findings.iter().any(|finding| {
-            finding.code == "product-proof-binary-identity-materialization-missing"
+            finding.code == "product-proof-version-identity-materialization-missing"
                 || finding.code == "product-proof-daemon-candidate-binding-missing"
         }),
         "the exact daemon identity probe inherited an attacker-controlled loader path: {:?}",
         report.findings
     );
-    assert_solver_checklist_only(&report, "Trust daemon binary identity");
+    assert_solver_checklist_only(&report, "version identity");
     println!("ambient-loader-child-ran");
 
     let _ = std::fs::remove_dir_all(root);
@@ -4203,24 +4188,111 @@ fn materialized_trust_tool_identity_json(
     let path = root.join(&path_text);
     std::fs::create_dir_all(path.parent().expect("tool identity parent"))
         .expect("create tool identity parent");
-    let mut contents = format!("materialized Trust tool fixture: {name}\n");
     #[cfg(unix)]
     if name == "trustd" {
         let commit = commit_hash.expect("materialized trustd identity requires commit hash");
-        contents = format!(
-            "#!/bin/sh\nprintf '%s\\n' 'trustd 1.96.0-trust' 'trust.identity=trustd' 'trust.protocol=trustd.status.v1' 'commit-hash: {commit}'\n"
-        );
+        write_native_trustd_test_file(&path, commit, false);
+        let digest = file_sha256(&path).expect("hash native trustd identity fixture");
+        return trust_tool_identity_json(name, &path_text, &digest, commit_hash);
     }
+    let contents = format!("materialized Trust tool fixture: {name}\n");
     write_executable_test_file(&path, contents.as_bytes());
     let digest = file_sha256(&path).expect("hash tool identity fixture");
     trust_tool_identity_json(name, &path_text, &digest, commit_hash)
 }
 
+#[cfg(unix)]
+fn write_native_trustd_test_file(path: &Path, commit: &str, reject_loader_env: bool) {
+    assert!(
+        commit.len() == 40
+            && commit
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "native trustd fixture requires a canonical candidate commit"
+    );
+    let source_path = path.with_extension("fixture.c");
+    let source = r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(int argc, char **argv) {
+    const char *ld = getenv("LD_LIBRARY_PATH");
+    const char *dyld = getenv("DYLD_LIBRARY_PATH");
+    if (__REJECT_LOADER_ENV__
+        && ((ld != NULL && strstr(ld, "attacker-controlled") != NULL)
+            || (dyld != NULL && strstr(dyld, "attacker-controlled") != NULL))) {
+        fputs("ambient loader path inherited\n", stderr);
+        return 97;
+    }
+    if (argc != 2 || strcmp(argv[1], "--version") != 0) {
+        return 2;
+    }
+    puts("trustd 1.96.0-trust");
+    puts("trust.identity=trustd");
+    puts("trust.protocol=__PROTOCOL__");
+    puts("commit-hash: __COMMIT__");
+    return 0;
+}
+"#
+    .replace(
+        "__REJECT_LOADER_ENV__",
+        if reject_loader_env { "1" } else { "0" },
+    )
+    .replace("__PROTOCOL__", trust_router::coordinator::STATUS_VERSION)
+    .replace("__COMMIT__", commit);
+    std::fs::write(&source_path, source).expect("write native trustd fixture source");
+    let compiler = if Path::new("/usr/bin/cc").is_file() { "/usr/bin/cc" } else { "cc" };
+    let mut command = std::process::Command::new(compiler);
+    command
+        .args(["-std=c11", "-O0", "-o"])
+        .arg(path)
+        .arg(&source_path)
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("DYLD_LIBRARY_PATH");
+    let output = command.output().expect("compile native trustd fixture");
+    assert!(
+        output.status.success(),
+        "native trustd fixture compilation failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::remove_file(source_path).expect("remove native trustd fixture source");
+}
+
+fn materialized_version_identity_json(
+    root: &PathBuf,
+    candidate: &str,
+    daemon_identity: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "product": "Trust",
+        "toolchain_alias": "trust",
+        "trust_product_version": "0.1.0",
+        "candidate_commit": candidate,
+        "candidate_command_version": 1,
+        "tools": {
+            "frontend": materialized_trust_tool_identity_json(root, "targo", None),
+            "extension": materialized_trust_tool_identity_json(root, "targo-trust", None),
+            "compiler": materialized_trust_tool_identity_json(
+                root,
+                "trustc",
+                Some(candidate),
+            ),
+            "daemon": daemon_identity,
+        }
+    })
+}
+
 fn candidate_daemon_from_json(root: &Path, identity: &serde_json::Value) -> BoundToolIdentity {
     let path_text = identity["path"].as_str().expect("daemon identity path");
+    let path = root
+        .join(path_text)
+        .canonicalize()
+        .expect("canonical daemon identity path");
     BoundToolIdentity {
         name: "trustd".to_string(),
-        path: Some(root.join(path_text).display().to_string()),
+        path: Some(path.display().to_string()),
         sha256: Some(identity["sha256"].as_str().expect("daemon identity digest").to_string()),
         executable: Some(true),
         version: Some(identity["version"].as_str().expect("daemon identity version").to_string()),
@@ -4412,7 +4484,7 @@ fn temp_root(label: &str) -> PathBuf {
     let root = std::env::temp_dir()
         .join(format!("targo-trust-release-cli-{label}-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&root).expect("create temp root");
-    root
+    root.canonicalize().expect("canonical temp root")
 }
 
 fn commit_all(root: &Path, message: &str) {

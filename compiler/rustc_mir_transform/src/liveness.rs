@@ -249,15 +249,13 @@ fn contract_source_mentions_identifier(text: &str, name: &str) -> bool {
         let member_name = index.checked_sub(1).is_some_and(|previous| {
             matches!(tokens[previous].0, TokenKind::Dot)
                 || (matches!(tokens[previous].0, TokenKind::Colon)
-                    && previous.checked_sub(1).is_some_and(|before| {
-                        matches!(tokens[before].0, TokenKind::Colon)
-                    }))
+                    && previous
+                        .checked_sub(1)
+                        .is_some_and(|before| matches!(tokens[before].0, TokenKind::Colon)))
         });
         let namespace_name = tokens.get(index + 1).is_some_and(|(kind, _)| {
             matches!(kind, TokenKind::Colon)
-                && tokens.get(index + 2).is_some_and(|(next, _)| {
-                    matches!(next, TokenKind::Colon)
-                })
+                && tokens.get(index + 2).is_some_and(|(next, _)| matches!(next, TokenKind::Colon))
         });
         !member_name && !namespace_name
     })

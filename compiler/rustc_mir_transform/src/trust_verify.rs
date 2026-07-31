@@ -48,12 +48,16 @@ use rustc_middle::mir::trust_proof::{
     TrustStatus,
 };
 use rustc_middle::mir::{
-    BasicBlock, BasicBlockData, BinOp as MirBinOp, Body, CallSource, Const, Local, LocalDecl,
-    Operand, Place, Rvalue, START_BLOCK, SourceInfo, Statement, StatementKind, Terminator,
-    TerminatorKind, UnOp, UnwindAction, VarDebugInfoContents, WithRetag,
+    BasicBlock, BasicBlockData, BinOp as MirBinOp, BindingForm, Body, CallSource, ClearCrossCrate,
+    Const, Local, LocalDecl, LocalInfo, Operand, Place, Rvalue, START_BLOCK, SourceInfo,
+    SourceScope, Statement, StatementKind, Terminator, TerminatorKind, UnOp, UnwindAction,
+    VarDebugInfoContents, WithRetag,
 };
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
+use rustc_mir_dataflow::Analysis;
+use rustc_mir_dataflow::impls::MaybeUninitializedPlaces;
+use rustc_mir_dataflow::move_paths::{LookupResult, MoveData};
 use rustc_session::Session;
 use rustc_session::config::{ErrorOutputType, TrustPolicy};
 use rustc_span::def_id::{DefId, LOCAL_CRATE, LocalDefId};
@@ -63,8 +67,7 @@ use trust_types::{
     BinOp, COVERAGE_FUNCTION_IDENTITY_SCHEMA_V1, Counterexample, CounterexampleValue,
     CoverageFunctionIdentityInventory, CoverageTransportSummary, CrateTransportSummary, Formula,
     FunctionTransportResult, HardenedVcCategory, Outcome, ProofStrength, ReasoningKind, Sort,
-    SourceSpan,
-    TRANSPORT_DIAGNOSTIC_CODE, TRANSPORT_PREFIX, TransportArtifactDigest,
+    SourceSpan, TRANSPORT_DIAGNOSTIC_CODE, TRANSPORT_PREFIX, TransportArtifactDigest,
     TransportEvidenceArtifact, TransportEvidenceDiagnostic, TransportEvidenceDiagnosticSeverity,
     TransportMessage, TransportMonitorEvidence, TransportMonitorStatus,
     TransportNativeTrustIrEvidence, TransportObligationResult, TransportProofEvidence,
@@ -94,8 +97,23 @@ pub(crate) enum CoverageEarlyOutKind {
 
 #[derive(Clone)]
 enum ClauseMonitorEvidence {
+    /// The proposition/evaluator equivalence is kernel-certified, but exact
+    /// MIR binding and control-flow placement have not yet been authenticated.
+    /// Like `MeasureCertified`, this state is private and never transports a
+    /// positive executability grade.
+    MonitorCertified(BoundCertifiedMonitor),
     Monitored(BoundCertifiedMonitor),
-    Unmonitored { reason: String },
+    /// The Clean kernel certified the exact scalar evaluator, but the current
+    /// MIR body has not yet authenticated every transition on which it would
+    /// run. This provisional state is compiler-private and must never cross
+    /// the public transport as `measured`.
+    MeasureCertified(BoundCertifiedMeasure),
+    /// The scalar evaluator plus a successful read-only placement preflight
+    /// over this body's pristine optimized MIR.
+    Measured(BoundCertifiedMeasure),
+    Unmonitored {
+        reason: String,
+    },
 }
 
 /// Runtime payload plus the exact static proposition it was certified against.
@@ -106,6 +124,17 @@ enum ClauseMonitorEvidence {
 #[derive(Clone, Debug)]
 struct BoundCertifiedMonitor {
     runtime: trust_spec_elab::RuntimeMonitor,
+    static_formula: Formula,
+    variable_domains: Vec<trust_types::CompilerContractVariableDomain>,
+}
+
+/// Kernel-bound executable scalar measure plus the exact static expression it
+/// was certified against. This is deliberately distinct from a Boolean
+/// monitor: E5 placement compares successive evaluations at authenticated
+/// control-flow edges instead of treating the scalar itself as a predicate.
+#[derive(Clone, Debug)]
+struct BoundCertifiedMeasure {
+    runtime: trust_spec_elab::RuntimeScalarTerm,
     static_formula: Formula,
     variable_domains: Vec<trust_types::CompilerContractVariableDomain>,
 }
@@ -122,6 +151,7 @@ struct ClauseMonitorRecord {
     /// loop contracts, matching the indices preserved in public contract ids.
     source_index: usize,
     kind: rustc_middle::mir::trust_contract::TrustContractKind,
+    subject: rustc_middle::mir::trust_contract::TrustContractSubject,
     span: rustc_span::Span,
     /// Digest of the compiler-native predicate identity consumed by the
     /// monitor lane, never of source-span text.
@@ -155,6 +185,70 @@ pub(crate) struct SessionIslandEnv {
     // refines its unsupported-predicate diagnostics for island-cited calls
     // (read-only; the stash is written only here, right after island checking).
     pub(crate) env: Option<trust_certify::clean_island::KernelEnvironment>,
+}
+
+/// Trust (two-language design item 10, phase 2): ensures-citations that could
+/// not be adjudicated during the body walk because the cited theorem lives in a
+/// DEFERRED island.
+///
+/// Phase 1 defers any island whose text names the `trust_import_*` namespace
+/// until after `trust_mint_program_admissions`, because the constants it talks
+/// about do not exist before the walk. A clause citing a theorem out of that
+/// suffix therefore sees `TheoremNotFound` in-walk — a scheduling fact, not a
+/// verdict.
+///
+/// Replaying the island INTO the walk instead is unsound, and cannot be repaired
+/// inside that lane at any level of care: the in-walk environment holds only the
+/// program admissions accumulated so far, so an island elaborated there can mean
+/// something other than what the authoritative whole-crate check produces
+/// (pinned by `tests/e6-fragment-probe/probes/d13_deferred_import_citation.rs`).
+/// Parity is available only where the authoritative check already runs, so the
+/// DISCHARGE moves post-walk rather than the island moving into the walk.
+///
+/// A body recorded here is QUARANTINED: `run_pass` publishes none of its
+/// authority-dependent output (no human verdict report, no transport envelope,
+/// no strict abort, no proof-authorized check elision), and
+/// [`finalize_pending_import_citations`] publishes exactly one envelope for it
+/// once the complete environment exists. The body is still credited in
+/// `processed_bodies`, so whole-crate coverage accounting is untouched: this
+/// withholds a body's SOLE envelope until the authoritative stage and never
+/// emits a second, amending one.
+#[derive(Default)]
+struct SessionPendingImportCitations {
+    /// Whether this crate carries at least one deferred island. Written once,
+    /// before the body walk starts. A crate with no deferred suffix can have no
+    /// pending citation, so an unregistered theorem name stays an ordinary
+    /// fail-closed decline there and nothing about that path changes.
+    crate_has_deferred_islands: bool,
+    bodies: FxHashMap<LocalDefId, PendingImportCitation>,
+}
+
+struct PendingImportCitation {
+    /// Canonical crate-qualified identity, byte-identical to the spelling the
+    /// coverage inventory uses (`safe_def_path_str`), because this body's single
+    /// envelope is emitted under it from the post-walk stage.
+    func_path: String,
+    func: trust_types::VerifiableFunction,
+    /// Every `ensures` clause of the function with its cited theorem, in
+    /// authored order. The in-walk conjunction rule still governs: all of them
+    /// must Certified-grade against the complete environment, or the body
+    /// discharges nothing.
+    cited: Vec<(rustc_span::Span, rustc_span::Symbol)>,
+    /// Row indices the citation would discharge, already gated in-walk to
+    /// solver-UNKNOWN / bare-Proved entries. A refuted or timed-out row never
+    /// reaches this list.
+    postcondition_indices: Vec<usize>,
+    /// Premise of the whole-function panic-freedom subsumption lane, captured
+    /// in-walk where the native bundle is in scope. The post-walk lane must
+    /// reach the verdict the in-walk lane WOULD have reached, so it replays that
+    /// lane with the same premise rather than assuming it either way.
+    native_bundle_built: bool,
+    /// The body's provisional artifacts, attached by `run_pass` when it
+    /// quarantines. `None` means the walk recorded the pending citation but
+    /// never reached publication for this body (a skip or abort lane returned
+    /// first); finalization then has nothing to amend and no envelope was
+    /// withheld.
+    artifacts: Option<Arc<VerificationArtifacts>>,
 }
 
 /// Invocation-scoped E6 facet records (two-language design §3.1, v3
@@ -312,6 +406,7 @@ fn transport_monitor_evidence_from_metadata(
 
     let status = match exactly_one(metadata, TRUST_MONITOR_STATUS_METADATA_KEY)? {
         "monitored" => TransportMonitorStatus::Monitored,
+        "measured" => TransportMonitorStatus::Measured,
         "unmonitored" => TransportMonitorStatus::Unmonitored,
         _ => return None,
     };
@@ -372,7 +467,18 @@ fn canonical_monitor_opaque_predicate_text(text: &str) -> Result<String, String>
     }
 }
 
+fn monitor_expression_class(
+    kind: TrustContractKind,
+) -> trust_types::CompilerContractExpressionClass {
+    if kind == TrustContractKind::Decreases {
+        trust_types::CompilerContractExpressionClass::Measure
+    } else {
+        trust_types::CompilerContractExpressionClass::Proposition
+    }
+}
+
 fn canonical_monitor_predicate_digest(
+    kind: TrustContractKind,
     predicate: &rustc_middle::mir::trust_contract::TrustContractPredicateKind,
 ) -> String {
     use rustc_middle::mir::trust_contract::TrustContractPredicateKind;
@@ -381,8 +487,10 @@ fn canonical_monitor_predicate_digest(
         TrustContractPredicateKind::Typed { text, proposition } => {
             let text = text.as_str();
             let body = text.strip_prefix(LOWERED_COMPILER_CONTRACT_PREFIX).unwrap_or(text).trim();
-            match trust_mir_extract::trust_contract_proposition_to_formula_and_domains(proposition)
-            {
+            match trust_mir_extract::trust_contract_proposition_to_formula_and_domains_for_class(
+                proposition,
+                monitor_expression_class(kind),
+            ) {
                 Ok((formula, domains)) => format!(
                     "typed:{body}:{}",
                     trust_types::typed_contract_proposition_digest(&formula, &domains)
@@ -413,6 +521,7 @@ fn canonical_monitor_predicate_digest(
 /// spelling round-trips to exactly the same formula. Opaque/bool/MIR-local
 /// rows deliberately have no typed monitor carrier.
 fn canonical_monitor_static_proposition(
+    kind: TrustContractKind,
     predicate: &rustc_middle::mir::trust_contract::TrustContractPredicateKind,
 ) -> Result<StaticMonitorProposition, String> {
     use rustc_middle::mir::trust_contract::TrustContractPredicateKind;
@@ -420,8 +529,12 @@ fn canonical_monitor_static_proposition(
     let TrustContractPredicateKind::Typed { text, proposition } = predicate else {
         return Err("compiler contract predicate has no query-owned typed proposition".to_string());
     };
+    let class = monitor_expression_class(kind);
     let (formula, variable_domains) =
-        trust_mir_extract::trust_contract_proposition_to_formula_and_domains(proposition)?;
+        trust_mir_extract::trust_contract_proposition_to_formula_and_domains_for_class(
+            proposition,
+            class,
+        )?;
     let body = text
         .as_str()
         .strip_prefix(LOWERED_COMPILER_CONTRACT_PREFIX)
@@ -433,7 +546,11 @@ fn canonical_monitor_static_proposition(
         return Err("compiler-native contract predicate is empty".to_string());
     }
     let round_trip = trust_types::parse_spec_expr(body).and_then(|parsed| {
-        trust_types::compiler_contract_formula_with_domains(&parsed, &variable_domains)
+        trust_types::compiler_contract_formula_with_domains_for_class(
+            &parsed,
+            &variable_domains,
+            class,
+        )
     });
     if round_trip.as_ref() != Some(&formula) {
         return Err(
@@ -464,6 +581,18 @@ fn static_runtime_monitor_domain(
         Static::MachineInt { width: 16, signed: false } => Ok(Runtime::U16),
         Static::MachineInt { width: 32, signed: false } => Ok(Runtime::U32),
         Static::MachineInt { width: 64, signed: false } => Ok(Runtime::U64),
+        Static::MachineInt { width: 128, signed: false } => Ok(Runtime::U128),
+        Static::MachineInt { width: 8, signed: true } => Ok(Runtime::I8),
+        Static::MachineInt { width: 16, signed: true } => Ok(Runtime::I16),
+        Static::MachineInt { width: 32, signed: true } => Ok(Runtime::I32),
+        Static::MachineInt { width: 64, signed: true } => Ok(Runtime::I64),
+        Static::MachineInt { width: 128, signed: true } => Ok(Runtime::I128),
+        Static::PointerSizedInt { width: 16, signed: false } => Ok(Runtime::USize16),
+        Static::PointerSizedInt { width: 32, signed: false } => Ok(Runtime::USize32),
+        Static::PointerSizedInt { width: 64, signed: false } => Ok(Runtime::USize64),
+        Static::PointerSizedInt { width: 16, signed: true } => Ok(Runtime::ISize16),
+        Static::PointerSizedInt { width: 32, signed: true } => Ok(Runtime::ISize32),
+        Static::PointerSizedInt { width: 64, signed: true } => Ok(Runtime::ISize64),
         other => {
             Err(format!("static source domain {other:?} has no exact certified runtime carrier"))
         }
@@ -540,6 +669,7 @@ fn collect_static_term_domain(
             collect_static_term_domain(lhs, domains, found)?;
             collect_static_term_domain(rhs, domains, found)
         }
+        Formula::Neg(inner) => collect_static_term_domain(inner, domains, found),
         other => Err(format!(
             "static term node {other:?} is outside the exact certified-monitor fragment"
         )),
@@ -559,10 +689,43 @@ fn static_atom_domain(
 
 fn static_positive_literal(formula: &Formula) -> bool {
     match formula {
-        Formula::Int(value) => (1..=i128::from(u64::MAX)).contains(value),
-        Formula::UInt(value) => (1..=u128::from(u64::MAX)).contains(value),
+        Formula::Int(value) => *value > 0,
+        Formula::UInt(value) => *value > 0,
         _ => false,
     }
+}
+
+fn runtime_monitor_domain_bits(domain: trust_spec_elab::RuntimeMonitorDomain) -> Option<u32> {
+    use trust_spec_elab::RuntimeMonitorDomain as Domain;
+    match domain {
+        Domain::Nat => None,
+        Domain::U8 | Domain::I8 => Some(8),
+        Domain::U16 | Domain::I16 | Domain::USize16 | Domain::ISize16 => Some(16),
+        Domain::U32 | Domain::I32 | Domain::USize32 | Domain::ISize32 => Some(32),
+        Domain::U64 | Domain::I64 | Domain::USize64 | Domain::ISize64 => Some(64),
+        Domain::U128 | Domain::I128 => Some(128),
+        Domain::Bool => Some(1),
+    }
+}
+
+fn runtime_monitor_domain_is_signed(domain: trust_spec_elab::RuntimeMonitorDomain) -> bool {
+    use trust_spec_elab::RuntimeMonitorDomain as Domain;
+    matches!(
+        domain,
+        Domain::I8
+            | Domain::I16
+            | Domain::I32
+            | Domain::I64
+            | Domain::I128
+            | Domain::ISize16
+            | Domain::ISize32
+            | Domain::ISize64
+    )
+}
+
+fn runtime_monitor_domain_mask(domain: trust_spec_elab::RuntimeMonitorDomain) -> Option<u128> {
+    runtime_monitor_domain_bits(domain)
+        .map(|bits| if bits == 128 { u128::MAX } else { (1_u128 << bits) - 1 })
 }
 
 fn static_monitor_literal(
@@ -571,27 +734,49 @@ fn static_monitor_literal(
 ) -> Result<trust_spec_elab::RuntimeMonitorExpr, String> {
     use trust_spec_elab::{RuntimeMonitorDomain as Domain, RuntimeMonitorExpr as Runtime};
 
-    if value > u128::from(u64::MAX) {
-        return Err("static monitor literal exceeds u64".to_string());
-    }
     let max = match domain {
-        Domain::Nat | Domain::U64 | Domain::USize64 => u128::from(u64::MAX),
+        Domain::Nat | Domain::U128 => u128::MAX,
         Domain::U8 => u128::from(u8::MAX),
-        Domain::U16 | Domain::USize16 => u128::from(u16::MAX),
-        Domain::U32 | Domain::USize32 => u128::from(u32::MAX),
-        Domain::U128 => u128::MAX,
-        // Trust: signed domains bound at their own type max (i8 admits 127, not 255).
-        Domain::I8 => u128::try_from(i8::MAX).unwrap_or(0),
-        Domain::I16 | Domain::ISize16 => u128::try_from(i16::MAX).unwrap_or(0),
-        Domain::I32 | Domain::ISize32 => u128::try_from(i32::MAX).unwrap_or(0),
-        Domain::I64 | Domain::ISize64 => u128::try_from(i64::MAX).unwrap_or(0),
-        Domain::I128 => u128::try_from(i128::MAX).unwrap_or(0),
+        Domain::U16 => u128::from(u16::MAX),
+        Domain::U32 => u128::from(u32::MAX),
+        Domain::U64 => u128::from(u64::MAX),
+        Domain::USize16 => u128::from(u16::MAX),
+        Domain::USize32 => u128::from(u32::MAX),
+        Domain::USize64 => u128::from(u64::MAX),
+        Domain::I8 => i8::MAX as u128,
+        Domain::I16 | Domain::ISize16 => i16::MAX as u128,
+        Domain::I32 | Domain::ISize32 => i32::MAX as u128,
+        Domain::I64 | Domain::ISize64 => i64::MAX as u128,
+        Domain::I128 => i128::MAX as u128,
         Domain::Bool => 1,
     };
     if value > max {
         return Err(format!("static monitor literal {value} is out of range for {domain:?}"));
     }
     Ok(if value == 0 { Runtime::Zero } else { Runtime::Lit(value) })
+}
+
+fn static_monitor_negative_literal(
+    magnitude: u128,
+    domain: trust_spec_elab::RuntimeMonitorDomain,
+) -> Result<trust_spec_elab::RuntimeMonitorExpr, String> {
+    use trust_spec_elab::RuntimeMonitorExpr as Runtime;
+
+    if !runtime_monitor_domain_is_signed(domain) {
+        return Err(format!("negative static monitor literal has non-signed carrier {domain:?}"));
+    }
+    let bits = runtime_monitor_domain_bits(domain)
+        .ok_or_else(|| format!("signed monitor carrier {domain:?} has no width"))?;
+    let max_magnitude = 1_u128 << (bits - 1);
+    if magnitude > max_magnitude {
+        return Err(format!(
+            "negative static monitor literal -{magnitude} is out of range for {domain:?}"
+        ));
+    }
+    let mask = runtime_monitor_domain_mask(domain)
+        .ok_or_else(|| format!("signed monitor carrier {domain:?} has no mask"))?;
+    let pattern = 0_u128.wrapping_sub(magnitude) & mask;
+    Ok(if pattern == 0 { Runtime::Zero } else { Runtime::Lit(pattern) })
 }
 
 fn static_formula_monitor_term(
@@ -618,7 +803,25 @@ fn static_formula_monitor_term(
             static_monitor_literal(u128::from(*value), domain)
         }
         Formula::Int(value) if *value >= 0 => static_monitor_literal(*value as u128, domain),
+        Formula::Int(value) => static_monitor_negative_literal(value.unsigned_abs(), domain),
         Formula::UInt(value) => static_monitor_literal(*value, domain),
+        Formula::Neg(inner) => {
+            if let Formula::Int(value) = &**inner
+                && *value >= 0
+            {
+                return static_monitor_negative_literal(*value as u128, domain);
+            }
+            if let Formula::UInt(value) = &**inner {
+                return static_monitor_negative_literal(*value, domain);
+            }
+            if !runtime_monitor_domain_is_signed(domain) {
+                return Err(format!("static unary negation has non-signed carrier {domain:?}"));
+            }
+            Ok(Runtime::Sub(
+                Box::new(Runtime::Zero),
+                Box::new(static_formula_monitor_term(inner, domain, domains)?),
+            ))
+        }
         Formula::Add(lhs, rhs)
         | Formula::Sub(lhs, rhs)
         | Formula::Mul(lhs, rhs)
@@ -738,6 +941,17 @@ fn static_formula_monitor_expr(
     static_formula_monitor_prop(formula, &domains)
 }
 
+fn static_formula_measure_expr(
+    formula: &Formula,
+    variable_domains: &[trust_types::CompilerContractVariableDomain],
+) -> Result<trust_spec_elab::RuntimeMonitorExpr, String> {
+    let domains = static_monitor_domain_map(variable_domains)?;
+    let mut domain = None;
+    collect_static_term_domain(formula, &domains, &mut domain)?;
+    let domain = domain.unwrap_or(trust_spec_elab::RuntimeMonitorDomain::Nat);
+    static_formula_monitor_term(formula, domain, &domains)
+}
+
 fn collect_runtime_monitor_variables(
     expr: &trust_spec_elab::RuntimeMonitorExpr,
     variables: &mut Vec<String>,
@@ -809,13 +1023,70 @@ fn bind_certified_monitor_to_static_formula(
     Ok(BoundCertifiedMonitor { runtime, static_formula, variable_domains })
 }
 
+fn bind_certified_measure_to_static_formula(
+    certified: trust_spec_elab::CertifiedMeasure,
+    static_proposition: StaticMonitorProposition,
+) -> Result<BoundCertifiedMeasure, String> {
+    let runtime = certified.into_runtime();
+    let StaticMonitorProposition { formula: static_formula, variable_domains } = static_proposition;
+    let static_expr = static_formula_measure_expr(&static_formula, &variable_domains)?;
+    if runtime.expr() != &static_expr {
+        return Err(format!(
+            "Clean executable measure {0:?} differs structurally from static measure {1:?}",
+            runtime.expr(),
+            static_expr
+        ));
+    }
+    let mut variables = Vec::new();
+    collect_runtime_monitor_variables(&static_expr, &mut variables);
+    if runtime.variables() != variables {
+        return Err(format!(
+            "Clean executable measure variables {:?} differ from static measure variables {:?}",
+            runtime.variables(),
+            variables
+        ));
+    }
+    validate_runtime_measure_domains(&runtime, &variable_domains)?;
+    if runtime.variables().is_empty() {
+        runtime.evaluate(&[]).map_err(|reason| {
+            format!("closed certified measure is not exactly executable: {reason}")
+        })?;
+    }
+    Ok(BoundCertifiedMeasure { runtime, static_formula, variable_domains })
+}
+
+fn runtime_and_static_domains_match(
+    runtime: trust_spec_elab::RuntimeMonitorDomain,
+    static_domain: trust_types::CompilerContractValueDomain,
+) -> bool {
+    use trust_spec_elab::RuntimeMonitorDomain as Runtime;
+    use trust_types::CompilerContractValueDomain as Static;
+    matches!(
+        (runtime, static_domain),
+        (Runtime::U8, Static::MachineInt { width: 8, signed: false })
+            | (Runtime::U16, Static::MachineInt { width: 16, signed: false })
+            | (Runtime::U32, Static::MachineInt { width: 32, signed: false })
+            | (Runtime::U64, Static::MachineInt { width: 64, signed: false })
+            | (Runtime::U128, Static::MachineInt { width: 128, signed: false })
+            | (Runtime::I8, Static::MachineInt { width: 8, signed: true })
+            | (Runtime::I16, Static::MachineInt { width: 16, signed: true })
+            | (Runtime::I32, Static::MachineInt { width: 32, signed: true })
+            | (Runtime::I64, Static::MachineInt { width: 64, signed: true })
+            | (Runtime::I128, Static::MachineInt { width: 128, signed: true })
+            | (Runtime::USize16, Static::PointerSizedInt { width: 16, signed: false })
+            | (Runtime::USize32, Static::PointerSizedInt { width: 32, signed: false })
+            | (Runtime::USize64, Static::PointerSizedInt { width: 64, signed: false })
+            | (Runtime::ISize16, Static::PointerSizedInt { width: 16, signed: true })
+            | (Runtime::ISize32, Static::PointerSizedInt { width: 32, signed: true })
+            | (Runtime::ISize64, Static::PointerSizedInt { width: 64, signed: true })
+            | (Runtime::Bool, Static::Bool)
+    )
+}
+
 fn validate_runtime_monitor_domains(
     runtime: &trust_spec_elab::RuntimeMonitor,
     variable_domains: &[trust_types::CompilerContractVariableDomain],
 ) -> Result<(), String> {
-    use trust_spec_elab::RuntimeMonitorDomain as RuntimeDomain;
-    use trust_types::CompilerContractValueDomain as StaticDomain;
-
     if runtime.variables().is_empty() {
         if !runtime.domains().is_empty() || !variable_domains.is_empty() {
             return Err(
@@ -843,14 +1114,7 @@ fn validate_runtime_monitor_domains(
         let runtime_domain = runtime
             .domain(runtime_name)
             .ok_or_else(|| format!("Clean variable `{runtime_name}` has no runtime domain"))?;
-        let exact = matches!(
-            (runtime_domain, domain.domain),
-            (RuntimeDomain::U8, StaticDomain::MachineInt { width: 8, signed: false })
-                | (RuntimeDomain::U16, StaticDomain::MachineInt { width: 16, signed: false })
-                | (RuntimeDomain::U32, StaticDomain::MachineInt { width: 32, signed: false })
-                | (RuntimeDomain::U64, StaticDomain::MachineInt { width: 64, signed: false })
-                | (RuntimeDomain::Bool, StaticDomain::Bool)
-        );
+        let exact = runtime_and_static_domains_match(runtime_domain, domain.domain);
         if !exact {
             return Err(format!(
                 "Clean runtime domain {:?} for `{runtime_name}` differs from static source domain {:?}",
@@ -864,6 +1128,65 @@ fn validate_runtime_monitor_domains(
             variable_domains.len(),
             runtime.variables().len()
         ));
+    }
+    Ok(())
+}
+
+fn validate_runtime_measure_domains(
+    runtime: &trust_spec_elab::RuntimeScalarTerm,
+    variable_domains: &[trust_types::CompilerContractVariableDomain],
+) -> Result<(), String> {
+    if runtime.variables().is_empty() {
+        if !runtime.domains().is_empty() || !variable_domains.is_empty() {
+            return Err(
+                "closed Clean measure differs from variable-bearing static expression".to_string()
+            );
+        }
+        return Ok(());
+    }
+    if runtime.domains().len() != runtime.variables().len() {
+        return Err("Clean measure variable/domain tables are not an exact bijection".to_string());
+    }
+    let mut seen = BTreeSet::new();
+    for runtime_name in runtime.variables() {
+        if !seen.insert(runtime_name.as_str()) {
+            return Err(format!("Clean measure variable `{runtime_name}` is duplicated"));
+        }
+        let static_name = if runtime_name == "result" { "_0" } else { runtime_name.as_str() };
+        let mut matches = variable_domains.iter().filter(|entry| entry.name == static_name);
+        let static_domain = matches.next().ok_or_else(|| {
+            format!("Clean measure variable `{runtime_name}` has no static source domain")
+        })?;
+        if matches.next().is_some() {
+            return Err(format!(
+                "static source domain for measure variable `{runtime_name}` is duplicated"
+            ));
+        }
+        let runtime_domain = runtime.domains().get(runtime_name).copied().ok_or_else(|| {
+            format!("Clean measure variable `{runtime_name}` has no runtime domain")
+        })?;
+        if !runtime_and_static_domains_match(runtime_domain, static_domain.domain) {
+            return Err(format!(
+                "Clean measure runtime domain {runtime_domain:?} for `{runtime_name}` differs from static source domain {:?}",
+                static_domain.domain
+            ));
+        }
+    }
+    if variable_domains.len() != runtime.variables().len() {
+        return Err(format!(
+            "static measure has {} domain binding(s), Clean measure has {} variable(s)",
+            variable_domains.len(),
+            runtime.variables().len()
+        ));
+    }
+    if runtime.domain()
+        != runtime
+            .variables()
+            .first()
+            .and_then(|name| runtime.domains().get(name).copied())
+            .unwrap_or(trust_spec_elab::RuntimeMonitorDomain::Nat)
+    {
+        return Err("Clean measure result carrier differs from its variable carrier".to_string());
     }
     Ok(())
 }
@@ -3828,6 +4151,10 @@ impl<'tcx> crate::MirPass<'tcx> for TrustVerify {
             }
         }
         trace!("Trust: run_pass entered for {:?}", mir_source.def_id());
+        // Evaluator certification alone is not executable authority. Resolve
+        // exact function/loop placement against this pristine optimized body
+        // before any report bundle can stamp `monitored` or `measured`.
+        preflight_certified_monitor_placement(tcx, body);
         if !verification_enabled(tcx.sess) {
             // Static verification/coverage/transport remains disabled for a
             // scoped-out Cargo unit. The authenticated Targo test marker is
@@ -3969,176 +4296,27 @@ impl<'tcx> crate::MirPass<'tcx> for TrustVerify {
             }
         }
 
-        let output_mode = TrustOutputMode::parse(tcx.sess);
-
-        // Trust: Report results via rustc diagnostics when human-readable output is enabled.
-        if output_mode.emit_human() {
-            if !artifacts.results.is_empty() {
-                report_results(
-                    tcx,
-                    body,
-                    &artifacts.results,
-                    &artifacts.result_bindings,
-                    &artifacts.proof_authorities,
-                    artifacts.proof_results.summary.certified as usize,
-                );
-            } else if !artifacts.transport_results.is_empty() {
-                report_transport_results(
-                    tcx,
-                    body,
-                    &artifacts.transport_results,
-                    artifacts.proof_results.summary.cached,
-                );
-            }
+        // Trust (item 10 phase 2): a body whose ensures-citation names a theorem
+        // out of the DEFERRED island suffix cannot be adjudicated yet — the
+        // declarations it cites are kernel-checked only after the program mint.
+        // Quarantine its ENTIRE authority-dependent output (human verdict report,
+        // transport envelope, strict abort, and the proof-authorized check
+        // elision below); `finalize_pending_import_citations` publishes exactly
+        // one outcome for it once the complete environment exists. The body was
+        // already credited in `processed_bodies` above, so coverage accounting is
+        // unchanged: this withholds the body's SOLE envelope rather than adding a
+        // second, amending one.
+        //
+        // Runtime monitor injection still runs. A certified clause monitor is
+        // executable evidence, not proof authority, and it needs `&mut Body`,
+        // which no longer exists post-walk — dropping it here would silently lose
+        // runtime checking for the affected body.
+        if quarantine_pending_import_citation_body(tcx, body, &artifacts) {
+            inject_certified_test_monitors(tcx, body);
+            return;
         }
 
-        // Compute the policy-visible rows once, independently of rendering.
-        // They are both the JSON payload and the compiler's memory-safe fatality
-        // boundary; tying enforcement to `emit_json()` would let a human-output
-        // invocation bypass a failure that Targo correctly rejects.
-        let demoted_rows = (artifacts.proof_results.summary.total != 0)
-            .then(|| demote_transport_rows_for_default_lane(tcx, body, &policy, artifacts.as_ref()))
-            .flatten();
-        let rows_after_demotion = demoted_rows.as_deref().unwrap_or(&artifacts.transport_results);
-        let contract_rows = rewrite_contract_panic_transport_rows(&policy, rows_after_demotion);
-        let rows_before_coroutine_assumption =
-            contract_rows.as_deref().unwrap_or(rows_after_demotion);
-        // Coroutine resume bodies remain fully analyzed: their real arithmetic,
-        // bounds, and panic obligations must never disappear behind a whole-body
-        // skip. The three compiler-inserted ResumedAfter* sentinels are instead
-        // an executor-protocol boundary. Every lane publishes that boundary as
-        // exactly one authenticated assumption row, additive to every real
-        // verdict. Explicit advisory lanes may continue conditionally; strict
-        // and memory-safe lanes reject the premise after preserving all result
-        // rows and diagnostics, so a zero-data-obligation coroutine can never
-        // manufacture `no_obligations` proof credit over a hidden Assume.
-        let coroutine_protocol_rows =
-            rows_with_coroutine_protocol_assumption(tcx, body, rows_before_coroutine_assumption);
-        let effective_rows =
-            coroutine_protocol_rows.as_deref().unwrap_or(rows_before_coroutine_assumption);
-        if coroutine_protocol_rows.is_some() && output_mode.emit_human() {
-            eprintln!(
-                "Trust: ASSUMPTION [{COROUTINE_PROTOCOL_ASSUMPTION_TAG}] `{func_path}`: \
-                 {COROUTINE_PROTOCOL_ASSUMPTION_DETAIL} — recorded as an unverified \
-                 assumption (NOT proved)"
-            );
-        }
-
-        // Trust #542: Emit structured JSON transport only when requested.
-        // targo-trust requests this for programmatic access without forcing raw
-        // transport into ordinary compiler stderr.
-        if output_mode.emit_json() {
-            // A VERIFIED function with ZERO panic obligations (it reached here only after the
-            // Verify decision + successful native lowering + artifact collection -- a lowering
-            // failure aborts earlier) is trivially panic-free. Emit a synthetic
-            // `no_obligations` proved evidence row so the per-function transport is COMPLETE
-            // (every analyzed fn has a row) and an all-0-obligation crate reports VERIFIED
-            // instead of tripping targo-trust's "no per-function TRUST_JSON transport rows"
-            // guard. SOUND: this path is never reached for a SKIPPED function, so it cannot
-            // mark an unverified function as proved.
-            if artifacts.proof_results.summary.total == 0 && coroutine_protocol_rows.is_none() {
-                let native_vacuously_clean =
-                    artifacts.full_verification.as_ref().is_some_and(native_run_is_vacuously_clean);
-                if native_vacuously_clean {
-                    emit_transport_json(
-                        tcx,
-                        &func_path,
-                        &[transport_no_obligations_row()],
-                        artifacts.proof_results.summary.cached,
-                    );
-                } else if artifacts.transport_results.is_empty() {
-                    // A native lowering/dispatch failure can leave the legacy
-                    // summary and display rows empty. It is not a vacuous proof:
-                    // publish an honest unproved row before strict mode aborts.
-                    emit_transport_json(
-                        tcx,
-                        &func_path,
-                        &[transport_native_verification_gap_row()],
-                        artifacts.proof_results.summary.cached,
-                    );
-                } else {
-                    emit_transport_json(
-                        tcx,
-                        &func_path,
-                        &artifacts.transport_results,
-                        artifacts.proof_results.summary.cached,
-                    );
-                }
-            } else {
-                // Trust (assumption ledger, W2.1 + W3.5/W3.6): in the explicit
-                // memory-safe lane, rewrite verifier-capability-gap rows (a native
-                // lowering failure, or a print/format/write dispatch) into honest
-                // `assumption:*` ledger rows so the policy compiles with a recorded
-                // conditional-proof entry instead of a hard abort. Returns `None`
-                // (emit the original rows) under ordinary strict enforcement or
-                // when no gap is demotable — the strict lane stays byte-identical.
-                // Trust (T9 contract-panic): in the explicit advisory lanes,
-                // reclassify vcgen-stamped FAILED contract-panic rows (matched
-                // → `contract-panic:matched`, unused →
-                // `contract-panic-unused`). Strict and memory-safe lanes keep
-                // the raw failed row and therefore fail closed.
-                // Composes AFTER assumption demotion. The memory-safe failed-row
-                // classifier explicitly excludes every contract-panic marker,
-                // while this rewrite touches only marker-stamped failures, so
-                // the two rewrites remain disjoint by construction.
-                emit_transport_json(
-                    tcx,
-                    &func_path,
-                    effective_rows,
-                    artifacts.proof_results.summary.cached,
-                );
-            }
-        }
-
-        // Batteries-on verification uses the native typed route. Strict scopes
-        // fail closed; the explicit memory-safe policy relaxes only rows the
-        // compiler reclassified with its authenticated no-unsafe marker.
-        let strict = policy.fail_closed();
-        let memory_safe = memory_safe_demotion_applies(tcx, body);
-        // Trust #3: `artifacts` is now an `Arc<VerificationArtifacts>`; borrow the
-        // shared payload (`as_ref`) for the `&VerificationArtifacts` consumers.
-        // Pass the policy so diagnostics distinguish strict, survey, and
-        // memory-safe runs.
-        report_strict_l0_verification_failure(tcx, body, &func_path, artifacts.as_ref(), &policy);
-        if strict && coroutine_protocol_rows.is_some() && !memory_safe {
-            abort_on_coroutine_protocol_assumption(tcx, body, &func_path);
-        }
-
-        // Trust: a GUARANTEED Level-0 safety violation — one whose counterexample
-        // formula is GROUND (folds to forced-true on every reaching execution, e.g.
-        // a constant `Vec::with_capacity(1 << 28)` lowering to `Ge(1<<28, 1<<28)`) —
-        // is a hard error in strict scope. The escalation is soundness-gated:
-        // only a GROUND forced violation (no free input vars) escalates; a merely
-        // POSSIBLE symbolic violation remains an ordinary unproved obligation.
-        if strict {
-            if memory_safe {
-                abort_on_memory_safe_non_demotable_failure(
-                    tcx,
-                    body,
-                    &func_path,
-                    artifacts.as_ref(),
-                    effective_rows,
-                );
-            } else {
-                abort_on_full_verification_failure(tcx, body, &func_path, artifacts.as_ref());
-            }
-            // Strict mode ALSO escalates a GROUND forced L0 violation here. The
-            // native trust-mc lane lowers only arithmetic-safety / panic-freedom
-            // obligations and never the OOM-ceiling check, so it vacuously forges
-            // `Proved` for a forced over-budget bulk allocation;
-            // the malformed native row may still be independently kernel-certified
-            // as its encoded formula, so without this structural escalation (which
-            // overrides any `Proved` for a forced
-            // UnboundedAllocation) the over-budget allocation slips through.
-            if !memory_safe {
-                escalate_refuted_l0_safety_counterexamples(
-                    tcx,
-                    body,
-                    &func_path,
-                    artifacts.as_ref(),
-                );
-            }
-        }
+        publish_body_verification_outcome(tcx, body, &func_path, &artifacts, &policy);
 
         // Trust (P4): the bounded runtime-ledger seam. A proof that survives to
         // codegen is the product, so this runs wherever verification runs — there
@@ -4171,6 +4349,197 @@ impl<'tcx> crate::MirPass<'tcx> for TrustVerify {
     fn is_mir_dump_enabled(&self) -> bool {
         // Trust: keep verifier-internal MIR changes out of ordinary dumps.
         false
+    }
+}
+
+/// Publish one body's verification outcome: human diagnostics, the single
+/// transport envelope, and every strict-policy abort.
+///
+/// Factored out of [`TrustVerify::run_pass`] so the ordinary in-walk path and the
+/// post-walk [`finalize_pending_import_citations`] path emit output from ONE
+/// implementation. A body whose ensures-citation was deferred must not acquire a
+/// different report shape than one adjudicated in-walk; two copies of this logic
+/// would drift, and the drift would be invisible.
+///
+/// MIR-MUTATING consequences deliberately stay in `run_pass`
+/// (`elide_kernel_certified_checks`, `inject_certified_test_monitors`): they need
+/// `&mut Body`, which no longer exists once the walk is over.
+fn publish_body_verification_outcome<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    func_path: &str,
+    artifacts: &Arc<VerificationArtifacts>,
+    policy: &TrustVerifyPolicy,
+) {
+    let output_mode = TrustOutputMode::parse(tcx.sess);
+
+    // Trust: Report results via rustc diagnostics when human-readable output is enabled.
+    if output_mode.emit_human() {
+        if !artifacts.results.is_empty() {
+            report_results(
+                tcx,
+                body,
+                &artifacts.results,
+                &artifacts.result_bindings,
+                &artifacts.proof_authorities,
+                artifacts.proof_results.summary.certified as usize,
+            );
+        } else if !artifacts.transport_results.is_empty() {
+            report_transport_results(
+                tcx,
+                body,
+                &artifacts.transport_results,
+                artifacts.proof_results.summary.cached,
+            );
+        }
+    }
+
+    // Compute the policy-visible rows once, independently of rendering.
+    // They are both the JSON payload and the compiler's memory-safe fatality
+    // boundary; tying enforcement to `emit_json()` would let a human-output
+    // invocation bypass a failure that Targo correctly rejects.
+    let demoted_rows = (artifacts.proof_results.summary.total != 0)
+        .then(|| demote_transport_rows_for_default_lane(tcx, body, &policy, artifacts.as_ref()))
+        .flatten();
+    let rows_after_demotion = demoted_rows.as_deref().unwrap_or(&artifacts.transport_results);
+    let contract_rows = rewrite_contract_panic_transport_rows(&policy, rows_after_demotion);
+    let rows_before_coroutine_assumption =
+        contract_rows.as_deref().unwrap_or(rows_after_demotion);
+    // Coroutine resume bodies remain fully analyzed: their real arithmetic,
+    // bounds, and panic obligations must never disappear behind a whole-body
+    // skip. The three compiler-inserted ResumedAfter* sentinels are instead
+    // an executor-protocol boundary. Every lane publishes that boundary as
+    // exactly one authenticated assumption row, additive to every real
+    // verdict. Explicit advisory lanes may continue conditionally; strict
+    // and memory-safe lanes reject the premise after preserving all result
+    // rows and diagnostics, so a zero-data-obligation coroutine can never
+    // manufacture `no_obligations` proof credit over a hidden Assume.
+    let coroutine_protocol_rows =
+        rows_with_coroutine_protocol_assumption(tcx, body, rows_before_coroutine_assumption);
+    let effective_rows =
+        coroutine_protocol_rows.as_deref().unwrap_or(rows_before_coroutine_assumption);
+    if coroutine_protocol_rows.is_some() && output_mode.emit_human() {
+        eprintln!(
+            "Trust: ASSUMPTION [{COROUTINE_PROTOCOL_ASSUMPTION_TAG}] `{func_path}`: \
+             {COROUTINE_PROTOCOL_ASSUMPTION_DETAIL} — recorded as an unverified \
+             assumption (NOT proved)"
+        );
+    }
+
+    // Trust #542: Emit structured JSON transport only when requested.
+    // targo-trust requests this for programmatic access without forcing raw
+    // transport into ordinary compiler stderr.
+    if output_mode.emit_json() {
+        // A VERIFIED function with ZERO panic obligations (it reached here only after the
+        // Verify decision + successful native lowering + artifact collection -- a lowering
+        // failure aborts earlier) is trivially panic-free. Emit a synthetic
+        // `no_obligations` proved evidence row so the per-function transport is COMPLETE
+        // (every analyzed fn has a row) and an all-0-obligation crate reports VERIFIED
+        // instead of tripping targo-trust's "no per-function TRUST_JSON transport rows"
+        // guard. SOUND: this path is never reached for a SKIPPED function, so it cannot
+        // mark an unverified function as proved.
+        if artifacts.proof_results.summary.total == 0 && coroutine_protocol_rows.is_none() {
+            let native_vacuously_clean =
+                artifacts.full_verification.as_ref().is_some_and(native_run_is_vacuously_clean);
+            if native_vacuously_clean {
+                emit_transport_json(
+                    tcx,
+                    &func_path,
+                    &[transport_no_obligations_row()],
+                    artifacts.proof_results.summary.cached,
+                );
+            } else if artifacts.transport_results.is_empty() {
+                // A native lowering/dispatch failure can leave the legacy
+                // summary and display rows empty. It is not a vacuous proof:
+                // publish an honest unproved row before strict mode aborts.
+                emit_transport_json(
+                    tcx,
+                    &func_path,
+                    &[transport_native_verification_gap_row()],
+                    artifacts.proof_results.summary.cached,
+                );
+            } else {
+                emit_transport_json(
+                    tcx,
+                    &func_path,
+                    &artifacts.transport_results,
+                    artifacts.proof_results.summary.cached,
+                );
+            }
+        } else {
+            // Trust (assumption ledger, W2.1 + W3.5/W3.6): in the explicit
+            // memory-safe lane, rewrite verifier-capability-gap rows (a native
+            // lowering failure, or a print/format/write dispatch) into honest
+            // `assumption:*` ledger rows so the policy compiles with a recorded
+            // conditional-proof entry instead of a hard abort. Returns `None`
+            // (emit the original rows) under ordinary strict enforcement or
+            // when no gap is demotable — the strict lane stays byte-identical.
+            // Trust (T9 contract-panic): in the explicit advisory lanes,
+            // reclassify vcgen-stamped FAILED contract-panic rows (matched
+            // → `contract-panic:matched`, unused →
+            // `contract-panic-unused`). Strict and memory-safe lanes keep
+            // the raw failed row and therefore fail closed.
+            // Composes AFTER assumption demotion. The memory-safe failed-row
+            // classifier explicitly excludes every contract-panic marker,
+            // while this rewrite touches only marker-stamped failures, so
+            // the two rewrites remain disjoint by construction.
+            emit_transport_json(
+                tcx,
+                &func_path,
+                effective_rows,
+                artifacts.proof_results.summary.cached,
+            );
+        }
+    }
+
+    // Batteries-on verification uses the native typed route. Strict scopes
+    // fail closed; the explicit memory-safe policy relaxes only rows the
+    // compiler reclassified with its authenticated no-unsafe marker.
+    let strict = policy.fail_closed();
+    let memory_safe = memory_safe_demotion_applies(tcx, body);
+    // Trust #3: `artifacts` is now an `Arc<VerificationArtifacts>`; borrow the
+    // shared payload (`as_ref`) for the `&VerificationArtifacts` consumers.
+    // Pass the policy so diagnostics distinguish strict, survey, and
+    // memory-safe runs.
+    report_strict_l0_verification_failure(tcx, body, &func_path, artifacts.as_ref(), &policy);
+    if strict && coroutine_protocol_rows.is_some() && !memory_safe {
+        abort_on_coroutine_protocol_assumption(tcx, body, &func_path);
+    }
+
+    // Trust: a GUARANTEED Level-0 safety violation — one whose counterexample
+    // formula is GROUND (folds to forced-true on every reaching execution, e.g.
+    // a constant `Vec::with_capacity(1 << 28)` lowering to `Ge(1<<28, 1<<28)`) —
+    // is a hard error in strict scope. The escalation is soundness-gated:
+    // only a GROUND forced violation (no free input vars) escalates; a merely
+    // POSSIBLE symbolic violation remains an ordinary unproved obligation.
+    if strict {
+        if memory_safe {
+            abort_on_memory_safe_non_demotable_failure(
+                tcx,
+                body,
+                &func_path,
+                artifacts.as_ref(),
+                effective_rows,
+            );
+        } else {
+            abort_on_full_verification_failure(tcx, body, &func_path, artifacts.as_ref());
+        }
+        // Strict mode ALSO escalates a GROUND forced L0 violation here. The
+        // native trust-mc lane lowers only arithmetic-safety / panic-freedom
+        // obligations and never the OOM-ceiling check, so it vacuously forges
+        // `Proved` for a forced over-budget bulk allocation;
+        // the malformed native row may still be independently kernel-certified
+        // as its encoded formula, so without this structural escalation (which
+        // overrides any `Proved` for a forced
+        // UnboundedAllocation) the over-budget allocation slips through.
+        if !memory_safe {
+            escalate_refuted_l0_safety_counterexamples(
+                tcx,
+                body,
+                &func_path,
+                artifacts.as_ref(),
+            );
+        }
     }
 }
 
@@ -4275,11 +4644,13 @@ enum TrustResolvedScalarType {
     U16,
     U32,
     U64,
+    U128,
     Usize,
     I8,
     I16,
     I32,
     I64,
+    I128,
     Isize,
     Bool,
 }
@@ -4291,36 +4662,33 @@ impl TrustResolvedScalarType {
             Self::U16 => "u16",
             Self::U32 => "u32",
             Self::U64 => "u64",
+            Self::U128 => "u128",
             Self::Usize => "usize",
             Self::I8 => "i8",
             Self::I16 => "i16",
             Self::I32 => "i32",
             Self::I64 => "i64",
+            Self::I128 => "i128",
             Self::Isize => "isize",
             Self::Bool => "bool",
         }
     }
 
-    /// The exact fixed-width carriers for which the certified monitor can be
-    /// emitted as Rust MIR. E9 elaboration deliberately accepts the broader
-    /// set above; signed and pointer-sized clauses remain static-only.
-    fn supports_runtime_monitor(self) -> bool {
-        matches!(self, Self::U8 | Self::U16 | Self::U32 | Self::U64 | Self::Bool)
-    }
-
     fn runtime_monitor_ty<'tcx>(self, tcx: TyCtxt<'tcx>) -> Option<Ty<'tcx>> {
-        if !self.supports_runtime_monitor() {
-            return None;
-        }
         Some(match self {
             Self::U8 => tcx.types.u8,
             Self::U16 => tcx.types.u16,
             Self::U32 => tcx.types.u32,
             Self::U64 => tcx.types.u64,
+            Self::U128 => tcx.types.u128,
+            Self::Usize => tcx.types.usize,
+            Self::I8 => tcx.types.i8,
+            Self::I16 => tcx.types.i16,
+            Self::I32 => tcx.types.i32,
+            Self::I64 => tcx.types.i64,
+            Self::I128 => tcx.types.i128,
+            Self::Isize => tcx.types.isize,
             Self::Bool => tcx.types.bool,
-            Self::Usize | Self::I8 | Self::I16 | Self::I32 | Self::I64 | Self::Isize => {
-                return None;
-            }
         })
     }
 }
@@ -4337,11 +4705,13 @@ fn trust_resolved_scalar_type(ty: Ty<'_>) -> Option<TrustResolvedScalarType> {
         ty::Uint(UintTy::U16) => TrustResolvedScalarType::U16,
         ty::Uint(UintTy::U32) => TrustResolvedScalarType::U32,
         ty::Uint(UintTy::U64) => TrustResolvedScalarType::U64,
+        ty::Uint(UintTy::U128) => TrustResolvedScalarType::U128,
         ty::Uint(UintTy::Usize) => TrustResolvedScalarType::Usize,
         ty::Int(IntTy::I8) => TrustResolvedScalarType::I8,
         ty::Int(IntTy::I16) => TrustResolvedScalarType::I16,
         ty::Int(IntTy::I32) => TrustResolvedScalarType::I32,
         ty::Int(IntTy::I64) => TrustResolvedScalarType::I64,
+        ty::Int(IntTy::I128) => TrustResolvedScalarType::I128,
         ty::Int(IntTy::Isize) => TrustResolvedScalarType::Isize,
         _ => return None,
     })
@@ -4354,10 +4724,10 @@ fn trust_resolved_scalar_type(ty: Ty<'_>) -> Option<TrustResolvedScalarType> {
 /// typeck/function-signature `Ty`, never the source path spelling: transparent
 /// aliases and qualified primitive paths therefore retain their Rust meaning.
 /// Only the primitive type names the elaborator understands
-/// (`u8`/`u16`/`u32`/`u64`/`usize`/`i*`/`bool`) are reported; anything else is
-/// omitted, which — since a clause referencing an unmapped var fails closed in
-/// `elaborate_goal_typed` — keeps unsupported shapes out of the machine lane
-/// rather than mis-elaborating them.
+/// (`u8`…`u128`, `usize`, `i8`…`i128`, `isize`, and `bool`) are reported;
+/// anything else is omitted, which — since a clause referencing an unmapped var
+/// fails closed in `elaborate_goal_typed` — keeps unsupported shapes out of the
+/// machine lane rather than mis-elaborating them.
 fn trust_fn_param_type_names(tcx: TyCtxt<'_>, local: LocalDefId) -> Vec<(String, String)> {
     use rustc_hir::PatKind;
 
@@ -4447,6 +4817,161 @@ fn trust_fn_monitor_places<'tcx>(
     out
 }
 
+fn source_scope_ancestor_distance(
+    body: &Body<'_>,
+    mut descendant: SourceScope,
+    ancestor: SourceScope,
+) -> Option<usize> {
+    let mut distance = 0usize;
+    loop {
+        if descendant == ancestor {
+            return Some(distance);
+        }
+        descendant = body.source_scopes[descendant].parent_scope?;
+        distance = distance.checked_add(1)?;
+    }
+}
+
+/// Rebind one query-authenticated loop clause environment to optimized MIR.
+///
+/// The query and MIR builder independently carry the same compiler-owned
+/// HIR-local binding identity. We require one whole local with that identity,
+/// a non-inlined source scope visible from the exact authenticated header, the
+/// exact certified scalar type, and definite initialization at that header.
+/// Optional debug names never participate. A missing or ambiguous row fails
+/// closed; there is no span/name-only fallback.
+fn trust_loop_monitor_places<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    header: BasicBlock,
+    required: &BTreeMap<String, trust_spec_elab::RuntimeMonitorDomain>,
+    source_bindings: &BTreeMap<String, u32>,
+) -> Result<FxHashMap<String, (Place<'tcx>, Ty<'tcx>)>, String> {
+    let header_scope = body.basic_blocks[header].terminator().source_info.scope;
+    let move_data = MoveData::gather_moves(body, tcx, |_| true);
+    let mut maybe_uninit = MaybeUninitializedPlaces::new(tcx, body, &move_data)
+        .iterate_to_fixpoint(tcx, body, Some("trust-certified-loop-monitor"))
+        .into_results_cursor(body);
+    maybe_uninit.seek_to_block_start(header);
+    let uninitialized = maybe_uninit.get();
+
+    let mut bindings = FxHashMap::default();
+    for (name, domain) in required {
+        let hir_local_id = source_bindings.get(name).ok_or_else(|| {
+            format!("loop monitor variable `{name}` has no exact whole-scalar HIR source binding")
+        })?;
+        let expected_ty = runtime_monitor_domain_ty(tcx, *domain)?;
+        let mut candidates = Vec::new();
+        for (local, decl) in body.local_decls.iter_enumerated() {
+            let candidate_hir_local_id = match &decl.local_info {
+                ClearCrossCrate::Set(info) => match &**info {
+                    LocalInfo::TrustSourceBinding { hir_local_id } => Some(*hir_local_id),
+                    // Keep the helper valid at pre-cleanup test seams while
+                    // making optimized MIR use the compact carrier.
+                    LocalInfo::User(BindingForm::Var(binding)) => {
+                        Some(binding.binding_hir_local_id.as_u32())
+                    }
+                    _ => None,
+                },
+                ClearCrossCrate::Clear => None,
+            };
+            if candidate_hir_local_id != Some(*hir_local_id)
+                || decl.source_info.scope.inlined_instance(&body.source_scopes).is_some()
+            {
+                continue;
+            }
+            let Some(distance) =
+                source_scope_ancestor_distance(body, header_scope, decl.source_info.scope)
+            else {
+                continue;
+            };
+            if decl.ty != expected_ty {
+                continue;
+            }
+            let place = Place::from(local);
+            let LookupResult::Exact(path) = move_data.rev_lookup.find(place.as_ref()) else {
+                continue;
+            };
+            if uninitialized.contains(path) {
+                continue;
+            }
+            candidates.push((distance, place));
+        }
+        candidates.sort_by_key(|(distance, place)| (*distance, place.local.as_usize()));
+        candidates.dedup();
+        let Some(best_distance) = candidates.first().map(|(distance, _)| *distance) else {
+            return Err(format!(
+                "no exact, initialized MIR source binding exists for loop monitor variable `{name}`"
+            ));
+        };
+        let mut best = candidates
+            .iter()
+            .filter(|(distance, _)| *distance == best_distance)
+            .map(|(_, place)| *place);
+        let place = best.next().expect("best distance came from a candidate");
+        if best.any(|candidate| candidate != place) {
+            return Err(format!(
+                "loop monitor variable `{name}` has multiple closest MIR source bindings"
+            ));
+        }
+        bindings.insert(name.clone(), (place, expected_ty));
+    }
+    Ok(bindings)
+}
+
+fn monitor_target_pointer_width(
+    tcx: TyCtxt<'_>,
+) -> Result<trust_spec_elab::TargetPointerWidth, String> {
+    let bits = u32::try_from(tcx.data_layout.pointer_size().bits())
+        .map_err(|_| "target pointer width does not fit u32".to_string())?;
+    trust_spec_elab::TargetPointerWidth::from_bits(bits)
+}
+
+fn monitor_var_types_from_static(
+    proposition: &StaticMonitorProposition,
+    pointer_width: trust_spec_elab::TargetPointerWidth,
+) -> Result<Vec<(String, String)>, String> {
+    use trust_types::CompilerContractValueDomain as Domain;
+
+    let mut out = Vec::with_capacity(proposition.variable_domains.len());
+    for entry in &proposition.variable_domains {
+        let ty = match entry.domain {
+            Domain::Bool => "bool".to_string(),
+            Domain::MachineInt { width, signed } => match (width, signed) {
+                (8 | 16 | 32 | 64 | 128, false) => format!("u{width}"),
+                (8 | 16 | 32 | 64 | 128, true) => format!("i{width}"),
+                _ => {
+                    return Err(format!(
+                        "static source domain {:?} has no exact Rust monitor type",
+                        entry.domain
+                    ));
+                }
+            },
+            Domain::PointerSizedInt { width, signed } if width == pointer_width.bits() => {
+                if signed { "isize".to_string() } else { "usize".to_string() }
+            }
+            Domain::PointerSizedInt { width, .. } => {
+                return Err(format!(
+                    "static pointer domain is {width}-bit but compilation target is {}-bit",
+                    pointer_width.bits()
+                ));
+            }
+            Domain::MathematicalInt => {
+                return Err(format!(
+                    "static variable `{}` has no lossless Rust runtime carrier",
+                    entry.name
+                ));
+            }
+        };
+        let name = monitor_formula_variable_name(&entry.name).to_string();
+        if out.iter().any(|(existing, _)| existing == &name) {
+            return Err(format!("static monitor binding `{name}` is duplicated"));
+        }
+        out.push((name, ty));
+    }
+    Ok(out)
+}
+
 fn runtime_monitor_domain_ty<'tcx>(
     tcx: TyCtxt<'tcx>,
     domain: trust_spec_elab::RuntimeMonitorDomain,
@@ -4463,16 +4988,40 @@ fn runtime_monitor_domain_ty<'tcx>(
         RuntimeMonitorDomain::I32 => tcx.types.i32,
         RuntimeMonitorDomain::I64 => tcx.types.i64,
         RuntimeMonitorDomain::I128 => tcx.types.i128,
-        // Trust: the pointer-width domains are carried by the FIXED-width type their name
-        // states, not by `usize`/`isize`. The domain already resolved the target's pointer
-        // width (USize32 vs USize64 are distinct variants), so emitting `usize` here would
-        // re-open that choice at codegen on a differently-configured target.
-        RuntimeMonitorDomain::USize16 => tcx.types.u16,
-        RuntimeMonitorDomain::USize32 => tcx.types.u32,
-        RuntimeMonitorDomain::USize64 => tcx.types.u64,
-        RuntimeMonitorDomain::ISize16 => tcx.types.i16,
-        RuntimeMonitorDomain::ISize32 => tcx.types.i32,
-        RuntimeMonitorDomain::ISize64 => tcx.types.i64,
+        RuntimeMonitorDomain::USize16
+        | RuntimeMonitorDomain::USize32
+        | RuntimeMonitorDomain::USize64 => {
+            let expected = match domain {
+                RuntimeMonitorDomain::USize16 => 16,
+                RuntimeMonitorDomain::USize32 => 32,
+                RuntimeMonitorDomain::USize64 => 64,
+                _ => unreachable!(),
+            };
+            if tcx.data_layout.pointer_size().bits() != expected {
+                return Err(format!(
+                    "certified usize monitor carrier is {expected}-bit but the target pointer width is {}",
+                    tcx.data_layout.pointer_size().bits()
+                ));
+            }
+            tcx.types.usize
+        }
+        RuntimeMonitorDomain::ISize16
+        | RuntimeMonitorDomain::ISize32
+        | RuntimeMonitorDomain::ISize64 => {
+            let expected = match domain {
+                RuntimeMonitorDomain::ISize16 => 16,
+                RuntimeMonitorDomain::ISize32 => 32,
+                RuntimeMonitorDomain::ISize64 => 64,
+                _ => unreachable!(),
+            };
+            if tcx.data_layout.pointer_size().bits() != expected {
+                return Err(format!(
+                    "certified isize monitor carrier is {expected}-bit but the target pointer width is {}",
+                    tcx.data_layout.pointer_size().bits()
+                ));
+            }
+            tcx.types.isize
+        }
         RuntimeMonitorDomain::Bool => tcx.types.bool,
         RuntimeMonitorDomain::Nat => {
             return Err("Nat monitor has no lossless Rust runtime carrier".to_string());
@@ -4499,15 +5048,16 @@ fn monitor_temp<'tcx>(body: &mut Body<'tcx>, ty: Ty<'tcx>, source_info: SourceIn
 }
 
 fn collect_runtime_monitor_term_domain(
-    monitor: &trust_spec_elab::RuntimeMonitor,
+    domains: &BTreeMap<String, trust_spec_elab::RuntimeMonitorDomain>,
     expr: &trust_spec_elab::RuntimeMonitorExpr,
     found: &mut Option<trust_spec_elab::RuntimeMonitorDomain>,
 ) -> Result<(), String> {
     use trust_spec_elab::RuntimeMonitorExpr;
     match expr {
         RuntimeMonitorExpr::Var(name) => {
-            let domain = monitor
-                .domain(name)
+            let domain = domains
+                .get(name)
+                .copied()
                 .ok_or_else(|| format!("certified monitor has no domain for `{name}`"))?;
             match found {
                 None => *found = Some(domain),
@@ -4525,22 +5075,25 @@ fn collect_runtime_monitor_term_domain(
         | RuntimeMonitorExpr::Sub(lhs, rhs)
         | RuntimeMonitorExpr::Mul(lhs, rhs)
         | RuntimeMonitorExpr::Div(lhs, rhs)
-        | RuntimeMonitorExpr::Rem(lhs, rhs) => {
-            collect_runtime_monitor_term_domain(monitor, lhs, found)?;
-            collect_runtime_monitor_term_domain(monitor, rhs, found)
+        | RuntimeMonitorExpr::Rem(lhs, rhs)
+        | RuntimeMonitorExpr::BitAnd(lhs, rhs)
+        | RuntimeMonitorExpr::BitOr(lhs, rhs)
+        | RuntimeMonitorExpr::BitXor(lhs, rhs) => {
+            collect_runtime_monitor_term_domain(domains, lhs, found)?;
+            collect_runtime_monitor_term_domain(domains, rhs, found)
         }
         _ => Err("certified monitor proposition used where a term was required".to_string()),
     }
 }
 
 fn runtime_monitor_atom_domain(
-    monitor: &trust_spec_elab::RuntimeMonitor,
+    domains: &BTreeMap<String, trust_spec_elab::RuntimeMonitorDomain>,
     lhs: &trust_spec_elab::RuntimeMonitorExpr,
     rhs: &trust_spec_elab::RuntimeMonitorExpr,
 ) -> Result<trust_spec_elab::RuntimeMonitorDomain, String> {
     let mut found = None;
-    collect_runtime_monitor_term_domain(monitor, lhs, &mut found)?;
-    collect_runtime_monitor_term_domain(monitor, rhs, &mut found)?;
+    collect_runtime_monitor_term_domain(domains, lhs, &mut found)?;
+    collect_runtime_monitor_term_domain(domains, rhs, &mut found)?;
     Ok(found.unwrap_or(trust_spec_elab::RuntimeMonitorDomain::Nat))
 }
 
@@ -4551,19 +5104,15 @@ fn runtime_monitor_literal_fits(
     use trust_spec_elab::RuntimeMonitorDomain as Domain;
     value
         <= match domain {
-            Domain::Nat | Domain::U64 | Domain::USize64 => u128::from(u64::MAX),
+            Domain::Nat | Domain::U128 | Domain::I128 => u128::MAX,
             Domain::U8 => u128::from(u8::MAX),
             Domain::U16 | Domain::USize16 => u128::from(u16::MAX),
             Domain::U32 | Domain::USize32 => u128::from(u32::MAX),
-            Domain::U128 => u128::MAX,
-            // Trust: a SIGNED domain's positive literal bound is its type max, not the
-            // unsigned one of the same width — `i8` admits 127, never 255. Widths come from
-            // the domain's own `bits()`/`is_signed()` contract (trust-spec-elab).
-            Domain::I8 => u128::try_from(i8::MAX).unwrap_or(0),
-            Domain::I16 | Domain::ISize16 => u128::try_from(i16::MAX).unwrap_or(0),
-            Domain::I32 | Domain::ISize32 => u128::try_from(i32::MAX).unwrap_or(0),
-            Domain::I64 | Domain::ISize64 => u128::try_from(i64::MAX).unwrap_or(0),
-            Domain::I128 => u128::try_from(i128::MAX).unwrap_or(0),
+            Domain::U64 | Domain::USize64 => u128::from(u64::MAX),
+            Domain::I8 => u128::from(u8::MAX),
+            Domain::I16 | Domain::ISize16 => u128::from(u16::MAX),
+            Domain::I32 | Domain::ISize32 => u128::from(u32::MAX),
+            Domain::I64 | Domain::ISize64 => u128::from(u64::MAX),
             Domain::Bool => 1,
         }
 }
@@ -4572,7 +5121,7 @@ fn emit_monitor_term<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &mut Body<'tcx>,
     source_info: SourceInfo,
-    monitor: &trust_spec_elab::RuntimeMonitor,
+    domains: &BTreeMap<String, trust_spec_elab::RuntimeMonitorDomain>,
     expr: &trust_spec_elab::RuntimeMonitorExpr,
     domain: trust_spec_elab::RuntimeMonitorDomain,
     domain_ty: Ty<'tcx>,
@@ -4582,7 +5131,7 @@ fn emit_monitor_term<'tcx>(
     use trust_spec_elab::{RuntimeMonitorDomain, RuntimeMonitorExpr};
     match expr {
         RuntimeMonitorExpr::Var(name) => {
-            if monitor.domain(name) != Some(domain) {
+            if domains.get(name).copied() != Some(domain) {
                 return Err(format!(
                     "certified monitor variable `{name}` is not bound to atom domain {domain:?}"
                 ));
@@ -4612,7 +5161,10 @@ fn emit_monitor_term<'tcx>(
         | RuntimeMonitorExpr::Sub(lhs, rhs)
         | RuntimeMonitorExpr::Mul(lhs, rhs)
         | RuntimeMonitorExpr::Div(lhs, rhs)
-        | RuntimeMonitorExpr::Rem(lhs, rhs) => {
+        | RuntimeMonitorExpr::Rem(lhs, rhs)
+        | RuntimeMonitorExpr::BitAnd(lhs, rhs)
+        | RuntimeMonitorExpr::BitOr(lhs, rhs)
+        | RuntimeMonitorExpr::BitXor(lhs, rhs) => {
             if domain == RuntimeMonitorDomain::Bool {
                 return Err("arithmetic is not supported for a Bool monitor atom".to_string());
             }
@@ -4623,19 +5175,30 @@ fn emit_monitor_term<'tcx>(
                     "monitor division/remainder requires a positive literal divisor".to_string()
                 );
             }
+            if runtime_monitor_domain_is_signed(domain)
+                && matches!(expr, RuntimeMonitorExpr::Div(..) | RuntimeMonitorExpr::Rem(..))
+            {
+                return Err(
+                    "signed monitor division/remainder is outside the certified runtime fragment"
+                        .to_string(),
+                );
+            }
             let op = match expr {
                 RuntimeMonitorExpr::Add(..) => MirBinOp::Add,
                 RuntimeMonitorExpr::Sub(..) => MirBinOp::Sub,
                 RuntimeMonitorExpr::Mul(..) => MirBinOp::Mul,
                 RuntimeMonitorExpr::Div(..) => MirBinOp::Div,
                 RuntimeMonitorExpr::Rem(..) => MirBinOp::Rem,
+                RuntimeMonitorExpr::BitAnd(..) => MirBinOp::BitAnd,
+                RuntimeMonitorExpr::BitOr(..) => MirBinOp::BitOr,
+                RuntimeMonitorExpr::BitXor(..) => MirBinOp::BitXor,
                 _ => unreachable!(),
             };
             let lhs = emit_monitor_term(
                 tcx,
                 body,
                 source_info,
-                monitor,
+                domains,
                 lhs,
                 domain,
                 domain_ty,
@@ -4646,7 +5209,7 @@ fn emit_monitor_term<'tcx>(
                 tcx,
                 body,
                 source_info,
-                monitor,
+                domains,
                 rhs,
                 domain,
                 domain_ty,
@@ -4662,6 +5225,49 @@ fn emit_monitor_term<'tcx>(
         }
         _ => Err("certified monitor proposition used where a term was required".to_string()),
     }
+}
+
+fn emit_measure_value<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &mut Body<'tcx>,
+    source_info: SourceInfo,
+    measure: &trust_spec_elab::RuntimeScalarTerm,
+    bindings: &FxHashMap<String, (Place<'tcx>, Ty<'tcx>)>,
+    statements: &mut Vec<Statement<'tcx>>,
+) -> Result<(Operand<'tcx>, Ty<'tcx>), String> {
+    if measure.variables().is_empty() {
+        let value = measure.evaluate(&[])?;
+        let ty = if measure.domain() == trust_spec_elab::RuntimeMonitorDomain::Nat {
+            tcx.types.u128
+        } else {
+            runtime_monitor_domain_ty(tcx, measure.domain())?
+        };
+        if !runtime_monitor_literal_fits(value, measure.domain()) {
+            return Err(format!(
+                "closed certified measure value {value} is outside {:?}",
+                measure.domain()
+            ));
+        }
+        return Ok((monitor_const_operand(tcx, body, value, ty, source_info.span), ty));
+    }
+    if measure.domain() == trust_spec_elab::RuntimeMonitorDomain::Nat {
+        return Err(
+            "a variable-bearing Nat measure has no lossless Rust runtime carrier".to_string()
+        );
+    }
+    let ty = runtime_monitor_domain_ty(tcx, measure.domain())?;
+    let value = emit_monitor_term(
+        tcx,
+        body,
+        source_info,
+        measure.domains(),
+        measure.expr(),
+        measure.domain(),
+        ty,
+        bindings,
+        statements,
+    )?;
+    Ok((value, ty))
 }
 
 fn emit_monitor_prop<'tcx>(
@@ -4680,7 +5286,7 @@ fn emit_monitor_prop<'tcx>(
         | RuntimeMonitorExpr::Lt(lhs, rhs)
         | RuntimeMonitorExpr::Ge(lhs, rhs)
         | RuntimeMonitorExpr::Gt(lhs, rhs) => {
-            let domain = runtime_monitor_atom_domain(monitor, lhs, rhs)?;
+            let domain = runtime_monitor_atom_domain(monitor.domains(), lhs, rhs)?;
             if domain == RuntimeMonitorDomain::Nat {
                 return Err(
                     "a variable-free Nat monitor must be constant-folded before MIR emission"
@@ -4703,7 +5309,7 @@ fn emit_monitor_prop<'tcx>(
                 tcx,
                 body,
                 source_info,
-                monitor,
+                monitor.domains(),
                 lhs,
                 domain,
                 domain_ty,
@@ -4714,7 +5320,7 @@ fn emit_monitor_prop<'tcx>(
                 tcx,
                 body,
                 source_info,
-                monitor,
+                monitor.domains(),
                 rhs,
                 domain,
                 domain_ty,
@@ -4805,6 +5411,1079 @@ fn append_monitor_chain<'tcx>(
     Ok(next)
 }
 
+fn append_measure_snapshot_block<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &mut Body<'tcx>,
+    measure: &trust_spec_elab::RuntimeScalarTerm,
+    bindings: &FxHashMap<String, (Place<'tcx>, Ty<'tcx>)>,
+    previous: Place<'tcx>,
+    previous_ty: Ty<'tcx>,
+    final_target: BasicBlock,
+    source_info: SourceInfo,
+) -> Result<BasicBlock, String> {
+    let mut statements = Vec::new();
+    let (value, ty) =
+        emit_measure_value(tcx, body, source_info, measure, bindings, &mut statements)?;
+    if ty != previous_ty {
+        return Err(format!(
+            "certified measure changed MIR carrier ({ty:?}, expected {previous_ty:?})"
+        ));
+    }
+    statements.push(Statement::new(
+        source_info,
+        StatementKind::Assign(Box::new((previous, Rvalue::Use(value, WithRetag::No)))),
+    ));
+    Ok(body.basic_blocks_mut().push(BasicBlockData::new_stmts(
+        statements,
+        Some(Terminator {
+            source_info,
+            kind: TerminatorKind::Goto { target: final_target },
+            attributes: ThinVec::new(),
+        }),
+        false,
+    )))
+}
+
+fn append_measure_backedge_block<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &mut Body<'tcx>,
+    helper: DefId,
+    measure: &trust_spec_elab::RuntimeScalarTerm,
+    bindings: &FxHashMap<String, (Place<'tcx>, Ty<'tcx>)>,
+    previous: Place<'tcx>,
+    previous_ty: Ty<'tcx>,
+    final_target: BasicBlock,
+    source_info: SourceInfo,
+) -> Result<BasicBlock, String> {
+    let mut statements = Vec::new();
+    let (current, ty) =
+        emit_measure_value(tcx, body, source_info, measure, bindings, &mut statements)?;
+    if ty != previous_ty {
+        return Err(format!(
+            "certified measure changed MIR carrier ({ty:?}, expected {previous_ty:?})"
+        ));
+    }
+    let decreasing = monitor_temp(body, tcx.types.bool, source_info);
+    statements.push(Statement::new(
+        source_info,
+        StatementKind::Assign(Box::new((
+            decreasing,
+            Rvalue::BinaryOp(MirBinOp::Lt, Box::new((current.clone(), Operand::Copy(previous)))),
+        ))),
+    ));
+    let condition = if runtime_monitor_domain_is_signed(measure.domain()) {
+        // E5's signed violation formula is `pre < 0 ∨ post >= pre`.
+        // Its executable success condition is therefore exactly
+        // `pre >= 0 ∧ post < pre`.
+        let nonnegative = monitor_temp(body, tcx.types.bool, source_info);
+        statements.push(Statement::new(
+            source_info,
+            StatementKind::Assign(Box::new((
+                nonnegative,
+                Rvalue::BinaryOp(
+                    MirBinOp::Ge,
+                    Box::new((
+                        Operand::Copy(previous),
+                        monitor_const_operand(tcx, body, 0, previous_ty, source_info.span),
+                    )),
+                ),
+            ))),
+        ));
+        let combined = monitor_temp(body, tcx.types.bool, source_info);
+        statements.push(Statement::new(
+            source_info,
+            StatementKind::Assign(Box::new((
+                combined,
+                Rvalue::BinaryOp(
+                    MirBinOp::BitAnd,
+                    Box::new((Operand::Copy(nonnegative), Operand::Copy(decreasing))),
+                ),
+            ))),
+        ));
+        Operand::Copy(combined)
+    } else {
+        Operand::Copy(decreasing)
+    };
+
+    let update = body.basic_blocks_mut().push(BasicBlockData::new_stmts(
+        vec![Statement::new(
+            source_info,
+            StatementKind::Assign(Box::new((previous, Rvalue::Use(current, WithRetag::No)))),
+        )],
+        Some(Terminator {
+            source_info,
+            kind: TerminatorKind::Goto { target: final_target },
+            attributes: ThinVec::new(),
+        }),
+        false,
+    ));
+    let destination = monitor_temp(body, tcx.types.unit, source_info);
+    Ok(body.basic_blocks_mut().push(BasicBlockData::new_stmts(
+        statements,
+        Some(Terminator {
+            source_info,
+            kind: TerminatorKind::Call {
+                func: Operand::function_handle(tcx, helper, [], source_info.span),
+                args: [Spanned { node: condition, span: source_info.span }].into(),
+                destination,
+                target: Some(update),
+                unwind: UnwindAction::Continue,
+                call_source: CallSource::Misc,
+                fn_span: source_info.span,
+            },
+            attributes: ThinVec::new(),
+        }),
+        false,
+    )))
+}
+
+/// Check one function-recursion E5 edge against the measure captured at
+/// function entry. The call-site bindings denote the recursive arguments, so
+/// this implements exactly `entry >= 0 && call < entry` for signed carriers
+/// and `call < entry` for unsigned carriers.
+fn append_recursion_measure_check_block<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &mut Body<'tcx>,
+    helper: DefId,
+    measure: &trust_spec_elab::RuntimeScalarTerm,
+    call_bindings: &FxHashMap<String, (Place<'tcx>, Ty<'tcx>)>,
+    entry: Place<'tcx>,
+    entry_ty: Ty<'tcx>,
+    final_target: BasicBlock,
+    source_info: SourceInfo,
+) -> Result<BasicBlock, String> {
+    let mut statements = Vec::new();
+    let (call_value, ty) =
+        emit_measure_value(tcx, body, source_info, measure, call_bindings, &mut statements)?;
+    if ty != entry_ty {
+        return Err(format!(
+            "certified recursion measure changed MIR carrier ({ty:?}, expected {entry_ty:?})"
+        ));
+    }
+    let decreasing = monitor_temp(body, tcx.types.bool, source_info);
+    statements.push(Statement::new(
+        source_info,
+        StatementKind::Assign(Box::new((
+            decreasing,
+            Rvalue::BinaryOp(MirBinOp::Lt, Box::new((call_value, Operand::Copy(entry)))),
+        ))),
+    ));
+    let condition = if runtime_monitor_domain_is_signed(measure.domain()) {
+        let nonnegative = monitor_temp(body, tcx.types.bool, source_info);
+        statements.push(Statement::new(
+            source_info,
+            StatementKind::Assign(Box::new((
+                nonnegative,
+                Rvalue::BinaryOp(
+                    MirBinOp::Ge,
+                    Box::new((
+                        Operand::Copy(entry),
+                        monitor_const_operand(tcx, body, 0, entry_ty, source_info.span),
+                    )),
+                ),
+            ))),
+        ));
+        let combined = monitor_temp(body, tcx.types.bool, source_info);
+        statements.push(Statement::new(
+            source_info,
+            StatementKind::Assign(Box::new((
+                combined,
+                Rvalue::BinaryOp(
+                    MirBinOp::BitAnd,
+                    Box::new((Operand::Copy(nonnegative), Operand::Copy(decreasing))),
+                ),
+            ))),
+        ));
+        Operand::Copy(combined)
+    } else {
+        Operand::Copy(decreasing)
+    };
+    let destination = monitor_temp(body, tcx.types.unit, source_info);
+    Ok(body.basic_blocks_mut().push(BasicBlockData::new_stmts(
+        statements,
+        Some(Terminator {
+            source_info,
+            kind: TerminatorKind::Call {
+                func: Operand::function_handle(tcx, helper, [], source_info.span),
+                args: [Spanned { node: condition, span: source_info.span }].into(),
+                destination,
+                target: Some(final_target),
+                unwind: UnwindAction::Continue,
+                call_source: CallSource::Misc,
+                fn_span: source_info.span,
+            },
+            attributes: ThinVec::new(),
+        }),
+        false,
+    )))
+}
+
+/// Authenticate the bounded function-level E5 topology before inserting any
+/// runtime calls. A non-self/indirect call may participate in mutual
+/// recursion, and Drop/coroutine/assembly control flow may hide another call
+/// edge, so none may be silently omitted from a positive measured row.
+fn certified_direct_self_recursion_sites<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    self_def: DefId,
+) -> Result<Vec<BasicBlock>, String> {
+    let mut sites = Vec::new();
+    let typing_env = body.typing_env(tcx);
+    for (bb, data) in body.basic_blocks.iter_enumerated() {
+        match &data.terminator().kind {
+            TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. } => {
+                let Some((callee, generic_args)) = func.const_fn_def() else {
+                    return Err(format!(
+                        "function-level decreases cannot classify indirect call in {bb:?}"
+                    ));
+                };
+                if callee != self_def {
+                    return Err(format!(
+                        "function-level decreases cannot classify non-self call `{callee:?}` in {bb:?} as non-recursive"
+                    ));
+                }
+                let resolved = ty::Instance::try_resolve(tcx, typing_env, callee, generic_args)
+                    .map_err(|_| {
+                        format!(
+                            "function-level decreases could not resolve direct self call in {bb:?}"
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        format!(
+                            "function-level decreases left direct self call in {bb:?} unresolved"
+                        )
+                    })?;
+                if resolved.def_id() != self_def {
+                    return Err(format!(
+                        "function-level decreases call in {bb:?} resolved to `{resolved:?}`, not the current function"
+                    ));
+                }
+                sites.push(bb);
+            }
+            TerminatorKind::Drop { .. } => {
+                return Err(format!(
+                    "function-level decreases cannot classify drop glue in {bb:?} as non-recursive"
+                ));
+            }
+            TerminatorKind::Yield { .. } | TerminatorKind::CoroutineDrop => {
+                return Err(format!(
+                    "function-level decreases cannot classify coroutine control flow in {bb:?}"
+                ));
+            }
+            TerminatorKind::InlineAsm { .. } => {
+                return Err(format!(
+                    "function-level decreases cannot classify inline assembly in {bb:?}"
+                ));
+            }
+            TerminatorKind::Goto { .. }
+            | TerminatorKind::SwitchInt { .. }
+            | TerminatorKind::UnwindResume
+            | TerminatorKind::UnwindTerminate(_)
+            | TerminatorKind::Return
+            | TerminatorKind::Unreachable
+            | TerminatorKind::Assert { .. }
+            | TerminatorKind::FalseEdge { .. }
+            | TerminatorKind::FalseUnwind { .. } => {}
+        }
+    }
+    Ok(sites)
+}
+
+struct CertifiedLoopRuntimeGroup<'a> {
+    header: BasicBlock,
+    span: rustc_span::Span,
+    source_loop_id: u32,
+    source_hir_local_id: u32,
+    invariants: Vec<&'a BoundCertifiedMonitor>,
+    invariant_source_indices: Vec<usize>,
+    measures: Vec<&'a BoundCertifiedMeasure>,
+    measure_source_indices: Vec<usize>,
+    source_bindings: BTreeMap<String, u32>,
+}
+
+struct CertifiedLoopRuntimeGroups<'a> {
+    groups: Vec<CertifiedLoopRuntimeGroup<'a>>,
+    provenance_rejections: BTreeMap<usize, String>,
+}
+
+fn certified_loop_provenance_rejections(
+    records: &[ClauseMonitorRecord],
+    failures: &[(u32, String)],
+) -> BTreeMap<usize, String> {
+    use rustc_middle::mir::trust_contract::TrustContractSubject;
+
+    let failures = failures.iter().cloned().collect::<BTreeMap<_, _>>();
+    records
+        .iter()
+        .filter(|record| {
+            matches!(
+                &record.evidence,
+                ClauseMonitorEvidence::MonitorCertified(_)
+                    | ClauseMonitorEvidence::Monitored(_)
+                    | ClauseMonitorEvidence::MeasureCertified(_)
+                    | ClauseMonitorEvidence::Measured(_)
+            )
+        })
+        .filter_map(|record| {
+            let TrustContractSubject::HirLoop { id, .. } = record.subject else {
+                return None;
+            };
+            failures.get(&id.index).map(|reason| {
+                (
+                    record.source_index,
+                    format!(
+                        "could not authenticate loop monitor header provenance: source loop {}: \
+                         {reason}",
+                        id.index
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
+fn certified_loop_runtime_groups<'a>(
+    tcx: TyCtxt<'_>,
+    body: &Body<'_>,
+    local: LocalDefId,
+    records: &'a [ClauseMonitorRecord],
+) -> Result<CertifiedLoopRuntimeGroups<'a>, String> {
+    use rustc_middle::mir::trust_contract::TrustContractSubject;
+
+    let rustc_bundle = tcx.trust_contracts(local.to_def_id());
+    let mut portable = trust_mir_extract::convert_trust_contract_bundle(tcx, rustc_bundle)
+        .map_err(|reason| {
+            format!(
+                "could not reconstruct exact loop contract bundle for monitor placement: {reason}"
+            )
+        })?;
+    let failures = trust_mir_extract::stamp_loop_header_provenance(body, &mut portable);
+    // Provenance is compiler-authenticated per source-loop identity. A missing
+    // optimized-away inner loop therefore rejects only that source group; it
+    // cannot revoke (or borrow) the distinct surviving outer loop's exact
+    // header. Conversion/catalog failures above remain body-global because
+    // they prevent trustworthy row alignment altogether.
+    let provenance_rejections = certified_loop_provenance_rejections(records, &failures);
+
+    let function_contract_count = rustc_bundle.contracts.len();
+    let mut groups = BTreeMap::<usize, CertifiedLoopRuntimeGroup<'a>>::new();
+    for record in records {
+        let TrustContractSubject::HirLoop { id, .. } = record.subject else {
+            continue;
+        };
+        let is_positive = matches!(
+            &record.evidence,
+            ClauseMonitorEvidence::MonitorCertified(_)
+                | ClauseMonitorEvidence::Monitored(_)
+                | ClauseMonitorEvidence::MeasureCertified(_)
+                | ClauseMonitorEvidence::Measured(_)
+        );
+        if !is_positive {
+            continue;
+        }
+        if provenance_rejections.contains_key(&record.source_index) {
+            continue;
+        }
+        let loop_index =
+            record.source_index.checked_sub(function_contract_count).ok_or_else(|| {
+                format!(
+                    "positive loop monitor row #{} overlaps the function contract namespace",
+                    record.source_index
+                )
+            })?;
+        let spec = portable.loop_contracts.get(loop_index).ok_or_else(|| {
+            format!(
+                "positive loop monitor row #{} has no portable loop clause",
+                record.source_index
+            )
+        })?;
+        let query_contract = rustc_bundle.loop_contracts.get(loop_index).ok_or_else(|| {
+            format!(
+                "positive loop monitor row #{} has no compiler-query loop clause",
+                record.source_index
+            )
+        })?;
+        if spec.source_loop_id != id.index || spec.source_hir_local_id != Some(id.hir_local_id) {
+            return Err(format!(
+                "positive loop monitor row #{} changed source-loop identity",
+                record.source_index
+            ));
+        }
+        let header_index = spec.mir_header.ok_or_else(|| {
+            format!(
+                "positive loop monitor row #{} has no authenticated MIR header",
+                record.source_index
+            )
+        })?;
+        if header_index >= body.basic_blocks.len() {
+            return Err(format!(
+                "positive loop monitor row #{} names invalid MIR header bb{header_index}",
+                record.source_index
+            ));
+        }
+        let header = BasicBlock::from_usize(header_index);
+        let group = groups.entry(header_index).or_insert_with(|| CertifiedLoopRuntimeGroup {
+            header,
+            span: record.span,
+            source_loop_id: id.index,
+            source_hir_local_id: id.hir_local_id,
+            invariants: Vec::new(),
+            invariant_source_indices: Vec::new(),
+            measures: Vec::new(),
+            measure_source_indices: Vec::new(),
+            source_bindings: BTreeMap::new(),
+        });
+        if group.source_loop_id != id.index || group.source_hir_local_id != id.hir_local_id {
+            return Err(format!(
+                "distinct source loops ({}/{}) and ({}/{}) resolve to the same MIR header bb{header_index}",
+                group.source_loop_id, group.source_hir_local_id, id.index, id.hir_local_id,
+            ));
+        }
+        let required_names = match &record.evidence {
+            ClauseMonitorEvidence::MonitorCertified(bound)
+            | ClauseMonitorEvidence::Monitored(bound) => {
+                bound.runtime.domains().keys().cloned().collect::<BTreeSet<_>>()
+            }
+            ClauseMonitorEvidence::MeasureCertified(bound)
+            | ClauseMonitorEvidence::Measured(bound) => {
+                bound.runtime.domains().keys().cloned().collect::<BTreeSet<_>>()
+            }
+            ClauseMonitorEvidence::Unmonitored { .. } => unreachable!(),
+        };
+        let mut clause_bindings = BTreeMap::new();
+        for binding in &query_contract.predicate.source_bindings {
+            let name = binding.name.to_string();
+            if !required_names.contains(&name) {
+                return Err(format!(
+                    "positive loop monitor row #{} carries an unused HIR source binding for `{name}`",
+                    record.source_index
+                ));
+            }
+            if let Some(previous) = clause_bindings.insert(name.clone(), binding.hir_local_id)
+                && previous != binding.hir_local_id
+            {
+                return Err(format!(
+                    "positive loop monitor row #{} gives `{name}` conflicting HIR source bindings",
+                    record.source_index
+                ));
+            }
+        }
+        for name in required_names {
+            let hir_local_id = clause_bindings.get(&name).ok_or_else(|| {
+                format!(
+                    "positive loop monitor row #{} variable `{name}` has no exact whole-scalar HIR source binding",
+                    record.source_index
+                )
+            })?;
+            if let Some(previous) = group.source_bindings.insert(name.clone(), *hir_local_id)
+                && previous != *hir_local_id
+            {
+                return Err(format!(
+                    "loop monitor variable `{name}` changes HIR source identity across clauses"
+                ));
+            }
+        }
+        match (&record.kind, &record.evidence) {
+            (
+                TrustContractKind::LoopInvariant,
+                ClauseMonitorEvidence::MonitorCertified(bound)
+                | ClauseMonitorEvidence::Monitored(bound),
+            ) => {
+                group.invariants.push(bound);
+                group.invariant_source_indices.push(record.source_index);
+            }
+            (
+                TrustContractKind::Decreases,
+                ClauseMonitorEvidence::MeasureCertified(bound)
+                | ClauseMonitorEvidence::Measured(bound),
+            ) => {
+                group.measures.push(bound);
+                group.measure_source_indices.push(record.source_index);
+            }
+            (kind, _) => {
+                return Err(format!(
+                    "positive loop monitor row #{} has incompatible evidence for {kind:?}",
+                    record.source_index
+                ));
+            }
+        }
+    }
+    Ok(CertifiedLoopRuntimeGroups { groups: groups.into_values().collect(), provenance_rejections })
+}
+
+fn certified_loop_required_domains(
+    group: &CertifiedLoopRuntimeGroup<'_>,
+) -> Result<BTreeMap<String, trust_spec_elab::RuntimeMonitorDomain>, String> {
+    let mut required = BTreeMap::new();
+    let mut insert = |name: &str, domain| match required.insert(name.to_string(), domain) {
+        Some(previous) if previous != domain => Err(format!(
+            "loop monitor variable `{name}` has conflicting certified domains {previous:?} and {domain:?}"
+        )),
+        _ => Ok(()),
+    };
+    for invariant in &group.invariants {
+        for (name, domain) in invariant.runtime.domains() {
+            insert(name, *domain)?;
+        }
+    }
+    for measure in &group.measures {
+        for (name, domain) in measure.runtime.domains() {
+            insert(name, *domain)?;
+        }
+    }
+    Ok(required)
+}
+
+fn canonical_monitor_predecessors(
+    predecessors: impl IntoIterator<Item = BasicBlock>,
+) -> Vec<BasicBlock> {
+    let mut predecessors = predecessors.into_iter().collect::<Vec<_>>();
+    predecessors.sort_unstable();
+    predecessors.dedup();
+    predecessors
+}
+
+fn preflight_monitor_emission<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    helper: DefId,
+    monitor: &trust_spec_elab::RuntimeMonitor,
+    bindings: &FxHashMap<String, (Place<'tcx>, Ty<'tcx>)>,
+    span: rustc_span::Span,
+) -> Result<(), String> {
+    // Exercise the exact emitter against an isolated clone. This is stronger
+    // than maintaining a second "supported syntax" predicate which could
+    // drift from the mutating placement path.
+    let mut probe = body.clone();
+    append_monitor_chain(
+        tcx,
+        &mut probe,
+        helper,
+        &[monitor],
+        bindings,
+        START_BLOCK,
+        SourceInfo::outermost(span),
+    )
+    .map(|_| ())
+}
+
+fn preflight_measure_snapshot_and_backedge<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    helper: DefId,
+    measure: &trust_spec_elab::RuntimeScalarTerm,
+    bindings: &FxHashMap<String, (Place<'tcx>, Ty<'tcx>)>,
+    span: rustc_span::Span,
+) -> Result<(), String> {
+    let source_info = SourceInfo::outermost(span);
+    let previous_ty = if measure.domain() == trust_spec_elab::RuntimeMonitorDomain::Nat {
+        tcx.types.u128
+    } else {
+        runtime_monitor_domain_ty(tcx, measure.domain())?
+    };
+    let mut probe = body.clone();
+    let previous = monitor_temp(&mut probe, previous_ty, source_info);
+    append_measure_snapshot_block(
+        tcx,
+        &mut probe,
+        measure,
+        bindings,
+        previous,
+        previous_ty,
+        START_BLOCK,
+        source_info,
+    )?;
+    append_measure_backedge_block(
+        tcx,
+        &mut probe,
+        helper,
+        measure,
+        bindings,
+        previous,
+        previous_ty,
+        START_BLOCK,
+        source_info,
+    )?;
+    Ok(())
+}
+
+fn preflight_function_measure_emission<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    helper: DefId,
+    measure: &trust_spec_elab::RuntimeScalarTerm,
+    entry_bindings: &FxHashMap<String, (Place<'tcx>, Ty<'tcx>)>,
+    recursion_sites: &[BasicBlock],
+    span: rustc_span::Span,
+) -> Result<(), String> {
+    let source_info = SourceInfo::outermost(span);
+    let mut probe = body.clone();
+    let mut entry_statements = Vec::new();
+    let (entry_value, entry_ty) = emit_measure_value(
+        tcx,
+        &mut probe,
+        source_info,
+        measure,
+        entry_bindings,
+        &mut entry_statements,
+    )?;
+    let entry = monitor_temp(&mut probe, entry_ty, source_info);
+    entry_statements.push(Statement::new(
+        source_info,
+        StatementKind::Assign(Box::new((entry, Rvalue::Use(entry_value, WithRetag::No)))),
+    ));
+
+    for &call_bb in recursion_sites {
+        let args = match &body.basic_blocks[call_bb].terminator().kind {
+            TerminatorKind::Call { args, .. } | TerminatorKind::TailCall { args, .. } => args,
+            _ => {
+                return Err(format!("authenticated recursive site {call_bb:?} is not a call"));
+            }
+        };
+        let mut call_bindings = FxHashMap::default();
+        for name in measure.variables() {
+            let &(entry_place, expected_ty) = entry_bindings.get(name).ok_or_else(|| {
+                format!(
+                    "recursion measure variable `{name}` has no exact function parameter binding"
+                )
+            })?;
+            if !entry_place.projection.is_empty()
+                || entry_place.local.as_usize() == 0
+                || entry_place.local.as_usize() > body.arg_count
+            {
+                return Err(format!(
+                    "recursion measure variable `{name}` is not a direct scalar parameter"
+                ));
+            }
+            let argument_index = entry_place.local.as_usize() - 1;
+            let argument = args.get(argument_index).ok_or_else(|| {
+                format!(
+                    "recursive call in {call_bb:?} has no argument #{argument_index} for measure variable `{name}`"
+                )
+            })?;
+            let actual_ty = argument.node.ty(&body.local_decls, tcx);
+            if actual_ty != expected_ty {
+                return Err(format!(
+                    "recursive argument for `{name}` in {call_bb:?} changed type ({actual_ty:?}, expected {expected_ty:?})"
+                ));
+            }
+            let captured = monitor_temp(&mut probe, expected_ty, source_info);
+            call_bindings.insert(name.clone(), (captured, expected_ty));
+        }
+        append_recursion_measure_check_block(
+            tcx,
+            &mut probe,
+            helper,
+            measure,
+            &call_bindings,
+            entry,
+            entry_ty,
+            START_BLOCK,
+            source_info,
+        )?;
+    }
+    Ok(())
+}
+
+fn preflight_function_measure_placement<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    helper: DefId,
+    local: LocalDefId,
+    records: &[ClauseMonitorRecord],
+) -> Result<Vec<usize>, String> {
+    let measures = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.subject,
+                rustc_middle::mir::trust_contract::TrustContractSubject::Function
+            ) && record.kind == TrustContractKind::Decreases
+                && matches!(
+                    &record.evidence,
+                    ClauseMonitorEvidence::MeasureCertified(_) | ClauseMonitorEvidence::Measured(_)
+                )
+        })
+        .collect::<Vec<_>>();
+    if measures.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let recursion_sites = certified_direct_self_recursion_sites(tcx, body, local.to_def_id())?;
+    let bindings = trust_fn_monitor_places(tcx, local);
+    for record in &measures {
+        let measure = match &record.evidence {
+            ClauseMonitorEvidence::MeasureCertified(bound)
+            | ClauseMonitorEvidence::Measured(bound) => bound,
+            _ => unreachable!(),
+        };
+        preflight_function_measure_emission(
+            tcx,
+            body,
+            helper,
+            &measure.runtime,
+            &bindings,
+            &recursion_sites,
+            record.span,
+        )
+        .map_err(|reason| {
+            format!(
+                "function-entry/recursive-edge evaluator is not exactly MIR-emittable: {reason}"
+            )
+        })?;
+    }
+    Ok(measures.iter().map(|record| record.source_index).collect())
+}
+
+fn preflight_function_monitor_placement<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    helper: DefId,
+    local: LocalDefId,
+    records: &[ClauseMonitorRecord],
+) -> (Vec<usize>, BTreeMap<usize, String>) {
+    let bindings = trust_fn_monitor_places(tcx, local);
+    let mut accepted = Vec::new();
+    let mut rejected = BTreeMap::new();
+    for record in records {
+        if !matches!(
+            record.subject,
+            rustc_middle::mir::trust_contract::TrustContractSubject::Function
+        ) {
+            continue;
+        }
+        let ClauseMonitorEvidence::MonitorCertified(bound) = &record.evidence else {
+            continue;
+        };
+        let result = match record.kind {
+            TrustContractKind::Requires => {
+                if bound.runtime.variables().iter().any(|name| name == "result") {
+                    Err("requires monitor references uninitialized entry `result`".to_string())
+                } else {
+                    preflight_monitor_emission(
+                        tcx,
+                        body,
+                        helper,
+                        &bound.runtime,
+                        &bindings,
+                        record.span,
+                    )
+                }
+            }
+            TrustContractKind::Ensures => {
+                // The mutating pass snapshots every non-result binding before
+                // the first user statement. Copy scalar bindings are the only
+                // certified carriers, so using the entry places in this probe
+                // exercises the same evaluator and exact types without
+                // changing the pristine body.
+                preflight_monitor_emission(
+                    tcx,
+                    body,
+                    helper,
+                    &bound.runtime,
+                    &bindings,
+                    record.span,
+                )
+            }
+            kind => Err(format!("function monitor has unsupported placement kind {kind:?}")),
+        };
+        match result {
+            Ok(()) => accepted.push(record.source_index),
+            Err(reason) => {
+                rejected.insert(record.source_index, reason);
+            }
+        }
+    }
+    (accepted, rejected)
+}
+
+fn preflight_loop_monitor_placement<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    helper: DefId,
+    local: LocalDefId,
+    records: &[ClauseMonitorRecord],
+) -> (Vec<usize>, BTreeMap<usize, String>) {
+    let candidate_indices = records
+        .iter()
+        .filter_map(|record| {
+            matches!(
+                record.subject,
+                rustc_middle::mir::trust_contract::TrustContractSubject::HirLoop { .. }
+            )
+            .then_some(record)
+        })
+        .filter(|record| {
+            matches!(
+                &record.evidence,
+                ClauseMonitorEvidence::MonitorCertified(_)
+                    | ClauseMonitorEvidence::MeasureCertified(_)
+            )
+        })
+        .map(|record| record.source_index)
+        .collect::<Vec<_>>();
+    if candidate_indices.is_empty() {
+        return (Vec::new(), BTreeMap::new());
+    }
+
+    let resolution = match certified_loop_runtime_groups(tcx, body, local, records) {
+        Ok(resolution) => resolution,
+        Err(reason) => {
+            return (
+                Vec::new(),
+                candidate_indices.into_iter().map(|index| (index, reason.clone())).collect(),
+            );
+        }
+    };
+    let original_dominators = body.basic_blocks.dominators();
+    let mut accepted = Vec::new();
+    let mut rejected = resolution.provenance_rejections;
+    for group in resolution.groups {
+        let group_indices = group
+            .invariant_source_indices
+            .iter()
+            .chain(&group.measure_source_indices)
+            .copied()
+            .collect::<Vec<_>>();
+        let placement = (|| -> Result<(), String> {
+            let domains = certified_loop_required_domains(&group)?;
+            let loop_bindings = trust_loop_monitor_places(
+                tcx,
+                body,
+                group.header,
+                &domains,
+                &group.source_bindings,
+            )?;
+            for invariant in &group.invariants {
+                preflight_monitor_emission(
+                    tcx,
+                    body,
+                    helper,
+                    &invariant.runtime,
+                    &loop_bindings,
+                    group.span,
+                )?;
+            }
+            if !group.measures.is_empty() {
+                let predecessors = canonical_monitor_predecessors(
+                    body.basic_blocks.predecessors()[group.header].iter().copied(),
+                );
+                if !predecessors
+                    .iter()
+                    .any(|&predecessor| !original_dominators.dominates(group.header, predecessor))
+                {
+                    return Err(
+                        "loop measure has no authenticated non-backedge entry snapshot edge"
+                            .to_string(),
+                    );
+                }
+                for predecessor in predecessors {
+                    if !body.basic_blocks[predecessor]
+                        .terminator()
+                        .successors()
+                        .any(|target| target == group.header)
+                    {
+                        return Err(format!(
+                            "authenticated loop predecessor {predecessor:?} does not target {:?}",
+                            group.header
+                        ));
+                    }
+                }
+                for measure in &group.measures {
+                    preflight_measure_snapshot_and_backedge(
+                        tcx,
+                        body,
+                        helper,
+                        &measure.runtime,
+                        &loop_bindings,
+                        group.span,
+                    )?;
+                }
+            }
+            Ok(())
+        })();
+        match placement {
+            Ok(()) => accepted.extend(group_indices),
+            Err(reason) => {
+                rejected.extend(group_indices.into_iter().map(|index| (index, reason.clone())));
+            }
+        }
+    }
+    (accepted, rejected)
+}
+
+fn emit_clause_monitor_status(tcx: TyCtxt<'_>, record: &ClauseMonitorRecord) {
+    match &record.evidence {
+        ClauseMonitorEvidence::Monitored(_) => {
+            tcx.dcx()
+                .struct_span_note(
+                    record.span,
+                    format!(
+                        "contract clause #{} ({:?}) is monitored: a kernel-certified runtime \
+                         monitor exists (monitor = true ↔ proposition; {})",
+                        record.source_index, record.kind, record.predicate_digest
+                    ),
+                )
+                .emit();
+        }
+        ClauseMonitorEvidence::Measured(_) => {
+            tcx.dcx()
+                .struct_span_note(
+                    record.span,
+                    format!(
+                        "contract clause #{} ({:?}) is measured: a kernel-certified scalar \
+                         evaluator is bound to the exact E5 measure and authenticated MIR \
+                         transitions ({})",
+                        record.source_index, record.kind, record.predicate_digest
+                    ),
+                )
+                .emit();
+        }
+        ClauseMonitorEvidence::MonitorCertified(_) => {
+            tcx.dcx()
+                .struct_span_note(
+                    record.span,
+                    format!(
+                        "contract clause #{} ({:?}) is unmonitored (the Boolean evaluator is \
+                         kernel-certified but exact MIR placement was not authenticated): not \
+                         runtime-checked, never a fake value ({})",
+                        record.source_index, record.kind, record.predicate_digest
+                    ),
+                )
+                .emit();
+        }
+        ClauseMonitorEvidence::MeasureCertified(_) => {
+            tcx.dcx()
+                .struct_span_note(
+                    record.span,
+                    format!(
+                        "contract clause #{} ({:?}) is unmonitored (the scalar evaluator is \
+                         kernel-certified but exact MIR transition placement was not \
+                         authenticated): not runtime-checked, never a fake value ({})",
+                        record.source_index, record.kind, record.predicate_digest
+                    ),
+                )
+                .emit();
+        }
+        ClauseMonitorEvidence::Unmonitored { reason } => {
+            tcx.dcx()
+                .struct_span_note(
+                    record.span,
+                    format!(
+                        "contract clause #{} ({:?}) is unmonitored ({}): not runtime-checked, \
+                         never a fake value ({})",
+                        record.source_index,
+                        record.kind,
+                        bounded_monitor_reason(reason),
+                        record.predicate_digest
+                    ),
+                )
+                .emit();
+        }
+    }
+}
+
+/// Convert kernel-certified evaluator candidates into public executable
+/// authority only after authenticating their exact pristine-MIR bindings and
+/// placement topology. This runs before any verification bundle is built, so
+/// neither human diagnostics nor durable metadata can observe a provisional
+/// candidate as `monitored`/`measured`.
+fn preflight_certified_monitor_placement<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) {
+    if body.source.promoted.is_some() {
+        return;
+    }
+    let Some(local) = body.source.def_id().as_local() else { return };
+    let records = tcx.sess.with_trust_compiler_state::<SessionCertifiedMonitors, _>(|state| {
+        state.functions.get(&local).cloned()
+    });
+    let Some(records) = records else { return };
+    let candidate_indices = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                &record.evidence,
+                ClauseMonitorEvidence::MonitorCertified(_)
+                    | ClauseMonitorEvidence::MeasureCertified(_)
+            )
+        })
+        .map(|record| record.source_index)
+        .collect::<Vec<_>>();
+
+    let mut accepted = FxHashSet::default();
+    let mut rejected = BTreeMap::new();
+    if !candidate_indices.is_empty() {
+        if let Some(helper) = tcx.get_diagnostic_item(sym::trust_certified_monitor_check) {
+            let (function_monitors, function_monitor_rejections) =
+                preflight_function_monitor_placement(tcx, body, helper, local, &records);
+            accepted.extend(function_monitors);
+            rejected.extend(function_monitor_rejections);
+
+            match preflight_function_measure_placement(tcx, body, helper, local, &records) {
+                Ok(indices) => accepted.extend(indices),
+                Err(reason) => {
+                    for record in &records {
+                        if matches!(
+                            record.subject,
+                            rustc_middle::mir::trust_contract::TrustContractSubject::Function
+                        ) && matches!(
+                            &record.evidence,
+                            ClauseMonitorEvidence::MeasureCertified(_)
+                        ) {
+                            rejected.insert(record.source_index, reason.clone());
+                        }
+                    }
+                }
+            }
+
+            let (loop_records, loop_rejections) =
+                preflight_loop_monitor_placement(tcx, body, helper, local, &records);
+            accepted.extend(loop_records);
+            rejected.extend(loop_rejections);
+        } else {
+            rejected.extend(candidate_indices.iter().copied().map(|index| {
+                (
+                    index,
+                    "certified monitor runtime helper is missing from the Trust sysroot"
+                        .to_string(),
+                )
+            }));
+        }
+    }
+
+    let mut final_records = records;
+    for record in &mut final_records {
+        let evidence = record.evidence.clone();
+        record.evidence = match evidence {
+            ClauseMonitorEvidence::MonitorCertified(bound)
+                if accepted.contains(&record.source_index) =>
+            {
+                ClauseMonitorEvidence::Monitored(bound)
+            }
+            ClauseMonitorEvidence::MeasureCertified(bound)
+                if accepted.contains(&record.source_index) =>
+            {
+                ClauseMonitorEvidence::Measured(bound)
+            }
+            ClauseMonitorEvidence::MonitorCertified(_)
+            | ClauseMonitorEvidence::MeasureCertified(_) => ClauseMonitorEvidence::Unmonitored {
+                reason: rejected.remove(&record.source_index).unwrap_or_else(|| {
+                    "exact MIR placement preflight did not produce unique authority".to_string()
+                }),
+            },
+            other => other,
+        };
+    }
+    tcx.sess.with_trust_compiler_state::<SessionCertifiedMonitors, _>(|state| {
+        state.functions.insert(local, final_records.clone());
+    });
+
+    if env_flag_enabled("TRUST_MONITOR_REPORT") || certified_monitor_test_mode(tcx.sess) {
+        for record in &final_records {
+            emit_clause_monitor_status(tcx, record);
+        }
+    }
+}
+
 /// Insert runtime enforcement only for a native `--test` unit or a tracked
 /// Targo-selected library linked by an ordinary unit/integration-test root.
 /// Evidence-grade Targo doctests remain unavailable until rustdoc provides an
@@ -4820,11 +6499,29 @@ fn inject_certified_test_monitors<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>
         state.functions.get(&local).cloned()
     });
     let Some(records) = records else { return };
+    for record in &records {
+        if let ClauseMonitorEvidence::Measured(bound) = &record.evidence {
+            // Keep the exact static measure live at the execution boundary,
+            // just as Boolean monitors retain their proposition. A future
+            // refactor must not be able to place an evaluator after silently
+            // dropping the formula/domain identity it was certified against.
+            debug_assert_eq!(
+                static_formula_measure_expr(&bound.static_formula, &bound.variable_domains)
+                    .as_ref(),
+                Ok(bound.runtime.expr())
+            );
+            debug_assert!(
+                validate_runtime_measure_domains(&bound.runtime, &bound.variable_domains).is_ok()
+            );
+        }
+    }
     let Some(helper) = tcx.get_diagnostic_item(sym::trust_certified_monitor_check) else {
-        if records
-            .iter()
-            .any(|record| matches!(&record.evidence, ClauseMonitorEvidence::Monitored(_)))
-        {
+        if records.iter().any(|record| {
+            matches!(
+                &record.evidence,
+                ClauseMonitorEvidence::Monitored(_) | ClauseMonitorEvidence::Measured(_)
+            )
+        }) {
             tcx.dcx().span_err(
                 body.span,
                 "certified monitor runtime helper is missing from the Trust sysroot",
@@ -4868,25 +6565,430 @@ fn inject_certified_test_monitors<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>
             _ => {}
         }
     }
+    let function_measures = records
+        .iter()
+        .filter_map(|record| {
+            matches!(
+                record.subject,
+                rustc_middle::mir::trust_contract::TrustContractSubject::Function
+            )
+            .then_some(record)
+        })
+        .filter_map(|record| match (&record.kind, &record.evidence) {
+            (TrustContractKind::Decreases, ClauseMonitorEvidence::Measured(bound)) => {
+                Some((record.span, bound))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    // Inventory the original body before loop/function monitor helper calls
+    // are inserted. Those helpers are compiler-owned and must not be mistaken
+    // for authored non-self edges in the E5 topology audit.
+    let recursion_sites = if function_measures.is_empty() {
+        Vec::new()
+    } else {
+        match certified_direct_self_recursion_sites(tcx, body, local.to_def_id()) {
+            Ok(sites) => sites,
+            Err(reason) => {
+                tcx.dcx().span_err(
+                    function_measures[0].0,
+                    format!("could not place kernel-certified recursion measure: {reason}"),
+                );
+                Vec::new()
+            }
+        }
+    };
 
-    // An explicit tail call is a normal return from the source function, but
-    // optimized MIR represents it with `TailCall` rather than a `Return`
-    // terminator. The current monitor placement deliberately does not rewrite
-    // that control-flow contract into an ordinary call: doing so here would
-    // silently change the program's explicit tail-call semantics. Reject the
-    // executable ensures lane before making any MIR changes instead of letting
-    // the tail-call path bypass its certified postcondition.
-    if !ensures.is_empty()
-        && body
-            .basic_blocks
+    // Resolve every loop clause against the same unmodified optimized MIR
+    // graph before installing any function-entry/return instrumentation.
+    // Source-loop HIR identity + dominator-proved header provenance is
+    // mandatory; positive evidence that cannot be placed is a hard compiler
+    // error, never silently demoted to an unmonitored artifact.
+    let has_positive_loop = records.iter().any(|record| {
+        matches!(
+            record.subject,
+            rustc_middle::mir::trust_contract::TrustContractSubject::HirLoop { .. }
+        ) && matches!(
+            &record.evidence,
+            ClauseMonitorEvidence::Monitored(_) | ClauseMonitorEvidence::Measured(_)
+        )
+    });
+    let loop_groups = if has_positive_loop {
+        match certified_loop_runtime_groups(tcx, body, local, &records) {
+            Ok(resolution) => {
+                for (source_index, reason) in resolution.provenance_rejections {
+                    let span = records
+                        .iter()
+                        .find(|record| record.source_index == source_index)
+                        .map_or(body.span, |record| record.span);
+                    tcx.dcx().span_err(
+                        span,
+                        format!("could not place kernel-certified loop monitor: {reason}"),
+                    );
+                }
+                resolution.groups
+            }
+            Err(reason) => {
+                tcx.dcx().span_err(
+                    body.span,
+                    format!("could not place kernel-certified loop monitors: {reason}"),
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let original_dominators = body.basic_blocks.dominators().clone();
+    let original_predecessors = loop_groups
+        .iter()
+        .map(|group| {
+            // `BasicBlocks::predecessors` retains one row per terminator
+            // successor, so a `SwitchInt` with two values targeting the same
+            // header names its predecessor twice. One instrumentation chain
+            // rewires every matching edge in that terminator; iterating the
+            // duplicate again would then reject the already-rewired edge.
+            // Placement authority is per predecessor block, not per duplicate
+            // switch value, so canonicalize that inventory before mutation.
+            let predecessors = canonical_monitor_predecessors(
+                body.basic_blocks.predecessors()[group.header].iter().copied(),
+            );
+            (group.header, predecessors)
+        })
+        .collect::<FxHashMap<_, _>>();
+    let mut prepared_loops = Vec::new();
+    for group in loop_groups {
+        let prepared = certified_loop_required_domains(&group).and_then(|domains| {
+            trust_loop_monitor_places(tcx, body, group.header, &domains, &group.source_bindings)
+        });
+        match prepared {
+            Ok(loop_bindings) => {
+                let source_info = SourceInfo::outermost(group.span);
+                let mut previous = Vec::with_capacity(group.measures.len());
+                let mut carrier_error = None;
+                for measure in &group.measures {
+                    let ty =
+                        if measure.runtime.domain() == trust_spec_elab::RuntimeMonitorDomain::Nat {
+                            tcx.types.u128
+                        } else {
+                            match runtime_monitor_domain_ty(tcx, measure.runtime.domain()) {
+                                Ok(ty) => ty,
+                                Err(reason) => {
+                                    carrier_error = Some(reason);
+                                    break;
+                                }
+                            }
+                        };
+                    previous.push((monitor_temp(body, ty, source_info), ty));
+                }
+                if let Some(reason) = carrier_error {
+                    tcx.dcx().span_err(
+                        group.span,
+                        format!("could not place kernel-certified loop measure: {reason}"),
+                    );
+                } else {
+                    prepared_loops.push((group, loop_bindings, previous));
+                }
+            }
+            Err(reason) => {
+                tcx.dcx().span_err(
+                    group.span,
+                    format!("could not bind kernel-certified loop monitor to MIR: {reason}"),
+                );
+            }
+        }
+    }
+
+    // Split every original incoming edge to a measured header before any
+    // header wrapper moves block contents. External entries initialize each
+    // measure snapshot; only dominator-proved backedges compare/update it.
+    // This resets an inner loop's snapshot on every outer-loop re-entry and
+    // handles all latches/continues without one arbitrary-backedge choice.
+    for (group, loop_bindings, previous) in &prepared_loops {
+        if group.measures.is_empty() {
+            continue;
+        }
+        let Some(predecessors) = original_predecessors.get(&group.header) else {
+            tcx.dcx().span_err(
+                group.span,
+                "authenticated loop header has no original predecessor inventory",
+            );
+            continue;
+        };
+        if !predecessors
             .iter()
-            .any(|data| matches!(data.terminator().kind, TerminatorKind::TailCall { .. }))
-    {
-        tcx.dcx().span_err(
-            ensures[0].0,
-            "certified ensures monitors cannot instrument a function containing an explicit tail call",
+            .any(|&predecessor| !original_dominators.dominates(group.header, predecessor))
+        {
+            tcx.dcx().span_err(
+                group.span,
+                "kernel-certified loop measure has no authenticated non-backedge on which to initialize its entry snapshot",
+            );
+            continue;
+        }
+        for &predecessor in predecessors {
+            let is_backedge = original_dominators.dominates(group.header, predecessor);
+            let source_info = SourceInfo::outermost(group.span);
+            let mut next = group.header;
+            let mut failed = None;
+            for (index, measure) in group.measures.iter().enumerate().rev() {
+                let (previous_place, previous_ty) = previous[index];
+                let block = if is_backedge {
+                    append_measure_backedge_block(
+                        tcx,
+                        body,
+                        helper,
+                        &measure.runtime,
+                        loop_bindings,
+                        previous_place,
+                        previous_ty,
+                        next,
+                        source_info,
+                    )
+                } else {
+                    append_measure_snapshot_block(
+                        tcx,
+                        body,
+                        &measure.runtime,
+                        loop_bindings,
+                        previous_place,
+                        previous_ty,
+                        next,
+                        source_info,
+                    )
+                };
+                match block {
+                    Ok(block) => next = block,
+                    Err(reason) => {
+                        failed = Some(reason);
+                        break;
+                    }
+                }
+            }
+            if let Some(reason) = failed {
+                tcx.dcx().span_err(
+                    group.span,
+                    format!("could not wire kernel-certified loop measure edge: {reason}"),
+                );
+                continue;
+            }
+            let mut rewired = false;
+            body.basic_blocks_mut()[predecessor].terminator_mut().successors_mut(|target| {
+                if *target == group.header {
+                    *target = next;
+                    rewired = true;
+                }
+            });
+            if !rewired {
+                tcx.dcx().span_err(
+                    group.span,
+                    format!(
+                        "authenticated loop predecessor {predecessor:?} no longer targets {:?}",
+                        group.header
+                    ),
+                );
+            }
+        }
+    }
+
+    // Check every invariant on initial entry and after every completed
+    // iteration by retaining the authenticated header block number as a
+    // wrapper. The former header body is moved once; every original/split edge
+    // still targets the wrapper.
+    for (group, loop_bindings, _) in &prepared_loops {
+        if group.invariants.is_empty() {
+            continue;
+        }
+        let source_info = SourceInfo::outermost(group.span);
+        let former_header = std::mem::replace(
+            &mut body.basic_blocks_mut()[group.header],
+            BasicBlockData::new(None, false),
         );
-        return;
+        let former_header = body.basic_blocks_mut().push(former_header);
+        let monitors = group.invariants.iter().map(|bound| &bound.runtime).collect::<Vec<_>>();
+        match append_monitor_chain(
+            tcx,
+            body,
+            helper,
+            &monitors,
+            loop_bindings,
+            former_header,
+            source_info,
+        ) {
+            Ok(first) => {
+                body.basic_blocks_mut()[group.header].terminator = Some(Terminator {
+                    source_info,
+                    kind: TerminatorKind::Goto { target: first },
+                    attributes: ThinVec::new(),
+                });
+            }
+            Err(reason) => {
+                body.basic_blocks_mut()[group.header].terminator = Some(Terminator {
+                    source_info,
+                    kind: TerminatorKind::Goto { target: former_header },
+                    attributes: ThinVec::new(),
+                });
+                tcx.dcx().span_err(
+                    group.span,
+                    format!("could not wire kernel-certified loop invariant: {reason}"),
+                );
+            }
+        }
+    }
+
+    // Snapshot each function-level measure in the entry state, then check it
+    // against the exact recursive argument tuple at every authenticated direct
+    // self-call. Capturing call operands into fresh scalar temporaries both
+    // preserves Move/Copy evaluation order and gives the certified evaluator a
+    // stable MIR place; the original call is rewritten to consume those temps.
+    let mut entry_measures = Vec::new();
+    if !recursion_sites.is_empty() {
+        let source_info = SourceInfo::outermost(function_measures[0].0);
+        let mut snapshot_statements = Vec::new();
+        let mut snapshot_failed = false;
+        for (span, measure) in &function_measures {
+            match emit_measure_value(
+                tcx,
+                body,
+                source_info,
+                &measure.runtime,
+                &bindings,
+                &mut snapshot_statements,
+            ) {
+                Ok((value, ty)) => {
+                    let snapshot = monitor_temp(body, ty, source_info);
+                    snapshot_statements.push(Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            snapshot,
+                            Rvalue::Use(value, WithRetag::No),
+                        ))),
+                    ));
+                    entry_measures.push((*span, *measure, snapshot, ty));
+                }
+                Err(reason) => {
+                    tcx.dcx().span_err(
+                        *span,
+                        format!(
+                            "could not evaluate kernel-certified recursion measure at entry: {reason}"
+                        ),
+                    );
+                    snapshot_failed = true;
+                    break;
+                }
+            }
+        }
+        if !snapshot_failed {
+            let entry_statements = &mut body.basic_blocks_mut()[START_BLOCK].statements;
+            snapshot_statements.append(entry_statements);
+            *entry_statements = snapshot_statements;
+        } else {
+            entry_measures.clear();
+        }
+    }
+    if !entry_measures.is_empty() {
+        for call_bb in recursion_sites {
+            let placement = (|| -> Result<BasicBlock, String> {
+                let mut original = body.basic_blocks[call_bb].terminator().clone();
+                let original_source_info = original.source_info;
+                let args = match &mut original.kind {
+                    TerminatorKind::Call { args, .. } | TerminatorKind::TailCall { args, .. } => {
+                        args
+                    }
+                    _ => {
+                        return Err(format!(
+                            "authenticated recursive site {call_bb:?} is no longer a call"
+                        ));
+                    }
+                };
+                let mut required_names = BTreeSet::new();
+                for (_, measure, _, _) in &entry_measures {
+                    required_names.extend(measure.runtime.variables().iter().cloned());
+                }
+                let mut capture_statements = Vec::new();
+                let mut call_bindings = FxHashMap::default();
+                for name in required_names {
+                    let &(entry_place, expected_ty) = bindings.get(&name).ok_or_else(|| {
+                        format!(
+                            "recursion measure variable `{name}` has no exact function parameter binding"
+                        )
+                    })?;
+                    if !entry_place.projection.is_empty()
+                        || entry_place.local.as_usize() == 0
+                        || entry_place.local.as_usize() > body.arg_count
+                    {
+                        return Err(format!(
+                            "recursion measure variable `{name}` is not a direct scalar parameter"
+                        ));
+                    }
+                    let argument_index = entry_place.local.as_usize() - 1;
+                    let argument = args.get_mut(argument_index).ok_or_else(|| {
+                        format!(
+                            "recursive call has no argument #{argument_index} for measure variable `{name}`"
+                        )
+                    })?;
+                    let actual_ty = argument.node.ty(&body.local_decls, tcx);
+                    if actual_ty != expected_ty {
+                        return Err(format!(
+                            "recursive argument for `{name}` changed type ({actual_ty:?}, expected {expected_ty:?})"
+                        ));
+                    }
+                    let captured = monitor_temp(body, expected_ty, original_source_info);
+                    capture_statements.push(Statement::new(
+                        original_source_info,
+                        StatementKind::Assign(Box::new((
+                            captured,
+                            Rvalue::Use(argument.node.clone(), WithRetag::No),
+                        ))),
+                    ));
+                    argument.node = Operand::Copy(captured);
+                    call_bindings.insert(name, (captured, expected_ty));
+                }
+
+                let final_call =
+                    body.basic_blocks_mut().push(BasicBlockData::new(Some(original), false));
+                let mut next = final_call;
+                for (span, measure, entry, entry_ty) in entry_measures.iter().rev() {
+                    next = append_recursion_measure_check_block(
+                        tcx,
+                        body,
+                        helper,
+                        &measure.runtime,
+                        &call_bindings,
+                        *entry,
+                        *entry_ty,
+                        next,
+                        SourceInfo::outermost(*span),
+                    )?;
+                }
+                Ok(body.basic_blocks_mut().push(BasicBlockData::new_stmts(
+                    capture_statements,
+                    Some(Terminator {
+                        source_info: original_source_info,
+                        kind: TerminatorKind::Goto { target: next },
+                        attributes: ThinVec::new(),
+                    }),
+                    false,
+                )))
+            })();
+            match placement {
+                Ok(first) => {
+                    let source_info = body.basic_blocks[call_bb].terminator().source_info;
+                    *body.basic_blocks_mut()[call_bb].terminator_mut() = Terminator {
+                        source_info,
+                        kind: TerminatorKind::Goto { target: first },
+                        attributes: ThinVec::new(),
+                    };
+                }
+                Err(reason) => {
+                    tcx.dcx().span_err(
+                        function_measures[0].0,
+                        format!(
+                            "could not wire kernel-certified recursion measure at {call_bb:?}: {reason}"
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     // In an ensures clause, parameter names denote ENTRY values (§1.2-3),
@@ -5007,6 +7109,76 @@ fn inject_certified_test_monitors<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>
                 }
             }
         }
+
+        // A `TailCall` returns the callee's value directly to this function's
+        // caller, so there is no post-call program point at which an `ensures`
+        // monitor can observe RETURN_PLACE. In monitor-enabled test artifacts,
+        // lower only that terminator to its semantically equivalent ordinary
+        // call → certified monitor chain → return form. The ordinary production
+        // artifact never runs this pass and retains the explicit tail call.
+        //
+        // This is the same instrumentation tradeoff made by stack-sensitive
+        // sanitizers: the test artifact may use an extra frame while checking
+        // the postcondition, but argument ownership, return value, and unwind
+        // propagation are unchanged. A diverging callee never reaches the
+        // monitor chain, unlike a pre-tail-call check, so a postcondition is not
+        // spuriously enforced on a non-returning execution.
+        let tail_calls = body
+            .basic_blocks
+            .iter_enumerated()
+            .filter_map(|(bb, data)| {
+                matches!(data.terminator().kind, TerminatorKind::TailCall { .. }).then_some(bb)
+            })
+            .collect::<Vec<_>>();
+        for tail_bb in tail_calls {
+            let original = body.basic_blocks[tail_bb].terminator().clone();
+            let TerminatorKind::TailCall { func, args, fn_span } = original.kind else {
+                unreachable!();
+            };
+            let final_return = body.basic_blocks_mut().push(BasicBlockData::new(
+                Some(Terminator {
+                    source_info: original.source_info,
+                    kind: TerminatorKind::Return,
+                    attributes: ThinVec::new(),
+                }),
+                false,
+            ));
+            match append_monitor_chain(
+                tcx,
+                body,
+                helper,
+                &monitors,
+                &ensures_bindings,
+                final_return,
+                source_info,
+            ) {
+                Ok(first) => {
+                    let terminator = body.basic_blocks_mut()[tail_bb].terminator_mut();
+                    terminator.kind = TerminatorKind::Call {
+                        func,
+                        args,
+                        destination: Place::return_place(),
+                        target: Some(first),
+                        // A TailCall has no local cleanup successor because
+                        // this frame has already run its drops, but a callee
+                        // panic still continues unwinding through the caller.
+                        // `Unreachable` would instead make that unwind UB.
+                        unwind: UnwindAction::Continue,
+                        call_source: CallSource::Misc,
+                        fn_span,
+                    };
+                    terminator.attributes = original.attributes;
+                }
+                Err(reason) => {
+                    tcx.dcx().span_err(
+                        ensures[0].0,
+                        format!(
+                            "could not wire kernel-certified ensures monitor after explicit tail call: {reason}"
+                        ),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -5058,7 +7230,13 @@ fn certified_monitor_test_mode(sess: &Session) -> bool {
 /// written here from inside `run_pass`. The citation sweep
 /// (`trust_check_citations`) runs AFTER the walk, so the session facet table
 /// is populated when a cited clause mentions a program function.
-fn trust_check_clean_islands(tcx: TyCtxt<'_>) -> trust_certify::clean_island::CleanIslandSession {
+///
+/// Returns the session plus any islands deferred to the post-walk phase
+/// because they name the `trust_import_*` kernel-import namespace. Those
+/// constants do not exist until program admissions have been minted.
+fn trust_check_clean_islands(
+    tcx: TyCtxt<'_>,
+) -> (trust_certify::clean_island::CleanIslandSession, Vec<(rustc_span::Span, String)>) {
     use rustc_span::BytePos;
     // HIR's item inventory is not an ordering contract. Clean file state is:
     // namespaces, `open`s, notation, options, and declarations affect later
@@ -5082,6 +7260,8 @@ fn trust_check_clean_islands(tcx: TyCtxt<'_>) -> trust_certify::clean_island::Cl
     });
 
     let mut clean_session = trust_certify::clean_island::CleanIslandSession::new();
+    let mut deferred_islands = Vec::new();
+    let mut defer_island_suffix = false;
     if let Some((earlier, later)) = ambiguous_order {
         clean_session.invalidate();
         let diagnostic = tcx.dcx().struct_span_err(
@@ -5109,6 +7289,21 @@ fn trust_check_clean_islands(tcx: TyCtxt<'_>) -> trust_certify::clean_island::Cl
                 );
                 continue;
             };
+            // E6 program admissions are minted only after the body walk. An
+            // island that names one of those constants must therefore be
+            // checked after the mint. Detect it before calling `check`: a
+            // rejection taints the stateful session, so probing early would
+            // prevent the later valid check and disable unrelated evidence.
+            //
+            // Clean file state is ordered. Once one island is deferred, defer
+            // the complete authored suffix as well: a later island may depend
+            // on its namespace, `open`, notation, options, or declarations
+            // even when its own text does not repeat `trust_import_`.
+            defer_island_suffix |= text.contains("trust_import_");
+            if defer_island_suffix {
+                deferred_islands.push((content_span, text));
+                continue;
+            }
             let outcome = clean_session.check(&text);
             if outcome.is_rejected() {
                 for err in &outcome.errors {
@@ -5160,17 +7355,18 @@ fn trust_check_clean_islands(tcx: TyCtxt<'_>) -> trust_certify::clean_island::Cl
     // Status diagnostics are automatic for the executable test lane and remain
     // opt-in for ordinary check/build invocations. The authoritative durable
     // copy is stamped onto the public verifier-api contract bundle below.
+    // Every Trust-enabled body reports only after its pristine-MIR placement
+    // preflight in `run_pass`. The island sweep may expose provisional
+    // evaluator state only in an explicit verify-off diagnostic probe; it
+    // never mints a positive executability status.
     let report_monitor_status = env_flag_enabled("TRUST_MONITOR_REPORT")
-        || (!contract_owners.is_empty() && certified_monitor_test_mode(tcx.sess));
+        && !verification_enabled(tcx.sess)
+        && !targo_certified_monitor_test_mode(tcx.sess);
     for local in contract_owners {
         let bundle = tcx.trust_contracts(local.to_def_id());
-        // Trust: the function's parameter name → Rust machine-int type name,
-        // so a machine-typed clause elaborates over the matching UInt carrier
-        // (two-language design §1.1). `result` is added when the return type
-        // is a supported machine int (E2 output-record naming).
-        let param_types = trust_fn_param_type_names(tcx, local);
+        let pointer_width = monitor_target_pointer_width(tcx);
 
-        // Trust: §1.1 per-clause monitored|unmonitored evidence. This sweep
+        // Trust: §1.1 per-clause monitored|measured|unmonitored evidence. This sweep
         // is unconditional: it is the producer for both reporting and runtime
         // enforcement. It consumes `c.predicate.kind`, the exact canonical
         // compiler-native predicate that trust-mir-extract feeds into VC
@@ -5179,72 +7375,152 @@ fn trust_check_clean_islands(tcx: TyCtxt<'_>) -> trust_certify::clean_island::Cl
         // payload of a Clean-kernel-accepted EQUIVALENCE certificate
         // (`monitor = true ↔ P`). Failure retains a reason and no expression,
         // so an unsupported clause cannot acquire a dummy `true` at runtime.
-        let var_types: Vec<(&str, &str)> =
-            param_types.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
+        let function_decreases_count = bundle
+            .contracts
+            .iter()
+            .filter(|contract| contract.kind == TrustContractKind::Decreases)
+            .count();
+        let mut loop_decreases_counts = BTreeMap::new();
+        for contract in &bundle.loop_contracts {
+            if contract.kind == TrustContractKind::Decreases
+                && let rustc_middle::mir::trust_contract::TrustContractSubject::HirLoop {
+                    id, ..
+                } = contract.subject
+            {
+                *loop_decreases_counts.entry((id.index, id.hir_local_id)).or_insert(0usize) += 1;
+            }
+        }
         let mut monitor_records = Vec::with_capacity(bundle.len());
         for (source_index, c) in bundle.iter_all().enumerate() {
-            // `result` denotes the output record and is meaningful only in an
-            // ensures clause. Removing it from the requires signature makes a
-            // precondition that mentions it explicitly unmonitored instead of
-            // ever wiring an entry read of uninitialized RETURN_PLACE.
-            let monitor_var_types =
-                if matches!(c.kind, rustc_middle::mir::trust_contract::TrustContractKind::Requires)
-                {
-                    var_types
-                        .iter()
-                        .copied()
-                        .filter(|(name, _)| *name != "result")
-                        .collect::<Vec<_>>()
-                } else {
-                    var_types.clone()
-                };
-            let predicate_digest = canonical_monitor_predicate_digest(&c.predicate.kind);
-            let static_proposition = canonical_monitor_static_proposition(&c.predicate.kind);
-            // Loop clauses are structurally typed in the query, but their
-            // public source row is reconstructed only after the clause is
-            // bound to a MIR loop header and deliberately has no
-            // `CompilerContractProposition` carrier. Do not require a digest
-            // that the public row cannot carry merely to preserve an explicit
-            // Unmonitored decision. Function clauses retain their exact typed
-            // proposition binding.
-            let typed_proposition_digest = (!matches!(
-                c.subject,
-                rustc_middle::mir::trust_contract::TrustContractSubject::HirLoop { .. }
-            ))
-            .then(|| {
-                static_proposition.as_ref().ok().map(|proposition| {
-                    trust_types::typed_contract_proposition_digest(
-                        &proposition.formula,
-                        &proposition.variable_domains,
-                    )
-                })
-            })
-            .flatten();
+            let predicate_digest = canonical_monitor_predicate_digest(c.kind, &c.predicate.kind);
+            let static_proposition =
+                canonical_monitor_static_proposition(c.kind, &c.predicate.kind);
+            let typed_proposition_digest = static_proposition.as_ref().ok().map(|proposition| {
+                trust_types::typed_contract_proposition_digest(
+                    &proposition.formula,
+                    &proposition.variable_domains,
+                )
+            });
             let evidence = match c.kind {
-                TrustContractKind::Requires | TrustContractKind::Ensures => {
+                TrustContractKind::Requires
+                | TrustContractKind::Ensures
+                | TrustContractKind::LoopInvariant => {
                     match (canonical_monitor_predicate_text(&c.predicate.kind), static_proposition)
                     {
-                        (Ok(text), Ok(static_proposition)) => match clean_session.environment() {
-                            Some(env) => match trust_spec_elab::certify_monitor_typed(
-                                env,
-                                &text,
-                                &monitor_var_types,
-                            )
-                            .and_then(|certified| {
-                                bind_certified_monitor_to_static_formula(
-                                    certified,
-                                    static_proposition,
+                        (Ok(text), Ok(static_proposition)) => match (
+                            clean_session.environment(),
+                            pointer_width.clone(),
+                        ) {
+                            (Some(env), Ok(pointer_width)) => {
+                                let var_types = monitor_var_types_from_static(
+                                    &static_proposition,
+                                    pointer_width,
                                 )
-                            }) {
-                                Ok(bound) => ClauseMonitorEvidence::Monitored(bound),
-                                Err(reason) => ClauseMonitorEvidence::Unmonitored { reason },
-                            },
-                            None => ClauseMonitorEvidence::Unmonitored {
+                                .map(|mut var_types| {
+                                    // `result` denotes the output record and is
+                                    // never initialized at function entry.
+                                    if c.kind == TrustContractKind::Requires {
+                                        var_types.retain(|(name, _)| name != "result");
+                                    }
+                                    var_types
+                                });
+                                match var_types.and_then(|var_types| {
+                                    let borrowed = var_types
+                                        .iter()
+                                        .map(|(name, ty)| (name.as_str(), ty.as_str()))
+                                        .collect::<Vec<_>>();
+                                    trust_spec_elab::certify_monitor_typed_for_target(
+                                        env,
+                                        &text,
+                                        &borrowed,
+                                        pointer_width,
+                                    )
+                                    .and_then(|certified| {
+                                        bind_certified_monitor_to_static_formula(
+                                            certified,
+                                            static_proposition,
+                                        )
+                                    })
+                                }) {
+                                    Ok(bound) => ClauseMonitorEvidence::MonitorCertified(bound),
+                                    Err(reason) => ClauseMonitorEvidence::Unmonitored { reason },
+                                }
+                            }
+                            (None, _) => ClauseMonitorEvidence::Unmonitored {
                                 reason:
                                     "crate-local Clean session is tainted by a rejected island; \
                                          no positive monitor evidence can be minted"
                                         .to_string(),
                             },
+                            (_, Err(reason)) => ClauseMonitorEvidence::Unmonitored { reason },
+                        },
+                        (Err(reason), _) | (_, Err(reason)) => {
+                            ClauseMonitorEvidence::Unmonitored { reason }
+                        }
+                    }
+                }
+                TrustContractKind::Decreases
+                    if match c.subject {
+                        rustc_middle::mir::trust_contract::TrustContractSubject::Function => {
+                            function_decreases_count != 1
+                        }
+                        rustc_middle::mir::trust_contract::TrustContractSubject::HirLoop {
+                            id,
+                            ..
+                        } => {
+                            loop_decreases_counts.get(&(id.index, id.hir_local_id)).copied()
+                                != Some(1)
+                        }
+                        _ => true,
+                    } =>
+                {
+                    ClauseMonitorEvidence::Unmonitored {
+                        reason: "E5 runtime placement requires exactly one decreases clause per function or source loop; lexicographic/multi-measure semantics are not inferred"
+                            .to_string(),
+                    }
+                }
+                TrustContractKind::Decreases => {
+                    match (canonical_monitor_predicate_text(&c.predicate.kind), static_proposition)
+                    {
+                        (Ok(text), Ok(static_proposition)) => match (
+                            clean_session.environment(),
+                            pointer_width.clone(),
+                        ) {
+                            (Some(env), Ok(pointer_width)) => {
+                                let measured = monitor_var_types_from_static(
+                                    &static_proposition,
+                                    pointer_width,
+                                )
+                                .and_then(|var_types| {
+                                    let borrowed = var_types
+                                        .iter()
+                                        .map(|(name, ty)| (name.as_str(), ty.as_str()))
+                                        .collect::<Vec<_>>();
+                                    trust_spec_elab::certify_measure_typed_for_target(
+                                        env,
+                                        &text,
+                                        &borrowed,
+                                        pointer_width,
+                                    )
+                                    .and_then(|certified| {
+                                        bind_certified_measure_to_static_formula(
+                                            certified,
+                                            static_proposition,
+                                        )
+                                    })
+                                });
+                                match measured {
+                                    Ok(bound) => ClauseMonitorEvidence::MeasureCertified(bound),
+                                    Err(reason) => ClauseMonitorEvidence::Unmonitored { reason },
+                                }
+                            }
+                            (None, _) => ClauseMonitorEvidence::Unmonitored {
+                                reason:
+                                    "crate-local Clean session is tainted by a rejected island; \
+                                     no positive measure evidence can be minted"
+                                        .to_string(),
+                            },
+                            (_, Err(reason)) => ClauseMonitorEvidence::Unmonitored { reason },
                         },
                         (Err(reason), _) | (_, Err(reason)) => {
                             ClauseMonitorEvidence::Unmonitored { reason }
@@ -5257,50 +7533,25 @@ fn trust_check_clean_islands(tcx: TyCtxt<'_>) -> trust_certify::clean_island::Cl
                     ),
                 },
             };
-            if report_monitor_status {
-                match &evidence {
-                    ClauseMonitorEvidence::Monitored(_) => {
-                        tcx.dcx()
-                            .struct_span_note(
-                                c.span,
-                                format!(
-                                    "contract clause #{source_index} ({:?}) is monitored: a \
-                                     kernel-certified runtime monitor exists (monitor = true ↔ \
-                                     proposition; {predicate_digest})",
-                                    c.kind
-                                ),
-                            )
-                            .emit();
-                    }
-                    ClauseMonitorEvidence::Unmonitored { reason } => {
-                        tcx.dcx()
-                            .struct_span_note(
-                                c.span,
-                                format!(
-                                    "contract clause #{source_index} ({:?}) is unmonitored ({}): \
-                                     not runtime-checked, never a fake value ({predicate_digest})",
-                                    c.kind,
-                                    bounded_monitor_reason(reason)
-                                ),
-                            )
-                            .emit();
-                    }
-                }
-            }
-            monitor_records.push(ClauseMonitorRecord {
+            let record = ClauseMonitorRecord {
                 source_index,
                 kind: c.kind,
+                subject: c.subject,
                 span: c.span,
                 predicate_digest,
                 typed_proposition_digest,
                 evidence,
-            });
+            };
+            if report_monitor_status {
+                emit_clause_monitor_status(tcx, &record);
+            }
+            monitor_records.push(record);
         }
         tcx.sess.with_trust_compiler_state::<SessionCertifiedMonitors, _>(|state| {
             state.functions.insert(local, monitor_records);
         });
     }
-    clean_session
+    (clean_session, deferred_islands)
 }
 
 /// Trust: E6 kernel-import — after the whole-crate per-body walk has populated
@@ -5845,35 +8096,74 @@ fn transport_row_is_authenticated_assumed_total_assumption(
 /// gap was on a different, fallback-bearing row. Over-restrictive is the safe
 /// direction here — the failure mode to avoid is tolerating a gap on an
 /// obligation that nothing checks at runtime, which is the UB class.
-fn residual_gap_is_runtime_checked(
-    failure: FullVerificationFailure,
+/// Why `residual_gap_tolerance_denial` said no. Reported to the user, so a
+/// build that fails where the ruling says it should pass explains itself instead
+/// of leaving the reader to guess between four different causes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GapToleranceDenial {
+    /// No obligation rows to scan, so the whole-function guarantee cannot be
+    /// established. Fail-closed: an empty scan proves nothing.
+    NoRows,
+    /// A row carries a raw `Failed` verdict even though the aggregate summary may
+    /// report it otherwise.
+    RowRefuted,
+    /// A row's kind has no runtime check, so accepting it would ship unverified
+    /// behaviour with nothing beneath it.
+    RowHasNoFallback,
+}
+
+impl GapToleranceDenial {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::NoRows => {
+                "there are no obligation rows to scan, so the whole-function guarantee that every \
+                 obligation keeps a runtime check could not be established"
+            }
+            Self::RowRefuted => {
+                "an obligation row carries a refuted verdict (even if the aggregate summary \
+                 reports it differently)"
+            }
+            Self::RowHasNoFallback => {
+                "at least one obligation has no runtime fallback, so accepting it would ship \
+                 behaviour with nothing checking it"
+            }
+        }
+    }
+}
+
+/// `None` when the residual gap MAY be tolerated; `Some(reason)` when it may not.
+fn residual_gap_tolerance_denial(
     results: &[(VerificationCondition, VerificationResult)],
     overflow_checks: bool,
-) -> bool {
-    // A refutation is always fatal: the verifier found a bug, not a gap.
-    if failure.failed > 0 {
-        return false;
-    }
-    // NOTE the buckets deliberately NOT consulted here, and why. `unknown` and
-    // `skipped` are aggregate counts that mix the legacy and native lanes; the
-    // native lane folds `insufficient_strength` and `missing_proof_artifacts`
-    // into `skipped`, which is EXACTLY what a solver-Proved-but-unauthorised row
-    // becomes — the case this policy ratifies. Denying on those counts would
-    // re-fail the very thing B accepts.
+) -> Option<GapToleranceDenial> {
+    // NOTE we do NOT deny on the aggregate `failure.failed`. That count folds in
+    // the native run's `summary.failed`, which carries DERIVED refutations: the
+    // whole-function `trust_mc_default_function` panic-freedom row is refuted
+    // precisely BECAUSE a constituent obligation is unproved, so it restates the
+    // gap rather than reporting an independent bug.
     //
-    // What makes ignoring them sound is the whole-function scan below, and it
-    // rests on one invariant worth stating: `artifacts.results` carries one row
-    // per non-admission bundle obligation, so a native obligation cannot
-    // contribute a count here without also appearing as a legacy VC whose kind
-    // this scan inspects. A contract/liveness/UB obligation therefore answers
-    // `false` to `has_runtime_fallback` and denies tolerance, whatever bucket the
-    // native summary put it in. If that one-row-per-obligation invariant is ever
-    // broken, this predicate must be revisited FIRST.
-    !results.is_empty()
-        && results.iter().all(|(vc, result)| {
-            !matches!(result, VerificationResult::Failed { .. })
-                && vc.kind.has_runtime_fallback(overflow_checks)
-        })
+    // MEASURED (stage2 e51769920): `(v as u16) * 2`, whose overflow obligation
+    // PROVES, builds clean with no refuted obligation; `(a as u16) * (b as u16)`,
+    // whose obligation is only runtime-checked, acquires one. The refutation
+    // tracks the unproved constituent, which is what "derived" means here.
+    //
+    // A PRIMARY refutation is still denied, by the per-row scan below over
+    // `results` — the authoritative post-processed view, the same one the
+    // `failed` bucket of the legacy summary is built from. A genuine
+    // counterexample surfaces there as `VerificationResult::Failed`, which is how
+    // `a + b` and the other negatives in tests/trust-provability keep failing.
+    if results.is_empty() {
+        return Some(GapToleranceDenial::NoRows);
+    }
+    for (vc, result) in results {
+        if matches!(result, VerificationResult::Failed { .. }) {
+            return Some(GapToleranceDenial::RowRefuted);
+        }
+        if !vc.kind.has_runtime_fallback(overflow_checks) {
+            return Some(GapToleranceDenial::RowHasNoFallback);
+        }
+    }
+    None
 }
 
 fn full_verification_failure(
@@ -6756,6 +9046,12 @@ fn report_strict_l0_verification_failure<'tcx>(
     ) else {
         return;
     };
+    // Trust (R1 scan-gap warning gate): a Level-0 verdict is being withheld for
+    // this function (in EVERY policy/output mode that reaches this seam). Recorded
+    // so `trust_ensure_whole_crate_verification` states the crate-level R1
+    // scan-poison cause only on compiles where a verdict was actually withheld —
+    // never on ordinary fully-proved source (see `r1_scan_gap_warning_applies`).
+    with_crate_verification_state(tcx.sess, |state| state.l0_verdict_withheld = true);
 
     let header = format!(
         "Trust Level 0 safety verification incomplete for `{func_path}`: {} obligation(s) were not proved",
@@ -6911,10 +9207,30 @@ fn escalate_refuted_l0_safety_counterexamples(
                 }
                 _ => trust_router::violation_is_forced(&vc.formula),
             };
+            // Trust (defense-in-depth, SOUNDNESS): NEVER escalate a bare `true`-
+            // literal obligation. A vcgen MODELING-GAP fail-close — the
+            // `Index<Range>` body with an unresolved receiver length or an
+            // untraceable range aggregate, an FFI boundary with no summary, a
+            // memory-provenance gap — emits a literal `Formula::Bool(true)`. It
+            // carries NO information about the program's actual values, so the
+            // indexed/called code may be provably safe (`bytes[52..56]` on a
+            // `[u8; 64]` whose `&[T; N]` length was not recovered). Reporting that as
+            // a GUARANTEED, every-execution Level-0 VIOLATION is a FALSE REFUTATION
+            // of correct code, and `violation_is_forced(Bool(true))` is `true`, so
+            // without this the fail-close marker escalates itself. A value-forced
+            // violation always folds through REAL modeled atoms (`Ge(1<<28, 1<<28)`,
+            // `Ge(100, 64)`), never a bare literal, so this exclusion drops only
+            // false refutations. FAIL-CLOSED and strictly conservative: it can only
+            // DEMOTE this escalation, never grant a proof — the obligation stays
+            // FAILED, so `abort_on_full_verification_failure` (which runs BEFORE this
+            // escalation on the same strict path) still hard-errors on it, and the
+            // coverage/warning lane still surfaces it.
+            let modeling_gap = trust_router::violation_is_modeling_gap_failclose(&vc.formula);
             let forced_overrides_proved = matches!(&vc.kind, VcKind::UnboundedAllocation { .. });
             (forced_overrides_proved || !matches!(result, VerificationResult::Proved { .. }))
                 && is_refutable_l0_safety_vc_kind(&vc.kind)
                 && forced
+                && !modeling_gap
         })
         .count();
     if refuted == 0 {
@@ -6989,14 +9305,53 @@ fn structural_refutation_solver_label(
 /// from REFUTE to a false PROVE. This override is load-bearing on the native
 /// path (mirrors `refute_forced_unbounded_allocations` for the OOM ceiling).
 ///
-/// Keyed on the `[unsafe` MESSAGE MARKER, NOT the formula: the full-lane
-/// reconstruction (`legacy_vc_from_api_obligation`) maps the `Bool(true)`
-/// payload to a symbolic `Var`, so a formula check would miss it — but it keeps
-/// `VcKind::Assertion` with the original description (`message.starts_with(
-/// "[unsafe…")`, the same discriminator the router labels these by). Every VC
-/// under this marker is a fail-closed unsafe finding by construction, so forcing
-/// it Failed can only ADD a refutation, never remove one; a panic-freedom
-/// Assertion (`"panic freedom …"`) or any non-unsafe Assertion is untouched.
+/// The `[unsafe` MESSAGE MARKER selects the FAMILY, not the verdict: the
+/// full-lane reconstruction (`legacy_vc_from_api_obligation`) re-kinds the row to
+/// `HardenedBoundary`/`UnsupportedMir` and can drop a payload-less `Bool(true)`
+/// violation to the `Bool(false)` placeholder, so a formula-only selector would
+/// miss the reconstructed mandate. The marker survives every shape, so it stays
+/// the selector.
+///
+/// Trust (positive-witness ICE + nullified sep discharges): the marker alone is
+/// NOT the refutation criterion. The `[unsafe` family holds BOTH
+/// unprovable design mandates (`[unsafe] missing SAFETY comment`,
+/// `[unsafe:unmodeled-call]`, `[unsafe:sep:addr_of]`, `[unsafe:asm]`, … — all
+/// `Formula::Bool(true)`) AND genuinely solvable separation-logic obligations
+/// with real violation formulas that the vcgen discharge lanes exist to prove:
+/// `[unsafe:sep:deref] null check` (`ptr == 0`, discharged by
+/// `SepEngine::discharge_stack_good` / `discharge_box_good`) and
+/// `[unsafe:sep:backing] … at construction` (`alloc_size < len`, the ESTABLISH
+/// obligation the `#[trust::backing]` certificate is built to discharge).
+/// Overriding those destroyed real proofs — and, because a genuine `Proved`
+/// then reached `structural_refutation_solver_label`, tripped its
+/// positive-witness assertion and ICEd the compiler on ordinary code
+/// (`let x = 7; let p = &x as *const i32; unsafe { *p }`).
+///
+/// So a result a solver PROVED about a NON-CONSTANT violation is left alone —
+/// exactly the "a discharged Assertion carries a real formula and is untouched"
+/// contract this pass was introduced with. A constant violation is still
+/// overridden from any non-`Failed` verdict, but the two constant classes are
+/// NOT symmetric:
+/// - `Bool(true)` is unprovable by construction (SAT is the trivial witness),
+///   so a `Proved` over it IS a positive-witness breach, and the assertion in
+///   `structural_refutation_solver_label` is a real invariant on this class —
+///   and on this class only.
+/// - `Bool(false)` is the full-lane reconstruction PLACEHOLDER
+///   (`legacy_vc_from_api_obligation` falls back to it when the obligation's
+///   payload formula cannot be reconstructed), and it is UNSAT — any sound
+///   solver CAN return `Proved` for it. Such a proof is refused for VACUITY,
+///   not unprovability: it says nothing about the original obligation, and the
+///   vacuity gate (`apply_vacuity_gate_with_authority`) runs only DOWNSTREAM of
+///   this pass (from `build_proof_results_with_runtime_checks` / authority
+///   minting), so this pass must refuse it itself. It is refuted under its own
+///   `…-over-vacuous-placeholder-proof:` label and deliberately EXCLUDED from
+///   the positive-witness assertion, which would otherwise ICE a debug build on
+///   a legitimately provable formula.
+/// Every other verdict (Unknown/Timeout/Skipped/…) is still forced Failed for
+/// the whole family, so this can only ADD refutations relative to no pass at
+/// all, and removes none that a solver did not independently prove; a
+/// panic-freedom Assertion (`"panic freedom …"`) or any non-unsafe Assertion is
+/// untouched.
 fn refute_unsafe_demand_findings(results: &mut [(VerificationCondition, VerificationResult)]) {
     let dbg = env_flag_enabled("TRUST_UNSAFE_CALL_DEBUG");
     for (vc, result) in results.iter_mut() {
@@ -7013,14 +9368,21 @@ fn refute_unsafe_demand_findings(results: &mut [(VerificationCondition, Verifica
         // `Assertion { message: "[unsafe:…] …" }`; a native-transport row
         // reconstructs (`legacy_vc_from_api_obligation` →
         // `native_contract_vc_kind`) to `HardenedBoundary { category:
-        // UnsafeOperation, detail: "[unsafe:…] …" }` — the authoritative form the
-        // native trust-mc lane accepts as a HardenedBoundary obligation and then
-        // trivially "proves" (route=TriviallySafe: no Horn rule derives the query
-        // target, so the always-SAT finding is never encoded as a goal); the
-        // fallback shape is `UnsupportedMir { detail }`. Match all three. The
+        // UnsafeOperation, detail: "[unsafe:…] …" }`; the fallback shape is
+        // `UnsupportedMir { detail }`. Match all three. The
         // `HardenedBoundary { category: UnsafeOperation }` arm is itself
         // sufficient (that category IS the unsafe-op demand), but the marker
         // check keeps it precise across future category reuse.
+        //
+        // The native trust-mc lane can NOT trivially "prove" these rows:
+        // `trust_mc_chc_credit_witness` (crates/trust-bmc/src/verifier_api.rs)
+        // refuses `TriviallySafe`-route credit for any obligation that is not
+        // the whole-function structural query, so a reconstructed unsafe row
+        // cannot arrive here `Proved` without a per-obligation
+        // violation-predicate witness. That gate is what makes the
+        // `discharged_by_a_real_solve` skip below safe: it spares only
+        // genuinely witnessed discharges, so the false-PROVE class this pass
+        // was introduced to close stays closed.
         let carries_unsafe_marker = match &vc.kind {
             VcKind::Assertion { message } => message.starts_with("[unsafe"),
             VcKind::HardenedBoundary { category, detail, .. } => {
@@ -7032,7 +9394,17 @@ fn refute_unsafe_demand_findings(results: &mut [(VerificationCondition, Verifica
             }
             _ => false,
         };
-        if !carries_unsafe_marker || matches!(result, VerificationResult::Failed { .. }) {
+        // A solver that PROVED a NON-CONSTANT violation discharged a real
+        // obligation (the sep-engine null / in-bounds / alignment / backing
+        // ESTABLISH lanes). Only a CONSTANT violation may have a `Proved`
+        // overridden, and the two constant classes carry different reasons —
+        // see the doc comment.
+        let discharged_by_a_real_solve = matches!(result, VerificationResult::Proved { .. })
+            && !matches!(vc.formula, Formula::Bool(_));
+        if !carries_unsafe_marker
+            || discharged_by_a_real_solve
+            || matches!(result, VerificationResult::Failed { .. })
+        {
             continue;
         }
         let time_ms = match &*result {
@@ -7041,11 +9413,22 @@ fn refute_unsafe_demand_findings(results: &mut [(VerificationCondition, Verifica
             VerificationResult::Timeout { timeout_ms, .. } => *timeout_ms,
             _ => 0,
         };
-        *result = VerificationResult::Failed {
-            solver: structural_refutation_solver_label("structural-unsafe-demand-finding", result),
-            time_ms,
-            counterexample: None,
+        // A `Proved` over the `Bool(false)` reconstruction placeholder is
+        // refuted for VACUITY, under its own label: `Bool(false)` is UNSAT, so
+        // a sound solver legitimately proves it, and the proof says nothing
+        // about the obligation whose payload the reconstruction lost. It is
+        // NOT a positive-witness breach, so it must not reach
+        // `structural_refutation_solver_label`, whose assertion is an
+        // invariant of the one class that is unprovable by construction:
+        // `Bool(true)`.
+        let solver = match (&*result, &vc.formula) {
+            (VerificationResult::Proved { solver, .. }, Formula::Bool(false)) => format!(
+                "structural-unsafe-demand-finding-over-vacuous-placeholder-proof:{solver}"
+            )
+            .into(),
+            _ => structural_refutation_solver_label("structural-unsafe-demand-finding", result),
         };
+        *result = VerificationResult::Failed { solver, time_ms, counterexample: None };
     }
 }
 
@@ -7597,12 +9980,27 @@ fn abort_on_full_verification_failure<'tcx>(
         FullVerificationFailure { failed: 0, unknown: 0, runtime_checked: 0, skipped: 0 },
     );
 
-    // Strict batteries-on verification accepts only a complete proof. A
-    // coverage gap is not a counterexample, but it is still not evidence and
-    // therefore fails closed. Contract-panic annotations document an
-    // intentional reachable panic; they are conditional evidence only in the
-    // explicit survey lane and provides no exemption here.
+    // `certify` accepts only complete static proof. Under default policy B, a
+    // residual coverage gap is still reported as unproved but may remain
+    // nonfatal only when every affected row keeps its exact Rust runtime check.
+    // Refutations, structural corruption, and rows without a runtime fallback
+    // remain fatal. Contract-panic annotations document an intentional
+    // reachable panic; they are conditional evidence only in the explicit
+    // survey lane and provide no exemption here.
     debug_assert!(strict_failure_is_fatal(failure, true) || has_unproved_assumption_panic);
+
+    // The bridged and native summaries describe overlapping rows. Their
+    // category-wise sum above is useful as a conservative fatality aggregate,
+    // but it is not a cardinality: adding it would report the same failed row
+    // twice. The diagnostic header therefore takes the largest independently
+    // authenticated inventory, plus the independent authority/panic floors.
+    let unique_failure_count = legacy_failure
+        .map_or(0, FullVerificationFailure::total)
+        .max(artifacts.full_verification.as_ref().map_or(0, |run| {
+            run.summary.requested_obligations.saturating_sub(run.summary.proved) as u32
+        }))
+        .max(native_authority_validation_failures.len().min(u32::MAX as usize) as u32)
+        .max(u32::from(has_unproved_assumption_panic));
 
     // Trust (completeness-gap ruling B): under the DEFAULT policy a residual gap
     // whose every obligation keeps its runtime check is reported, not fatal — the
@@ -7610,27 +10008,66 @@ fn abort_on_full_verification_failure<'tcx>(
     // no safety and costs drop-in. `certify` still demands full static discharge.
     // A refutation, an unaccounted row, or any obligation with no runtime fallback
     // keeps the function fail-closed.
-    let tolerate_runtime_checked_gap = !tcx
-        .sess
-        .opts
-        .unstable_opts
-        .trust_policy
-        .requires_full_discharge()
+    // Trust (completeness-gap ruling B). Two different things share the
+    // `native_authority_validation_failures` list and they must NOT share a fate:
+    //
+    //  * STRUCTURAL integrity — the native run's derived state does not validate,
+    //    or the result/binding/authority carriers are not row-aligned. Then
+    //    `artifacts.results` cannot be trusted, so the whole-function fallback
+    //    scan below would be reading garbage. Always fatal, under every policy.
+    //  * PER-ROW credit absence — a native row claims `Proved` while its compiler
+    //    row carries no private static authority. That is the completeness gap
+    //    itself, and under B it is reported rather than fatal.
+    //
+    // Rather than string-match the reasons (fragile, and the exact failure mode
+    // this program keeps finding), the structural conditions are recomputed here
+    // from the same inputs the validator uses.
+    //
+    // SAFETY OF TOLERATING THE SECOND CLASS: this function takes
+    // `&VerificationArtifacts` and returns `()` — as its own header notes, it
+    // "never rewrites the public run or its counters". Downgrading its diagnostic
+    // changes the EXIT CODE only. No row is relabelled, no proof credit is
+    // granted, and erasure is unaffected because `elide_kernel_certified_checks`
+    // licenses on `KernelCertified` authority, which such a row by construction
+    // does not carry.
+    let native_structurally_sound = artifacts
+        .full_verification
+        .as_ref()
+        .is_none_or(|run| run.validate_derived_state().is_ok())
+        && artifacts.results.len() == artifacts.result_bindings.len()
+        && artifacts.results.len() == artifacts.proof_authorities.len();
+    let requires_full_discharge =
+        tcx.sess.opts.unstable_opts.trust_policy.requires_full_discharge();
+    let gap_denial = residual_gap_tolerance_denial(&artifacts.results, tcx.sess.overflow_checks());
+    let gap_is_runtime_checked = gap_denial.is_none();
+    let tolerate_runtime_checked_gap = !requires_full_discharge
         && !has_unproved_assumption_panic
-        && native_authority_validation_failures.is_empty()
-        && residual_gap_is_runtime_checked(
-            failure,
-            &artifacts.results,
-            tcx.sess.overflow_checks(),
-        );
+        && native_structurally_sound
+        && gap_is_runtime_checked;
+
+    // Trust: when the default policy COULD have tolerated this gap but did not,
+    // say which condition withheld it. A build that fails where the ruling says
+    // it should pass is otherwise indistinguishable from one that fails for a
+    // good reason, and "it just fails" is not a diagnosis anyone can act on.
+    let tolerance_blocked_by: Option<&'static str> = if requires_full_discharge {
+        None // `certify` is meant to fail here; nothing to explain.
+    } else if has_unproved_assumption_panic {
+        Some("an unproved assumption-panic row keeps the function fail-closed")
+    } else if !native_structurally_sound {
+        Some(
+            "the native run's derived state or carrier row-alignment did not validate, so the \
+             per-row kinds could not be trusted",
+        )
+    } else {
+        gap_denial.map(GapToleranceDenial::describe)
+    };
+    // Trust (R1 scan-gap warning gate): this seam, like
+    // `report_strict_l0_verification_failure`, is a point where a verdict is
+    // actually withheld — record it so the crate-level R1 scan-poison warning may
+    // state its cause (see `r1_scan_gap_warning_applies`).
+    with_crate_verification_state(tcx.sess, |state| state.l0_verdict_withheld = true);
     let header = format!(
-        "Trust strict verification failed for `{func_path}`: {} obligation(s) were not fully verified",
-        failure
-            .total()
-            .max(artifacts.full_verification.as_ref().map_or(0, |run| {
-                run.summary.requested_obligations.saturating_sub(run.summary.proved) as u32
-            }))
-            .max(u32::from(has_unproved_assumption_panic)),
+        "Trust strict verification failed for `{func_path}`: {unique_failure_count} obligation(s) were not fully verified",
     );
     // Trust: collect the notes once, then emit them on an error (aborting) or a
     // warning (coverage gap) diagnostic — the two `Diag` levels are distinct
@@ -7741,6 +10178,12 @@ fn abort_on_full_verification_failure<'tcx>(
         let mut diag = tcx.dcx().struct_span_err(body.span, header);
         for note in notes {
             diag.note(note);
+        }
+        if let Some(reason) = tolerance_blocked_by {
+            diag.note(format!(
+                "the default policy reports rather than fails a gap whose obligations all keep \
+                 their runtime checks; that did not apply here because {reason}"
+            ));
         }
         diag.emit();
     }
@@ -8351,6 +10794,26 @@ struct CrateVerificationState {
     r1_attributions: BTreeMap<String, Vec<R1Flip>>,
     r1_generic_mono_covered: FxHashSet<String>,
     r1_generic_mono_caller_closure: FxHashSet<String>,
+    /// Why the crate-wide R1 caller scan could not account for this crate
+    /// (`CrateCallInfo::incomplete_notes`, already bounded and rendered by the
+    /// oracle; each entry carries the offending item's span). Non-empty means R1's
+    /// verdict-improvement lane was disabled for EVERY function, so
+    /// `trust_ensure_whole_crate_verification` reports the cause once, beside the
+    /// coverage-shortfall report — but only when a verdict was actually withheld
+    /// (`l0_verdict_withheld`), so ordinary all-proved source never pays a warning
+    /// for merely containing a `global_asm!` item. Empty when the scan was
+    /// complete or never ran (`-Ztrust-no-r1`).
+    r1_scan_gaps: Vec<crate::trust_r1_oracle::R1ScanGapNote>,
+    /// True iff at least one function in this crate ended the walk with a
+    /// non-proved Level-0 outcome (the `strict_l0_verification_failure` /
+    /// `abort_on_full_verification_failure` reporting seams fired, in any policy
+    /// or output mode) — i.e. a verdict was actually withheld that R1's
+    /// improvement lane could conceivably have mattered to. Gates the crate-level
+    /// scan-gap warning above; deliberately coarse (crate-level, may
+    /// under-approximate on exotic reporting seams, which errs toward SILENCE —
+    /// never toward warning on clean source; verification itself stays
+    /// fail-closed regardless).
+    l0_verdict_withheld: bool,
     panic_free_proven_funcs: FxHashSet<String>,
     /// Exact extracted call identities for bodyless foreign, non-unwinding
     /// C-family imports. Only the compiler's `is_foreign_item` classification
@@ -9058,6 +11521,9 @@ pub fn trust_init_r1_attributions(tcx: TyCtxt<'_>) {
             state.r1_attributions.clear();
             state.r1_generic_mono_covered.clear();
             state.r1_generic_mono_caller_closure.clear();
+            // No scan ran, so there is no scan gap to report: R1 is off by request,
+            // not poisoned. Reporting one here would blame the crate for a flag.
+            state.r1_scan_gaps.clear();
             state.r1_initialized = true;
         });
         return;
@@ -9072,7 +11538,7 @@ pub fn trust_init_r1_attributions(tcx: TyCtxt<'_>) {
     if trace {
         eprintln!(
             "TRUST_R1_TRACE: init: incomplete={} address_taken={} callers_keys={} recursive={} hidden={}",
-            info.incomplete,
+            info.incomplete.len(),
             info.address_taken.len(),
             info.callers.len(),
             info.recursive.len(),
@@ -9156,10 +11622,17 @@ pub fn trust_init_r1_attributions(tcx: TyCtxt<'_>) {
         );
     }
 
+    // Carry the scan's OWN reasons (with the offending items' spans) to the
+    // crate-level reporting seam. A poisoned scan disables the R1
+    // verdict-improvement lane for every function in the crate; without this, an
+    // affected function emitted an ordinary "Level 0 safety verification
+    // incomplete" with nothing anywhere naming the cause.
+    let scan_gaps = info.incomplete_notes.clone();
     with_crate_verification_state(tcx.sess, |state| {
         state.r1_attributions = map;
         state.r1_generic_mono_covered = generic_mono_covered;
         state.r1_generic_mono_caller_closure = caller_closure;
+        state.r1_scan_gaps = scan_gaps;
         state.r1_initialized = true;
     });
 }
@@ -9199,6 +11672,18 @@ fn whole_crate_coverage_shortfall_is_fatal(
     processed != eligible && policy.fail_closed()
 }
 
+/// Whether the crate-level R1 scan-gap warning fires: the scan must be poisoned
+/// AND some function must actually have kept a non-proved Level-0 verdict this
+/// compile. The second conjunct is the UX contract pinned by
+/// `tests::r1_scan_gap_warning_requires_a_withheld_verdict`: a raw `dcx` warning
+/// cannot be suppressed by `-Awarnings`/`#[allow]`, so ordinary fully-proved
+/// source containing a `global_asm!` item must compile without it. The positive
+/// half (poison + withheld verdict ⇒ warn, naming the cause) is pinned
+/// end-to-end by tests/ui/trust/r1/reject_global_asm_names_reason.rs.
+fn r1_scan_gap_warning_applies(scan_poisoned: bool, l0_verdict_withheld: bool) -> bool {
+    scan_poisoned && l0_verdict_withheld
+}
+
 #[allow(rustc::potential_query_instability)]
 pub fn trust_ensure_whole_crate_verification(tcx: TyCtxt<'_>) {
     // Parser islands and authored citations are language-integrity checks, not
@@ -9213,7 +11698,15 @@ pub fn trust_ensure_whole_crate_verification(tcx: TyCtxt<'_>) {
     // program function. Diagnostics-only consequence: citation errors now
     // follow per-body verification output; no verdict changes either way
     // (facets refine the fail-closed message, never admit a call).
-    let mut clean_session = trust_check_clean_islands(tcx);
+    let (mut clean_session, deferred_islands) = trust_check_clean_islands(tcx);
+    // Trust (item 10 phase 2): tell the in-walk citation lane, BEFORE the body
+    // walk starts, whether this crate has a deferred island suffix at all. Only
+    // then may an unregistered theorem name be read as "not checked yet" instead
+    // of "absent" — see `SessionPendingImportCitations`.
+    let has_deferred_islands = !deferred_islands.is_empty();
+    tcx.sess.with_trust_compiler_state::<SessionPendingImportCitations, _>(|state| {
+        state.crate_has_deferred_islands = has_deferred_islands;
+    });
     // Trust: E9 §5d — stash a clone of the island-checked env for the in-walk
     // ensures-citation discharge. `environment()` is `None` when the session is
     // tainted, so a partially-registered island crate can never mint discharge
@@ -9223,6 +11716,30 @@ pub fn trust_ensure_whole_crate_verification(tcx: TyCtxt<'_>) {
         state.env = island_env_clone;
     });
     if !verification_enabled(tcx.sess) {
+        // Islands remain mandatory language-integrity checks when verification
+        // is disabled. No body walk means no program admissions, so a deferred
+        // import legitimately cannot elaborate, but it must fail visibly
+        // instead of escaping the Clean kernel altogether.
+        for (content_span, text) in &deferred_islands {
+            let outcome = clean_session.check(text);
+            for err in &outcome.errors {
+                let start = err.start.min(text.len());
+                let end = err.end.max(start).min(text.len());
+                let lo = content_span.lo() + rustc_span::BytePos(start as u32);
+                let mut hi = content_span.lo() + rustc_span::BytePos(end as u32);
+                if hi == lo && lo < content_span.hi() {
+                    hi = lo + rustc_span::BytePos(1);
+                }
+                tcx.dcx()
+                    .struct_span_err(content_span.with_lo(lo).with_hi(hi), err.message.clone())
+                    .with_note(
+                        "this island names the kernel-import namespace, which is populated only \
+                         by an enabled verification walk; it cannot elaborate under \
+                         -Ztrust-verify=off",
+                    )
+                    .emit();
+            }
+        }
         trust_check_citations(tcx, &clean_session);
         return;
     }
@@ -9241,7 +11758,86 @@ pub fn trust_ensure_whole_crate_verification(tcx: TyCtxt<'_>) {
     // inventory, so mint admissions for recognized facet-certified functions into
     // the session env BEFORE the citation sweep reads it.
     trust_mint_program_admissions(tcx, &mut clean_session);
+    // The required program constants now exist. Check each deferred island in
+    // authored order against the same stateful Environment + FileContext. A
+    // rejection is a hard compiler error, exactly as it is in the pre-walk
+    // phase; deferral never authorizes unchecked declarations.
+    for (content_span, text) in &deferred_islands {
+        let outcome = clean_session.check(text);
+        if outcome.is_rejected() {
+            for err in &outcome.errors {
+                let start = err.start.min(text.len());
+                let end = err.end.max(start).min(text.len());
+                let lo = content_span.lo() + rustc_span::BytePos(start as u32);
+                let mut hi = content_span.lo() + rustc_span::BytePos(end as u32);
+                if hi == lo && lo < content_span.hi() {
+                    hi = lo + rustc_span::BytePos(1);
+                }
+                tcx.dcx()
+                    .struct_span_err(content_span.with_lo(lo).with_hi(hi), err.message.clone())
+                    .with_note(
+                        "this island names the kernel-import namespace, so it was checked after \
+                         program admissions were minted (two-language design item 10)",
+                    )
+                    .emit();
+            }
+        } else if !outcome.registered.is_empty() {
+            tcx.dcx()
+                .struct_span_note(
+                    *content_span,
+                    format!(
+                        "Clean island kernel-checked after program admission: {} declaration(s) \
+                         registered ({})",
+                        outcome.registered.len(),
+                        outcome.registered.join(", ")
+                    ),
+                )
+                .emit();
+        }
+    }
+    // Keep the session mirror exact for post-walk readers. The in-walk
+    // discharge lanes have already run, so this does not pretend that a
+    // deferred theorem discharged a clause.
+    let island_env_after_deferred_checks = clean_session.environment().cloned();
+    tcx.sess.with_trust_compiler_state::<SessionIslandEnv, _>(|state| {
+        state.env = island_env_after_deferred_checks;
+    });
+    // Trust (item 10 phase 2): THIS is the authoritative stage — complete program
+    // admissions, the deferred island suffix kernel-checked in authored order,
+    // and the full facet table. Adjudicate every quarantined ensures-citation
+    // here, where parity holds by construction rather than by care, and publish
+    // each affected body's single withheld outcome.
+    //
+    // Placed BEFORE the coverage reconciliation below so every envelope this
+    // emits is already in the transport set when the identity inventory is
+    // stated; targo compares the two as exact SETS, so emission order is free but
+    // emission-before-inventory is not.
+    finalize_pending_import_citations(tcx, &clean_session);
     trust_check_citations(tcx, &clean_session);
+    // Fail-closed backstop for the quarantine. A body recorded as pending has had
+    // its SOLE envelope withheld, so a leftover record means one eligible body
+    // published no evidence at all while still counting as processed — coverage
+    // would reconcile and the transport set would be short. `finalize` above
+    // drains the map and nothing can record into it after the walk, so this is
+    // unreachable today; it exists so that a future lane which records later
+    // fails loudly here instead of silently shrinking the evidence inventory.
+    let leftover_pending = tcx
+        .sess
+        .with_trust_compiler_state::<SessionPendingImportCitations, _>(|state| state.bodies.len());
+    if leftover_pending != 0 {
+        tcx.dcx()
+            .struct_err(format!(
+                "Trust verification accounting incomplete: {leftover_pending} function \
+                 body/bodies had a deferred ensures-citation quarantined but were never \
+                 adjudicated; their verification evidence was withheld and never published"
+            ))
+            .with_note(
+                "a quarantined body must be finalized by \
+                 `finalize_pending_import_citations` in the same invocation that \
+                 withheld it",
+            )
+            .emit();
+    }
     // Trust (assertion-grade coverage, roadmap §4.1): the walk above guarantees an
     // attributable outcome for every eligible body — the `TrustVerify` pass ran, or
     // `inner_optimized_mir` took a credited pre-pass early-out (tainted-by-errors /
@@ -9319,6 +11915,58 @@ pub fn trust_ensure_whole_crate_verification(tcx: TyCtxt<'_>) {
                 "{message}; survey remains nonfatal but this coverage gap carries no proof credit"
             ));
         }
+    }
+    // Trust (R1 scan-poison reason channel): report, ONCE per crate, that the
+    // whole-program caller scan could not account for this crate — and why.
+    //
+    // The scan feeds R1's verdict-IMPROVEMENT lane (an obligation unprovable in
+    // isolation may be discharged when every caller establishes a precondition). A
+    // gap poisons it for every function in the crate. Before this warning existed
+    // NOTHING stated the cause anywhere: the pure core's gap classification is
+    // dropped at its only other consumer (`try_harvest_flip` tests Total/not-Total
+    // and discards the gap list), so an affected function reported an ordinary
+    // "Level 0 safety verification incomplete" and the crate-wide reason was
+    // silent. This warning IS the fix for that silence; it lives here because this
+    // seam already owns crate-level verification reporting (the coverage-shortfall
+    // report directly above — a dcx diagnostic, unlike trust_ir_flip's
+    // `note_fallback`, which is only a `tracing::warn!` log line and is NOT a
+    // precedent for user-facing warnings).
+    //
+    // GATED on `l0_verdict_withheld`: a raw `dcx` warning is unsuppressible
+    // (`-Awarnings`/`#[allow]`/`--cap-lints` cannot touch a non-lint), and
+    // `-Ztrust-verify` defaults to On — so firing on the mere PRESENCE of a
+    // `global_asm!` item would warn on every compile of ordinary, fully-proved
+    // source. The cause is worth stating exactly when its effect was felt: some
+    // function actually kept a non-proved Level-0 verdict this compile. Those
+    // compiles already emit per-function diagnostics, so this adds the missing
+    // crate-level cause, never new noise on clean builds.
+    //
+    // A WARNING, never an error: the poison only ever KEEPS an honest verdict
+    // (fail-closed), so it cannot make an unsound build pass, and it must not turn
+    // a sound build into a failing one either. Empty under `-Ztrust-no-r1`.
+    let (r1_scan_gaps, l0_verdict_withheld) = with_crate_verification_state(tcx.sess, |state| {
+        (state.r1_scan_gaps.clone(), state.l0_verdict_withheld)
+    });
+    if r1_scan_gap_warning_applies(!r1_scan_gaps.is_empty(), l0_verdict_withheld) {
+        let mut diag = tcx.dcx().struct_warn(
+            "Trust R1 whole-program caller coverage is disabled for this crate: the crate-wide \
+             call scan could not account for every item, so no function's caller set is \
+             provably exhaustive",
+        );
+        for note in &r1_scan_gaps {
+            match note.span {
+                // Point at the offending item itself: an anonymous def path like
+                // `crate::{global_asm#0}` is not a location a reader can act on.
+                Some(span) => diag.span_note(span, note.text.clone()),
+                None => diag.note(note.text.clone()),
+            };
+        }
+        diag.note(
+            "this is conservative, not a failure: every affected function keeps its honest \
+             verdict, so an obligation a caller-established precondition would have discharged \
+             is reported incomplete instead of proved",
+        );
+        diag.emit();
     }
     // Emit the crate-level coverage row once, at the end of the eager walk, on the
     // same JSON transport lane as the per-function rows. SOUNDNESS: pure fail-closed
@@ -10360,8 +13008,11 @@ fn try_harvest_flip<'tcx>(
         mint_caller_propagation_certificate,
     };
 
-    // (0) Coverage MUST be provably Total (folds recursive/address-taken/public/incomplete/
-    //     hidden). Pass an empty recursive set — the signal is already folded into is_public.
+    // (0) Coverage MUST be provably Total. The signals carry recursive/address-taken/
+    //     public/hidden (recursion folded into is_public, so the recursive set passed to
+    //     classify_coverage is empty) plus the crate-scan poison in its OWN
+    //     `scan_incomplete` channel (NOT in is_public — a poisoned scan says nothing
+    //     about external reachability).
     let trace = env_flag_enabled("TRUST_R1_TRACE");
     let f_did = f_local.to_def_id();
     // Trust (R1 completeness #3): a CLOSED-WORLD GENERIC F is coverable per-MONOMORPHIZATION,
@@ -10385,15 +13036,22 @@ fn try_harvest_flip<'tcx>(
     let empty_rec: FxHashSet<String> = FxHashSet::default();
     let f_dp = with_no_trimmed_paths!(tcx.def_path_str(f_did));
     if !matches!(classify_coverage(f_dp.as_str(), &empty_rec, &signals), CallerCoverage::Total) {
+        // `scan_incomplete` is reported separately from `is_public`: a poisoned
+        // crate-wide scan is not evidence that F is externally reachable.
         if trace {
             eprintln!(
-                "TRUST_R1_TRACE: {f_dp}: not Total (is_public={} address_taken={})",
-                signals.is_public, signals.address_taken
+                "TRUST_R1_TRACE: {f_dp}: not Total (is_public={} address_taken={} \
+                 scan_incomplete={})",
+                signals.is_public,
+                signals.address_taken,
+                signals.scan_incomplete.len()
             );
         }
         debug!(
-            "R1 skip {f_dp}: not Total (is_public={} address_taken={})",
-            signals.is_public, signals.address_taken
+            "R1 skip {f_dp}: not Total (is_public={} address_taken={} scan_incomplete={})",
+            signals.is_public,
+            signals.address_taken,
+            signals.scan_incomplete.len()
         );
         return None;
     }
@@ -11746,10 +14404,18 @@ fn try_harvest_recursive_flip<'tcx>(
 /// MUST be called at the analysis phase: it borrows
 /// `mir_drops_elaborated_and_const_checked`, which `optimized_mir` later STEALS
 /// during codegen — borrowing here (pre-steal) is sound and panic-free, and does
-/// not run `TrustVerify` (no query cycle). Struct names are keyed by
-/// `safe_def_path_str` to match the extracted IR's `Ty::Adt` name.
-// `is_stolen` is the sanctioned escape hatch for drivers handling steal state;
-// the set intersection is order-independent (collected back into a set).
+/// not run `TrustVerify` (no query cycle). Const-context bodies, whose `Steal`
+/// `inner_mir_for_ctfe`'s stealing arm consumes during `check_crate`'s eager
+/// const-eval (BEFORE this hook runs), are RECOVERED through `mir_for_ctfe` —
+/// the steal CONSUMER, a tracked query returning a stable `&Body` after the
+/// steal — so the backing-certification inventory stays COMPLETE. Struct names
+/// are keyed by `safe_def_path_str` to match the extracted IR's `Ty::Adt` name.
+// `is_stolen` here only selects between two views of the SAME body (borrow the
+// intact `Steal` vs read the `mir_for_ctfe` recovery) or blocks certification
+// CLOSED — it can never REMOVE a body from the certifier's evidence, so the
+// untracked read cannot flip a verdict anti-conservatively on either side of an
+// incremental replay; the set intersection is order-independent (collected back
+// into a set).
 #[allow(rustc::untracked_query_information, rustc::potential_query_instability)]
 pub fn trust_init_backing_certificates(tcx: TyCtxt<'_>) {
     if !verification_enabled(tcx.sess)
@@ -11766,22 +14432,172 @@ pub fn trust_init_backing_certificates(tcx: TyCtxt<'_>) {
     // The whole-crate extraction below also feeds clamp-via-helper return-bound
     // summaries for every enabled local crate, not only crates containing a
     // `#[trust::backing]` struct. Reporting roles cannot suppress this work.
-    // 2. Extract every local function body — borrowing post-analysis MIR (not yet
-    //    stolen). A body that is already stolen (e.g. const-eval'd) is skipped;
-    //    its absence can only make a struct fail to certify (fail-closed), never
-    //    unsound.
+    // 2. Extract the whole-crate body inventory.
+    //
+    //    SOUNDNESS — the certifier's shape dictates this loop's shape.
+    //    `certify_backing_invariants` starts `all_establish = true` /
+    //    `broken_by_mutation = false` and only ever WEAKENS them from evidence
+    //    it SEES; only `saw_constructor` is evidence-driven. A body missing
+    //    from its input therefore pushes TOWARD certification — and the
+    //    certificate publishes the use-site ASSUME `alloc_size >= self.len`,
+    //    which turns a guarded access from CAUGHT into PROVED. This loop used
+    //    to drop bodies silently on two paths, each justified by an inverted
+    //    "omission is fail-closed" claim: a `def_kind` filter to
+    //    `Fn | AssocFn` (dropping every closure, const/static initializer,
+    //    ctor shim, and synthetic coroutine body `mir_keys` yields) and an
+    //    `is_stolen()` `continue` (dropping `#[rustc_comptime]` fns, whose
+    //    always-const bodies `inner_mir_for_ctfe`'s stealing arm consumes
+    //    during `check_crate`'s eager const-eval). A non-establishing
+    //    constructor in ANY of those bodies — `const B: S = S { ptr, len }`,
+    //    a `static` initializer, a tuple-ctor shim used as a function value,
+    //    a constructing closure, a stolen comptime fn — was invisible, so the
+    //    struct certified from the bodies that remained.
+    //
+    //    The discipline is the one the paired-condvar lane's const arm already
+    //    models (`certify_paired_condvars_for_crate`): inventory EVERY
+    //    `mir_keys` body owner, RECOVERING what a plain borrow cannot see —
+    //    `mir_for_ctfe` is the const-context steal's CONSUMER, a tracked query
+    //    returning a stable `&Body` after the steal, and serves ctor shims
+    //    directly via `shim::build_adt_ctor` — plus each owner's
+    //    `promoted_mir` fragments (promotion MOVES a `&S { .. }` aggregate out
+    //    of its parent body, so the constructor lives in the promoted body
+    //    only). Trivial consts (`tcx.trivial_const`: a lone
+    //    `_0 = const <val>; return`) provably contain no aggregate, no field
+    //    write, and no promoteds — and `mir_for_ctfe`/`mir_promoted`
+    //    debug-assert against them — so skipping them is sound AND required.
+    //    Only a body that can neither be borrowed nor recovered may block
+    //    certification, and it blocks CLOSED
+    //    (`backing_inventory_complete = false` ⇒ no certificate), never open.
+    //
+    //    `funcs` — the input of the six per-function summary lanes below —
+    //    deliberately keeps its old universe (`Fn | AssocFn` bodies whose
+    //    `Steal` is intact): those lanes are per-function inserts whose
+    //    omission only ever LOSES a summary (conservative). `backing_funcs` is
+    //    the complete inventory and feeds certification alone.
+    let need_backing = !sealed.is_empty();
     let mut funcs = Vec::new();
+    let mut backing_funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
+    let mut backing_inventory_complete = true;
     for &local_def_id in tcx.mir_keys(()) {
         let def_id = local_def_id.to_def_id();
-        if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
-            continue;
+        match tcx.def_kind(def_id) {
+            kind @ (DefKind::Fn
+            | DefKind::AssocFn
+            | DefKind::Closure
+            | DefKind::SyntheticCoroutineBody) => {
+                let fn_like = matches!(kind, DefKind::Fn | DefKind::AssocFn);
+                if !fn_like && !need_backing {
+                    continue;
+                }
+                let steal = tcx.mir_drops_elaborated_and_const_checked(local_def_id);
+                if !steal.is_stolen() {
+                    let body = steal.borrow();
+                    let func =
+                        trust_mir_extract::extract_function_with_contract_bundle(tcx, &body, None);
+                    if need_backing {
+                        backing_funcs.push(func.clone());
+                    }
+                    if fn_like {
+                        funcs.push(func);
+                    }
+                } else if need_backing {
+                    // Stolen at the analysis phase ⇒ `inner_mir_for_ctfe`'s
+                    // stealing arm consumed it (codegen's `optimized_mir` steal
+                    // happens later), which fires only for an always-const body
+                    // — a `#[rustc_comptime]` fn. Recover through the steal
+                    // consumer. `SyntheticCoroutineBody` has no HIR body
+                    // (`hir_body_const_context` would panic on it) and no const
+                    // context, so it cannot legitimately be stolen here.
+                    if !matches!(kind, DefKind::SyntheticCoroutineBody)
+                        && matches!(
+                            tcx.hir_body_const_context(local_def_id),
+                            Some(
+                                rustc_hir::ConstContext::Const { .. }
+                                    | rustc_hir::ConstContext::Static(_)
+                            )
+                        )
+                    {
+                        let body = tcx.mir_for_ctfe(local_def_id);
+                        backing_funcs.push(
+                            trust_mir_extract::extract_function_with_contract_bundle(
+                                tcx, body, None,
+                            ),
+                        );
+                    } else {
+                        // No recovery query exists for this body: block CLOSED.
+                        backing_inventory_complete = false;
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+                if need_backing {
+                    for promoted in tcx.promoted_mir(def_id).iter() {
+                        backing_funcs.push(
+                            trust_mir_extract::extract_function_with_contract_bundle(
+                                tcx, promoted, None,
+                            ),
+                        );
+                    }
+                }
+            }
+            DefKind::Const { .. }
+            | DefKind::AssocConst { .. }
+            | DefKind::AnonConst
+            | DefKind::InlineConst
+            | DefKind::Static { .. } => {
+                // A const/static initializer is itself a body that can
+                // CONSTRUCT a backing struct (`const B: S = S { ptr, len }` is
+                // exactly the non-establishing-constructor shape).
+                if !need_backing || tcx.is_trivial_const(local_def_id) {
+                    continue;
+                }
+                let body = tcx.mir_for_ctfe(local_def_id);
+                backing_funcs.push(trust_mir_extract::extract_function_with_contract_bundle(
+                    tcx, body, None,
+                ));
+                for promoted in tcx.promoted_mir(def_id).iter() {
+                    backing_funcs.push(trust_mir_extract::extract_function_with_contract_bundle(
+                        tcx, promoted, None,
+                    ));
+                }
+            }
+            DefKind::Ctor(..) => {
+                // The tuple-ctor SHIM constructs the struct
+                // (`_0 = S(move _1, move _2)`); a ctor used as a function VALUE
+                // constructs inside the shim, not at its call site.
+                // `mir_for_ctfe` serves ctors via `shim::build_adt_ctor`
+                // without touching any `Steal`; ctor shims have no promoteds.
+                //
+                // CAPABILITY COST, named rather than implied: `mir_keys` yields
+                // every tuple-struct ctor unconditionally, and a shim's establish
+                // obligation is over its UNTRACKED parameter pointer — symbolic
+                // size, never UNSAT. Inventorying shims therefore makes a tuple
+                // `#[trust::backing]` struct CATEGORICALLY uncertifiable: its
+                // ctor is always a visible non-establishing constructor. That is
+                // the sound direction (the shim really can construct the struct
+                // from anything), and the escape is a named-field struct whose
+                // constructors are ordinary bodies. Recorded here because the
+                // regression is a consequence of THIS arm, and silently losing a
+                // capability is the failure mode this file's audit history warns
+                // about.
+                if need_backing {
+                    let body = tcx.mir_for_ctfe(local_def_id);
+                    backing_funcs.push(trust_mir_extract::extract_function_with_contract_bundle(
+                        tcx, body, None,
+                    ));
+                }
+            }
+            _ => {
+                // `mir_keys` yielded a body-owner kind outside the enumeration
+                // above (`GlobalAsm` is stripped by `mir_keys` itself). No
+                // borrow or recovery is known for it: block certification
+                // CLOSED rather than certify from a partial inventory.
+                if need_backing {
+                    backing_inventory_complete = false;
+                }
+            }
         }
-        let steal = tcx.mir_drops_elaborated_and_const_checked(local_def_id);
-        if steal.is_stolen() {
-            continue;
-        }
-        let body = steal.borrow();
-        funcs.push(trust_mir_extract::extract_function_with_contract_bundle(tcx, &body, None));
     }
     // 3a. Clamp-via-helper return-bound summaries — whole-crate, always (sound:
     //     only const-certain, single-assigned, non-negative return bounds, and
@@ -11805,16 +14621,28 @@ pub fn trust_init_backing_certificates(tcx: TyCtxt<'_>) {
     // channel (fail-closed per function in trust-vcgen — only bodies proven to
     // be pure tag predicates over a pinned shared-ref param record anything).
     let return_bool_preds = trust_vcgen::compute_return_bool_pred_summaries(&funcs);
-    // 3b. Certify backing across the whole set, intersect with the sealed set
-    //     (only when a sealed backing struct exists — else nothing to certify).
+    // 3b. Certify backing across the COMPLETE body inventory, intersect with
+    //     the sealed set (only when a sealed backing struct exists — else
+    //     nothing to certify). An incomplete inventory fails CLOSED: the
+    //     certifier only weakens from evidence it sees, so judging from a
+    //     partial view could only ever push TOWARD certification.
     let certified: FxHashSet<String> = if sealed.is_empty() {
         FxHashSet::default()
-    } else {
-        let established = trust_vcgen::certify_backing_invariants(&funcs);
+    } else if !backing_inventory_complete {
         if env_flag_enabled("TRUST_CERT_DEBUG") {
             eprintln!(
-                "TRUST_CERT_DEBUG: extracted {} fn(s); established = {established:?}",
-                funcs.len()
+                "TRUST_CERT_DEBUG: backing inventory INCOMPLETE ({} body(ies) extracted); \
+                 established = {{}} (fail closed)",
+                backing_funcs.len()
+            );
+        }
+        FxHashSet::default()
+    } else {
+        let established = trust_vcgen::certify_backing_invariants(&backing_funcs);
+        if env_flag_enabled("TRUST_CERT_DEBUG") {
+            eprintln!(
+                "TRUST_CERT_DEBUG: extracted {} body(ies); established = {established:?}",
+                backing_funcs.len()
             );
         }
         established.intersection(&sealed).cloned().collect()
@@ -12089,6 +14917,75 @@ fn transport_derived_total_certificate_row() -> TransportObligationResult {
     }
 }
 
+/// Trust (span normalization, authoritative note): rustc `Span` -> `trust_types::SourceSpan`,
+/// the RAW LO+HI range. Deliberately does NOT rebase to
+/// [`rustc_span::Span::source_callsite`].
+///
+/// # Why raw, and why that is only half right
+///
+/// This span is an OBLIGATION IDENTITY KEY before it is a diagnostic, and the identity
+/// lane's exact comparisons run ACROSS its copies, so the copies must agree
+/// character-for-character:
+///
+/// * `exact_callsite_span_multiset_matches` (this file) binds R1's oracle call-site
+///   inventory (`trust_r1_oracle::source_span` output) to the producer's VC locations
+///   (`trust_vcgen` rows off a `trust-mir-extract::convert_span`-stamped
+///   `VerifiableFunction`) by exact span MULTISET. It never sees THIS fn's output — what
+///   it pins is the lockstep of the other two copies. The fn itself returns `bool`; its
+///   callers are what reject (`return None`, fail-closed) on a mismatch.
+/// * `collect_synthesized_box_deref_spans` (this file) builds a DROP set from THIS fn's
+///   output for the missing-SAFETY documentation lint, matched by exact set membership
+///   against `convert_span`-stamped `UnsafeBlock` spans — a cross-copy exact comparison
+///   that this fn's output IS part of.
+/// * `trust_router::strengthen_whole_program::SealedVcIdentity` keys a sealed VC on
+///   `(function, kind, file, line_start, col_start, formula)`, where the location was
+///   stamped by whichever identity-lane copy produced the VC.
+///
+/// `source_callsite()` is NOT a projection — it is a MERGE. It maps every span originating
+/// in one macro expansion onto the single point of the invocation. Rebasing this range to
+/// it would make two distinct calls inside one macro invocation indistinguishable to a
+/// check whose entire purpose is exactness, and would widen the lint drop set so a user's
+/// genuine raw deref at the same call site as a compiler-synthesized box deref silently
+/// loses its lint. That is anti-conservative, so the raw range stays.
+///
+/// **BYTE-IDENTICAL COPIES — keep them in lockstep.** `trust-mir-extract/src/convert.rs`
+/// (`convert_span`) and `trust_r1_oracle.rs` (`source_span`) are character-for-character the
+/// same function; `trust_r1_oracle.rs::span_line_col` is its LO-only projection. Per the
+/// comparisons above, normalizing ONE copy and not the others would make R1 fail closed on
+/// every macro-generated call site and de-cover the box-deref lint drop.
+///
+/// # The half that IS wrong — one part fixed here, one part still open
+///
+/// The same value is also what gets reported to the user and sealed into
+/// `SealedVcIdentity.file`. For a macro-generated obligation the LO `BytePos` lies in the
+/// macro DEFINITION's `SourceFile`, so:
+///
+/// * the reported location is not actionable — the user cannot add a `requires` clause or
+///   a `// SAFETY:` comment inside `core`'s `macros/mod.rs`; STILL OPEN, see below. And
+/// * `bootstrap.toml` sets `remap-debuginfo = true`, and `RealFileName::to_string_lossy`'s
+///   `Local` arm falls back to `maybe_remapped` because a decoded foreign `SourceFile`
+///   carries no `local` path — so the raw rendering was
+///   `/rustc/<sha>/library/core/src/macros/mod.rs`, where `<sha>` is the COMPILER's
+///   commit, and the sealed identity moved whenever the compiler was rebuilt at a
+///   different commit although the user's program did not change. FIXED at the producers:
+///   `trust_types::stable_obligation_file` (behaviourally tested in trust-types) elides
+///   the build token to the fixed `<toolchain>` placeholder, in all three copies at once.
+///
+/// Every other user-facing position in this tree is callsite-normalized (see the
+/// `source_callsite()` calls in `rustc_lint::for_loops_over_fallibles`,
+/// `rustc_borrowck::diagnostics::mutability_errors`, `rustc_expand::base`, and
+/// `rustc_const_eval::const_eval::error`), as is the trust-ir debug-info lane
+/// (`trust-thir-lower/src/lib.rs::to_source_span`, which carries the long-form analysis).
+///
+/// The actionability fix is therefore ADDITIVE — carry a callsite ANCHOR beside the raw
+/// range (a new field computed from `span.source_callsite()` under a new binding; the
+/// parity pin deliberately permits exactly that shape) — never a swap, which trades a
+/// reporting defect for an identity defect. It is not attempted here because it is a
+/// `trust_types::SourceSpan` schema change reaching every construction site, its
+/// `PartialEq`, its serde wire form, and R1's sealed identity.
+///
+/// The current divergence (six converters across five files) is pinned by
+/// `crates/trust-types/tests/span_normalization_parity.rs` so it cannot widen unnoticed.
 fn source_span_from_rustc_span(tcx: TyCtxt<'_>, span: rustc_span::Span) -> SourceSpan {
     if span.is_dummy() {
         return SourceSpan::default();
@@ -12099,7 +14996,9 @@ fn source_span_from_rustc_span(tcx: TyCtxt<'_>, span: rustc_span::Span) -> Sourc
     let hi = source_map.lookup_char_pos(span.hi());
 
     SourceSpan {
-        file: lo.file.name.prefer_local_unconditionally().to_string(),
+        file: trust_types::stable_obligation_file(
+            lo.file.name.prefer_local_unconditionally().to_string(),
+        ),
         line_start: lo.line as u32,
         col_start: lo.col.0 as u32,
         line_end: hi.line as u32,
@@ -13635,7 +16534,7 @@ fn collect_verification_artifacts_inner_with_policy<'tcx>(
     // negative authority leaks across functions, panics, or compiler Sessions.
     let empty_contracts = TrustContractBundle::empty(def_id);
     let rustc_contracts = trust_contracts_if_any(tcx, def_id).unwrap_or(&empty_contracts);
-    let compiler_contracts =
+    let mut compiler_contracts =
         match trust_mir_extract::convert_trust_contract_bundle(tcx, rustc_contracts) {
             Ok(bundle) => bundle,
             Err(reason) => {
@@ -13648,6 +16547,46 @@ fn collect_verification_artifacts_inner_with_policy<'tcx>(
                 ));
             }
         };
+    let loop_provenance_failures =
+        trust_mir_extract::stamp_loop_header_provenance(body, &mut compiler_contracts);
+    if !loop_provenance_failures.is_empty() {
+        let mut reasons = Vec::with_capacity(loop_provenance_failures.len());
+        for (source_loop_id, reason) in loop_provenance_failures {
+            let mut emitted = false;
+            for contract in &rustc_contracts.loop_contracts {
+                let rustc_middle::mir::trust_contract::TrustContractSubject::HirLoop { id, .. } =
+                    contract.subject
+                else {
+                    continue;
+                };
+                if id.index != source_loop_id {
+                    continue;
+                }
+                tcx.dcx()
+                    .struct_span_err(
+                        contract.span,
+                        format!("invalid authored loop contract provenance: {reason}"),
+                    )
+                    .with_note(
+                        "E4/E5 clauses require a compiler-authenticated HIR-loop to natural-MIR-header mapping; span fallback cannot authorize a failed mapping",
+                    )
+                    .emit();
+                emitted = true;
+            }
+            if !emitted {
+                tcx.dcx()
+                    .struct_span_err(
+                        body.span,
+                        format!(
+                            "invalid authored loop contract provenance for source loop {source_loop_id}: {reason}"
+                        ),
+                    )
+                    .emit();
+            }
+            reasons.push(reason);
+        }
+        return Some(unsupported_contract_artifacts(tcx, body, &def_path, reasons.join("; ")));
+    }
 
     let mut func = trust_mir_extract::extract_function_with_contract_bundle(
         tcx,
@@ -13660,7 +16599,7 @@ fn collect_verification_artifacts_inner_with_policy<'tcx>(
     // L0 panic/OOM/bounds obligations; they never ride a side channel whose
     // non-emptiness could suppress another discovery lane.
     let loop_contract_failures =
-        trust_vcgen::bind_compiler_loop_contracts(&mut func, &compiler_contracts.loop_contracts);
+        trust_vcgen::bind_compiler_loop_contract_bundle(&mut func, &compiler_contracts);
     for (index, reason) in loop_contract_failures {
         let span =
             rustc_contracts.loop_contracts.get(index).map_or(body.span, |contract| contract.span);
@@ -15629,21 +18568,39 @@ fn discharge_ensures_citations_in_walk<'tcx>(
                 clause_text = rewrite_by_value_prime(&clause_text, pname);
             }
         }
-        if !matches!(
-            trust_certify::clean_island::kernel_discharge_ensures_citation(
-                &env,
-                theorem.as_str(),
-                &clause_text,
-                &params,
-                &bare,
-                &table,
-            ),
-            CitationVerdict::KernelStatementMatchCertified
-        ) {
+        let verdict = trust_certify::clean_island::kernel_discharge_ensures_citation(
+            &env,
+            theorem.as_str(),
+            &clause_text,
+            &params,
+            &bare,
+            &table,
+        );
+        if !matches!(verdict, CitationVerdict::KernelStatementMatchCertified) {
             if std::env::var_os("TRUST_E9_DEBUG").is_some() {
                 eprintln!(
-                    "TRUST_E9_DEBUG NOT-CERTIFIED fn={} clause={clause_text:?} thm={theorem}",
+                    "TRUST_E9_DEBUG NOT-CERTIFIED fn={} clause={clause_text:?} thm={theorem} \
+                     verdict={verdict:?}",
                     func.def_path
+                );
+            }
+            // Trust (item 10 phase 2): an UNREGISTERED theorem name, in a crate
+            // that carries a deferred island suffix, is a scheduling fact rather
+            // than a verdict — those declarations are kernel-checked only after
+            // the program mint, so the name legitimately cannot resolve yet.
+            // Quarantine the body for post-walk adjudication against the
+            // complete environment. Every OTHER verdict — statement drift,
+            // out-of-fragment clause, unsafe/partial theorem, taint — keeps its
+            // existing fail-closed decline: deferral is available only for the
+            // one cause it actually explains, so it can never become a way to
+            // retry a citation the kernel already refused.
+            if matches!(verdict, CitationVerdict::TheoremNotFound) {
+                record_pending_import_citation(
+                    tcx,
+                    local,
+                    func,
+                    &cited,
+                    &postcondition_indices,
                 );
             }
             return Vec::new();
@@ -15670,6 +18627,322 @@ fn discharge_ensures_citations_in_walk<'tcx>(
         );
     }
     discharged
+}
+
+/// Record a body whose ensures-citation must be adjudicated after the walk.
+/// See [`SessionPendingImportCitations`] for why post-walk is the only sound
+/// placement.
+///
+/// No-op unless the crate actually carries a deferred island suffix: without one
+/// there is nothing that could later register the name, so the citation is
+/// simply absent and `trust_check_citations` reports it as the hard error it is.
+/// Recording is idempotent per body — the discharge lane can run more than once
+/// for one body, and a repeat must not clobber artifacts `run_pass` already
+/// attached.
+fn record_pending_import_citation(
+    tcx: TyCtxt<'_>,
+    local: LocalDefId,
+    func: &trust_types::VerifiableFunction,
+    cited: &[(rustc_span::Span, rustc_span::Symbol)],
+    postcondition_indices: &[usize],
+) {
+    let record = PendingImportCitation {
+        func_path: trust_mir_extract::safe_def_path_str(tcx, local.to_def_id()),
+        func: func.clone(),
+        cited: cited.to_vec(),
+        postcondition_indices: postcondition_indices.to_vec(),
+        // Conservative default: the in-walk stamp below supplies the real
+        // premise. Absent it, the post-walk lane declines the subsumption
+        // derivation rather than assuming a bundle it never observed.
+        native_bundle_built: false,
+        artifacts: None,
+    };
+    tcx.sess.with_trust_compiler_state::<SessionPendingImportCitations, _>(|state| {
+        if !state.crate_has_deferred_islands {
+            return;
+        }
+        state.bodies.entry(local).or_insert(record);
+    });
+}
+
+/// Stamp the panic-freedom subsumption premise onto a quarantined body, from the
+/// one place the native bundle is in scope. No-op for every ordinary body.
+fn note_pending_import_citation_native_bundle(
+    tcx: TyCtxt<'_>,
+    body: &Body<'_>,
+    native_bundle_built: bool,
+) {
+    let Some(local) = body.source.def_id().as_local() else { return };
+    tcx.sess.with_trust_compiler_state::<SessionPendingImportCitations, _>(|state| {
+        if let Some(pending) = state.bodies.get_mut(&local) {
+            pending.native_bundle_built = native_bundle_built;
+        }
+    });
+}
+
+/// Trust (two-language design item 10, phase 2): adjudicate every quarantined
+/// ensures-citation against the COMPLETE crate environment, then publish each
+/// affected body's single verification outcome.
+///
+/// Called from `trust_ensure_whole_crate_verification` after
+/// `trust_mint_program_admissions` and after the deferred island suffix has been
+/// kernel-checked in authored order — i.e. exactly where the AUTHORITATIVE
+/// whole-crate check runs. That placement is the whole design: it supplies
+/// context, environment, facet, admission and inventory parity BY CONSTRUCTION,
+/// which is what two in-walk attempts could not do at any level of care (the walk
+/// holds a partial admission inventory; see [`SessionPendingImportCitations`]).
+///
+/// The criterion is the in-walk criterion, unchanged and unweakened:
+/// `kernel_discharge_ensures_citation` must return
+/// `KernelStatementMatchCertified` for EVERY ensures clause of the function (the
+/// conjunction rule), and no row a solver refuted or timed out is ever touched.
+/// A citation that still does not discharge leaves the body's rows exactly as the
+/// walk computed them, so the honest unproved verdict and its strict abort are
+/// published here rather than lost.
+#[allow(rustc::potential_query_instability)]
+fn finalize_pending_import_citations(
+    tcx: TyCtxt<'_>,
+    clean_session: &trust_certify::clean_island::CleanIslandSession,
+) {
+    let mut pending: Vec<(LocalDefId, PendingImportCitation)> = tcx
+        .sess
+        .with_trust_compiler_state::<SessionPendingImportCitations, _>(|state| {
+            state.bodies.drain().collect()
+        });
+    if pending.is_empty() {
+        return;
+    }
+    // Deterministic diagnostic order, independent of hash iteration order.
+    pending.sort_by_key(|(local, _)| {
+        let span = tcx.def_span(*local);
+        (span.lo(), span.hi())
+    });
+    let policy = TrustVerifyPolicy::from_session(tcx.sess);
+    // The authoritative environment: island declarations INCLUDING the deferred
+    // suffix, plus every program admission minted from the complete facet table.
+    // `environment()` is `None` on a tainted session, so a crate whose island
+    // suffix was rejected discharges nothing — the same fail-closed policy every
+    // other island consumer applies, and the reason the rejected-island case
+    // still publishes an honest unproved verdict below.
+    let env = clean_session.environment().cloned();
+    let table =
+        tcx.sess.with_trust_compiler_state::<SessionFnFacets, _>(|state| state.composed_table());
+    for (local, record) in pending {
+        let Some(provisional) = record.artifacts.clone() else {
+            // The walk recorded a pending citation but never reached publication
+            // for this body (a skip or abort lane returned first). Nothing was
+            // withheld, so there is nothing to publish.
+            continue;
+        };
+        let mut artifacts = (*provisional).clone();
+        let discharged = match env.as_ref() {
+            Some(env) => discharge_pending_import_citation(
+                tcx,
+                local,
+                &record,
+                env,
+                &table,
+                &mut artifacts,
+            ),
+            None => Vec::new(),
+        };
+        if !discharged.is_empty() {
+            // Rebuild exactly the derived views the in-walk pipeline builds after
+            // its own citation lane, in the same order, from the same inputs.
+            for (index, theorem) in &discharged {
+                if let Some(row) =
+                    exact_result_row_identity(*index, &artifacts.results[*index].0)
+                {
+                    artifacts.proof_authorities[*index] =
+                        Some(ResultProofAuthority::EnsuresCitationDischarge {
+                            row,
+                            theorem: theorem.clone(),
+                        });
+                    if std::env::var_os("TRUST_E9_DEBUG").is_some() {
+                        eprintln!("TRUST_E9_DEBUG AUTHORITY-INSTALLED-POST-WALK index={index}");
+                    }
+                }
+            }
+            // LAST in the authority phase in-walk, and last here: it consumes
+            // every other row's FINAL authority as a premise. Re-running it after
+            // the citation authority exists is what keeps a deferred-theorem body
+            // from earning LESS credit than an identical body citing an ordinary
+            // island. Monotone by construction — it bails on any Failed/Timeout
+            // row and never overwrites an existing authority.
+            apply_whole_function_panic_freedom_subsumption(
+                tcx.sess,
+                record.native_bundle_built,
+                &mut artifacts.results,
+                &artifacts.result_bindings,
+                &mut artifacts.proof_authorities,
+            );
+            let cleancic = certify_all(&artifacts.results, None);
+            artifacts.proof_results = build_proof_results(
+                tcx.sess,
+                &artifacts.results,
+                &[],
+                &artifacts.result_bindings,
+                &artifacts.proof_authorities,
+                Some(&record.func),
+            );
+            artifacts.telemetry = build_proof_telemetry(
+                tcx.sess,
+                &artifacts.results,
+                &artifacts.result_bindings,
+                &artifacts.proof_authorities,
+            );
+            artifacts.transport_results = build_transport_results_bound(
+                tcx.sess,
+                &artifacts.results,
+                artifacts.full_verification.as_ref(),
+                &cleancic,
+                &artifacts.result_bindings,
+                &artifacts.proof_authorities,
+            );
+        }
+        // `optimized_mir` is already computed for every eligible body by the eager
+        // walk, so this is a cache read, not a second verification.
+        //
+        // The body read here differs from the one `run_pass` publishes against in
+        // exactly one way: `inject_certified_test_monitors` has already run on it.
+        // Both body-derived predicates inside `publish_body_verification_outcome`
+        // are insensitive to that — `body_has_coroutine_protocol_assert` looks for
+        // `ResumedAfter*` assert terminators, and `function_uses_unsafe` reads the
+        // SOURCE def plus inlined source scopes, neither of which monitor
+        // injection creates. A change that makes either predicate depend on
+        // injected calls must capture them in-walk instead.
+        let body = tcx.optimized_mir(local.to_def_id());
+        publish_body_verification_outcome(
+            tcx,
+            body,
+            &record.func_path,
+            &Arc::new(artifacts),
+            &policy,
+        );
+    }
+}
+
+/// Re-adjudicate one quarantined body's citations against the complete
+/// environment and rewrite the rows it proves. Returns the `(row index,
+/// theorem)` pairs discharged, empty if ANY clause fails to Certified-grade.
+///
+/// Every in-walk gate is re-applied rather than trusted from the provisional
+/// record: the eligible-entry check (never override a refutation or timeout), the
+/// by-value prime collapse restricted to provably-immutable bindings, and the
+/// conjunction rule over all cited clauses.
+fn discharge_pending_import_citation(
+    tcx: TyCtxt<'_>,
+    local: LocalDefId,
+    record: &PendingImportCitation,
+    env: &trust_certify::clean_island::KernelEnvironment,
+    table: &trust_spec_elab::FacetTable,
+    artifacts: &mut VerificationArtifacts,
+) -> Vec<(usize, String)> {
+    use trust_certify::clean_island::CitationVerdict;
+    if record.cited.is_empty() || record.postcondition_indices.is_empty() {
+        return Vec::new();
+    }
+    for &index in &record.postcondition_indices {
+        // The provisional artifacts are the walk's, so the row set is the same
+        // one the indices were computed against; re-check the bound and the
+        // eligibility anyway. A Failed/Refuted or Timeout entry is NEVER
+        // overridden — a kernel "proof" against a refuted VC means the elaborated
+        // goal diverged from the VC and must stay fatal.
+        let Some((_, result)) = artifacts.results.get(index) else {
+            return Vec::new();
+        };
+        if !matches!(
+            result,
+            VerificationResult::Unknown { .. } | VerificationResult::Proved { .. }
+        ) {
+            return Vec::new();
+        }
+    }
+    if artifacts.results.len() != artifacts.proof_authorities.len() {
+        return Vec::new();
+    }
+    let bare =
+        record.func.def_path.rsplit("::").next().unwrap_or(&record.func.def_path).to_string();
+    let params_typed = trust_fn_param_type_names(tcx, local);
+    let params: Vec<(&str, &str)> = params_typed
+        .iter()
+        .filter(|(n, _)| n != "result")
+        .map(|(n, t)| (n.as_str(), t.as_str()))
+        .collect();
+    let collapsible = trust_fn_collapsible_by_value_params(tcx, local);
+    let mut theorems = Vec::new();
+    for (clause_span, theorem) in &record.cited {
+        let Ok(mut clause_text) = tcx.sess.source_map().span_to_snippet(*clause_span) else {
+            return Vec::new();
+        };
+        for (pname, _) in &params {
+            if collapsible.contains(*pname) {
+                clause_text = rewrite_by_value_prime(&clause_text, pname);
+            }
+        }
+        let verdict = trust_certify::clean_island::kernel_discharge_ensures_citation(
+            env,
+            theorem.as_str(),
+            &clause_text,
+            &params,
+            &bare,
+            table,
+        );
+        if !matches!(verdict, CitationVerdict::KernelStatementMatchCertified) {
+            if std::env::var_os("TRUST_E9_DEBUG").is_some() {
+                eprintln!(
+                    "TRUST_E9_DEBUG POST-WALK-NOT-CERTIFIED fn={} clause={clause_text:?} \
+                     thm={theorem} verdict={verdict:?}",
+                    record.func.def_path
+                );
+            }
+            return Vec::new();
+        }
+        theorems.push(theorem.to_string());
+    }
+    let theorem_list = theorems.join("+");
+    let mut discharged = Vec::new();
+    for &index in &record.postcondition_indices {
+        artifacts.results[index].1 = VerificationResult::Proved {
+            solver: trust_types::Symbol::intern("clean-kernel-citation"),
+            time_ms: 0,
+            strength: trust_types::ProofStrength::smt_unsat_certified(),
+            proof_certificate: None,
+            solver_warnings: None,
+            native_proof_envelope: None,
+        };
+        discharged.push((index, theorem_list.clone()));
+    }
+    if std::env::var_os("TRUST_E9_DEBUG").is_some() {
+        eprintln!(
+            "TRUST_E9_DEBUG POST-WALK-DISCHARGED fn={} indices={:?}",
+            record.func.def_path, record.postcondition_indices
+        );
+    }
+    discharged
+}
+
+/// Attach this body's provisional artifacts to its pending-citation record and
+/// report whether publication must be withheld. Returns `false` for every
+/// ordinary body, so the non-deferred path is byte-identical to before.
+fn quarantine_pending_import_citation_body(
+    tcx: TyCtxt<'_>,
+    body: &Body<'_>,
+    artifacts: &Arc<VerificationArtifacts>,
+) -> bool {
+    if body.source.promoted.is_some() {
+        return false;
+    }
+    let Some(local) = body.source.def_id().as_local() else { return false };
+    tcx.sess.with_trust_compiler_state::<SessionPendingImportCitations, _>(|state| {
+        match state.bodies.get_mut(&local) {
+            Some(pending) => {
+                pending.artifacts = Some(Arc::clone(artifacts));
+                true
+            }
+            None => false,
+        }
+    })
 }
 
 /// R4 §1 typed-citation discharge (the composed lane; design note
@@ -16100,6 +19373,7 @@ fn collect_full_verification_artifacts_once<'tcx>(
             native_trust_ir_bundle.as_ref(),
             &body_bound_carriers,
             &context,
+            vc_timeout_ms(tcx.sess),
         ),
         Err(reason) => LiveFullVerificationDispatch {
             result: native_trust_ir_bundle_build_failure_result(
@@ -16221,9 +19495,13 @@ fn collect_full_verification_artifacts_once<'tcx>(
     // undocumented-unsafe call into a false PROVE (`undocumented_unsafe_sig_call`
     // surviving mutant). Force it Failed structurally, exactly as
     // `refute_forced_unbounded_allocations` locks the OOM route to the structural
-    // verdict. Fail-closed: fires ONLY on a ground `Bool(true)` Assertion violation
-    // (a panic-freedom or discharged Assertion carries `Bool(false)`/a real
-    // formula and is untouched), so it can only ADD a refutation, never remove one.
+    // verdict. Fail-closed: a `Proved` verdict is overridden ONLY for a ground
+    // `Bool(_)` violation — `Bool(true)` because it is unprovable by construction,
+    // `Bool(false)` because a proof of the reconstruction placeholder is vacuous
+    // (see the pass doc for why the two classes carry different labels); a
+    // discharged unsafe obligation carrying a REAL formula — the sep-engine
+    // null / in-bounds / alignment / `[unsafe:sep:backing]` ESTABLISH lanes —
+    // keeps its proof, so this only ADDS refutations.
     refute_unsafe_demand_findings(&mut results);
     // Trust #540 (R1): apply whole-program caller-propagation verdict flips on the FULL
     // strict path too — same sound helper as the boundary-policy seam, EXTENDED with the
@@ -16416,6 +19694,16 @@ fn collect_full_verification_artifacts_once<'tcx>(
     // unless EVERY ensures clause of the function Certified-grades).
     let mut discharged_citations =
         discharge_ensures_citations_in_walk(tcx, body, func, &mut results);
+    // Trust (item 10 phase 2): if the lane above quarantined this body for
+    // post-walk adjudication, hand it the panic-freedom subsumption premise from
+    // here, where the native bundle is in scope. The post-walk lane must be able
+    // to reach the verdict THIS pipeline would have reached; it cannot infer the
+    // premise from the artifacts alone. No-op for every ordinary body.
+    note_pending_import_citation_native_bundle(
+        tcx,
+        body,
+        native_trust_ir_bundle.as_ref().is_ok_and(|bundle| bundle.is_some()),
+    );
     // R4 §1: the composed defeq lane runs only when the cited lane owned
     // nothing (all-uncited surface); mixed surfaces discharge nothing.
     if discharged_citations.is_empty() {
@@ -16779,6 +20067,7 @@ fn append_bridge_lane_full_verification_evidence_unchecked(
             obligation_id: obligation.obligation_id.clone(),
             engine: full_result.engine.clone(),
             status: trust_verifier_api::EvidenceStatus::Proved,
+            decline: None,
             proof_strength: Some(trust_verifier_api::ProofStrength::smt_unsat()),
             artifacts,
             counterexample: None,
@@ -16977,6 +20266,21 @@ fn stamp_clause_monitor_metadata(
             "Clean kernel certified monitor=true iff proposition under the strict rooted certification audit (canonical foundations only; no trust markers)"
                 .to_string(),
         ),
+        ClauseMonitorEvidence::MonitorCertified(_) => (
+            "unmonitored",
+            "Clean kernel certified the Boolean evaluator, but exact MIR binding and placement were not authenticated for this body"
+                .to_string(),
+        ),
+        ClauseMonitorEvidence::Measured(_) => (
+            "measured",
+            "Clean kernel certified the scalar evaluator against the exact E5 measure and the compiler authenticated its exact MIR transition placement; monitor-enabled test artifacts check strict descent there (runtime evidence, not static proof)"
+                .to_string(),
+        ),
+        ClauseMonitorEvidence::MeasureCertified(_) => (
+            "unmonitored",
+            "Clean kernel certified the scalar evaluator, but exact MIR transition placement was not authenticated for this body"
+                .to_string(),
+        ),
         ClauseMonitorEvidence::Unmonitored { reason } => {
             ("unmonitored", bounded_monitor_reason(reason))
         }
@@ -17131,7 +20435,13 @@ fn monitor_record_matches_public_contract(
                 TRUST_CONTRACT_TYPED_PROPOSITION_DIGEST_METADATA_KEY,
             ) == Some(expected)
         }
-        None => !matches!(&record.evidence, ClauseMonitorEvidence::Monitored(_)),
+        None => !matches!(
+            &record.evidence,
+            ClauseMonitorEvidence::MonitorCertified(_)
+                | ClauseMonitorEvidence::Monitored(_)
+                | ClauseMonitorEvidence::MeasureCertified(_)
+                | ClauseMonitorEvidence::Measured(_)
+        ),
     };
     typed_proposition_matches
         && exactly_one_metadata_value(&contract.metadata, "trust.contract.kind") == Some(kind_label)
@@ -17175,7 +20485,8 @@ fn unsupported_contract_marker_matches_monitor_record(
     if !matches!(
         &obligation.kind,
         trust_verifier_api::ObligationKind::Custom { namespace, name }
-            if namespace == "trust.contract" && name == "unsupported"
+            if namespace == trust_verifier_api::TRUST_CONTRACT_OBLIGATION_NAMESPACE
+                && name == "unsupported"
     ) {
         return false;
     }
@@ -17999,11 +21310,22 @@ fn verify_full_bundle_with_body_bound_receipts(
     native_bundle: Option<&trust_ir_bridge::NativeVerificationBundle>,
     body_bound_carriers: &[CompilerFinalizedBodyBoundCarrier],
     context: &trust_router::VerifierExecutionContext,
+    per_obligation_timeout_ms: u64,
 ) -> LiveFullVerificationDispatch {
     // The mint boundary owns the production engine set. In particular, no
     // caller can inject a trust-wp-named fake engine and obtain a private live
     // receipt from its otherwise well-shaped composite evidence.
-    let engine = trust_router::FullVerificationEngine::with_required_native_engines();
+    //
+    // Build at the session's configured `-Z trust-verify-timeout-ms` rather than
+    // the engine's session-less default: the native trust-mc engine used to
+    // hardcode a mirror of that default, so raising the flag bought no extra
+    // budget here and hard-but-provable obligations kept reporting
+    // Unknown/Timeout no matter what the user asked for. SOUND: the budget
+    // bounds only how long a sound solver lane may run; a larger budget can turn
+    // Unknown into a definite verdict, never an unproved obligation into a proof.
+    let engine = trust_router::FullVerificationEngine::with_required_native_engines_timeout_ms(
+        per_obligation_timeout_ms,
+    );
     // The ordinary entry points deliberately discard all affine sidecars.
     // Always use the optional-native live API, including when no native bundle
     // exists: the dedicated direct TrustVC lane is precisely the no-native-
@@ -20624,7 +23946,9 @@ fn publish_native_bundle_dump(
 /// `trust_mir_mutually_recursive_functions` query, so this hot path never rescans or retains
 /// full MIR snapshots. A direct self edge is excluded by that query; the exact
 /// in-progress check still prevents re-entering the currently optimizing body.
-fn optimized_mir_query_would_cycle(tcx: TyCtxt<'_>, callee: DefId) -> bool {
+// Trust: pub(crate) for `trust_r1_oracle`'s coroutine-body recovery, which reads
+// `optimized_mir` (the steal consumer) and must not re-enter an in-flight computation.
+pub(crate) fn optimized_mir_query_would_cycle(tcx: TyCtxt<'_>, callee: DefId) -> bool {
     OPTIMIZED_MIR_VERIFY_IN_PROGRESS.with(|s| {
         let in_progress = s.borrow();
         in_progress.contains(&callee)
@@ -20962,6 +24286,18 @@ pub(crate) fn trust_mir_direct_local_callees<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
 ) -> &'tcx [LocalDefId] {
+    // Trust: this borrow is unguarded BY CONSTRUCTION, and must stay that way. Its only caller is
+    // the SCC builder below, whose node set now excludes every body without an `optimized_mir`
+    // (i.e. `hir_body_const_context` outside `None | Some(ConstFn)`) — see the filter there. A
+    // `#[rustc_comptime]` fn, whose elaborated MIR `inner_mir_for_ctfe` steals, is therefore never
+    // passed to this query and the `Steal` cannot have been consumed.
+    //
+    // Do NOT "harden" this with `is_stolen()`. That call is documented as unusable inside rustc
+    // (`rustc_data_structures/src/steal.rs`: "leaks information not tracked by the query system,
+    // breaking incremental compilation") and this query is `cache_on_disk`, so it would make the
+    // cached result depend on query order. And its natural fallback — an empty adjacency — is
+    // anti-conservative here, because singleton components are discarded and `[]` therefore reads
+    // as "known leaf" rather than "unknown". Exclude the node instead.
     let elaborated = tcx.mir_drops_elaborated_and_const_checked(def_id);
     let mut callees: Vec<LocalDefId> = {
         let body = elaborated.borrow();
@@ -20990,6 +24326,34 @@ pub(crate) fn trust_mir_mutually_recursive_functions<'tcx>(
         .copied()
         .filter(|&def_id| {
             matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn | DefKind::Closure)
+                // Trust: a body with no `optimized_mir` cannot participate in an
+                // `optimized_mir` query cycle, so it is not an SCC node. This excludes
+                // `#[rustc_comptime]` fns, whose constness is `Const { always: true }` and which
+                // therefore map to `ConstContext::Const` (`hir_body_const_context`,
+                // `rustc_middle/src/hir/map.rs:346-365`) — so `inner_mir_for_ctfe` STEALS their
+                // elaborated MIR rather than cloning it, as an ordinary `const fn` would.
+                // `check_crate` eagerly evaluates non-generic const items before the whole-crate
+                // verification walk runs, so by the time this graph is built the steal has already
+                // happened and reading such a body would hard-ICE.
+                //
+                // Filtering here rather than guarding the borrow is deliberate. `Steal::is_stolen`
+                // documents that it "should not be used within rustc as it leaks information not
+                // tracked by the query system, breaking incremental compilation", and it carries
+                // `#[rustc_lint_untracked_query_information]`. Both this adjacency provider and the
+                // aggregate SCC query are `cache_on_disk`, so an `is_stolen()` branch would let
+                // their cached output depend on query ORDER rather than on tracked inputs.
+                // `hir_body_const_context` is a tracked query and has no such hazard.
+                //
+                // Equally important: an empty adjacency would be the WRONG fallback even setting
+                // that aside. Singleton components are discarded below, so dropping a node's edges
+                // SHRINKS the mutually-recursive set — `[]` reads as "known leaf", not "unknown".
+                // That is anti-conservative: it suppresses the pre-steal snapshot taken only for
+                // SCC members, makes `optimized_mir_query_would_cycle` answer false, and lets
+                // sealed-dispatch analysis proceed where it would otherwise refuse.
+                && matches!(
+                    tcx.hir_body_const_context(def_id),
+                    None | Some(rustc_hir::ConstContext::ConstFn)
+                )
         })
         .collect();
     nodes.sort_unstable_by_key(|def_id| def_id.local_def_index.as_u32());
@@ -22238,7 +25602,7 @@ fn native_trust_ir_route_for_api_obligation(
             Some(("trust-mc", trust_ir::ObligationKind::TranslationValidation))
         }
         trust_verifier_api::ObligationKind::Custom { namespace, .. }
-            if namespace == "trust.vc.hardened" =>
+            if namespace == trust_verifier_api::TRUST_VC_HARDENED_OBLIGATION_NAMESPACE =>
         {
             Some(("trust-mc", trust_ir::ObligationKind::TranslationValidation))
         }
@@ -22503,10 +25867,57 @@ fn trust_mc_typed_chc_contract_for_native_trust_ir_obligation(
         obligation,
         unsupported_reason.is_none(),
     );
-    let (relations, rules) = if routed_to_structural_chc {
-        trust_mc_default_function_chc_from_trust_ir(native_trust_ir_bundle, request)?
+    // Trust (data-flow CFG-CHC, ENV-GATED / WIP — `TRUST_MC_DATAFLOW_CHC`):
+    // redirect per-statement ARITHMETIC-safety obligations to the enriched
+    // whole-function CFG-CHC in `ArithmeticSafetyOnly` mode. Proving the
+    // function's overflow CHC error-unreachable SOUNDLY discharges the specific
+    // overflow obligation (proving-more is sound; PDR-unknown stays unproved →
+    // never a false SAFE). Gated to LOOPY functions (a CFG back-edge), so a
+    // straight-line safety obligation keeps its single-formula path and cannot
+    // regress to UNKNOWN on an unrelated overflow. Bounds-check obligations are
+    // NOT redirected — the CHC has no bounds violation edge, so they stay on the
+    // single-formula path. The encoder's own coverage gate
+    // (`function_overflow_surface_fully_modeled`) fails closed to `Ok(None)` when
+    // the overflow surface is not fully modeled, so a redirected obligation can
+    // only be PROVED when its overflow is genuinely captured.
+    //
+    // The env gate defaults OFF, so with no opt-in this whole block is inert and
+    // the emitted CHC is byte-identical to the structural encoding above.
+    let redirect_safety_to_dataflow = trust_mc_dataflow_chc_enabled()
+        && matches!(obligation.kind, trust_verifier_api::ObligationKind::ArithmeticSafety)
+        && native_trust_ir_bundle
+            .module
+            .function_by_id(request.function)
+            .is_some_and(function_has_back_edge);
+    // Structural mode preserves the whole-function structural encoding's error
+    // edges; ArithmeticSafetyOnly is used only for a redirected arithmetic
+    // obligation.
+    let error_mode = if routed_to_structural_chc {
+        ChcErrorMode::Structural
     } else {
-        (
+        ChcErrorMode::ArithmeticSafetyOnly
+    };
+    // The enriched whole-function CFG-CHC backs the structurally-routed
+    // obligations OR a loop-carried arithmetic obligation.
+    let dataflow_eligible =
+        (trust_mc_dataflow_chc_enabled() && routed_to_structural_chc) || redirect_safety_to_dataflow;
+    let enriched = if dataflow_eligible {
+        trust_mc_dataflow_function_chc_from_trust_ir(native_trust_ir_bundle, request, error_mode)?
+    } else {
+        None
+    };
+    // True iff we used the enriched CHC but NOT via the standard structural path
+    // — i.e. we redirected an arithmetic-safety obligation. Used below to suppress
+    // the single-formula "unsupported" placeholder marking (we now have a real CHC).
+    let redirected_to_dataflow = enriched.is_some() && !routed_to_structural_chc;
+    let (relations, rules, enriched_vars) = match enriched {
+        Some((relations, rules, vars)) => (relations, rules, Some(vars)),
+        None if routed_to_structural_chc => {
+            let (relations, rules) =
+                trust_mc_default_function_chc_from_trust_ir(native_trust_ir_bundle, request)?;
+            (relations, rules, None)
+        }
+        None => (
             serde_json::json!([
                 { "name": "error" }
             ]),
@@ -22518,7 +25929,8 @@ fn trust_mc_typed_chc_contract_for_native_trust_ir_obligation(
                     },
                 }
             ]),
-        )
+            None,
+        ),
     };
     let mut value = serde_json::json!({
         "schema_version": TRUST_MC_TYPED_CHC_OBLIGATION_SCHEMA,
@@ -22526,7 +25938,7 @@ fn trust_mc_typed_chc_contract_for_native_trust_ir_obligation(
         "origin": "mir_derived",
         "function_name": function_name,
         "query": { "target": "error" },
-        "vars": chc_constraint.vars,
+        "vars": enriched_vars.unwrap_or_else(|| chc_constraint.vars.clone()),
         "relations": relations,
         "rules": rules,
         "native_metadata": trust_mc_native_typed_chc_metadata_json(
@@ -22541,8 +25953,13 @@ fn trust_mc_typed_chc_contract_for_native_trust_ir_obligation(
     // structural whole-CFG reachability CHC (see `trust_mc_routes_to_structural_
     // default_function_chc`); its `value` carries a genuine proof input, so
     // stamping it unsupported would make the transport wrongly refuse the real
-    // reachability proof and leave it runtime-checked forever.
-    if let Some(reason) = unsupported_reason.as_ref().filter(|_| !routed_to_structural_chc) {
+    // reachability proof and leave it runtime-checked forever. The same holds for
+    // an arithmetic-safety obligation REDIRECTED to the env-gated data-flow CHC:
+    // it too now carries a genuine MIR-derived proof input, not a placeholder.
+    if let Some(reason) = unsupported_reason
+        .as_ref()
+        .filter(|_| !routed_to_structural_chc && !redirected_to_dataflow)
+    {
         if let serde_json::Value::Object(object) = &mut value {
             object.insert("origin".to_string(), serde_json::json!("router_placeholder"));
             object.insert(
@@ -22838,6 +26255,987 @@ fn trust_mc_default_instruction_requires_fail_closed_admission(
                 if instruction.results.len() != 1
                     || !trust_ir::dialect::trust_rust::is_thread_local_addr(op)
         )
+}
+
+// ---------------------------------------------------------------------------
+// Trust (data-flow CFG-CHC encoder — ENV-GATED, WIP): data-flow enrichment of
+// the structural CFG-CHC safety encoder above.
+//
+// The default encoder above emits a PURELY STRUCTURAL forward-reachability CHC:
+// nullary block relations, an unconstrained entry fact, nullary transitions
+// (branch conditions dropped), and per-block `error` edges. It is a total-havoc
+// over-approximation — sound, but too weak to discharge loop-carried arithmetic.
+//
+// This enriched encoder threads SSA data flow into the SAME reachability CHC so
+// PDR/Spacer can synthesize the invariants (e.g. `off <= len`) needed to prove
+// `error` unreachable (= SAFE). It models:
+//   * block relations parameterized by their integer/bool params (`arg_sorts`),
+//   * the entry fact with those params left FREE (full input havoc),
+//   * a straight-line fold of `BinOp{Add,Sub,Mul}` / `Const::Int` / `Copy` /
+//     `ICmp` / `Overflow` into Bool-sorted equality constraints,
+//   * EVERY terminator kind the structural encoder handles, so a function is
+//     enriched whenever the structural encoder would accept it: `Br` / `CondBr` /
+//     `Switch` / `Invoke` transitions that THREAD block args and carry the block
+//     fold (plus, for `CondBr`, the branch guard `cond` / `¬cond`); `Return` /
+//     `CoroSuspend` / `Resume` as no-successor terminators; and `Unreachable` —
+//     the checked-arithmetic panic sink — as a REACHABLE `error` edge (the
+//     obligation discharger: the enriched incoming guard lets PDR prove that edge
+//     dead). Call return values (`Invoke` results, `Call`/unmodeled body insts)
+//     are HAVOC'd — declared where used, never constrained (sound),
+//   * every structural `error` edge preserved verbatim (with canonical args).
+//
+// GATING. The whole lane is opt-in via `TRUST_MC_DATAFLOW_CHC` and defaults OFF,
+// so the shipped default corpus is byte-identical to the structural encoder
+// unless a caller explicitly asks for enrichment. This is deliberate: the
+// encoder is WIP and low-yield; do not enable it without validation.
+//
+// Soundness discipline (this is a reachability proof — `error` unreachable ⇒
+// SAFE, so we must OVER-approximate the reachable set and never emit a false
+// SAFE):
+//   * Only emit a transition constraint ENTAILED by the real semantics; havoc
+//     (emit nothing) is always sound. Entry params stay free.
+//   * Integers are modeled as mathematical `int` (not `bit_vec`) so LIA
+//     invariants synthesize; a value's var carries its NON-NEGATIVE magnitude
+//     for unsigned types, under which unsigned compares equal integer compares
+//     on all real states.
+//   * The `Overflow` bit is modeled per width: signed `i8..i64` as
+//     `sum ∉ [MIN,MAX]`; UNSIGNED `u8..u64` as `sum > 2^W-1` (add/mul) or
+//     `sum < 0` (sub). 128-bit is NOT modeled (its wrap point exceeds `i128`),
+//     and neither are the POINTER-WIDTH `Isize`/`Usize` (trust-ir v25 carries
+//     them faithfully, so their wrap point is TARGET-dependent and a fixed
+//     64-bit bound could MISS a real 32-bit overflow) — all of them are havoced
+//     and gated out.
+//   * UNSIGNED >= 0 DISCIPLINE (false-proof-critical): the unsigned `> 2^W-1`
+//     test is faithful in `int` only if every unsigned operand carries its type
+//     invariant `v >= 0` (a modeled-negative unsigned var could make an overflow
+//     test spuriously false and MISS a real overflow). We emit `0 <= v <= 2^W-1`
+//     for every FREE unsigned var — the entry (function-parameter) block's
+//     params — where it removes only NON-REAL model states (SOUND). We do NOT
+//     attach it to a fold-defined value (e.g. an unsigned subtraction result):
+//     conjoining `>= 0` with its defining equality would exclude REAL wrap
+//     states. Fold-defined values inherit non-negativity from their operands
+//     (sum of non-negatives is non-negative); a genuinely-wrapping unsigned sub
+//     feeding an overflow is the one residual gap (checked-mode subs are
+//     `SubOverflow` with their own edge). Signed vars get NO `>= 0` (they can be
+//     negative).
+//   * ANY uncertainty (a missing terminator, an SSA edge arity mismatch, or a
+//     future/unknown terminator kind) → `Ok(None)`, i.e. fall back to the
+//     untouched structural encoder. Purely additive.
+// ---------------------------------------------------------------------------
+
+/// Runtime gate for the data-flow-enriched CFG-CHC encoder. Reads the
+/// `TRUST_MC_DATAFLOW_CHC` environment variable (present ⇒ enabled) so the
+/// frozen driver can toggle enrichment without a recompile. Defaults OFF, which
+/// is what keeps the default verification lane byte-identical to the structural
+/// encoder.
+fn trust_mc_dataflow_chc_enabled() -> bool {
+    std::env::var_os("TRUST_MC_DATAFLOW_CHC").is_some()
+}
+
+/// Debug gate: when `TRUST_MC_DATAFLOW_CHC_DEBUG` is set, the enriched encoder
+/// prints one `[DATAFLOW-FIRED]` / `[DATAFLOW-FALLBACK]` line per function so a
+/// rebuild can confirm at runtime whether enrichment actually engaged.
+fn trust_mc_dataflow_chc_debug_enabled() -> bool {
+    std::env::var_os("TRUST_MC_DATAFLOW_CHC_DEBUG").is_some()
+}
+
+/// Which family of `error` edges the enriched CHC emits. Relations and
+/// transitions are identical across modes; ONLY the `error` edges differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChcErrorMode {
+    /// Whole-function structural reachability — the default_function encoding:
+    /// `Unreachable`→error, fail-closed-admission→error, and the `reachable:false`
+    /// placeholder. Preserves the exact byte-shape the default obligations use.
+    Structural,
+    /// Only DIRECT arithmetic-overflow violations reach `error` — for a redirected
+    /// arithmetic-safety obligation. Per modeled `Overflow` we emit
+    /// `error :- bbB(args), fold, (lhs op rhs is out of range)`; NO structural
+    /// edges are emitted (`Unreachable` / `Return` / calls / closures become pure
+    /// havoc'd sinks with no `error` edge). Proving `error` unreachable then proves
+    /// EXACTLY "no modeled arithmetic overflow occurs" — what the obligation
+    /// asserts — undisturbed by unrelated panics / absent callees / closures.
+    /// SOUND: dropping the other structural edges is dropping OTHER obligations'
+    /// error routes (each proved separately); we never drop an overflow edge, and
+    /// an over-approximated reachable set with a faithful violation edge cannot
+    /// miss a real overflow.
+    ArithmeticSafetyOnly,
+}
+
+/// Successor block ids of a block (empty for a return-like / divergent / missing
+/// terminator). Shared by the loop detector and any CFG walk.
+fn chc_block_successors(block: &trust_ir::Block) -> Vec<trust_ir::BlockId> {
+    let Some(terminator) = block.terminator() else {
+        return Vec::new();
+    };
+    match &terminator.inst {
+        trust_ir::Inst::Br { target, .. } => vec![*target],
+        trust_ir::Inst::CondBr { then_target, else_target, .. } => {
+            vec![*then_target, *else_target]
+        }
+        trust_ir::Inst::Switch { default, cases, .. } => {
+            let mut successors = vec![*default];
+            successors.extend(cases.iter().map(|case| case.target));
+            successors
+        }
+        trust_ir::Inst::Invoke { normal_dest, unwind_dest, .. } => {
+            vec![*normal_dest, *unwind_dest]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Whether the function's CFG contains a back-edge (a loop), via textbook
+/// 3-colour DFS (white/gray/black): an edge into a gray (on-path) node is a
+/// back-edge. Used to gate the safety-obligation redirect below so only
+/// loop-carried arithmetic is routed to the whole-function CFG-CHC — a
+/// straight-line safety obligation keeps its single-formula proof path.
+///
+/// The DFS carries its own explicit stack rather than recursing: this runs
+/// inside a compiler pass over arbitrary user CFGs, where a deep chain of blocks
+/// would overflow the native stack.
+fn function_has_back_edge(function: &trust_ir::Function) -> bool {
+    const WHITE: u8 = 0;
+    const GRAY: u8 = 1;
+    const BLACK: u8 = 2;
+    let successors_of = |block_id: trust_ir::BlockId| -> Vec<trust_ir::BlockId> {
+        function.block(block_id).map(chc_block_successors).unwrap_or_default()
+    };
+    let mut color: FxHashMap<u32, u8> = FxHashMap::default();
+    for root in &function.blocks {
+        if color.get(&root.id.index()).copied().unwrap_or(WHITE) != WHITE {
+            continue;
+        }
+        color.insert(root.id.index(), GRAY);
+        // (block, its successors, index of the next successor to visit)
+        let mut stack: Vec<(trust_ir::BlockId, Vec<trust_ir::BlockId>, usize)> =
+            vec![(root.id, successors_of(root.id), 0)];
+        while let Some((block_id, successors, cursor)) = stack.pop() {
+            if cursor >= successors.len() {
+                color.insert(block_id.index(), BLACK);
+                continue;
+            }
+            let successor = successors[cursor];
+            stack.push((block_id, successors, cursor + 1));
+            match color.get(&successor.index()).copied().unwrap_or(WHITE) {
+                // gray successor → back-edge; white → descend; black → done.
+                GRAY => return true,
+                WHITE => {
+                    color.insert(successor.index(), GRAY);
+                    stack.push((successor, successors_of(successor), 0));
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// SOUNDNESS gate for `ArithmeticSafetyOnly` mode. The whole-function CHC
+/// conflates every arithmetic-safety obligation into one `error` query but only
+/// models the `Overflow` widths [`chc_overflow_width_modeled`] accepts. If the
+/// function contains an arithmetic-safety op we DON'T model — a 128-bit or
+/// pointer-width `Overflow` (wrap not expressible as a fixed bound in `int`), or
+/// an integer `UDiv`/`SDiv`/`URem`/`SRem` (div/rem-by-zero) — proving `error`
+/// unreachable would NOT cover that op, so discharging its obligation from this
+/// CHC would be a FALSE SAFE. Conservative: any such op ⇒ the surface is not
+/// fully modeled ⇒ the encoder falls back to the single-formula path for this
+/// function's safety obligations.
+///
+/// NOTE the standing assumption: arithmetic_safety obligations arise from CHECKED
+/// arithmetic (`Overflow` insts) + div/rem, as in trust's verified configuration.
+/// A plain `BinOp{Add,Sub,Mul}` that could be an UNCHECKED (release-mode) overflow
+/// obligation is NOT caught here — flagged for the corpus to be checked-mode, and
+/// one of the reasons this lane stays env-gated OFF.
+fn function_overflow_surface_fully_modeled(function: &trust_ir::Function) -> bool {
+    function.blocks.iter().all(|block| {
+        block.body.iter().all(|node| match &node.inst {
+            // Signed i8..i64 AND unsigned u8..u64 overflow are modeled; 128-bit
+            // and pointer-width (`Isize`/`Usize`) `Overflow` are not.
+            trust_ir::Inst::Overflow { ty, .. } => chc_overflow_width_modeled(ty),
+            // Integer div/rem-by-zero is still unmodeled (float div is not an
+            // arithmetic-safety violation).
+            trust_ir::Inst::BinOp { op, .. } => !matches!(
+                op,
+                trust_ir::BinOp::UDiv
+                    | trust_ir::BinOp::SDiv
+                    | trust_ir::BinOp::URem
+                    | trust_ir::BinOp::SRem
+            ),
+            _ => true,
+        })
+    })
+}
+
+/// Stable CHC variable name for an SSA value (`v{index}`).
+fn chc_value_var_name(value: trust_ir::ValueId) -> String {
+    format!("v{}", value.index())
+}
+
+/// Scalar CHC sort JSON for a `trust_ir::Ty`, or `None` for non-scalar types
+/// (pointers, floats, aggregates) which are dropped from block relations and
+/// havoced. `Bool` → bool sort; any integer → mathematical `int` (deliberately
+/// NOT `bit_vec`, which would force the `bv_*` op family and block LIA invariant
+/// synthesis).
+fn chc_scalar_sort_json(ty: &trust_ir::Ty) -> Option<serde_json::Value> {
+    if matches!(ty, trust_ir::Ty::Bool) {
+        Some(serde_json::json!({ "kind": "bool" }))
+    } else if ty.is_integer() {
+        Some(serde_json::json!({ "kind": "int" }))
+    } else {
+        None
+    }
+}
+
+/// A `{kind:var}` expression referencing an SSA value at the given sort.
+fn chc_var_expr(value: trust_ir::ValueId, sort: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "kind": "var", "name": chc_value_var_name(value), "sort": sort })
+}
+
+/// An `{kind:int_const}` expression. The value is encoded as a decimal STRING so
+/// the full `i128` range round-trips (the reader parses `as_str` → `i128`).
+fn chc_int_const(value: i128) -> serde_json::Value {
+    serde_json::json!({ "kind": "int_const", "value": value.to_string() })
+}
+
+/// A `{kind:binary}` expression. `op` must be one of the reader's snake_case
+/// binary ops (`add`/`sub`/`mul`/`eq`/`ne`/`lt`/`le`/`gt`/`ge`/`and`/`or`/…).
+fn chc_binary(op: &str, lhs: serde_json::Value, rhs: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "kind": "binary", "op": op, "lhs": lhs, "rhs": rhs })
+}
+
+/// Declare a value's top-level `vars` entry once (keyed by SSA index so a value
+/// threaded through several blocks is declared exactly once, with a consistent
+/// sort — every referenced var must appear in `vars` or ingestion rejects it).
+fn chc_declare_var(
+    var_decls: &mut BTreeMap<u32, serde_json::Value>,
+    value: trust_ir::ValueId,
+    sort: &serde_json::Value,
+) {
+    var_decls
+        .entry(value.index())
+        .or_insert_with(|| serde_json::json!({ "name": chc_value_var_name(value), "sort": sort }));
+}
+
+/// The surviving `(ValueId, sort)` params of a block, in declaration order. This
+/// is the single source of truth for a block relation's arity/sorts: it is
+/// reused for the relation declaration's `arg_sorts`, every head into the block,
+/// and every body premise out of the block, so the reader's strict positional
+/// arity+sort match never diverges.
+fn chc_block_relation_params(
+    block: &trust_ir::Block,
+) -> Vec<(trust_ir::ValueId, serde_json::Value)> {
+    block
+        .params
+        .iter()
+        .filter_map(|(value, ty)| chc_scalar_sort_json(ty).map(|sort| (*value, sort)))
+        .collect()
+}
+
+/// Map an integer `BinOp` to its CHC op string. Only `Add`/`Sub`/`Mul` are
+/// modeled; every other op (div/rem/bitwise/shift) returns `None` and is havoced
+/// (sound over-approximation).
+fn chc_map_int_binop(op: trust_ir::BinOp) -> Option<&'static str> {
+    match op {
+        trust_ir::BinOp::Add => Some("add"),
+        trust_ir::BinOp::Sub => Some("sub"),
+        trust_ir::BinOp::Mul => Some("mul"),
+        _ => None,
+    }
+}
+
+/// Map an `ICmpOp` to its CHC (mathematical-integer) comparison op. Signed and
+/// unsigned compares both map to the integer relation: a value's var carries its
+/// non-negative magnitude, under which unsigned compare == integer compare on
+/// every real state, so both are sound. The ICmp RESULT is always Bool.
+fn chc_map_icmp(op: trust_ir::ICmpOp) -> &'static str {
+    use trust_ir::ICmpOp;
+    match op {
+        ICmpOp::Eq => "eq",
+        ICmpOp::Ne => "ne",
+        ICmpOp::Ult | ICmpOp::Slt => "lt",
+        ICmpOp::Ule | ICmpOp::Sle => "le",
+        ICmpOp::Ugt | ICmpOp::Sgt => "gt",
+        ICmpOp::Uge | ICmpOp::Sge => "ge",
+    }
+}
+
+/// Exact inclusive `(min, max)` range of a FIXED-WIDTH SIGNED integer type, for
+/// the overflow bit. Returns `None` for unsigned, 128-bit and pointer-width
+/// (`Isize`) types: an unbounded-`int` model cannot express 128-bit wrap, and
+/// `Isize`'s width is TARGET-dependent (trust-ir v25 carries `isize` faithfully
+/// instead of respelling it `I64`), so pinning a 64-bit bound could miss a real
+/// 32-bit overflow. Both are havoced (fail-closed) rather than modeled
+/// inexactly.
+fn chc_signed_overflow_bounds(ty: &trust_ir::Ty) -> Option<(i128, i128)> {
+    match ty {
+        trust_ir::Ty::I8 => Some((i8::MIN as i128, i8::MAX as i128)),
+        trust_ir::Ty::I16 => Some((i16::MIN as i128, i16::MAX as i128)),
+        trust_ir::Ty::I32 => Some((i32::MIN as i128, i32::MAX as i128)),
+        trust_ir::Ty::I64 => Some((i64::MIN as i128, i64::MAX as i128)),
+        _ => None,
+    }
+}
+
+/// Inclusive maximum `2^W - 1` of a FIXED-WIDTH UNSIGNED integer type.
+/// `u64::MAX` (18446744073709551615) fits in `i128`; `u128` does NOT (`2^128 - 1`
+/// overflows `i128`) and `Usize` is target-width, so both return `None` and stay
+/// gated out / havoced (see [`chc_signed_overflow_bounds`]).
+fn chc_unsigned_overflow_max(ty: &trust_ir::Ty) -> Option<i128> {
+    match ty {
+        trust_ir::Ty::U8 => Some(u8::MAX as i128),
+        trust_ir::Ty::U16 => Some(u16::MAX as i128),
+        trust_ir::Ty::U32 => Some(u32::MAX as i128),
+        trust_ir::Ty::U64 => Some(u64::MAX as i128),
+        _ => None,
+    }
+}
+
+/// Is `ty` an integer width whose overflow this encoder models (signed `i8..i64`
+/// or unsigned `u8..u64`)? 128-bit and pointer-width are NOT modeled.
+fn chc_overflow_width_modeled(ty: &trust_ir::Ty) -> bool {
+    chc_signed_overflow_bounds(ty).is_some() || chc_unsigned_overflow_max(ty).is_some()
+}
+
+/// The overflow-safety VIOLATION predicate for a signed OR unsigned `Overflow`,
+/// as a Bool expr over the unbounded-`int` result `sum = lhs op rhs`. Returns
+/// `None` for widths we do not model (128-bit, pointer-width), which are havoced
+/// + gated out.
+///
+///  * SIGNED `iW`: `sum > iW::MAX ∨ sum < iW::MIN`.
+///  * UNSIGNED add/mul (`uW`): `sum > uW::MAX` (the true wrap point, `2^W-1`).
+///    SOUND in `int` PROVIDED every unsigned operand carries its type invariant
+///    `>= 0` — which is why free unsigned vars get a `>= 0` fact.
+///  * UNSIGNED sub (`uW`): underflow `sum < 0` (i.e. `lhs < rhs`).
+fn chc_overflow_violation(
+    op: trust_ir::OverflowOp,
+    ty: &trust_ir::Ty,
+    sum: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    if let Some((min, max)) = chc_signed_overflow_bounds(ty) {
+        return Some(chc_binary(
+            "or",
+            chc_binary("gt", sum.clone(), chc_int_const(max)),
+            chc_binary("lt", sum.clone(), chc_int_const(min)),
+        ));
+    }
+    let unsigned_max = chc_unsigned_overflow_max(ty)?;
+    Some(match op {
+        // `a + b` / `a * b` overflow above `2^W - 1`.
+        trust_ir::OverflowOp::AddOverflow | trust_ir::OverflowOp::MulOverflow => {
+            chc_binary("gt", sum.clone(), chc_int_const(unsigned_max))
+        }
+        // `a - b` underflows below 0 (unsigned).
+        trust_ir::OverflowOp::SubOverflow => chc_binary("lt", sum.clone(), chc_int_const(0)),
+    })
+}
+
+/// Type-invariant range facts `[v >= 0, v <= 2^W - 1]` for an UNSIGNED value of a
+/// modeled width, else empty. These are emitted ONLY for FREE unsigned vars
+/// (entry params) — where the var is unconstrained and the facts merely remove
+/// the NON-REAL negative / oversized model states (SOUND). They must NOT be
+/// attached to a fold-defined value (e.g. an unsigned subtraction result), where
+/// conjoining `>= 0` with its defining equality would exclude REAL wrap states —
+/// see the module soundness note.
+fn chc_unsigned_range_facts(
+    value: trust_ir::ValueId,
+    ty: &trust_ir::Ty,
+    var_decls: &mut BTreeMap<u32, serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let Some(max) = chc_unsigned_overflow_max(ty) else {
+        return Vec::new();
+    };
+    let int = serde_json::json!({ "kind": "int" });
+    chc_declare_var(var_decls, value, &int);
+    vec![
+        chc_binary("ge", chc_var_expr(value, &int), chc_int_const(0)),
+        chc_binary("le", chc_var_expr(value, &int), chc_int_const(max)),
+    ]
+}
+
+/// Straight-line fold of a block body (everything before the terminator).
+/// Returns `(constraints, overflow_violations)`: `constraints` are the
+/// Bool-sorted equalities carried on the block's outgoing transitions;
+/// `overflow_violations` are the per-`Overflow` out-of-range Bool predicates used
+/// by `ArithmeticSafetyOnly` mode to build DIRECT `error` edges (unused by
+/// `Structural` mode). Every referenced value is declared. Unmodeled
+/// instructions are HAVOCed (emit nothing) — a sound over-approximation.
+fn chc_fold_block_body(
+    block: &trust_ir::Block,
+    var_decls: &mut BTreeMap<u32, serde_json::Value>,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let int = serde_json::json!({ "kind": "int" });
+    let boolean = serde_json::json!({ "kind": "bool" });
+    let mut constraints = Vec::new();
+    let mut overflow_violations = Vec::new();
+    // `block.instructions()` / `block.body` INCLUDE the terminator node; the
+    // straight-line fold must skip it.
+    for node in block.body.iter().filter(|node| !node.is_terminator()) {
+        match &node.inst {
+            trust_ir::Inst::BinOp { op, ty, lhs, rhs } if ty.is_integer() => {
+                let Some(mapped) = chc_map_int_binop(*op) else { continue };
+                let Some(dest) = node.results.first() else { continue };
+                chc_declare_var(var_decls, *dest, &int);
+                chc_declare_var(var_decls, *lhs, &int);
+                chc_declare_var(var_decls, *rhs, &int);
+                constraints.push(chc_binary(
+                    "eq",
+                    chc_var_expr(*dest, &int),
+                    chc_binary(mapped, chc_var_expr(*lhs, &int), chc_var_expr(*rhs, &int)),
+                ));
+            }
+            trust_ir::Inst::Overflow { op, ty, lhs, rhs } => {
+                // results[0] = wrapped value, results[1] = overflow bit (Bool).
+                // Model signed `i8..i64` AND unsigned `u8..u64` (the unsigned wrap
+                // point `2^W-1` fits in `i128`). 128-bit and pointer-width are NOT
+                // modeled, so havoc the whole instruction (and gate it out).
+                // SOUNDNESS for unsigned: the `> 2^W-1` test is faithful only if the
+                // operands carry their `>= 0` type invariant — that is enforced for
+                // FREE unsigned vars (entry params) elsewhere.
+                if !chc_overflow_width_modeled(ty) {
+                    continue;
+                }
+                let Some(value) = node.results.first() else { continue };
+                let overflow_bit = node.results.get(1);
+                chc_declare_var(var_decls, *value, &int);
+                chc_declare_var(var_decls, *lhs, &int);
+                chc_declare_var(var_decls, *rhs, &int);
+                let op_string = match op {
+                    trust_ir::OverflowOp::AddOverflow => "add",
+                    trust_ir::OverflowOp::SubOverflow => "sub",
+                    trust_ir::OverflowOp::MulOverflow => "mul",
+                };
+                let sum =
+                    chc_binary(op_string, chc_var_expr(*lhs, &int), chc_var_expr(*rhs, &int));
+                // On the ¬overflow branch this equality is exact; on the overflow
+                // branch the guard (`overflow_bit` true) routes control to the panic
+                // split, so the unbounded value is never used to conclude SAFE.
+                constraints.push(chc_binary("eq", chc_var_expr(*value, &int), sum.clone()));
+                // The overflow-safety VIOLATION predicate (signed range test, or the
+                // unsigned `> 2^W-1` / `< 0` wrap test). Carried for the
+                // `ArithmeticSafetyOnly` direct `error` edge, and also (when present)
+                // defining the overflow-bit result.
+                let Some(out_of_range) = chc_overflow_violation(*op, ty, &sum) else { continue };
+                if let Some(overflow_bit) = overflow_bit {
+                    chc_declare_var(var_decls, *overflow_bit, &boolean);
+                    constraints.push(chc_binary(
+                        "eq",
+                        chc_var_expr(*overflow_bit, &boolean),
+                        out_of_range.clone(),
+                    ));
+                }
+                overflow_violations.push(out_of_range);
+            }
+            trust_ir::Inst::Const { ty, value } if ty.is_integer() => {
+                if let trust_ir::Constant::Int(literal) = value {
+                    let Some(dest) = node.results.first() else { continue };
+                    chc_declare_var(var_decls, *dest, &int);
+                    constraints
+                        .push(chc_binary("eq", chc_var_expr(*dest, &int), chc_int_const(*literal)));
+                }
+            }
+            trust_ir::Inst::Copy { ty, operand } if ty.is_integer() => {
+                let Some(dest) = node.results.first() else { continue };
+                chc_declare_var(var_decls, *dest, &int);
+                chc_declare_var(var_decls, *operand, &int);
+                constraints.push(chc_binary(
+                    "eq",
+                    chc_var_expr(*dest, &int),
+                    chc_var_expr(*operand, &int),
+                ));
+            }
+            trust_ir::Inst::ICmp { op, ty, lhs, rhs } if ty.is_integer() => {
+                let mapped = chc_map_icmp(*op);
+                let Some(dest) = node.results.first() else { continue };
+                // Result is Bool even though `ty` names the OPERAND type.
+                chc_declare_var(var_decls, *dest, &boolean);
+                chc_declare_var(var_decls, *lhs, &int);
+                chc_declare_var(var_decls, *rhs, &int);
+                constraints.push(chc_binary(
+                    "eq",
+                    chc_var_expr(*dest, &boolean),
+                    chc_binary(mapped, chc_var_expr(*lhs, &int), chc_var_expr(*rhs, &int)),
+                ));
+            }
+            // Everything else — including every `Call` result: havoc (emit
+            // nothing). Sound over-approximation.
+            _ => {}
+        }
+    }
+    (constraints, overflow_violations)
+}
+
+/// Build one enriched transition rule `bb(target params) :- bb(source params),
+/// body_constraints`, threading the edge's block args into the target head and
+/// declaring every referenced value. Returns `None` (⇒ abort enrichment, fall
+/// back to structural) on an SSA arity mismatch between the edge args and the
+/// target block params.
+fn chc_transition_rule(
+    source: &trust_ir::Block,
+    target: &trust_ir::Block,
+    edge_args: &[trust_ir::ValueId],
+    body_constraints: Vec<serde_json::Value>,
+    var_decls: &mut BTreeMap<u32, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if edge_args.len() != target.params.len() {
+        return None;
+    }
+    // Body premise: the source block's canonical params.
+    let source_params = chc_block_relation_params(source);
+    for (value, sort) in &source_params {
+        chc_declare_var(var_decls, *value, sort);
+    }
+    let source_args: Vec<_> =
+        source_params.iter().map(|(value, sort)| chc_var_expr(*value, sort)).collect();
+    // Head: for each surviving target param position, thread the edge actual
+    // (same sort by SSA well-typedness).
+    let mut head_args = Vec::new();
+    for (position, (_param, param_ty)) in target.params.iter().enumerate() {
+        if let Some(sort) = chc_scalar_sort_json(param_ty) {
+            let actual = edge_args[position];
+            chc_declare_var(var_decls, actual, &sort);
+            head_args.push(chc_var_expr(actual, &sort));
+        }
+    }
+    Some(serde_json::json!({
+        "head": { "name": trust_mc_default_block_relation(target.id), "args": head_args },
+        "body": {
+            "relation": { "name": trust_mc_default_block_relation(source.id), "args": source_args },
+            "constraints": body_constraints,
+        },
+    }))
+}
+
+/// Build one structural `error` edge `error :- bb(source params), [bool_const]`
+/// with the block's canonical args (so it matches the enriched relation arity).
+/// This mirrors [`trust_mc_default_error_rule`] exactly, preserving every
+/// structural error edge in the enriched path (and keeping the non-vacuity gate
+/// satisfied — every `error` rule retains a relation premise).
+fn chc_error_rule(
+    source: &trust_ir::Block,
+    reachable: bool,
+    reason: String,
+    var_decls: &mut BTreeMap<u32, serde_json::Value>,
+) -> serde_json::Value {
+    let params = chc_block_relation_params(source);
+    for (value, sort) in &params {
+        chc_declare_var(var_decls, *value, sort);
+    }
+    let args: Vec<_> = params.iter().map(|(value, sort)| chc_var_expr(*value, sort)).collect();
+    serde_json::json!({
+        "head": { "name": "error" },
+        "body": {
+            "relation": { "name": trust_mc_default_block_relation(source.id), "args": args },
+            "constraints": [
+                {
+                    "kind": "bool_const",
+                    "value": reachable,
+                    "reason": reason,
+                }
+            ],
+        },
+    })
+}
+
+/// Build one DIRECT arithmetic-overflow `error` edge for `ArithmeticSafetyOnly`
+/// mode: `error :- bbB(source params), [fold..., violation]`. The block fold is
+/// conjoined so the violation's `lhs`/`rhs` are tied to the block params (a bare
+/// violation over free vars would be trivially satisfiable and prove nothing);
+/// `violation` is the out-of-range predicate. This is the genuine
+/// overflow-safety property — it is the ONLY error route in this mode.
+fn chc_overflow_error_rule(
+    source: &trust_ir::Block,
+    fold: &[serde_json::Value],
+    violation: &serde_json::Value,
+    var_decls: &mut BTreeMap<u32, serde_json::Value>,
+) -> serde_json::Value {
+    let params = chc_block_relation_params(source);
+    for (value, sort) in &params {
+        chc_declare_var(var_decls, *value, sort);
+    }
+    let args: Vec<_> = params.iter().map(|(value, sort)| chc_var_expr(*value, sort)).collect();
+    let mut constraints = fold.to_vec();
+    constraints.push(violation.clone());
+    serde_json::json!({
+        "head": { "name": "error" },
+        "body": {
+            "relation": { "name": trust_mc_default_block_relation(source.id), "args": args },
+            "constraints": constraints,
+        },
+    })
+}
+
+/// Data-flow-enriched parallel of [`trust_mc_default_function_chc_from_trust_ir`].
+///
+/// Returns `Ok(Some((relations, rules, vars)))` when the function is fully in
+/// scope and every block could be framed faithfully; returns `Ok(None)`
+/// (fail-closed hatch) to request the untouched structural fallback; returns
+/// `Err` only for the same hard errors the structural encoder reports (missing
+/// function / no blocks). NEVER emits a false SAFE — see the module comment above
+/// for the soundness discipline.
+fn trust_mc_dataflow_function_chc_from_trust_ir(
+    native_trust_ir_bundle: &trust_ir_bridge::NativeVerificationBundle,
+    request: &trust_ir::TrustMcNativeRequest,
+    error_mode: ChcErrorMode,
+) -> Result<Option<(serde_json::Value, serde_json::Value, Vec<serde_json::Value>)>, String> {
+    let function =
+        native_trust_ir_bundle.module.function_by_id(request.function).ok_or_else(|| {
+            format!(
+                "data-flow trust-mc function admission cannot find TrustIr function {}",
+                request.function.index()
+            )
+        })?;
+    trust_mc_dataflow_chc_for_function(function, error_mode)
+}
+
+/// The `Function`-level core of the data-flow encoder, split out from the
+/// bundle/request resolution above so it is unit-testable against a hand-built
+/// `trust_ir::Function`. This wrapper adds the runtime
+/// `TRUST_MC_DATAFLOW_CHC_DEBUG` firing trace around the pure encoder.
+fn trust_mc_dataflow_chc_for_function(
+    function: &trust_ir::Function,
+    error_mode: ChcErrorMode,
+) -> Result<Option<(serde_json::Value, serde_json::Value, Vec<serde_json::Value>)>, String> {
+    let outcome = trust_mc_dataflow_chc_for_function_impl(function, error_mode)?;
+    if trust_mc_dataflow_chc_debug_enabled() {
+        match &outcome {
+            Some((relations, rules, _)) => eprintln!(
+                "[DATAFLOW-FIRED] fn={} mode={error_mode:?} relations={} rules={}",
+                function.name,
+                relations.as_array().map_or(0, |array| array.len()),
+                rules.as_array().map_or(0, |array| array.len()),
+            ),
+            None => eprintln!(
+                "[DATAFLOW-FALLBACK] fn={} mode={error_mode:?} reason=out-of-scope \
+                 (missing-terminator / edge-arity-mismatch / unmodeled-terminator / \
+                 unmodeled-arithmetic / no-overflow-edge)",
+                function.name,
+            ),
+        }
+    }
+    Ok(outcome)
+}
+
+/// The pure `Function`-level encoder (no I/O). Same contract: `Ok(Some(..))` when
+/// fully enriched, `Ok(None)` to request the structural fallback, `Err` only on a
+/// function with no blocks / an unresolvable entry. `error_mode` selects which
+/// `error` edges are emitted (see [`ChcErrorMode`]).
+fn trust_mc_dataflow_chc_for_function_impl(
+    function: &trust_ir::Function,
+    error_mode: ChcErrorMode,
+) -> Result<Option<(serde_json::Value, serde_json::Value, Vec<serde_json::Value>)>, String> {
+    if function.blocks.is_empty() {
+        return Err(format!(
+            "data-flow trust-mc function admission for `{}` has no typed TrustIr blocks",
+            function.name
+        ));
+    }
+
+    // Fail-closed pre-check: a block with no terminator is malformed IR — fall
+    // back to the structural encoder for the whole function. Every real terminator
+    // kind IS modeled below (mirroring the structural encoder exactly), so a
+    // function is enriched whenever the structural encoder would accept it. The
+    // only other fallbacks are an SSA edge arity mismatch (`chc_transition_rule`
+    // returns `None`) and any future/unknown terminator kind (the `_` arm).
+    for block in &function.blocks {
+        if block.terminator().is_none() {
+            return Ok(None);
+        }
+    }
+
+    // ArithmeticSafetyOnly soundness gate: if the function has an arithmetic-safety
+    // op we do NOT model as an `error` edge, the whole-function overflow CHC would
+    // miss it and could falsely discharge that op's obligation — fall back instead.
+    if error_mode == ChcErrorMode::ArithmeticSafetyOnly
+        && !function_overflow_surface_fully_modeled(function)
+    {
+        return Ok(None);
+    }
+
+    let bool_sort = serde_json::json!({ "kind": "bool" });
+    let mut var_decls: BTreeMap<u32, serde_json::Value> =
+        BTreeMap::new();
+    // Set when an `ArithmeticSafetyOnly` overflow `error` edge is emitted; if none
+    // are, the CHC would prove `error` unreachable vacuously (a false SAFE), so we
+    // fall back below.
+    let mut any_overflow_error = false;
+
+    // Relations: `error` + one relation per block carrying its canonical
+    // (int/bool) param projection as `arg_sorts`.
+    let mut relations = Vec::with_capacity(function.blocks.len() + 1);
+    relations.push(serde_json::json!({ "name": "error" }));
+    for block in &function.blocks {
+        let arg_sorts: Vec<_> =
+            chc_block_relation_params(block).into_iter().map(|(_, sort)| sort).collect();
+        relations.push(serde_json::json!({
+            "name": trust_mc_default_block_relation(block.id),
+            "arg_sorts": arg_sorts,
+        }));
+    }
+
+    let mut rules: Vec<serde_json::Value> = Vec::new();
+
+    // Entry fact: `bbEntry(params) :- (empty body)` — all params FREE (full input
+    // havoc). Constraining them would under-approximate the input space.
+    {
+        let entry_block = function.block(function.entry).ok_or_else(|| {
+            format!(
+                "data-flow trust-mc function admission for `{}` cannot resolve entry block {}",
+                function.name,
+                function.entry.index()
+            )
+        })?;
+        let entry_params = chc_block_relation_params(entry_block);
+        for (value, sort) in &entry_params {
+            chc_declare_var(&mut var_decls, *value, sort);
+        }
+        let entry_args: Vec<_> =
+            entry_params.iter().map(|(value, sort)| chc_var_expr(*value, sort)).collect();
+        // In ArithmeticSafetyOnly mode, constrain each unsigned ENTRY param (a
+        // genuinely-free function input) with its type invariant `0 <= p <= 2^W-1`.
+        // SOUND: it removes only NON-REAL negative/oversized model states of a free
+        // var, and it is what lets PDR bound an unsigned accumulator. Omitted in
+        // Structural mode so the default_function encoding keeps its exact shape.
+        let mut entry_constraints: Vec<serde_json::Value> = Vec::new();
+        if error_mode == ChcErrorMode::ArithmeticSafetyOnly {
+            for (value, ty) in &entry_block.params {
+                entry_constraints.extend(chc_unsigned_range_facts(*value, ty, &mut var_decls));
+            }
+        }
+        rules.push(serde_json::json!({
+            "head": { "name": trust_mc_default_block_relation(function.entry), "args": entry_args },
+            "body": { "constraints": entry_constraints },
+        }));
+    }
+
+    for block in &function.blocks {
+        // Terminator presence was validated by the pre-check above.
+        let Some(terminator) = block.terminator() else {
+            return Ok(None);
+        };
+        // `fold` (kept owned for the ArithmeticSafetyOnly error edges below) is
+        // CLONED into every outgoing transition; `overflow_violations` are the
+        // per-`Overflow` out-of-range predicates for the direct overflow edges.
+        let (fold, overflow_violations) = chc_fold_block_body(block, &mut var_decls);
+
+        // Tracks whether this block already routes to `error` (Structural mode
+        // only), so the `reachable:false` placeholder is emitted only when it does
+        // not. Set by the `Unreachable` arm and the fail-closed-instruction scan.
+        let mut emitted_error_rule = false;
+        match &terminator.inst {
+            trust_ir::Inst::Br { target, args } => {
+                let Some(target_block) = function.block(*target) else {
+                    return Ok(None);
+                };
+                let Some(rule) =
+                    chc_transition_rule(block, target_block, args, fold.clone(), &mut var_decls)
+                else {
+                    return Ok(None);
+                };
+                rules.push(rule);
+            }
+            trust_ir::Inst::CondBr { cond, then_target, then_args, else_target, else_args } => {
+                chc_declare_var(&mut var_decls, *cond, &bool_sort);
+                let (Some(then_block), Some(else_block)) =
+                    (function.block(*then_target), function.block(*else_target))
+                else {
+                    return Ok(None);
+                };
+                // then-edge: guard `cond` holds.
+                let mut then_constraints = fold.clone();
+                then_constraints.push(chc_var_expr(*cond, &bool_sort));
+                let Some(then_rule) = chc_transition_rule(
+                    block,
+                    then_block,
+                    then_args,
+                    then_constraints,
+                    &mut var_decls,
+                ) else {
+                    return Ok(None);
+                };
+                rules.push(then_rule);
+                // else-edge: guard `¬cond`.
+                let mut else_constraints = fold.clone();
+                else_constraints.push(serde_json::json!({
+                    "kind": "unary",
+                    "op": "not",
+                    "expr": chc_var_expr(*cond, &bool_sort),
+                }));
+                let Some(else_rule) = chc_transition_rule(
+                    block,
+                    else_block,
+                    else_args,
+                    else_constraints,
+                    &mut var_decls,
+                ) else {
+                    return Ok(None);
+                };
+                rules.push(else_rule);
+            }
+            // No in-function successor — like the structural encoder, emit no
+            // transition rule. (`fold` is discarded; its only role was to build
+            // transition constraints.)
+            trust_ir::Inst::Return { .. } => {}
+            // The panic sink. In `Structural` mode, model it EXACTLY as the
+            // structural encoder does — a REACHABLE `error` edge with the block's
+            // canonical data-flow args (weakens toward true → never a false SAFE).
+            // In `ArithmeticSafetyOnly` mode it is a PURE SINK (no error edge): an
+            // unrelated panic must NOT make `error` reachable, or it would block the
+            // overflow proof — that panic is a DIFFERENT obligation, proved apart.
+            trust_ir::Inst::Unreachable => {
+                if error_mode == ChcErrorMode::Structural {
+                    rules.push(chc_error_rule(
+                        block,
+                        true,
+                        format!(
+                            "typed TrustIr block {} reaches an unreachable terminator",
+                            block.id.index()
+                        ),
+                        &mut var_decls,
+                    ));
+                    emitted_error_rule = true;
+                }
+            }
+            // Multi-way branch. Mirror the structural encoder: an edge to
+            // `default` (unless the TyCtxt-vetted exhaustive-enum flag certifies it
+            // dead — the one edge-drop precedent, matched exactly) and one to every
+            // case target. NO per-case discriminant guard is added — an unguarded
+            // edge is a sound over-approximation (precision, not soundness). Each
+            // edge threads its own block args + the block fold.
+            trust_ir::Inst::Switch {
+                default,
+                default_args,
+                cases,
+                exhaustive_enum_unreachable,
+                ..
+            } => {
+                if !*exhaustive_enum_unreachable {
+                    let Some(default_block) = function.block(*default) else {
+                        return Ok(None);
+                    };
+                    let Some(rule) = chc_transition_rule(
+                        block,
+                        default_block,
+                        default_args,
+                        fold.clone(),
+                        &mut var_decls,
+                    ) else {
+                        return Ok(None);
+                    };
+                    rules.push(rule);
+                }
+                for case in cases {
+                    let Some(case_block) = function.block(case.target) else {
+                        return Ok(None);
+                    };
+                    let Some(rule) = chc_transition_rule(
+                        block,
+                        case_block,
+                        &case.args,
+                        fold.clone(),
+                        &mut var_decls,
+                    ) else {
+                        return Ok(None);
+                    };
+                    rules.push(rule);
+                }
+            }
+            // Call with two successors (Itanium/LLVM `invoke`). Mirror the
+            // structural encoder: carry reachability along BOTH edges. The callee's
+            // return value bound on the normal edge is HAVOC'd — a fresh
+            // unconstrained SSA value. The unwind edge carries no block args: the
+            // landing pad receives the exception via its `LandingPad` instruction,
+            // not via block params.
+            trust_ir::Inst::Invoke { normal_dest, normal_args, unwind_dest, .. } => {
+                let Some(normal_block) = function.block(*normal_dest) else {
+                    return Ok(None);
+                };
+                let Some(normal_rule) = chc_transition_rule(
+                    block,
+                    normal_block,
+                    normal_args,
+                    fold.clone(),
+                    &mut var_decls,
+                ) else {
+                    return Ok(None);
+                };
+                rules.push(normal_rule);
+                let Some(unwind_block) = function.block(*unwind_dest) else {
+                    return Ok(None);
+                };
+                let Some(unwind_rule) =
+                    chc_transition_rule(block, unwind_block, &[], fold.clone(), &mut var_decls)
+                else {
+                    return Ok(None);
+                };
+                rules.push(unwind_rule);
+            }
+            // Return-like / divergent terminators with NO in-function successor —
+            // mirror the structural encoder (no transition rule). `CoroSuspend`
+            // saves its resume state and returns to the resumer; `Resume` re-raises
+            // the in-flight exception to the unwinder. The `reachable:false`
+            // placeholder below fires for these blocks, exactly as for `Return`.
+            trust_ir::Inst::CoroSuspend { .. } | trust_ir::Inst::Resume { .. } => {}
+            // Any future/unknown terminator kind → fall back to the untouched
+            // structural encoder for the whole function (sound: never a false SAFE).
+            _ => return Ok(None),
+        }
+
+        match error_mode {
+            // Structural: preserve every structural `error` edge, with canonical
+            // block args so the relation-app arity matches the relation declaration
+            // — fail-closed-admission edges + the reachable:false placeholder. (The
+            // `Unreachable`→error edge was emitted above.)
+            ChcErrorMode::Structural => {
+                for instruction in block.instructions() {
+                    if trust_mc_default_instruction_requires_fail_closed_admission(instruction) {
+                        rules.push(chc_error_rule(
+                            block,
+                            true,
+                            format!(
+                                "typed TrustIr block {} contains unsupported native trust-mc admission instruction {:?}",
+                                block.id.index(),
+                                instruction.inst
+                            ),
+                            &mut var_decls,
+                        ));
+                        emitted_error_rule = true;
+                    }
+                }
+                if !emitted_error_rule {
+                    rules.push(chc_error_rule(
+                        block,
+                        false,
+                        format!(
+                            "typed TrustIr block {} has no reachable native trust-mc admission error",
+                            block.id.index()
+                        ),
+                        &mut var_decls,
+                    ));
+                }
+            }
+            // ArithmeticSafetyOnly: the ONLY `error` edges are the direct
+            // arithmetic-overflow violations from this block's fold. No
+            // Unreachable/admission/placeholder edges — unrelated panics/closures
+            // are pure havoc'd transitions. The block fold is conjoined so the
+            // violation is tied to the block params.
+            ChcErrorMode::ArithmeticSafetyOnly => {
+                for violation in &overflow_violations {
+                    rules.push(chc_overflow_error_rule(block, &fold, violation, &mut var_decls));
+                    any_overflow_error = true;
+                }
+            }
+        }
+    }
+
+    // A vacuous ArithmeticSafetyOnly CHC (no overflow `error` edge at all) would
+    // prove `error` unreachable trivially — a false SAFE for whatever obligation
+    // was redirected. Fall back to the single-formula path instead.
+    if error_mode == ChcErrorMode::ArithmeticSafetyOnly && !any_overflow_error {
+        return Ok(None);
+    }
+
+    let vars: Vec<serde_json::Value> = var_decls.into_values().collect();
+    Ok(Some((serde_json::Value::Array(relations), serde_json::Value::Array(rules), vars)))
 }
 
 fn trust_mc_public_typed_chc_contract_for_obligation(
@@ -24694,7 +29092,7 @@ fn trust_mc_can_emit_direct_typed_chc_input(
     ) || matches!(
         &obligation.kind,
         trust_verifier_api::ObligationKind::Custom { namespace, .. }
-            if namespace == "trust.vc.hardened"
+            if namespace == trust_verifier_api::TRUST_VC_HARDENED_OBLIGATION_NAMESPACE
     )
 }
 
@@ -26608,6 +31006,7 @@ fn native_trust_ir_bundle_build_failure_result(
             obligation_id: obligation.obligation_id.clone(),
             engine: manifest.clone(),
             status: trust_verifier_api::EvidenceStatus::Unsupported,
+            decline: None,
             proof_strength: None,
             artifacts: Vec::new(),
             counterexample: None,
@@ -27790,7 +32189,8 @@ fn source_clause_marker_identity(
             ) && matches!(
                 &obligation.kind,
                 trust_verifier_api::ObligationKind::Custom { namespace, name }
-                    if namespace == "trust.contract" && name == "unsupported"
+                    if namespace == trust_verifier_api::TRUST_CONTRACT_OBLIGATION_NAMESPACE
+                        && name == "unsupported"
             );
             kind_matches.then_some(identity)
         }
@@ -29314,7 +33714,7 @@ fn hardened_vc_from_api_obligation(
 ) -> Option<VcKind> {
     let custom_hardened_name = match &obligation.kind {
         trust_verifier_api::ObligationKind::Custom { namespace, name }
-            if namespace == "trust.vc.hardened" =>
+            if namespace == trust_verifier_api::TRUST_VC_HARDENED_OBLIGATION_NAMESPACE =>
         {
             Some(name.as_str())
         }
@@ -29799,7 +34199,8 @@ fn report_results(
                 // rows pass for different reasons, and a reader must be able to
                 // tell a kernel-rechecked postcondition from one that rests on
                 // the adapter's answer.
-                if matches!(authority, Some(ResultProofAuthority::BodyBoundKernelCertified { .. })) {
+                if matches!(authority, Some(ResultProofAuthority::BodyBoundKernelCertified { .. }))
+                {
                     *reasons
                         .entry(format!(
                             "[{tag}] PROVED ({solver}): body-bound ensures re-derived and kernel-checked by trust-certify"
@@ -30217,18 +34618,14 @@ fn build_transport_results_with_runtime_checks_bound(
                         } else {
                             Outcome::Unknown
                         };
-                        (
-                            outcome,
-                            solver.to_string(),
-                            *time_ms,
-                            None,
-                            None,
-                            Some(reason.clone()),
-                        )
+                        (outcome, solver.to_string(), *time_ms, None, None, Some(reason.clone()))
                     }
                     VerificationResult::Timeout { solver, timeout_ms } => {
-                        let outcome =
-                            if runtime_fallback { Outcome::RuntimeChecked } else { Outcome::Timeout };
+                        let outcome = if runtime_fallback {
+                            Outcome::RuntimeChecked
+                        } else {
+                            Outcome::Timeout
+                        };
                         (
                             outcome,
                             solver.to_string(),
@@ -31611,6 +36008,41 @@ fn transport_row_is_unproved_expected_absent_callee(row: &TransportObligationRes
             .contains(trust_types::assumption::EXPECTED_ABSENT_CALLEE_ASSUMPTION_PREFIX)
 }
 
+/// SOUNDNESS GAP — RECORDED, NOT FIXED. `.contains()` on a USER-CONTROLLED string.
+///
+/// `row.description` is user-reachable text. The shortest path found:
+/// `unsupported_predicate_reason` in `trust_contract_query.rs` inlines
+/// `span_to_snippet(span)` raw into "unsupported contract predicate expression
+/// `{snippet}`" for any `#[requires(EXPR)]` that declines to lower — e.g. one
+/// containing a string literal — and that text flows unsanitized through
+/// trust-mir-extract into this row's description. Embedding the assumption prefix
+/// in a contract expression therefore classifies the row as an
+/// `#[trust::assume_total]` callee assumption the author never wrote.
+///
+/// Effect, scoped honestly: this is a GATE DOWNGRADE, not a false proof. Strict
+/// and Certify fold `assumed` back into `unknown`, so only the Advisory lane
+/// flips — `unknown > 0 => Inconclusive/exit 1` becomes
+/// `assumed > 0, F=U=0 => ConditionalPass/exit 0`. In the memory-safe lane the
+/// marker causes OVER-rejection, not a bypass; do not "fix" in that direction.
+/// What is real: an unverified user string launders a fail-closed unknown into
+/// the "explicit user-audited assumption" bucket and flips a documented blocking
+/// status.
+///
+/// This file already knows the hazard — see the note that "the description is
+/// user-controlled, so only the final `contract_id` suffix is authoritative",
+/// hardening applied to the ensures-citation parser and not here. The sibling
+/// check on this same marker, `api_obligation_is_assumed_total_callee_marker`,
+/// does it correctly with `strip_prefix` plus full provenance recomputation, and
+/// has an adversarial test whose first case is literally "embedded marker". This
+/// predicate has none.
+///
+/// FIX SHAPE: carry the class on an authenticated channel, as the compiler
+/// already does for the assumed-total SET via `insert_exact_absent_call_identity`
+/// (whose own comment warns of "the 'spelling as authority' hazard"); or sanitize
+/// `obligation.description` in `legacy_unsupported_kind_detail` before it becomes
+/// `detail`. NOT applied here because this crate cannot be compile-validated
+/// without a full bootstrap, and the change wants a regression test modelled on
+/// the sibling's — which needs the same build.
 fn transport_row_is_unproved_assumed_total_callee(row: &TransportObligationResult) -> bool {
     row.outcome != Outcome::Proved
         && row.description.contains(trust_types::assumption::ASSUMED_TOTAL_CALLEE_ASSUMPTION_PREFIX)

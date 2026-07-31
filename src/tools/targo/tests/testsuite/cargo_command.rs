@@ -1150,7 +1150,7 @@ fn explicit_unverified_targo_propagates_to_nested_cargo_compile_without_rustflag
                         stderr,
                     );
                     assert!(
-                        stderr.contains("-Zno-trust-verify"),
+                        stderr.contains("-Ztrust-verify=off"),
                         "trybuild-style rustflag stripping lost the unverified compiler lane:\n{}",
                         stderr,
                     );

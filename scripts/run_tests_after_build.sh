@@ -10,7 +10,7 @@
 #   T1  targo test on Trust verifier crates      ~10 min
 #   T2  ./x.py test library/std (stdlib)         ~30 min
 #   T3  Trust e2e shell scripts                  ~variable
-#   T3b certified-monitor release E2Es (Linux)   ~variable
+#   T3b certified-monitor release E2Es           ~variable
 #   T4  ./x.py test tests/ui (canonical suite)   ~2-6 hours
 #
 # Outputs each tier's log under build-logs/tests-T*.log and a one-line
@@ -609,8 +609,8 @@ record_tier_status T3_e2e "$T3_RC"
 # T3b: the three ignored real-Targo certified-monitor tests are a distinct
 # release boundary. Ordinary `targo test` and the T3 shell glob do not execute
 # them. The dedicated gate proves each exact ignored test actually ran once;
-# it deliberately fails on non-Linux and non-x86_64/aarch64 hosts instead of
-# converting the platform cfg into a successful zero-test run.
+# it supports Linux/macOS x86_64/aarch64 and deliberately fails on other hosts
+# instead of converting the platform cfg into a successful zero-test run.
 STAGE2_SYSROOT="$(cd "${STAGE2_BIN}/.." && pwd -P)"
 T3B_ENV=(
     /usr/bin/env -i

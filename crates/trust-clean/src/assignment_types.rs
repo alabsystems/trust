@@ -1115,6 +1115,7 @@ mod tests {
                     name: "demo::OptionBool".into(),
                     variant: 0,
                     active_field: None,
+                    args: None,
                 },
                 vec![],
             ),
@@ -1127,6 +1128,7 @@ mod tests {
                     name: "demo::OptionBool".into(),
                     variant: 1,
                     active_field: None,
+                    args: None,
                 },
                 vec![Operand::Constant(ConstValue::Bool(true))],
             ),
@@ -1139,6 +1141,7 @@ mod tests {
                     name: "demo::OptionBool".into(),
                     variant: 99,
                     active_field: None,
+                    args: None,
                 },
                 vec![],
             ),
@@ -1236,7 +1239,7 @@ mod tests {
         ]);
         let aggregate = |name: &str, variant, active_field, operands| {
             Rvalue::Aggregate(
-                AggregateKind::Adt { name: name.into(), variant, active_field },
+                AggregateKind::Adt { name: name.into(), variant, active_field, args: None },
                 operands,
             )
         };

@@ -403,6 +403,13 @@ fn obligation_sources_for_module(
                 obligation: obligation.id,
                 public_obligation_id: public.obligation_id.clone(),
                 function: obligation.function,
+                // This `trust_ir::SourceSpan` carries OBLIGATION-IDENTITY coordinates, not
+                // debug info: `range` is the raw LO edge of a `ProofObligationSourceRange`,
+                // fed from `trust_types::SourceSpan` by `lower.rs::ObligationSourceMetadata::
+                // to_proof_source_identity` (NOT callsite-rebased — the same type on
+                // `InstrNode.span` IS callsite-rebased; the lane is a property of the
+                // producer, not the type). trust-wp's verifier_api equality-compares this
+                // projection against the embedded source, so it must stay verbatim.
                 span: source.range.map(|range| SourceSpan {
                     file: range.file,
                     line: range.start_line,

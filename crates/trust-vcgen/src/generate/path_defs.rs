@@ -1205,22 +1205,6 @@ pub(super) fn v2_path_def_fixpoint(
         }
         extend_killing_redefs(&mut next_defs, guards::extract_block_definitions(func, block));
         extend_killing_redefs(&mut next_defs, extract_set_discriminant_definitions(func, block));
-        // a block ending in an Assert-guarded CheckedBinaryOp leaves its
-        // result definition (`_t.0 == lhs OP rhs`) and no-overflow range true on the
-        // SUCCESS edge. Inject it into the outflow so a chained `x + y + z` — whose
-        // second add lives in a later block and consumes the first add's tuple result
-        // via `_r = _t.0` — can connect that result back to the (Ite-)bounded operands.
-        // Soundness: these facts hold ONLY when the assert passed, and they reach only
-        // the success target — `discovered_clauses` yields `ClauseTarget::Panic` for the
-        // overflow edge, which the queue loop below skips (it requires
-        // `ClauseTarget::Block`), so the result def never reaches the edge where it is
-        // false. The operand temps are read at the CheckedBinaryOp, the last statement
-        // before the Assert terminator, so they cannot be reassigned later in this block;
-        // any DOWNSTREAM reassignment of an operand drops the fact via the same
-        // `extend_killing_redefs` free-variable kill, and the join intersection drops it
-        // on any path that lacks it. Adding a genuinely-true fact is monotone: it can
-        // turn a false-FAIL into a PROVE for safe code, never make a real overflow PROVE.
-        extend_killing_redefs(&mut next_defs, guards::extract_assert_passed_semantics(func, block));
         // loop-backedge: a value the block's TERMINATOR reassigns (a direct
         // `Call { dest: i }` to a user var) is invisible to the statement-based
         // `extract_block_definitions` above, so no killing def is generated. On a
@@ -1238,41 +1222,97 @@ pub(super) fn v2_path_def_fixpoint(
             let term_set: FxHashSet<String> = term_defs.into_iter().collect();
             next_defs.retain(|f| formula_survives_redefs(f, &term_set));
         }
-        // Trust (probe-call model): a modeled std `is_some`/`is_none`/`is_ok`/
-        // `is_err` call terminator DEFINES its bool dest as exactly
-        // `receiver.__tag == PROBE_TAG` — thread that (plus the tag's
-        // variant-range) to the call's successors, exactly like the
-        // assert-passed result defs above. Injected AFTER the terminator kill:
-        // the kill removes stale PRE-call facts about the dest; this fact IS the
-        // post-call definition the terminator just established. Fail-closed
-        // (`Vec::new()`) outside the recognized shape — see
-        // `probe_call_definitions` for the gates and soundness argument.
-        extend_killing_redefs(&mut next_defs, probe_call_definitions(func, block));
-        // Trust (eq-guard channel): the `o == None` / `o != None` twin of the
-        // probe fact above — same threading, same soundness discipline.
-        extend_killing_redefs(&mut next_defs, eq_unit_call_definitions(func, block));
-        // Trust (inferred contract): the USER guard-helper twin — a call whose
-        // callee has an automatically-derived bool-pred contract threads the
-        // same probe-shaped fact pair. Same discipline; empty map ⇒ no-op.
-        extend_killing_redefs(&mut next_defs, inferred_pred_call_definitions(func, block));
+
+        // `next_defs` is the BASE outflow: facts true after the block and
+        // terminator write-kill, regardless of whether a panicking terminator
+        // returns normally or transfers to cleanup. Success-only facts must
+        // never enter this set.
+        let base_outflow = next_defs;
+        let mut normal_outflow = base_outflow.clone();
+        match &block.terminator {
+            Terminator::Assert { .. } => {
+                // A checked operation's result equation and no-overflow range
+                // hold only after its Assert succeeds. This is what connects a
+                // chained `x + y + z` across rustc's checked-op blocks, but it
+                // is false on the panic/unwind edge.
+                extend_killing_redefs(
+                    &mut normal_outflow,
+                    guards::extract_assert_passed_semantics(func, block),
+                );
+            }
+            Terminator::Call { .. } => {
+                // These are post-RETURN definitions of the call destination.
+                // Add them after the terminator kill, and only to the normal
+                // return edge. A cleanup edge observes no returned value.
+                extend_killing_redefs(&mut normal_outflow, probe_call_definitions(func, block));
+                extend_killing_redefs(&mut normal_outflow, eq_unit_call_definitions(func, block));
+                extend_killing_redefs(
+                    &mut normal_outflow,
+                    inferred_pred_call_definitions(func, block),
+                );
+            }
+            _ => {}
+        }
+
         for guarded in block.terminator.discovered_clauses(block_id) {
             if let trust_types::ClauseTarget::Block(target) = guarded.target {
-                queue.push_back((target, next_defs.clone()));
+                // Assert's sole in-CFG discovered clause is its normal-success
+                // edge. Switch clauses are ordinary base outflow. A future
+                // conditional terminator fails closed to base facts.
+                let outflow = match &block.terminator {
+                    Terminator::Assert { target: success, .. } if target == *success => {
+                        &normal_outflow
+                    }
+                    _ => &base_outflow,
+                };
+                queue.push_back((target, outflow.clone()));
             }
         }
-        // SOUNDNESS INVARIANT (faithful unwind modeling): a `Call`/`Assert`/`Drop`
-        // cleanup edge is carried by `unguarded_successors()` (the model appends
-        // `unwind_cleanup_target()`), so the cleanup block is enqueued here as an
-        // ordinary CHC successor — NOT special-cased away — and its per-block
-        // relation + drop obligations are generated exactly like a normal-path
-        // block's. Recording it as an UNGUARDED (always-explored) successor is a
-        // SOUND over-approximation: the verifier checks the cleanup drops on MORE
-        // paths than reality (the edge is really taken only on panic), never fewer,
-        // so it can never let a cleanup-path drop panic be reported as proved — an
-        // unproven cleanup-block `Drop` stays an undischarged (unknown) obligation
-        // just like a normal-path drop.
-        for target in block.terminator.unguarded_successors() {
-            queue.push_back((target, next_defs.clone()));
+
+        // Faithful unwind transport. Normal Call return receives post-return
+        // facts; every cleanup edge receives BASE facts only. Enqueue both when
+        // normal and cleanup target the same block: the incoming intersection
+        // then deliberately removes success-only facts from that join.
+        match &block.terminator {
+            Terminator::Call { target, unwind, .. } => {
+                if let Some(target) = target {
+                    queue.push_back((*target, normal_outflow.clone()));
+                }
+                if let Some(cleanup) = unwind.cleanup_target() {
+                    queue.push_back((cleanup, base_outflow.clone()));
+                }
+            }
+            Terminator::Assert { unwind, .. } => {
+                // The normal target was enqueued through discovered_clauses.
+                if let Some(cleanup) = unwind.cleanup_target() {
+                    queue.push_back((cleanup, base_outflow.clone()));
+                }
+            }
+            Terminator::Goto(target) => {
+                queue.push_back((*target, base_outflow.clone()));
+            }
+            Terminator::Drop { target, unwind, .. } => {
+                queue.push_back((*target, base_outflow.clone()));
+                if let Some(cleanup) = unwind.cleanup_target() {
+                    queue.push_back((cleanup, base_outflow.clone()));
+                }
+            }
+            Terminator::Opaque { targets, .. } => {
+                for target in targets {
+                    queue.push_back((*target, base_outflow.clone()));
+                }
+            }
+            Terminator::SwitchInt { .. }
+            | Terminator::Return
+            | Terminator::Unreachable
+            | Terminator::Resume => {}
+            // `Terminator` is non-exhaustive across crate boundaries. Unknown
+            // future successors receive only base facts, never success facts.
+            _ => {
+                for target in block.terminator.unguarded_successors() {
+                    queue.push_back((target, base_outflow.clone()));
+                }
+            }
         }
     }
 

@@ -99,6 +99,20 @@ pub enum NativeProofEnvelopeKind {
     ChcInductiveInvariant,
     /// A PDR/IC3 inductive invariant model (ay-chc PDR engine).
     PdrInductiveInvariant,
+    /// A Clean-kernel refutation term: `bincode`-serialized CIC proof of
+    /// `False` from the negation of the obligation.
+    ///
+    /// Unlike every other kind here, this one is replayable to a *decision*
+    /// rather than merely inspectable — but ONLY by a replayer that rebuilds
+    /// the local context from the verification condition itself and checks the
+    /// carried term against that rebuilt context. The carried context artifact
+    /// is audit material and MUST NOT be used as the checking context: a term
+    /// checked against an attacker-chosen context that happens to contain
+    /// `h : False` kernel-checks perfectly and proves nothing about the
+    /// obligation. See `trust_router::ay_certify::replay_certified_envelope`,
+    /// which is the only supported replayer and derives its context solely
+    /// from the VC in hand.
+    CleanKernelRefutation,
 }
 
 /// Mirror of the compiler-side `NativeTransportIdentity` (the transport tuple
@@ -513,6 +527,9 @@ impl<'de> DeserializeSeed<'de> for NativeProofKindSeed<'_> {
                     "SmtUnsatBundle" => Some(NativeProofEnvelopeKind::SmtUnsatBundle),
                     "ChcInductiveInvariant" => Some(NativeProofEnvelopeKind::ChcInductiveInvariant),
                     "PdrInductiveInvariant" => Some(NativeProofEnvelopeKind::PdrInductiveInvariant),
+                    "CleanKernelRefutation" => {
+                        Some(NativeProofEnvelopeKind::CleanKernelRefutation)
+                    }
                     _ => None,
                 };
                 if kind.is_none() {
@@ -3112,11 +3129,11 @@ pub struct CertifiedTestExecutableReport {
 /// Keep this independent of the enclosing report schema: execution semantics
 /// can evolve without silently changing what an older `trust.report.v1`
 /// consumer interprets from the same field names.
-pub const CERTIFIED_TEST_EXECUTION_SCHEMA_VERSION: &str = "trust.certified-test-execution.v1";
+pub const CERTIFIED_TEST_EXECUTION_SCHEMA_VERSION: &str = "trust.certified-test-execution.v2";
 
 /// Exact human-readable boundary paired with
 /// [`CertifiedTestExecutionCompletionScope::TopLevelCargoChildExitOnlyV1`].
-pub const CERTIFIED_TEST_EXECUTION_SCOPE: &str = "authorized selected-package non-doctest test executable paths under Cargo; monitors installed in authenticated artifacts; sealed launch permits ordinary child spawning but uses an anonymous executable image, so current_exe/self-reexecution and pathname/inode/xattr/mode identity are not preserved; completion attests only the top-level Cargo child exit, not libtest-case completion, monitor coverage, exec replacement, descendant processes, or runtime-loaded code";
+pub const CERTIFIED_TEST_EXECUTION_SCOPE: &str = "authorized selected-package non-doctest test executable paths under Cargo; monitors installed in authenticated artifacts; authenticated launch permits ordinary child spawning and is host-specific: Linux uses a sealed anonymous executable image, so current_exe/self-reexecution and pathname/inode/xattr/mode identity are not preserved; macOS uses a private signed pathname snapshot whose bytes and suspended live-process code identity are reauthenticated before release, so snapshot-path current_exe/self-reexecution is preserved during that process lifetime but original-artifact pathname/inode/xattr/mode identity is not; completion attests only the top-level Cargo child exit, not libtest-case completion, monitor coverage, exec replacement, descendant processes, or runtime-loaded code";
 
 /// Machine-readable meaning of a phase-B completion state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3124,7 +3141,7 @@ pub const CERTIFIED_TEST_EXECUTION_SCOPE: &str = "authorized selected-package no
 pub enum CertifiedTestExecutionCompletionScope {
     /// Only the top-level Cargo child reaching an exit status is attested.
     /// This is not libtest-case completion, monitor coverage, process-tree,
-    /// `exec`, runtime dynamic-load, or anonymous-image pathname/inode identity
+    /// `exec`, runtime dynamic-load, or host launch/original-artifact identity
     /// attestation.
     TopLevelCargoChildExitOnlyV1,
 }
@@ -5803,7 +5820,7 @@ pub struct TransportObligationResult {
     pub monitor: Option<TransportMonitorEvidence>,
 }
 
-/// Machine-stable runtime-monitor status for one contract proposition.
+/// Machine-stable runtime executability status for one contract clause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -5811,6 +5828,10 @@ pub enum TransportMonitorStatus {
     /// A runtime decision procedure was accepted only after the Clean kernel
     /// checked its equivalence certificate against the proposition.
     Monitored,
+    /// An E5 scalar evaluator was accepted only after the Clean kernel checked
+    /// its exact typed binding. Authenticated test artifacts combine it with
+    /// compiler-owned entry/transition provenance to check strict descent.
+    Measured,
     /// No certified runtime decision procedure exists for this proposition.
     Unmonitored,
 }
@@ -5824,6 +5845,7 @@ impl TransportMonitorStatus {
     pub const fn executability(self) -> crate::grade::Executability {
         match self {
             Self::Monitored => crate::grade::Executability::Monitored,
+            Self::Measured => crate::grade::Executability::Measured,
             Self::Unmonitored => crate::grade::Executability::Unmonitored,
         }
     }
@@ -5833,7 +5855,8 @@ impl TransportMonitorStatus {
 /// kernel-certified runtime monitor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransportMonitorEvidence {
-    /// Typed monitor disposition; only `Monitored` permits runtime execution.
+    /// Typed runtime disposition; `Monitored` and `Measured` permit only their
+    /// respective authenticated runtime lanes.
     pub status: TransportMonitorStatus,
     /// Bounded compiler explanation of the disposition.
     pub reason: String,
@@ -7041,9 +7064,12 @@ mod tests {
     #[test]
     fn certified_test_execution_report_is_typed_and_round_trips() {
         assert!(
-            CERTIFIED_TEST_EXECUTION_SCOPE.contains("current_exe/self-reexecution")
-                && CERTIFIED_TEST_EXECUTION_SCOPE.contains("pathname/inode/xattr/mode identity"),
-            "the public scope must disclose anonymous-image identity divergence"
+            CERTIFIED_TEST_EXECUTION_SCOPE.contains("Linux uses a sealed anonymous executable image")
+                && CERTIFIED_TEST_EXECUTION_SCOPE
+                    .contains("macOS uses a private signed pathname snapshot")
+                && CERTIFIED_TEST_EXECUTION_SCOPE
+                    .contains("original-artifact pathname/inode/xattr/mode identity is not"),
+            "the public scope must disclose both host launch boundaries"
         );
         let mut gate = sample_gate();
         gate.test_execution = Some(CertifiedTestExecutionReport {
@@ -10719,19 +10745,34 @@ mod tests {
     }
 
     #[test]
-    fn test_transport_monitor_unmonitored_roundtrip_and_unknown_status_rejected() {
-        let evidence = TransportMonitorEvidence {
-            status: TransportMonitorStatus::Unmonitored,
-            reason: "quantified propositions have no finite runtime monitor".to_string(),
-            predicate_digest: format!("sha256:{}", "b".repeat(64)),
-        };
-        let json = serde_json::to_string(&evidence).expect("serialize monitor evidence");
-        assert!(json.contains("\"status\":\"unmonitored\""));
-        assert_eq!(
-            serde_json::from_str::<TransportMonitorEvidence>(&json)
-                .expect("deserialize monitor evidence"),
-            evidence,
-        );
+    fn test_transport_monitor_measured_unmonitored_roundtrip_and_unknown_status_rejected() {
+        for (status, wire, reason, fill) in [
+            (
+                TransportMonitorStatus::Measured,
+                "measured",
+                "kernel-bound E5 scalar with authenticated transition placement",
+                'c',
+            ),
+            (
+                TransportMonitorStatus::Unmonitored,
+                "unmonitored",
+                "quantified propositions have no finite runtime monitor",
+                'b',
+            ),
+        ] {
+            let evidence = TransportMonitorEvidence {
+                status,
+                reason: reason.to_string(),
+                predicate_digest: format!("sha256:{}", fill.to_string().repeat(64)),
+            };
+            let json = serde_json::to_string(&evidence).expect("serialize monitor evidence");
+            assert!(json.contains(&format!("\"status\":\"{wire}\"")));
+            assert_eq!(
+                serde_json::from_str::<TransportMonitorEvidence>(&json)
+                    .expect("deserialize monitor evidence"),
+                evidence,
+            );
+        }
 
         let unknown = format!(
             r#"{{"status":"assumed","reason":"forged","predicate_digest":"sha256:{}"}}"#,

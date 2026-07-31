@@ -210,6 +210,16 @@ pub(crate) fn command(root: &Path) -> Result<Command, String> {
     command_with_pathspec_mode(root, "--literal-pathspecs")
 }
 
+/// Construct a controlled Git command for subcommands, such as
+/// `check-ignore`, whose operands are pathnames and which reject Git's global
+/// pathspec-mode options.
+///
+/// Callers must use this only with subcommands that define their operands as
+/// literal pathnames rather than pathspecs.
+pub(crate) fn pathname_command(root: &Path) -> Result<Command, String> {
+    command_with_pathspec_mode(root, "")
+}
+
 fn command_with_pathspec_mode(root: &Path, pathspec_mode: &str) -> Result<Command, String> {
     let root = fs::canonicalize(root).map_err(|error| {
         format!("could not canonicalize controlled Git root {}: {error}", root.display())
@@ -236,7 +246,11 @@ fn command_with_pathspec_mode(root: &Path, pathspec_mode: &str) -> Result<Comman
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_ATTR_NOSYSTEM", "1")
-        .args(["--no-pager", pathspec_mode])
+        .arg("--no-pager");
+    if !pathspec_mode.is_empty() {
+        command.arg(pathspec_mode);
+    }
+    command
         .arg("--git-dir")
         .arg(git_dir)
         .arg("--work-tree")

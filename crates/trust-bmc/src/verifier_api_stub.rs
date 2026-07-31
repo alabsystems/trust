@@ -14,7 +14,9 @@ use trust_verifier_api::{
 use crate::{TrustMcConfig, TrustMcProofMode};
 
 const ENGINE_NAME: &str = "trust-mc";
-const TRUST_VC_HARDENED_NAMESPACE: &str = "trust.vc.hardened";
+// Aliased from the owning vocabulary crate, never re-declared: a local
+// spelling could drift from the admitted list and split the hardened lane.
+use trust_verifier_api::TRUST_VC_HARDENED_OBLIGATION_NAMESPACE as TRUST_VC_HARDENED_NAMESPACE;
 const TRUST_VC_HARDENED_WILDCARD: &str = "*";
 const TRUST_VC_FORMULA_SCHEMA_METADATA_KEY: &str = "trust.vc.formula.schema";
 const TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY: &str = "trust.vc.formula.payload";
@@ -55,6 +57,7 @@ impl TrustMcVerifierApiAdapter {
             obligation_id: obligation.obligation_id.clone(),
             engine: self.manifest.clone(),
             status: EvidenceStatus::Unsupported,
+            decline: None,
             proof_strength: None,
             artifacts: Vec::new(),
             counterexample: None,

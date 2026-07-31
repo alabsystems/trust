@@ -218,6 +218,25 @@ pub fn prepare_tool_cargo(
     }
     if path.ends_with("targo") && !features.iter().any(|feature| feature == "all-static") {
         features.push("vendored-openssl".to_string());
+        // Trust: VENDOR LIBGIT2 ON THIS PATH TOO (2026-07-30). Without it,
+        // `libgit2-sys`'s build script takes
+        // `try_to_use_system_libgit2 = !vendored && !zlib_ng_compat` (build.rs:113)
+        // and pkg-config-probes the system, so targo and cargo take a RUNTIME
+        // dependency on Homebrew's /opt/homebrew/opt/libgit2/lib/libgit2.1.9.dylib.
+        //
+        // That dylib is package-manager-owned and `brew deps rust` lists it, so
+        // `brew uninstall rust && brew autoremove` deletes it and every targo on the
+        // machine dies at dyld load — with targo being how everything here is built.
+        // It also drifts underneath already-built binaries: measured 2026-07-30,
+        // stage0/bin/targo was linked against libgit2 1.9.4 and stage1/bin/targo
+        // against 1.9.6, i.e. brew upgraded it between the two.
+        //
+        // `all-static` (src/tools/targo/Cargo.toml:301) already implies
+        // vendored-libgit2, which is why the guard above excludes that case. This
+        // makes the ORDINARY path match, exactly as vendored-openssl already does —
+        // OpenSSL was vendored here and libgit2 was simply missed. Vendoring needs no
+        // network: the bundled C tree ships inside the crate.
+        features.push("vendored-libgit2".to_string());
     }
 
     // build.tool.TOOL_NAME.features in bootstrap.toml allows specifying which features to enable
@@ -998,6 +1017,11 @@ fn restored_sysroot_bins_for_tool_settings(
     ) {
         bins.push(("rustfmt", "trustfmt"));
     }
+    if tool_enabled_for_tool_settings(extended, tools, "trustup") {
+        // Trust: same name on both sides — `trustup` has no upstream spelling
+        // to be compatible with, which is the point of it.
+        bins.push(("trustup", "trustup"));
+    }
     if tool_enabled_for_tool_settings(extended, tools, "trust-analyzer") {
         bins.push(("rust-analyzer", "trust-analyzer"));
     }
@@ -1186,6 +1210,35 @@ pub(crate) fn ensure_user_facing_tools(
             target,
         );
         install_bins(builder, &trustd.tool_path, &["trustd"]);
+    }
+    if tool_enabled_for_tool_settings(
+        builder.config.extended,
+        builder.config.tools.as_ref(),
+        "trustup",
+    ) {
+        // Trust: `trustup` is the Trust-native toolchain selector — the
+        // replacement for rustup, which this project does not depend on. It is
+        // std-only and in-tree, so it builds exactly like the other
+        // `Mode::ToolTarget` frontends and installs under its own name only.
+        // Wiring it in is not adopting it: nothing here makes it the default
+        // selector, and no existing selection path consults it.
+        let trustup = builder.ensure(ToolBuild {
+            build_compiler: get_tool_target_compiler(
+                builder,
+                ToolTargetBuildMode::Dist(target_compiler),
+            ),
+            output_compiler: target_compiler,
+            target,
+            tool: "trustup",
+            mode: Mode::ToolTarget,
+            path: "src/tools/trustup",
+            source_type: SourceType::InTree,
+            extra_features: Vec::new(),
+            allow_features: "",
+            cargo_args: Vec::new(),
+            artifact_kind: ToolArtifactKind::Binary,
+        });
+        install_bins(builder, &trustup.tool_path, &["trustup"]);
     }
     if extended_rustc_tool_is_default_step(builder, "cargo-clippy", true) {
         let tool = builder.ensure(ToolBuild {

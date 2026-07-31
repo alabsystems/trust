@@ -115,7 +115,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "ay"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-allsat",
  "ay-chc",
@@ -126,15 +126,15 @@ dependencies = [
  "ay-milp",
  "ay-proof",
  "ay-translate",
- "num-bigint",
+ "num-bigint 0.4.6",
  "num-rational",
- "num-traits",
+ "num-traits 0.2.19",
  "thiserror",
 ]
 
 [[package]]
 name = "ay-allsat"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-sat",
  "tracing",
@@ -142,27 +142,27 @@ dependencies = [
 
 [[package]]
 name = "ay-arrays"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
- "num-bigint",
+ "num-bigint 0.4.6",
  "tracing",
 ]
 
 [[package]]
 name = "ay-bv"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
  "ay-sys",
- "num-bigint",
+ "num-bigint 0.4.6",
  "stacker",
  "tracing",
 ]
 
 [[package]]
 name = "ay-chc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-arrays",
  "ay-bv",
@@ -175,10 +175,10 @@ dependencies = [
  "ay-lia",
  "ay-sat",
  "ay-sys",
- "num-bigint",
- "num-integer",
+ "num-bigint 0.4.6",
+ "num-integer 0.1.46",
  "num-rational",
- "num-traits",
+ "num-traits 0.2.19",
  "rustc-hash 2.1.2",
  "serde",
  "serde_json",
@@ -190,15 +190,15 @@ dependencies = [
 
 [[package]]
 name = "ay-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-sys",
  "foldhash 0.1.5",
  "hashbrown 0.15.5",
- "num-bigint",
- "num-integer",
+ "num-bigint 0.4.6",
+ "num-integer 0.1.46",
  "num-rational",
- "num-traits",
+ "num-traits 0.2.19",
  "serde",
  "stacker",
  "thiserror",
@@ -206,36 +206,36 @@ dependencies = [
 
 [[package]]
 name = "ay-count"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-sat",
  "ay-sys",
- "num-bigint",
- "num-integer",
+ "num-bigint 0.4.6",
+ "num-integer 0.1.46",
  "num-rational",
- "num-traits",
+ "num-traits 0.2.19",
  "rustc-hash 2.1.2",
 ]
 
 [[package]]
 name = "ay-diff-logic"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
- "num-bigint",
+ "num-bigint 0.4.6",
  "num-rational",
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
 name = "ay-dispatch"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rustc-hash 2.1.2",
 ]
 
 [[package]]
 name = "ay-dpll"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-arrays",
  "ay-bv",
@@ -261,10 +261,10 @@ dependencies = [
  "ay-strings",
  "ay-sys",
  "libc",
- "num-bigint",
- "num-integer",
+ "num-bigint 0.4.6",
+ "num-integer 0.1.46",
  "num-rational",
- "num-traits",
+ "num-traits 0.2.19",
  "serde_json",
  "sha2 0.10.9",
  "stacker",
@@ -274,15 +274,16 @@ dependencies = [
 
 [[package]]
 name = "ay-drat-check"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-proof-common",
+ "rustc-hash 2.1.2",
  "thiserror",
 ]
 
 [[package]]
 name = "ay-dt"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
  "ay-euf",
@@ -291,51 +292,51 @@ dependencies = [
 
 [[package]]
 name = "ay-euf"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
  "hashbrown 0.15.5",
- "num-bigint",
+ "num-bigint 0.4.6",
  "tracing",
 ]
 
 [[package]]
 name = "ay-fp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
- "num-bigint",
+ "num-bigint 0.4.6",
  "num-rational",
- "num-traits",
+ "num-traits 0.2.19",
  "tracing",
 ]
 
 [[package]]
 name = "ay-frontend"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
  "logos 0.15.1",
- "num-bigint",
+ "num-bigint 0.4.6",
  "num-rational",
- "num-traits",
+ "num-traits 0.2.19",
  "stacker",
  "thiserror",
 ]
 
 [[package]]
 name = "ay-intsat"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
- "num-bigint",
- "num-integer",
- "num-traits",
+ "num-bigint 0.4.6",
+ "num-integer 0.1.46",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
 name = "ay-jit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
  "serde",
@@ -344,141 +345,139 @@ dependencies = [
 
 [[package]]
 name = "ay-lia"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
  "ay-intsat",
  "ay-lra",
- "num-bigint",
- "num-integer",
+ "num-bigint 0.4.6",
+ "num-integer 0.1.46",
  "num-rational",
- "num-traits",
+ "num-traits 0.2.19",
  "tracing",
 ]
 
 [[package]]
 name = "ay-lra"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
  "ay-jit",
  "hashbrown 0.15.5",
- "num-bigint",
- "num-integer",
+ "num-bigint 0.4.6",
+ "num-integer 0.1.46",
  "num-rational",
- "num-traits",
+ "num-traits 0.2.19",
  "smallvec",
  "tracing",
 ]
 
 [[package]]
 name = "ay-map"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
- "num-bigint",
 ]
 
 [[package]]
 name = "ay-milp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-dpll",
  "ay-lra",
- "num-bigint",
- "num-integer",
+ "num-bigint 0.4.6",
+ "num-integer 0.1.46",
  "num-rational",
- "num-traits",
+ "num-traits 0.2.19",
  "thiserror",
 ]
 
 [[package]]
 name = "ay-model-check"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
- "num-bigint",
- "num-integer",
+ "num-bigint 0.4.6",
+ "num-integer 0.1.46",
  "num-rational",
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
 name = "ay-multiset"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
- "num-bigint",
 ]
 
 [[package]]
 name = "ay-nia"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
  "ay-lia",
  "ay-lra",
  "ay-nonlinear-common",
  "ay-sys",
- "num-bigint",
- "num-integer",
+ "num-bigint 0.4.6",
+ "num-integer 0.1.46",
  "num-rational",
- "num-traits",
+ "num-traits 0.2.19",
  "stacker",
  "tracing",
 ]
 
 [[package]]
 name = "ay-nonlinear-common"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "num-rational",
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
 name = "ay-nra"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
  "ay-lra",
  "ay-nonlinear-common",
  "hashbrown 0.15.5",
- "num-bigint",
- "num-integer",
+ "num-bigint 0.4.6",
+ "num-integer 0.1.46",
  "num-rational",
- "num-traits",
+ "num-traits 0.2.19",
  "stacker",
  "tracing",
 ]
 
 [[package]]
 name = "ay-prefetch"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "ay-proof"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
  "ay-sat",
- "num-bigint",
+ "num-bigint 0.4.6",
  "num-rational",
- "num-traits",
+ "num-traits 0.2.19",
  "serde",
  "thiserror",
 ]
 
 [[package]]
 name = "ay-proof-common"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "ay-sat"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
  "ay-drat-check",
@@ -501,43 +500,42 @@ dependencies = [
 
 [[package]]
 name = "ay-sat-congruence-core"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "ay-seq"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
- "num-bigint",
+ "num-bigint 0.4.6",
 ]
 
 [[package]]
 name = "ay-set"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
- "num-bigint",
 ]
 
 [[package]]
 name = "ay-strings"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
- "num-bigint",
+ "num-bigint 0.4.6",
  "tracing",
 ]
 
 [[package]]
 name = "ay-sys"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "ay-translate"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-core",
  "ay-dpll",
@@ -683,7 +681,7 @@ checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
  "js-sys",
- "num-traits",
+ "num-traits 0.2.19",
  "serde",
  "wasm-bindgen",
  "windows-link",
@@ -744,7 +742,7 @@ dependencies = [
  "clean-kernel",
  "hashbrown 0.17.1",
  "httparse",
- "num-bigint",
+ "num-bigint 0.4.6",
  "num-rational",
  "percent-encoding",
  "rayon",
@@ -760,8 +758,8 @@ dependencies = [
 name = "clean-ck0"
 version = "1.2.0"
 dependencies = [
- "num-bigint",
- "num-traits",
+ "num-bigint 0.4.6",
+ "num-traits 0.2.19",
  "thiserror",
 ]
 
@@ -787,9 +785,9 @@ dependencies = [
  "clean-parser",
  "clean-runtime",
  "hashbrown 0.17.1",
- "num-bigint",
+ "num-bigint 0.4.6",
  "num-rational",
- "num-traits",
+ "num-traits 0.2.19",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -808,9 +806,9 @@ dependencies = [
  "bincode 2.0.1",
  "hashbrown 0.17.1",
  "lz4_flex",
- "num-bigint",
+ "num-bigint 0.4.6",
  "num-rational",
- "num-traits",
+ "num-traits 0.2.19",
  "rayon",
  "serde",
  "serde_json",
@@ -875,10 +873,10 @@ dependencies = [
  "clean-elab",
  "clean-kernel",
  "glob",
- "num-bigint",
  "serde",
  "serde_json",
  "thiserror",
+ "tla-core 0.1.0 (git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883)",
 ]
 
 [[package]]
@@ -1258,6 +1256,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "indexmap"
+version = "2.14.0"
+source = "git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883#0c85599c17cf9efa907b7bca2a2107076cdca883"
+dependencies = [
+ "equivalent",
+ "hashbrown 0.17.1",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1342,6 +1349,14 @@ dependencies = [
 
 [[package]]
 name = "logos"
+version = "0.14.2"
+source = "git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883#0c85599c17cf9efa907b7bca2a2107076cdca883"
+dependencies = [
+ "logos-derive 0.14.2 (git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883)",
+]
+
+[[package]]
+name = "logos"
 version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff472f899b4ec2d99161c51f60ff7075eeb3097069a36050d8037a6325eb8154"
@@ -1352,6 +1367,20 @@ dependencies = [
 [[package]]
 name = "logos-codegen"
 version = "0.14.2"
+dependencies = [
+ "beef",
+ "fnv",
+ "lazy_static",
+ "proc-macro2",
+ "quote",
+ "regex-syntax",
+ "syn",
+]
+
+[[package]]
+name = "logos-codegen"
+version = "0.14.2"
+source = "git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883#0c85599c17cf9efa907b7bca2a2107076cdca883"
 dependencies = [
  "beef",
  "fnv",
@@ -1383,6 +1412,14 @@ name = "logos-derive"
 version = "0.14.2"
 dependencies = [
  "logos-codegen 0.14.2",
+]
+
+[[package]]
+name = "logos-derive"
+version = "0.14.2"
+source = "git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883#0c85599c17cf9efa907b7bca2a2107076cdca883"
+dependencies = [
+ "logos-codegen 0.14.2 (git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883)",
 ]
 
 [[package]]
@@ -1442,16 +1479,33 @@ dependencies = [
 name = "num-bigint"
 version = "0.4.6"
 dependencies = [
- "num-integer",
- "num-traits",
+ "num-integer 0.1.46",
+ "num-traits 0.2.19",
  "serde",
+]
+
+[[package]]
+name = "num-bigint"
+version = "0.4.6"
+source = "git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883#0c85599c17cf9efa907b7bca2a2107076cdca883"
+dependencies = [
+ "num-integer 0.1.46 (git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883)",
+ "num-traits 0.2.19 (git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883)",
 ]
 
 [[package]]
 name = "num-integer"
 version = "0.1.46"
 dependencies = [
- "num-traits",
+ "num-traits 0.2.19",
+]
+
+[[package]]
+name = "num-integer"
+version = "0.1.46"
+source = "git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883#0c85599c17cf9efa907b7bca2a2107076cdca883"
+dependencies = [
+ "num-traits 0.2.19 (git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883)",
 ]
 
 [[package]]
@@ -1460,15 +1514,23 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
 dependencies = [
- "num-bigint",
- "num-integer",
- "num-traits",
+ "num-bigint 0.4.6",
+ "num-integer 0.1.46",
+ "num-traits 0.2.19",
  "serde",
 ]
 
 [[package]]
 name = "num-traits"
 version = "0.2.19"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
+name = "num-traits"
+version = "0.2.19"
+source = "git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883#0c85599c17cf9efa907b7bca2a2107076cdca883"
 dependencies = [
  "autocfg",
 ]
@@ -1631,7 +1693,7 @@ version = "0.8.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ba8be72d372b2c9b35542551678538b562e7cf86c3315773cae48dfbfe7790c"
 dependencies = [
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -1655,6 +1717,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rowan"
+version = "0.15.16"
+source = "git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883#0c85599c17cf9efa907b7bca2a2107076cdca883"
+dependencies = [
+ "countme",
+ "hashbrown 0.14.5",
+ "rustc-hash 1.1.0",
+ "text-size",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1663,6 +1736,11 @@ checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 [[package]]
 name = "rustc-hash"
 version = "2.1.2"
+
+[[package]]
+name = "rustc-hash"
+version = "2.1.2"
+source = "git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883#0c85599c17cf9efa907b7bca2a2107076cdca883"
 
 [[package]]
 name = "rustc_version"
@@ -1957,7 +2035,7 @@ dependencies = [
 
 [[package]]
 name = "tla-arc"
-version = "0.10.0"
+version = "0.1.0"
 dependencies = [
  "serde",
  "stable_deref_trait",
@@ -1965,7 +2043,7 @@ dependencies = [
 
 [[package]]
 name = "tla-arena"
-version = "0.10.0"
+version = "0.1.0"
 
 [[package]]
 name = "tla-ariadne"
@@ -1976,15 +2054,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "tla-ariadne"
+version = "0.4.1"
+source = "git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883#0c85599c17cf9efa907b7bca2a2107076cdca883"
+dependencies = [
+ "unicode-width",
+ "yansi",
+]
+
+[[package]]
 name = "tla-backend"
-version = "0.10.0"
+version = "0.1.0"
 dependencies = [
  "tla-mc-core",
 ]
 
 [[package]]
 name = "tla-check"
-version = "0.10.0"
+version = "0.1.0"
 dependencies = [
  "ahash",
  "chrono",
@@ -1995,9 +2082,9 @@ dependencies = [
  "dashmap",
  "libc",
  "memmap2",
- "num-bigint",
- "num-integer",
- "num-traits",
+ "num-bigint 0.4.6",
+ "num-integer 0.1.46",
+ "num-traits 0.2.19",
  "rustc-hash 2.1.2",
  "serde",
  "serde_json",
@@ -2009,13 +2096,13 @@ dependencies = [
  "tla-arc",
  "tla-arena",
  "tla-backend",
- "tla-core",
+ "tla-core 0.1.0",
  "tla-dialect",
  "tla-eval",
  "tla-im",
  "tla-ir",
  "tla-jit-abi",
- "tla-lock",
+ "tla-lock 0.1.0",
  "tla-mc-core",
  "tla-resource",
  "tla-smallvec",
@@ -2030,43 +2117,62 @@ dependencies = [
 
 [[package]]
 name = "tla-core"
-version = "0.10.0"
+version = "0.1.0"
 dependencies = [
  "crossbeam-epoch",
  "indexmap 2.14.0",
  "logos 0.14.2",
- "num-bigint",
- "num-traits",
- "rowan",
+ "num-bigint 0.4.6",
+ "num-traits 0.2.19",
+ "rowan 0.15.16",
  "rustc-hash 2.1.2",
  "serde",
  "serde_json",
  "thiserror",
- "tla-ariadne",
+ "tla-ariadne 0.4.1",
  "tla-im",
- "tla-lock",
+ "tla-lock 0.1.0",
+]
+
+[[package]]
+name = "tla-core"
+version = "0.1.0"
+source = "git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883#0c85599c17cf9efa907b7bca2a2107076cdca883"
+dependencies = [
+ "crossbeam-epoch",
+ "indexmap 2.14.0 (git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883)",
+ "logos 0.14.2 (git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883)",
+ "num-bigint 0.4.6 (git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883)",
+ "num-traits 0.2.19 (git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883)",
+ "rowan 0.15.16 (git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883)",
+ "rustc-hash 2.1.2 (git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883)",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tla-ariadne 0.4.1 (git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883)",
+ "tla-lock 0.1.0 (git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883)",
 ]
 
 [[package]]
 name = "tla-dialect"
-version = "0.10.0"
+version = "0.1.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "tla-eval"
-version = "0.10.0"
+version = "0.1.0"
 dependencies = [
  "indexmap 2.14.0",
- "num-bigint",
- "num-integer",
- "num-traits",
+ "num-bigint 0.4.6",
+ "num-integer 0.1.46",
+ "num-traits 0.2.19",
  "rustc-hash 2.1.2",
  "serde",
  "serde_json",
  "thiserror",
- "tla-core",
+ "tla-core 0.1.0",
  "tla-smallvec",
  "tla-stack",
  "tla-tir",
@@ -2075,7 +2181,7 @@ dependencies = [
 
 [[package]]
 name = "tla-im"
-version = "0.10.0"
+version = "0.1.0"
 dependencies = [
  "bitmaps",
  "rand_core",
@@ -2088,11 +2194,11 @@ dependencies = [
 
 [[package]]
 name = "tla-ir"
-version = "0.10.0"
+version = "0.1.0"
 dependencies = [
- "num-traits",
+ "num-traits 0.2.19",
  "thiserror",
- "tla-core",
+ "tla-core 0.1.0",
  "tla-jit-abi",
  "tla-tir",
  "tla-value",
@@ -2102,34 +2208,63 @@ dependencies = [
 
 [[package]]
 name = "tla-jit-abi"
-version = "0.10.0"
+version = "0.1.0"
 dependencies = [
- "num-traits",
+ "num-traits 0.2.19",
  "serde",
  "thiserror",
- "tla-core",
+ "tla-core 0.1.0",
  "tla-value",
  "xxhash-rust 0.8.15",
 ]
 
 [[package]]
 name = "tla-lock"
-version = "0.10.0"
+version = "0.1.0"
 dependencies = [
- "tla-lock-api",
- "tla-lock-core",
+ "tla-lock-api 0.1.0",
+ "tla-lock-core 0.1.0",
+]
+
+[[package]]
+name = "tla-lock"
+version = "0.1.0"
+source = "git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883#0c85599c17cf9efa907b7bca2a2107076cdca883"
+dependencies = [
+ "tla-lock-api 0.1.0 (git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883)",
+ "tla-lock-core 0.1.0 (git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883)",
 ]
 
 [[package]]
 name = "tla-lock-api"
-version = "0.10.0"
+version = "0.1.0"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
+name = "tla-lock-api"
+version = "0.1.0"
+source = "git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883#0c85599c17cf9efa907b7bca2a2107076cdca883"
 dependencies = [
  "scopeguard",
 ]
 
 [[package]]
 name = "tla-lock-core"
-version = "0.10.0"
+version = "0.1.0"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "redox_syscall",
+ "smallvec",
+ "windows-link",
+]
+
+[[package]]
+name = "tla-lock-core"
+version = "0.1.0"
+source = "git+https://github.com/alabsystems/ty.git?rev=0c85599c17cf9efa907b7bca2a2107076cdca883#0c85599c17cf9efa907b7bca2a2107076cdca883"
 dependencies = [
  "cfg-if",
  "libc",
@@ -2140,29 +2275,29 @@ dependencies = [
 
 [[package]]
 name = "tla-mc-core"
-version = "0.10.0"
+version = "0.1.0"
 dependencies = [
  "crossbeam",
  "rustc-hash 2.1.2",
  "thiserror",
- "tla-lock",
+ "tla-lock 0.1.0",
  "tla-smallvec",
 ]
 
 [[package]]
 name = "tla-resource"
-version = "0.10.0"
+version = "0.1.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "tla-rp"
-version = "0.10.0"
+version = "0.1.0"
 
 [[package]]
 name = "tla-smallvec"
-version = "0.10.0"
+version = "0.1.0"
 
 [[package]]
 name = "tla-stack"
@@ -2177,26 +2312,26 @@ dependencies = [
 
 [[package]]
 name = "tla-tir"
-version = "0.10.0"
+version = "0.1.0"
 dependencies = [
- "num-traits",
+ "num-traits 0.2.19",
  "rustc-hash 2.1.2",
  "thiserror",
- "tla-core",
+ "tla-core 0.1.0",
  "tla-value",
 ]
 
 [[package]]
 name = "tla-trust-cg"
-version = "0.10.0"
+version = "0.1.0"
 dependencies = [
  "libloading",
- "num-bigint",
- "num-traits",
+ "num-bigint 0.4.6",
+ "num-traits 0.2.19",
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
- "tla-core",
+ "tla-core 0.1.0",
  "tla-ir",
  "tla-jit-abi",
  "tla-tir",
@@ -2213,17 +2348,17 @@ dependencies = [
 
 [[package]]
 name = "tla-value"
-version = "0.10.0"
+version = "0.1.0"
 dependencies = [
  "dashmap",
  "indexmap 2.14.0",
- "num-bigint",
- "num-traits",
+ "num-bigint 0.4.6",
+ "num-traits 0.2.19",
  "rustc-hash 2.1.2",
  "serde",
  "serde_json",
  "thiserror",
- "tla-core",
+ "tla-core 0.1.0",
  "tla-im",
  "tla-rp",
  "tla-smallvec",
@@ -2368,6 +2503,7 @@ dependencies = [
  "trust-cg-ir",
  "trust-cg-lower",
  "trust-cg-opt",
+ "trust-cg-process-env",
  "trust-cg-regalloc",
  "trust-cg-verify",
  "trust-ir",
@@ -2408,6 +2544,7 @@ dependencies = [
  "thiserror",
  "trust-cg-codegen",
  "trust-cg-ir",
+ "trust-cg-process-env",
  "trust-ir",
  "trust-ir-build",
 ]
@@ -2420,6 +2557,7 @@ dependencies = [
  "thiserror",
  "trust-cg-ir",
  "trust-ir",
+ "trust-ir-build",
 ]
 
 [[package]]
@@ -2431,7 +2569,12 @@ dependencies = [
  "thiserror",
  "trust-cg-ir",
  "trust-cg-lower",
+ "trust-cg-process-env",
 ]
+
+[[package]]
+name = "trust-cg-process-env"
+version = "0.1.0"
 
 [[package]]
 name = "trust-cg-regalloc"
@@ -2456,6 +2599,7 @@ dependencies = [
  "trust-cg-ir",
  "trust-cg-lower",
  "trust-cg-opt",
+ "trust-cg-process-env",
  "trust-ir",
 ]
 
@@ -2498,7 +2642,7 @@ dependencies = [
  "serde_json",
  "tempfile 3.27.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "tla-check",
- "tla-core",
+ "tla-core 0.1.0",
  "trust-ir",
  "trust-spec-temporal-macros",
 ]
@@ -2854,4 +2998,4 @@ dependencies = [
 
 [[patch.unused]]
 name = "ay-encode"
-version = "0.2.0"
+version = "0.3.0"

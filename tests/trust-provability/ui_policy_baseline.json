@@ -23,6 +23,10 @@
   "ice": false,
   "rc": 1
  },
+ "certified_monitor_extended_carriers.rs": {
+  "ice": false,
+  "rc": 0
+ },
  "certified_monitor_legacy_marker_rejected.rs": {
   "ice": false,
   "rc": 0
@@ -36,6 +40,10 @@
   "rc": 0
  },
  "certified_monitor_operator_runtime.rs": {
+  "ice": false,
+  "rc": 1
+ },
+ "certified_monitor_recursive_decreases.rs": {
   "ice": false,
   "rc": 1
  },
@@ -79,7 +87,7 @@
   "ice": false,
   "rc": 1
  },
- "certified_monitor_tail_call_rejected.rs": {
+ "certified_monitor_tail_call.rs": {
   "ice": false,
   "rc": 1
  },
@@ -357,7 +365,7 @@
  },
  "native_requires_assumed_binds_param.rs": {
   "ice": false,
-  "rc": 1
+  "rc": 0
  },
  "native_requires_shadow_not_assumed.rs": {
   "ice": false,
@@ -442,6 +450,14 @@
  "trust_ir_lower_rpit_no_cycle.rs": {
   "ice": false,
   "rc": 1
+ },
+ "trust_ir_lower_self_referential_static_no_cycle.rs": {
+  "ice": false,
+  "rc": 0
+ },
+ "trust_ir_lower_struct_payload_enum.rs": {
+  "ice": false,
+  "rc": 0
  },
  "trust_sealed_dyn_summary.rs": {
   "ice": false,

@@ -24,10 +24,7 @@
 //! `docs/design/2026-07-25-select-encoding-ergonomics.md` and probe `f01`.
 
 clean {
-    def u64_lt (a : UInt64) (b : UInt64) : Bool :=
-        Bool.not (Nat.ble (UInt64.toNat b) (UInt64.toNat a))
-
-    def min_isl (a : UInt64) (b : UInt64) : UInt64 := cond (u64_lt a b) a b
+    def min_isl (a : UInt64) (b : UInt64) : UInt64 := if a < b then a else b
 }
 
 /// Ordinary Rust. The island above is its specification, and no proof is written.

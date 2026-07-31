@@ -5360,6 +5360,16 @@ pub fn func_operand_name<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>) -> 
                     {
                         return marked;
                     }
+                    if let Some(marked) =
+                        tcx_marked_unsigned_wrapping_primitive_path(tcx, *def_id, &generic)
+                    {
+                        return marked;
+                    }
+                    if let Some(marked) =
+                        tcx_marked_wrapping_refutation_path(tcx, *def_id, &generic)
+                    {
+                        return marked;
+                    }
                     // Trust (#84): the `?` operator desugars to a `Try::branch` call and
                     // (on the early-return arm) a `FromResidual::from_residual` call. For
                     // the std `Result`/`Option`/`ControlFlow` carriers — when no error
@@ -5454,6 +5464,139 @@ fn tcx_marked_pure_total_intrinsic_path(
         return None;
     }
     Some(format!("{}{}", trust_types::TRUST_RUSTC_INTRINSIC_PATH_PREFIX, path))
+}
+
+/// Return the primitive self type when `def_id` is an exact inherent
+/// `core` integer `wrapping_*` method.
+///
+/// This broader classifier grants no semantic or proof authority. The MIR
+/// inliner uses it only to preserve authenticated library-call identity until
+/// Trust's final verification pass. Otherwise `-O` can inline a defined
+/// wrapping operation into an indistinguishable ordinary `Add`/`Sub`/`Mul`,
+/// causing false no-overflow obligations and erasing the E6 S3/S4 body shape.
+/// Keeping every exact integer `wrapping_*` call intact also makes currently
+/// unsupported carriers fail closed as calls instead of being misclassified as
+/// source arithmetic. LLVM remains free to inline after verification.
+fn tcx_authenticated_core_integer_wrapping_self_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+) -> Option<ty::Ty<'tcx>> {
+    if tcx.trait_impl_of_assoc(def_id).is_some() {
+        return None;
+    }
+    let impl_did = tcx.impl_of_assoc(def_id)?;
+    let core_lang_item_crate = tcx.lang_items().sized_trait()?.krate;
+    if def_id.is_local()
+        || def_id.krate != core_lang_item_crate
+        || impl_did.krate != core_lang_item_crate
+    {
+        return None;
+    }
+    let self_ty = tcx.type_of(impl_did).skip_binder();
+    if !matches!(
+        self_ty.kind(),
+        rustc_middle::ty::TyKind::Int(_) | rustc_middle::ty::TyKind::Uint(_)
+    ) || !tcx.item_name(def_id).as_str().starts_with("wrapping_")
+    {
+        return None;
+    }
+    let sig = tcx.fn_sig(def_id).instantiate_identity().skip_binder();
+    if sig.safety() != rustc_hir::Safety::Safe
+        || sig.abi() != rustc_abi::ExternAbi::Rust
+        || sig.c_variadic()
+    {
+        return None;
+    }
+    Some(self_ty)
+}
+
+/// Whether a definition is an exact inherent `core` integer `wrapping_*`
+/// method whose call identity must survive MIR optimization while Trust
+/// verification is enabled.
+///
+/// This is an optimization-preservation predicate, not a totality or E6
+/// admission predicate. Only [`tcx_marked_unsigned_wrapping_primitive_path`]
+/// below mints the much narrower semantic marker.
+#[must_use]
+pub fn tcx_is_authenticated_core_integer_wrapping_method(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    tcx_authenticated_core_integer_wrapping_self_ty(tcx, def_id).is_some()
+}
+
+/// Mark the exact inherent unsigned-primitive wrapping methods modeled by the
+/// E6 arithmetic and composed-expression lanes.
+///
+/// These calls name library methods rather than rustc intrinsics, so
+/// [`TyCtxt::intrinsic`] cannot authenticate them and their `core` bodies are
+/// unavailable to the same-unit facet fixpoint. Identity must not come from
+/// diagnostic path text: a user can author a same-suffix module function or a
+/// method on a local type. This compiler also exposes
+/// `#[rustc_allow_incoherent_impl]`, so primitive self type alone is not an
+/// identity proof. Instead require the item and impl to live in the exact crate
+/// that supplies the `Sized` lang item, plus an inherent primitive impl and the
+/// exact safe Rust `(U, U) -> U` signature.
+///
+/// Only u8/u16/u32/u64 match the current E6 machine-domain boundary. `u128` and
+/// `usize` stay excluded until their corresponding domain/target-width
+/// authority is carried end to end. The accepted operations are total,
+/// deterministic, panic-free, and pure.
+fn tcx_marked_unsigned_wrapping_primitive_path(
+    tcx: TyCtxt<'_>,
+    def_id: DefId,
+    path: &str,
+) -> Option<String> {
+    let self_ty = tcx_authenticated_core_integer_wrapping_self_ty(tcx, def_id)?;
+    if !matches!(
+        self_ty.kind(),
+        rustc_middle::ty::TyKind::Uint(
+            ty::UintTy::U8 | ty::UintTy::U16 | ty::UintTy::U32 | ty::UintTy::U64
+        )
+    ) {
+        return None;
+    }
+    if !matches!(tcx.item_name(def_id).as_str(), "wrapping_add" | "wrapping_sub" | "wrapping_mul") {
+        return None;
+    }
+    let sig = tcx.fn_sig(def_id).instantiate_identity().skip_binder();
+    if sig.inputs().len() != 2
+        || sig.inputs()[0] != self_ty
+        || sig.inputs()[1] != self_ty
+        || sig.output() != self_ty
+    {
+        return None;
+    }
+    let marked = format!("{}{}", trust_types::TRUST_RUSTC_TOTAL_PRIMITIVE_METHOD_PATH_PREFIX, path);
+    trust_types::RustcTotalPrimitiveMethod::classify(&marked).map(|_| marked)
+}
+
+/// Mark an exact inherent `core` integer wrapping add/sub method for the
+/// refutation-only modular call model.
+///
+/// The E6 marker above intentionally excludes signed, pointer-sized, and
+/// 128-bit carriers. Full-mode assertion refutation already models a subset of
+/// those carriers, but recovering identity from a source-spellable
+/// `wrapping_add` suffix lets a user lookalike manufacture a false
+/// counterexample. This second closed marker preserves that existing
+/// refutation precision without widening E6 proof authority.
+fn tcx_marked_wrapping_refutation_path(
+    tcx: TyCtxt<'_>,
+    def_id: DefId,
+    path: &str,
+) -> Option<String> {
+    let self_ty = tcx_authenticated_core_integer_wrapping_self_ty(tcx, def_id)?;
+    if !matches!(tcx.item_name(def_id).as_str(), "wrapping_add" | "wrapping_sub") {
+        return None;
+    }
+    let sig = tcx.fn_sig(def_id).instantiate_identity().skip_binder();
+    if sig.inputs().len() != 2
+        || sig.inputs()[0] != self_ty
+        || sig.inputs()[1] != self_ty
+        || sig.output() != self_ty
+    {
+        return None;
+    }
+    let marked =
+        format!("{}{}", trust_types::TRUST_RUSTC_WRAPPING_REFUTATION_METHOD_PATH_PREFIX, path);
+    trust_types::RustcWrappingRefutationMethod::classify(&marked).map(|_| marked)
 }
 
 fn pure_total_intrinsic_marker_allowed(name: &str, must_be_overridden: bool) -> bool {
@@ -5961,7 +6104,26 @@ fn func_operand_is_unsafe_sig<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>
     }
 }
 
-/// Convert a rustc Span to our SourceSpan.
+/// Convert a rustc Span to our SourceSpan: the RAW LO+HI range, deliberately NOT rebased
+/// to the callsite, with the file rendering run through
+/// `trust_types::stable_obligation_file` (toolchain build token elided, so a sealed
+/// identity survives compiler rebuilds).
+///
+/// BYTE-IDENTICAL to `rustc_mir_transform::trust_verify::source_span_from_rustc_span` and
+/// `rustc_mir_transform::trust_r1_oracle::source_span`, and it must stay that way: R1's
+/// `exact_callsite_span_multiset_matches` compares the oracle's spans against the VC
+/// locations this function stamps, and the box-deref lint drop set matches
+/// `source_span_from_rustc_span` output against this function's `UnsafeBlock` spans — so
+/// normalizing one copy and not the others makes those exact comparisons fail closed on
+/// every span that differs. (An ADDITIVE callsite anchor under a new binding is the one
+/// permitted evolution; it too must land in all three copies together.)
+///
+/// Why raw (identity exactness), why the raw location is still not user-actionable for
+/// macro-generated obligations, and why that remaining fix is additive rather than a swap:
+/// see the note on `trust_verify::source_span_from_rustc_span`. Why the trust-ir
+/// debug-info lane (`trust-thir-lower::to_source_span`) correctly does the opposite: see
+/// the note there. Divergence pinned by
+/// `crates/trust-types/tests/span_normalization_parity.rs`.
 pub(crate) fn convert_span(tcx: TyCtxt<'_>, span: Span) -> SourceSpan {
     if span.is_dummy() {
         return SourceSpan::default();
@@ -5972,7 +6134,9 @@ pub(crate) fn convert_span(tcx: TyCtxt<'_>, span: Span) -> SourceSpan {
     let hi = source_map.lookup_char_pos(span.hi());
 
     SourceSpan {
-        file: lo.file.name.prefer_local_unconditionally().to_string(),
+        file: trust_types::stable_obligation_file(
+            lo.file.name.prefer_local_unconditionally().to_string(),
+        ),
         line_start: lo.line as u32,
         col_start: lo.col.0 as u32,
         line_end: hi.line as u32,
@@ -6293,6 +6457,96 @@ pub fn source_spelled_intrinsics_bswap(x: u8) -> u8 { intrinsics::bswap(x) }
 #[inline(never)]
 pub fn source_spelled_intrinsics_bitreverse(x: u8) -> u8 { intrinsics::bitreverse(x) }
 
+macro_rules! wrapping_positive {
+    ($name:ident, $ty:ty, $method:ident) => {
+        #[inline(never)]
+        pub fn $name(x: $ty, y: $ty) -> $ty { x.$method(y) }
+    };
+}
+wrapping_positive!(compiler_wrapping_u8_add, u8, wrapping_add);
+wrapping_positive!(compiler_wrapping_u8_sub, u8, wrapping_sub);
+wrapping_positive!(compiler_wrapping_u8_mul, u8, wrapping_mul);
+wrapping_positive!(compiler_wrapping_u16_add, u16, wrapping_add);
+wrapping_positive!(compiler_wrapping_u16_sub, u16, wrapping_sub);
+wrapping_positive!(compiler_wrapping_u16_mul, u16, wrapping_mul);
+wrapping_positive!(compiler_wrapping_u32_add, u32, wrapping_add);
+wrapping_positive!(compiler_wrapping_u32_sub, u32, wrapping_sub);
+wrapping_positive!(compiler_wrapping_u32_mul, u32, wrapping_mul);
+wrapping_positive!(compiler_wrapping_u64_add, u64, wrapping_add);
+wrapping_positive!(compiler_wrapping_u64_sub, u64, wrapping_sub);
+wrapping_positive!(compiler_wrapping_u64_mul, u64, wrapping_mul);
+
+#[inline(never)]
+pub fn compiler_wrapping_composed_u64(x: u64) -> u64 {
+    x.wrapping_add(1).wrapping_mul(2)
+}
+
+#[inline(never)]
+pub fn excluded_wrapping_u128_add(x: u128, y: u128) -> u128 { x.wrapping_add(y) }
+#[inline(never)]
+pub fn excluded_wrapping_usize_add(x: usize, y: usize) -> usize { x.wrapping_add(y) }
+#[inline(never)]
+pub fn excluded_wrapping_i8_add(x: i8, y: i8) -> i8 { x.wrapping_add(y) }
+#[inline(never)]
+pub fn excluded_wrapping_i16_sub(x: i16, y: i16) -> i16 { x.wrapping_sub(y) }
+#[inline(never)]
+pub fn excluded_wrapping_i32_mul(x: i32, y: i32) -> i32 { x.wrapping_mul(y) }
+#[inline(never)]
+pub fn excluded_wrapping_i64_add(x: i64, y: i64) -> i64 { x.wrapping_add(y) }
+#[inline(never)]
+pub fn excluded_wrapping_i128_add(x: i128, y: i128) -> i128 { x.wrapping_add(y) }
+#[inline(never)]
+pub fn excluded_wrapping_ptr_add(x: *const u8, y: usize) -> *const u8 { x.wrapping_add(y) }
+#[inline(never)]
+pub fn excluded_wrapping_add_signed(x: u64, y: i64) -> u64 { x.wrapping_add_signed(y) }
+#[inline(never)]
+pub fn excluded_wrapping_add_unsigned(x: i64, y: u64) -> i64 { x.wrapping_add_unsigned(y) }
+#[inline(never)]
+pub fn excluded_saturating_u64_add(x: u64, y: u64) -> u64 { x.saturating_add(y) }
+
+pub mod wrapping_names {
+    #[inline(never)]
+    pub fn wrapping_add(x: u64, y: u64) -> u64 { x ^ y }
+}
+#[inline(never)]
+pub fn source_spelled_wrapping_add(x: u64, y: u64) -> u64 {
+    wrapping_names::wrapping_add(x, y)
+}
+
+pub struct UserUint(pub u64);
+impl UserUint {
+    #[inline(never)]
+    pub fn wrapping_sub(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) }
+    #[inline(never)]
+    pub fn wrapping_add(self, rhs: Self, extra: Self) -> Self {
+        Self(self.0 ^ rhs.0 ^ extra.0)
+    }
+}
+#[inline(never)]
+pub fn user_inherent_wrapping_sub(x: UserUint, y: UserUint) -> UserUint {
+    x.wrapping_sub(y)
+}
+#[inline(never)]
+pub fn user_wrong_signature_wrapping_add(
+    x: UserUint,
+    y: UserUint,
+    z: UserUint,
+) -> UserUint {
+    x.wrapping_add(y, z)
+}
+
+pub trait UserWrapping {
+    fn wrapping_mul(self, rhs: u64) -> u64;
+}
+impl UserWrapping for u64 {
+    #[inline(never)]
+    fn wrapping_mul(self, rhs: u64) -> u64 { self ^ rhs }
+}
+#[inline(never)]
+pub fn user_trait_wrapping_mul(x: u64, y: u64) -> u64 {
+    <u64 as UserWrapping>::wrapping_mul(x, y)
+}
+
 // v24 direct-call unwind-exemption fixture: `direct_call_add` makes a DIRECT
 // call to `add_helper`. `add_helper` divides (an always-checked div-by-zero /
 // INT_MIN÷-1 panic), so it MAY unwind, and the caller has no drop-carrying
@@ -6304,6 +6558,17 @@ pub fn add_helper(a: i32, b: i32) -> i32 { a / b }
 pub fn direct_call_add(a: i32, b: i32) -> i32 { add_helper(a, b) }
 "#;
     const TEST_CRATE_PATH: &str = "return_shapes.rs";
+
+    const INCOHERENT_PRIMITIVE_IMPL_SOURCE: &str = r#"
+#![feature(rustc_attrs)]
+#![allow(internal_features)]
+
+impl u64 {
+    #[rustc_allow_incoherent_impl]
+    pub fn wrapping_add(self, rhs: u64) -> u64 { self ^ rhs }
+}
+"#;
+    const INCOHERENT_PRIMITIVE_IMPL_TEST_CRATE_PATH: &str = "incoherent_primitive_impl.rs";
 
     const CAST_SOURCE: &str = r#"
 #![feature(auto_traits, const_trait_impl, intrinsics, lang_items, no_core, rustc_attrs, unboxed_closures)]
@@ -6493,6 +6758,30 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
         }
     }
 
+    struct InMemoryIncoherentPrimitiveImplFileLoader;
+
+    impl rustc_span::source_map::FileLoader for InMemoryIncoherentPrimitiveImplFileLoader {
+        fn file_exists(&self, path: &Path) -> bool {
+            path == Path::new(INCOHERENT_PRIMITIVE_IMPL_TEST_CRATE_PATH)
+        }
+
+        fn read_file(&self, path: &Path) -> io::Result<String> {
+            if self.file_exists(path) {
+                Ok(INCOHERENT_PRIMITIVE_IMPL_SOURCE.to_string())
+            } else {
+                Err(io::Error::other("unexpected incoherent-impl test file path"))
+            }
+        }
+
+        fn read_binary_file(&self, _path: &Path) -> io::Result<Arc<[u8]>> {
+            Err(io::Error::other("binary reads are not supported in incoherent-impl tests"))
+        }
+
+        fn current_directory(&self) -> io::Result<PathBuf> {
+            std::env::current_dir()
+        }
+    }
+
     struct InMemoryClosureFileLoader;
 
     impl rustc_span::source_map::FileLoader for InMemoryClosureFileLoader {
@@ -6563,6 +6852,11 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
         rvalues: BTreeMap<String, Rvalue>,
     }
 
+    #[derive(Default)]
+    struct IncoherentPrimitiveImplCallbacks {
+        candidates: Vec<(String, Option<String>, Option<String>)>,
+    }
+
     impl rustc_driver::Callbacks for ReturnShapeCallbacks {
         fn config(&mut self, config: &mut Config) {
             config.file_loader = Some(Box::new(InMemoryFileLoader));
@@ -6599,23 +6893,39 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
                 let item = tcx.hir_item(item_id);
                 if let rustc_hir::ItemKind::Fn { ident, .. } = item.kind {
                     let fn_name = ident.name.to_string();
-                    let body = tcx.optimized_mir(item.owner_id.def_id.to_def_id());
                     if fn_name.starts_with("compiler_intrinsic_")
                         || fn_name.starts_with("source_spelled_intrinsics_")
+                        || fn_name.starts_with("compiler_wrapping_")
+                        || fn_name.starts_with("excluded_wrapping_")
+                        || fn_name.starts_with("excluded_saturating_")
+                        || fn_name.starts_with("source_spelled_wrapping_")
+                        || fn_name.starts_with("user_inherent_wrapping_")
+                        || fn_name.starts_with("user_wrong_signature_wrapping_")
+                        || fn_name.starts_with("user_trait_wrapping_")
                     {
-                        let callees = body
-                            .basic_blocks
-                            .iter()
-                            .filter_map(|block| match &block.terminator().kind {
-                                mir::TerminatorKind::Call { func, .. } => {
-                                    Some(func_operand_name(tcx, func))
-                                }
-                                _ => None,
-                            })
-                            .collect();
+                        // Inspect pre-optimization MIR. The canonical core
+                        // wrapping methods are aggressively inlined/lowered at
+                        // high MIR optimization levels, so requiring a Call to
+                        // survive in optimized MIR would test an optimization
+                        // accident rather than the production identity gate.
+                        let elaborated =
+                            tcx.mir_drops_elaborated_and_const_checked(item.owner_id.def_id);
+                        let callees = {
+                            let body = elaborated.borrow();
+                            body.basic_blocks
+                                .iter()
+                                .filter_map(|block| match &block.terminator().kind {
+                                    mir::TerminatorKind::Call { func, .. } => {
+                                        Some(func_operand_name(tcx, func))
+                                    }
+                                    _ => None,
+                                })
+                                .collect()
+                        };
                         self.results.direct_callees.insert(fn_name, callees);
                         continue;
                     }
+                    let body = tcx.optimized_mir(item.owner_id.def_id.to_def_id());
                     // v24: the direct-call fixture is inspected ONLY for its `Call`
                     // TERMINATOR (unwind-exemption pin), not a return-place rvalue —
                     // its `_0` is initialized by the call destination, not an `Assign`
@@ -6689,6 +6999,29 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
                 self.rvalues.insert(name.to_string(), convert_rvalue(tcx, &rvalue, None, None));
             }
 
+            Compilation::Stop
+        }
+    }
+
+    impl rustc_driver::Callbacks for IncoherentPrimitiveImplCallbacks {
+        fn config(&mut self, config: &mut Config) {
+            config.file_loader = Some(Box::new(InMemoryIncoherentPrimitiveImplFileLoader));
+        }
+
+        fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+            tcx.sess.dcx().abort_if_errors();
+            for local_def_id in tcx.iter_local_def_id() {
+                let def_id = local_def_id.to_def_id();
+                if tcx.def_kind(def_id) != rustc_hir::def::DefKind::AssocFn
+                    || tcx.item_name(def_id).as_str() != "wrapping_add"
+                {
+                    continue;
+                }
+                let path = crate::safe_def_path_str(tcx, def_id);
+                let e6_marked = tcx_marked_unsigned_wrapping_primitive_path(tcx, def_id, &path);
+                let refutation_marked = tcx_marked_wrapping_refutation_path(tcx, def_id, &path);
+                self.candidates.push((path, e6_marked, refutation_marked));
+            }
             Compilation::Stop
         }
     }
@@ -7125,6 +7458,38 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
 
     fn fixture_direct_callees() -> &'static BTreeMap<String, Vec<String>> {
         &extract_test_results().direct_callees
+    }
+
+    fn incoherent_primitive_impl_candidates() -> &'static [(String, Option<String>, Option<String>)]
+    {
+        static RESULTS: OnceLock<Vec<(String, Option<String>, Option<String>)>> = OnceLock::new();
+        RESULTS.get_or_init(|| {
+            let mut callbacks = IncoherentPrimitiveImplCallbacks::default();
+            let mut args = vec![
+                "rustc".to_string(),
+                INCOHERENT_PRIMITIVE_IMPL_TEST_CRATE_PATH.to_string(),
+                "--crate-name".to_string(),
+                "trust_mir_extract_incoherent_primitive_impl".to_string(),
+                "--crate-type=lib".to_string(),
+                "--edition=2021".to_string(),
+                "-Zno-codegen".to_string(),
+                "-Zcodegen-backend=dummy".to_string(),
+                "-Ztrust-verify=off".to_string(),
+                "-Ainternal_features".to_string(),
+            ];
+            args.push("--sysroot".to_string());
+            args.push(compiler_sysroot());
+            let result =
+                rustc_driver::catch_fatal_errors(|| -> rustc_interface::interface::Result<()> {
+                    rustc_driver::run_compiler(&args, &mut callbacks);
+                    Ok(())
+                });
+            assert!(
+                result.is_ok(),
+                "failed to compile the incoherent primitive-impl identity negative"
+            );
+            callbacks.candidates
+        })
     }
 
     fn extract_return_place_rvalue<'tcx>(
@@ -8311,6 +8676,132 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
                 source_spelled
             );
         }
+    }
+
+    #[test]
+    fn direct_unsigned_wrapping_marker_requires_tcx_primitive_inherent_identity() {
+        let callees = fixture_direct_callees();
+        for width in ["u8", "u16", "u32", "u64"] {
+            for (suffix, method) in
+                [("add", "wrapping_add"), ("sub", "wrapping_sub"), ("mul", "wrapping_mul")]
+            {
+                let caller = format!("compiler_wrapping_{width}_{suffix}");
+                let extracted = callees.get(&caller).expect("unsigned wrapping caller extracted");
+                assert_eq!(extracted.len(), 1, "expected one direct call from {caller}");
+                assert!(
+                    extracted[0]
+                        .starts_with(trust_types::TRUST_RUSTC_TOTAL_PRIMITIVE_METHOD_PATH_PREFIX),
+                    "TyCtxt-confirmed unsigned primitive {method} must carry the sealed method marker: {extracted:?}",
+                );
+                assert!(
+                    !extracted[0].starts_with(trust_types::TRUST_RUSTC_INTRINSIC_PATH_PREFIX),
+                    "a core library method must not impersonate a rustc intrinsic: {extracted:?}",
+                );
+                assert_eq!(
+                    trust_types::RustcTotalPrimitiveMethod::classify(&extracted[0])
+                        .map(trust_types::RustcTotalPrimitiveMethod::width),
+                    Some(width.trim_start_matches('u').parse().expect("numeric width")),
+                    "the marker grammar must preserve the exact admitted machine width",
+                );
+                assert!(
+                    extracted[0].contains("core::num") && extracted[0].contains(method),
+                    "the marker must preserve the authenticated primitive method path: {extracted:?}",
+                );
+            }
+        }
+
+        let composed = callees
+            .get("compiler_wrapping_composed_u64")
+            .expect("composed unsigned wrapping caller extracted");
+        assert_eq!(composed.len(), 2, "the pre-optimization S4 chain must retain two calls");
+        for callee in composed {
+            assert!(
+                trust_types::RustcTotalPrimitiveMethod::classify(callee)
+                    .is_some_and(|method| method.width() == 64),
+                "every node in the composed chain must carry exact sealed u64 identity: {composed:?}",
+            );
+        }
+
+        for caller in [
+            "excluded_wrapping_u128_add",
+            "excluded_wrapping_usize_add",
+            "excluded_wrapping_i8_add",
+            "excluded_wrapping_i16_sub",
+            "excluded_wrapping_i32_mul",
+            "excluded_wrapping_i64_add",
+            "excluded_wrapping_i128_add",
+            "excluded_wrapping_ptr_add",
+            "excluded_wrapping_add_signed",
+            "excluded_wrapping_add_unsigned",
+            "excluded_saturating_u64_add",
+            "source_spelled_wrapping_add",
+            "user_inherent_wrapping_sub",
+            "user_wrong_signature_wrapping_add",
+            "user_trait_wrapping_mul",
+        ] {
+            let extracted = callees.get(caller).expect("unsigned wrapping caller extracted");
+            assert_eq!(extracted.len(), 1, "expected one direct call from {caller}");
+            assert!(
+                !extracted[0]
+                    .starts_with(trust_types::TRUST_RUSTC_TOTAL_PRIMITIVE_METHOD_PATH_PREFIX),
+                "excluded or lookalike method must remain unmarked ({caller}): {extracted:?}",
+            );
+        }
+
+        for caller in [
+            "excluded_wrapping_u128_add",
+            "excluded_wrapping_usize_add",
+            "excluded_wrapping_i8_add",
+            "excluded_wrapping_i16_sub",
+            "excluded_wrapping_i64_add",
+            "excluded_wrapping_i128_add",
+        ] {
+            let extracted = callees.get(caller).expect("refutation wrapping caller extracted");
+            assert!(
+                trust_types::RustcWrappingRefutationMethod::classify(&extracted[0]).is_some(),
+                "an exact non-E6 core wrapping add/sub must retain sealed refutation identity: \
+                 {caller}: {extracted:?}"
+            );
+        }
+
+        for caller in [
+            "excluded_wrapping_i32_mul",
+            "excluded_wrapping_ptr_add",
+            "excluded_wrapping_add_signed",
+            "excluded_wrapping_add_unsigned",
+            "excluded_saturating_u64_add",
+            "source_spelled_wrapping_add",
+            "user_inherent_wrapping_sub",
+            "user_wrong_signature_wrapping_add",
+            "user_trait_wrapping_mul",
+        ] {
+            let extracted = callees.get(caller).expect("wrapping negative caller extracted");
+            assert!(
+                !extracted[0]
+                    .starts_with(trust_types::TRUST_RUSTC_WRAPPING_REFUTATION_METHOD_PATH_PREFIX),
+                "an unsupported or source-authored lookalike must not receive refutation identity: \
+                 {caller}: {extracted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn incoherent_local_primitive_impl_cannot_mint_core_method_identity() {
+        let candidates = incoherent_primitive_impl_candidates();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "the compiler must expose the authored incoherent u64 associated item"
+        );
+        let (path, e6_marked, refutation_marked) = &candidates[0];
+        assert!(
+            path.contains("wrapping_add"),
+            "negative fixture must exercise the colliding method leaf: {path}"
+        );
+        assert!(
+            e6_marked.is_none() && refutation_marked.is_none(),
+            "a local #[rustc_allow_incoherent_impl] item must fail both core identity markers"
+        );
     }
 
     #[test]

@@ -61,9 +61,45 @@ use std::collections::HashMap;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::DebugInfo;
 use rustc_span::def_id::LocalDefId;
-use trust_ir::Module;
+use trust_ir::{Module, ProofDigest};
 
 use crate::{CalleeRef, Lowered};
+
+/// One green body as the flip consumes it: the per-body mini-module, the
+/// callee-identity ledger `to_mir` spells calls from, and the lineage digest
+/// ([`crate::lineage::body_lineage_digest`]) binding both — computed at RECORD
+/// time over the intact hook-time `Lowered`, so the flip event and the
+/// coverage row (`crate_module`) can state the same identity.
+/// Fields are `pub(crate)`: outside this crate a `GreenBody` is opaque, so the only
+/// way to obtain one is [`take`] — which can only return what [`green_body`] minted.
+pub struct GreenBody {
+    pub(crate) module: Module,
+    pub(crate) callees: Vec<CalleeRef>,
+    /// Trust (L1, artifact-lineage attestation): always present — [`green_body`] is
+    /// the only constructor and it refuses a body whose digest cannot be computed
+    /// (no green without a digest), so every flip event carries it. The value is
+    /// additionally RE-DERIVED and checked at the flip
+    /// ([`crate::flip::derive_flip_body`]), so even an in-crate value assembled by
+    /// some future path with a digest that does not describe its own payload fails
+    /// closed rather than publishing a false attestation.
+    pub(crate) lineage: ProofDigest,
+}
+
+/// Trust (L1): mint the registry entry for one green body — the SINGLE place a
+/// [`GreenBody`] comes into existence, and therefore the single place the
+/// "no digest, no green" rule can be enforced.
+///
+/// `None` when the lineage digest refuses (a mini-module that is not a
+/// single-function per-body lowering). The caller ([`record_green`]) then
+/// records NOTHING: the flip cannot fire for a body it would be unable to name
+/// by digest, so the attestation chain has no hole at its first link.
+///
+/// Split out of `record_green` — which needs a `TyCtxt` and so cannot be unit
+/// tested — precisely so this rule is a test obligation and not a comment.
+fn green_body(module: &Module, callees: &[CalleeRef]) -> Option<GreenBody> {
+    let lineage = crate::lineage::body_lineage_digest(module, callees).ok()?;
+    Some(GreenBody { module: module.clone(), callees: callees.to_vec(), lineage })
+}
 
 /// Green bodies for one compiler Session. The crate-local `DefIndex` is safe as
 /// the key only inside that Session; a process-global registry let a later
@@ -72,11 +108,36 @@ use crate::{CalleeRef, Lowered};
 /// `mir_built` queries.
 #[derive(Default)]
 struct SessionFlipRegistry {
-    entries: HashMap<u32, (Module, Vec<CalleeRef>)>,
+    entries: HashMap<u32, GreenBody>,
     /// def_indexes that saw a SECOND `record_green` — the once-per-def
     /// invariant broke, so no lowering for that def may be trusted for the
     /// rest of the session (see `record_green`). `take` refuses them.
     poisoned: std::collections::HashSet<u32>,
+}
+
+impl SessionFlipRegistry {
+    /// The TyCtxt-free registry write (see `record_green` for the poison
+    /// rationale). Split out so the record→take round-trip — including the
+    /// lineage digest riding the entry — is a unit-testable obligation.
+    fn insert_green(&mut self, def_index: u32, entry: GreenBody) {
+        match self.entries.entry(def_index) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(entry);
+            }
+            std::collections::hash_map::Entry::Occupied(o) => {
+                o.remove();
+                self.poisoned.insert(def_index);
+            }
+        }
+    }
+
+    /// The TyCtxt-free registry consume: poisoned defs NEVER yield a module.
+    fn take_green(&mut self, def_index: u32) -> Option<GreenBody> {
+        if self.poisoned.contains(&def_index) {
+            return None;
+        }
+        self.entries.remove(&def_index)
+    }
 }
 
 /// Trust: all session-level flip gates (see module docs). Cheap; called per green body.
@@ -139,22 +200,42 @@ pub const fn session_gates_allow_flip(
 const fn debuginfo_level_allows_flip(debuginfo: DebugInfo) -> bool {
     match debuginfo {
         DebugInfo::None => true,
-        // Trust (C2): line tables are NOT yet earned, and this arm records the measurement
-        // rather than the intention. Widening it to `LineTablesOnly` was tried and REVERTED:
-        // with the flip admitted at that level, `llvm-dwarfdump --debug-line` on a three-fn
-        // probe disagreed with built on every row (built rows at cols 25/25/27/27/29,
-        // derived at 30/27/34/29/33).
+        // Trust (C2, re-measured 2026-07-26): line tables are STILL not earned, but the
+        // reason recorded here has changed, and the change is the useful part.
         //
-        // The Module is NOT the problem — its spans are right. The artifact for the same
-        // probe records `ret ; #loc: 0 2 24` (0-based col 24 = the `{`, i.e. built's 1-based
-        // 25) and `and ; #loc: 0 3 26` (= built's 27). The defect is in CONSUMPTION:
-        // `to_mir::set_span_from_node`'s CharPos -> BytePos reconstruction lands the wrong
-        // byte for some nodes. Fix that, re-run the dwarfdump comparison, and this arm can
-        // open honestly.
+        // The consumption defect this arm used to name IS FIXED and verified. The producer
+        // now stamps the tail `Return` at `shrink_to_hi()` like `construct_fn` does, and
+        // `span_from_source_span` resolves the end-of-line column exactly instead of either
+        // fabricating it or (my next mistake) rejecting it. On both hand-written probes the
+        // dwarfdump line tables are now byte-identical, flip on vs off.
         //
-        // `Limited`/`Full` additionally want the LEXICAL SCOPE TREE (`SourceScopeData`
-        // nesting) and the derived body has exactly one fn-level scope, so they stay shut
-        // beyond the line question.
+        // Two probes agreeing is not a gate. At corpus scale — 300 tests/ui files, 64 of
+        // which flipped at least one body (106 bodies total) — 49 agree and 15 DISAGREE, in
+        // two distinct classes:
+        //
+        //   * ROW COUNT differs (6 files; e.g. 2039 built vs 2035 derived rows in
+        //     threads-sendsync/yield.rs, 690/684 in box/unit/basic-operations.rs). The
+        //     derived body has a different number of statements, so it cannot have the same
+        //     number of line rows. This is not a span bug at all: `DerivedAgreed` is
+        //     equivalence UP TO the documented normalizations, and line-table identity is a
+        //     STRUCTURAL demand that equivalence-up-to-normalization does not answer.
+        //   * COLUMN differs at equal row count (9 files; e.g. traits/issue-18412.rs, where
+        //     built attributes a row to the method name at col 35 and the derived body puts
+        //     it at col 5, the `fn` keyword). Genuine per-node attribution divergence —
+        //     built picks a different sub-expression span than the producer's innermost-expr
+        //     rule does.
+        //
+        // So opening this arm needs one of: a normalization ledger that preserves statement
+        // structure under debuginfo, or an attribution pass that matches built's choice
+        // node by node. Neither is a span-reconstruction fix, which is why the previous
+        // note pointed the next reader at the wrong thing.
+        //
+        // `Limited`/`Full` need everything above PLUS `var_debug_info` for locals. The
+        // lexical scope tree they also want now EXISTS (C2-scopes: the Module carries it,
+        // `build_source_scopes` rebuilds it, and it reproduces built's per-`let` chain), but
+        // the shim mints debug info for PARAMS only — deliberately, since binding a name to
+        // a guessed local is worse than silence — so a derived body at `Limited` would show
+        // a debugger correctly-nested scopes containing no locals.
         DebugInfo::LineDirectivesOnly
         | DebugInfo::LineTablesOnly
         | DebugInfo::Limited
@@ -220,6 +301,15 @@ pub fn record_green(tcx: TyCtxt<'_>, def: LocalDefId, lowered: &Lowered, markers
     if !lowered.pending_consts.is_empty() {
         return;
     }
+    // Trust (L1, artifact-lineage attestation): mint the entry — including its lineage
+    // digest over the INTACT hook-time (module, callee ledger), the same object
+    // `crate_module::record` digests for the artifact row, BEFORE it strips `functions[0]`
+    // for assembly. Fail-closed: no digest, no green — a flip event must always be able to
+    // name, by digest, exactly which body it selected, or the whole attestation chain has a
+    // hole at its first link.
+    let Some(entry) = green_body(&lowered.module, &lowered.callees) else {
+        return;
+    };
     let def_index = def.to_def_id().index.as_u32();
     tcx.sess.with_trust_compiler_state::<SessionFlipRegistry, _>(|reg| {
         // `mir_built` runs once per def, so a SECOND registration for the same
@@ -233,40 +323,102 @@ pub fn record_green(tcx: TyCtxt<'_>, def: LocalDefId, lowered: &Lowered, markers
         // diagnostic. POISON instead: drop the entry and mark the def_index
         // permanently ineligible so `take` returns None and the body falls
         // back to built MIR (fail-closed, never a wrong body).
-        match reg.entries.entry(def_index) {
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((lowered.module.clone(), lowered.callees.clone()));
-            }
-            std::collections::hash_map::Entry::Occupied(o) => {
-                o.remove();
-                reg.poisoned.insert(def_index);
-            }
-        }
+        reg.insert_green(def_index, entry);
     });
 }
 
-/// Trust: consume the green `(Module, callee ledger)` for `def`, if any. Removing the entry
-/// bounds memory and makes a second `take` (which cannot happen: `optimized_mir` runs once per
-/// def per session) inert. A poisoned registry (panic while locked) yields `None` —
-/// fail-closed to the normal path.
-pub fn take(tcx: TyCtxt<'_>, def: LocalDefId) -> Option<(Module, Vec<CalleeRef>)> {
+/// Trust: consume the green [`GreenBody`] (module, callee ledger, lineage digest) for `def`,
+/// if any. Removing the entry bounds memory and makes a second `take` (which cannot happen:
+/// `optimized_mir` runs once per def per session) inert. A poisoned registry (panic while
+/// locked) yields `None` — fail-closed to the normal path.
+pub fn take(tcx: TyCtxt<'_>, def: LocalDefId) -> Option<GreenBody> {
     let def_index = def.to_def_id().index.as_u32();
     tcx.sess.with_trust_compiler_state::<SessionFlipRegistry, _>(|reg| {
         // A poisoned def NEVER yields a module: the flip falls back to built
         // MIR rather than risk codegen'ing a body registered for different
         // args (see `record_green`).
-        if reg.poisoned.contains(&def_index) {
-            return None;
-        }
-        reg.entries.remove(&def_index)
+        reg.take_green(def_index)
     })
 }
 
 #[cfg(test)]
 mod tests {
     use rustc_session::config::DebugInfo;
+    use trust_ir::{BlockId, FuncId, FuncTy, Function, Module};
 
-    use super::{loop_contract_count_allows_flip, session_gates_allow_flip};
+    use super::{
+        GreenBody, SessionFlipRegistry, green_body, loop_contract_count_allows_flip,
+        session_gates_allow_flip,
+    };
+    use crate::lineage::body_lineage_digest;
+
+    fn probe_module(fn_name: &str) -> Module {
+        let mut module = Module::new("flip_registry_probe");
+        let ty = module.add_func_type(FuncTy {
+            params: Vec::new(),
+            returns: Vec::new(),
+            is_vararg: false,
+        });
+        module.add_function(Function::new(FuncId::new(0), fn_name, ty, BlockId::new(0)));
+        module
+    }
+
+    /// Built through the production constructor, never by hand — a test that
+    /// assembled a `GreenBody` field-by-field could not witness the fail-closed rule.
+    fn green_probe(fn_name: &str) -> GreenBody {
+        green_body(&probe_module(fn_name), &[])
+            .expect("a single-function probe module must mint a green body")
+    }
+
+    /// Trust (L1) FAIL-CLOSED: no digest, no green. A mini-module that is not a
+    /// single-function per-body lowering cannot be attested, so no registry entry
+    /// exists for it and the body stays on built MIR.
+    #[test]
+    fn test_green_body_declines_when_lineage_cannot_be_digested() {
+        assert!(
+            green_body(&Module::new("no_bodies"), &[]).is_none(),
+            "a body-less mini-module must not become a green entry: the flip event could \
+             not name, by digest, which body it selected"
+        );
+        assert!(
+            green_body(&probe_module("probe"), &[]).is_some(),
+            "the ordinary single-function case must still be admitted (the gate is not vacuous)"
+        );
+    }
+
+    /// Trust (L1): the record→take round-trip carries the lineage digest — the flip
+    /// consumes exactly the digest minted at record time, never a recomputation of a
+    /// possibly-different object.
+    #[test]
+    fn test_flip_registry_round_trip_carries_lineage_digest() {
+        let mut reg = SessionFlipRegistry::default();
+        let entry = green_probe("probe");
+        let minted = entry.lineage;
+        reg.insert_green(7, entry);
+
+        let taken = reg.take_green(7).expect("recorded green body must be takeable once");
+        assert_eq!(taken.lineage, minted, "take must yield the digest minted at record time");
+        assert_eq!(
+            taken.lineage,
+            body_lineage_digest(&taken.module, &taken.callees)
+                .expect("taken module must still digest"),
+            "the carried digest must still describe the carried (module, ledger)"
+        );
+        assert!(reg.take_green(7).is_none(), "a second take must be inert (memory bound)");
+    }
+
+    /// Trust (L1): the poison invariant survives the GreenBody refactor — a double
+    /// record drops the entry, digest and all; nothing digest-bearing escapes.
+    #[test]
+    fn test_flip_registry_double_record_poisons_and_yields_nothing() {
+        let mut reg = SessionFlipRegistry::default();
+        reg.insert_green(7, green_probe("first"));
+        reg.insert_green(7, green_probe("second"));
+        assert!(
+            reg.take_green(7).is_none(),
+            "a def_index recorded twice is poisoned: no module (and no digest) may be trusted"
+        );
+    }
 
     /// The measured scope of "compiled from trust-ir", pinned so it cannot be
     /// widened by editing one comparison. Measured 2026-07-25 on a five-body

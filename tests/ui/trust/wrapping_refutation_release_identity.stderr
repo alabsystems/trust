@@ -1,0 +1,18 @@
+
+=== Trust Verification Report (wrapping_refutation_release_identity) ===
+
+note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
+  --> $DIR/wrapping_refutation_release_identity.rs:17:1
+   |
+LL | / pub fn signed_literal_roundtrip(x: i32) {
+LL | |     assert!(x.wrapping_add(1).wrapping_sub(1) == x);
+LL | | }
+   | |_^
+
+note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
+  --> $DIR/wrapping_refutation_release_identity.rs:21:1
+   |
+LL | / pub fn usize_roundtrip(x: usize, n: usize) {
+LL | |     assert!(x.wrapping_add(n).wrapping_sub(n) == x);
+LL | | }
+   | |_^

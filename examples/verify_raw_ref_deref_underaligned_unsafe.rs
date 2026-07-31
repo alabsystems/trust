@@ -1,7 +1,8 @@
 // Trust test: raw-pointer deref under-aligned -- unsafe variant
-// VcKind: Assertion
-// Expected: Assertion FAILED
-// The assertion finding is the fail-closed catch for insufficient alignment.
+// VcKind: Assertion { message: "[unsafe...]" } -- transports as the hardened
+//   unsafe-operation family (`hardened_unsafe_operation`), not `assert`.
+// Expected: HardenedBoundary(UnsafeOperation) FAILED
+// The unsafe-demand finding is the fail-closed catch for insufficient alignment.
 // Counterexample: a `u8` local is 1-byte aligned, but `*const u32` needs 4.
 //
 // Soundness guard: the stack-good lane discharges alignment ONLY when the

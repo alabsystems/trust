@@ -496,6 +496,7 @@ impl TrustWpVerificationEngine {
             obligation_id: obligation.obligation_id.clone(),
             engine: self.manifest.clone(),
             status: EvidenceStatus::Unsupported,
+            decline: None,
             proof_strength: None,
             artifacts: Vec::new(),
             counterexample: None::<Counterexample>,
@@ -516,7 +517,9 @@ impl TrustWpVerificationEngine {
         {
             return match self.validate_native_replay_evidence(bundle, obligation, candidate) {
                 Ok(()) => candidate.clone(),
-                Err(diagnostic) => {
+                // The candidate row is unacceptable, but we learned nothing about
+                // the program: the obligation stays undischarged.
+                Err(NativeReplayEvidenceRejection::Invalid(diagnostic)) => {
                     let mut rejected = self.unsupported_evidence(bundle, obligation);
                     rejected.evidence_id =
                         format!("trust-wp:rejected:{}", obligation.obligation_id);
@@ -526,6 +529,25 @@ impl TrustWpVerificationEngine {
                         candidate.evidence_id
                     ));
                     rejected
+                }
+                // The obligation's own predicate replayed to FALSE. That is a
+                // REFUTATION of the program, not a gap in our coverage, so it is
+                // reported `Failed` with its counterexample — matching what the
+                // sibling lowering path (`NativeContractLoweringOutcome::Failed`)
+                // has always done for the identical condition. Reporting this as
+                // `Unsupported` downgraded a real bug report to a coverage gap
+                // and dropped the counterexample.
+                Err(NativeReplayEvidenceRejection::Refuted { diagnostic, counterexample }) => {
+                    let mut refuted = self.unsupported_evidence(bundle, obligation);
+                    refuted.evidence_id = format!("trust-wp:refuted:{}", obligation.obligation_id);
+                    refuted.status = EvidenceStatus::Failed;
+                    refuted.counterexample = Some(*counterexample);
+                    refuted.diagnostics.insert(0, diagnostic);
+                    refuted.diagnostics.push(format!(
+                        "candidate evidence {} claimed a proof for a predicate that replays to false",
+                        candidate.evidence_id
+                    ));
+                    refuted
                 }
             };
         }
@@ -660,6 +682,7 @@ impl TrustWpVerificationEngine {
             obligation_id: obligation.obligation_id.clone(),
             engine: self.manifest.clone(),
             status: EvidenceStatus::Failed,
+            decline: None,
             proof_strength: None,
             artifacts: Vec::new(),
             counterexample,
@@ -676,59 +699,58 @@ impl TrustWpVerificationEngine {
         bundle: &TrustContractBundle,
         obligation: &TrustObligation,
         evidence: &ObligationEvidence,
-    ) -> Result<(), String> {
+    ) -> Result<(), NativeReplayEvidenceRejection> {
         if !is_trust_wp_owned_obligation_kind(&obligation.kind) {
-            return Err(format!(
+            return Err(NativeReplayEvidenceRejection::Invalid(format!(
                 "trust-wp native replay does not own {:?} obligations",
                 obligation.kind
-            ));
+            )));
         }
         if evidence.engine.name != self.manifest.name {
-            return Err(format!(
+            return Err(NativeReplayEvidenceRejection::Invalid(format!(
                 "candidate evidence engine `{}` is not trust-wp-owned evidence",
                 evidence.engine.name
-            ));
+            )));
         }
         if evidence.status != EvidenceStatus::Proved {
-            return Err(format!(
+            return Err(NativeReplayEvidenceRejection::Invalid(format!(
                 "candidate trust_wp evidence is diagnostic-only: status {:?} is not Proved",
                 evidence.status
-            ));
+            )));
         }
         if evidence.proof_strength.as_ref() != Some(&ProofStrength::deductive()) {
-            return Err(format!(
+            return Err(NativeReplayEvidenceRejection::Invalid(format!(
                 "candidate trust_wp evidence must carry deductive proof strength after checked native replay, got {:?}",
                 evidence.proof_strength
-            ));
+            )));
         }
         if evidence.publication.evidence_bundle_hash.as_ref().is_none_or(String::is_empty) {
-            return Err(
-                "candidate trust_wp evidence is missing proof evidence digest metadata".to_string()
-            );
+            return Err(NativeReplayEvidenceRejection::Invalid(
+                "candidate trust_wp evidence is missing proof evidence digest metadata".to_string(),
+            ));
         }
         let summary_facts = summary_facts_for_obligation(bundle, obligation)?;
 
         let predicate = typed_trust_wp_pure_predicate(bundle, obligation)?;
-        let replay = replay_typed_predicate(&predicate)?;
+        let replay = replay_typed_predicate_for_candidate(obligation, &predicate)?;
         let expected = expected_native_replay_metadata(bundle, obligation, &replay, &summary_facts);
         if evidence.evidence_id != expected.evidence_id {
-            return Err(
+            return Err(NativeReplayEvidenceRejection::Invalid(
                 "candidate trust_wp evidence id does not match deterministic typed replay metadata"
                     .to_string(),
-            );
+            ));
         }
         if evidence.artifacts != expected.artifacts {
-            return Err(native_replay_artifact_mismatch_detail(
-                &expected.artifacts,
-                &evidence.artifacts,
+            return Err(NativeReplayEvidenceRejection::Invalid(
+                native_replay_artifact_mismatch_detail(&expected.artifacts, &evidence.artifacts),
             ));
         }
         if evidence.publication.evidence_bundle_hash != Some(expected.evidence_bundle_hash.clone())
         {
-            return Err(
+            return Err(NativeReplayEvidenceRejection::Invalid(
                 "candidate trust_wp evidence bundle hash does not match deterministic typed replay metadata"
                     .to_string(),
-            );
+            ));
         }
 
         validate_aggregate_native_replay_gate(evidence)?;
@@ -4232,6 +4254,7 @@ fn trust_wp_verified_evidence_to_trust(
         obligation_id: obligation.obligation_id.clone(),
         engine: manifest.clone(),
         status: EvidenceStatus::Proved,
+        decline: None,
         proof_strength: Some(proof_strength),
         artifacts,
         counterexample: None::<Counterexample>,
@@ -4980,10 +5003,68 @@ fn bundle_crate_name(bundle: &TrustContractBundle) -> String {
     }
 }
 
+/// Why a candidate native-replay evidence row was rejected.
+///
+/// SOUNDNESS: the two arms are NOT interchangeable, and collapsing them is what
+/// this type exists to prevent. `Refuted` means the obligation's own predicate
+/// replayed to FALSE — the program is wrong, and there is a counterexample.
+/// `Invalid` means the candidate evidence row is malformed, mismatched, or
+/// unsupported — we learned nothing about the program.
+///
+/// They used to share one `String`, so a refutation reached
+/// `EvidenceStatus::Unsupported` and its counterexample was dropped: a real bug
+/// report was downgraded to a coverage gap. The sibling lowering path
+/// (`NativeContractLoweringOutcome::Failed`) always got this right; only the
+/// candidate-validation path collapsed it.
+///
+/// This also matters for any future multi-engine fallback: `Unsupported` is the
+/// retryable class and `Failed` is terminal, so a refutation wearing
+/// `Unsupported` would invite a second engine to re-litigate a settled
+/// refutation.
+#[derive(Debug, Clone)]
+enum NativeReplayEvidenceRejection {
+    /// The candidate evidence row is not acceptable. Says nothing about the
+    /// program; the obligation stays undischarged (`Unsupported`).
+    Invalid(String),
+    /// The obligation's predicate is FALSE. Terminal (`Failed`), with a
+    /// counterexample.
+    Refuted { diagnostic: String, counterexample: Box<Counterexample> },
+}
+
+impl From<String> for NativeReplayEvidenceRejection {
+    fn from(diagnostic: String) -> Self {
+        Self::Invalid(diagnostic)
+    }
+}
+
+/// Replay a typed predicate, flattening both failure modes to a diagnostic.
+///
+/// Callers that must ACT on the difference — anything choosing an
+/// `EvidenceStatus` — must use [`replay_typed_predicate_for_candidate`] instead,
+/// which preserves the refutation/incompleteness distinction. This flattening
+/// helper is only appropriate where the outcome is already known to be a success
+/// or the distinction genuinely does not matter.
 fn replay_typed_predicate(predicate: &TrustWpPureExprV1) -> Result<TrustWpNativeReplay, String> {
     replay_typed_predicate_for_evidence(predicate).map_err(|failure| match failure {
         NativeReplayFailure::False { diagnostic } | NativeReplayFailure::Unknown { diagnostic } => {
             diagnostic
+        }
+    })
+}
+
+/// Replay a typed predicate, preserving the refutation/incompleteness
+/// distinction the caller needs to pick a status.
+fn replay_typed_predicate_for_candidate(
+    obligation: &TrustObligation,
+    predicate: &TrustWpPureExprV1,
+) -> Result<TrustWpNativeReplay, NativeReplayEvidenceRejection> {
+    replay_typed_predicate_for_evidence(predicate).map_err(|failure| match failure {
+        NativeReplayFailure::False { diagnostic } => NativeReplayEvidenceRejection::Refuted {
+            diagnostic,
+            counterexample: Box::new(native_replay_counterexample(obligation, predicate)),
+        },
+        NativeReplayFailure::Unknown { diagnostic } => {
+            NativeReplayEvidenceRejection::Invalid(diagnostic)
         }
     })
 }
@@ -5385,7 +5466,13 @@ fn bundle_subject_label(bundle: &TrustContractBundle) -> String {
     }
 }
 
-#[cfg(not(feature = "trust-build"))]
+// Deliberately NOT cfg-gated. This is a pure formatter over the obligation and
+// predicate with no build-specific dependency; it was previously
+// `cfg(not(trust-build))` only because its sole caller was. The candidate
+// -validation path attaches a counterexample to a refutation in every build
+// configuration, and a refutation that silently loses its counterexample under
+// `trust-build` — the compiler's own configuration — would be the one place it
+// matters most.
 fn native_replay_counterexample(
     obligation: &TrustObligation,
     predicate: &TrustWpPureExprV1,
@@ -7759,6 +7846,7 @@ mod tests {
             obligation_id: obligation.obligation_id.clone(),
             engine: manifest.clone(),
             status: EvidenceStatus::Proved,
+            decline: None,
             proof_strength: Some(ProofStrength::deductive()),
             artifacts: metadata.artifacts,
             counterexample: None::<Counterexample>,
@@ -9689,12 +9777,33 @@ mod tests {
         let evidence = engine.verify(&false_bundle, &false_bundle.obligations);
 
         assert_eq!(evidence.len(), 1);
-        assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
+        // A predicate that replays to FALSE is a REFUTATION of the program, not a
+        // gap in our coverage. This assertion used to demand `Unsupported`, which
+        // downgraded a real bug report to a coverage gap and dropped the
+        // counterexample — while the sibling lowering path
+        // (`NativeContractLoweringOutcome::Failed`) reported the identical
+        // condition correctly. `Unsupported` is also the retryable class, so a
+        // refutation wearing it would invite a second engine to re-litigate a
+        // settled refutation once a fallback exists.
+        assert_eq!(evidence[0].status, EvidenceStatus::Failed);
         assert!(evidence[0].proof_strength.is_none());
+        assert!(
+            evidence[0].counterexample.is_some(),
+            "a refutation must carry its counterexample, not just a diagnostic"
+        );
         assert!(evidence[0].diagnostics.iter().any(|diagnostic| {
             diagnostic.contains("typed predicate is false")
                 && diagnostic.contains("native pure replay rule")
         }));
+        // The copied candidate is still rejected as evidence — the refutation is
+        // about the obligation, and the bogus proof claim is called out too.
+        assert!(
+            evidence[0]
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("claimed a proof for a predicate that replays to false")),
+            "the rejected candidate must still be named"
+        );
     }
 
     #[test]

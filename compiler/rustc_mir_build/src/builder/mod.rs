@@ -100,6 +100,31 @@ pub(crate) fn build_mir_inner_impl<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> 
                 // the freshly built MIR leaves this query.
                 {
                     let lowered = trust_thir_lower::lower_module_from_thir(tcx, def, &thir, expr);
+                    // Trust (measurement honesty): the SYMBOLIC class — bodies that lower with
+                    // zero tags but whose module carries a value-less opaque carrier (symbolic
+                    // assoc-const / const-param global, opaque generic-param type spelling).
+                    // They count as "lowered clean" in the coverage ratchet, yet they are
+                    // excluded from the interpretation differential AND from the crate splice,
+                    // so they can never become `Agreed` and can never be executed. Without this
+                    // event the scorecard's clean-rate silently mixes MODELLED bodies with
+                    // placeholder ones, and every wave that converts a fail-closed tag into an
+                    // opaque spelling reads as progress toward "no gaps" whether or not it
+                    // closed one. Emit it for EVERY body (the flag is a property of the
+                    // lowering, not of which differential lane the body later takes) so the
+                    // scorecard can subtract the class instead of inferring it.
+                    tracing::debug!(
+                        ?def,
+                        symbolic = lowered.symbolic,
+                        // Trust (#173): the THIRD dishonest-clean class. A body whose live value
+                        // took a tag-free opaque collapse (wave-EL data-enum lane, non-pure
+                        // struct sibling) is tag-free but carries a placeholder, and the
+                        // differential refuses to sample it. Counting it as MODELLED overstated
+                        // the modelled rate; reported separately for the same reason `symbolic`
+                        // is.
+                        opaque = lowered.opaque_collapse,
+                        clean = lowered.unsupported.is_empty(),
+                        "trust-ir-lower: body class"
+                    );
                     // Trust (B9-A): `compare` also returns the MIR-side verification snapshot
                     // (`extract_function`) for every clean body — the crate-seam differential
                     // bundles a call-bearing body against its (call-free clean) callees at
@@ -450,6 +475,12 @@ struct Builder<'a, 'tcx> {
     // the root (most of them do) and saves us from retracing many sub-paths
     // many times, and rechecking many nodes.
     lint_level_roots_cache: GrowableBitSet<hir::ItemLocalId>,
+
+    /// HIR-local identities of source loops carrying first-class Trust
+    /// invariant/decreases clauses. Every THIR `Scope` entry path flows
+    /// through `Builder::in_scope`, which uses this exact set to retain the
+    /// identity even when ordinary MIR source scopes collapse to lint roots.
+    trust_contracted_loop_ids: GrowableBitSet<hir::ItemLocalId>,
 
     /// Collects additional coverage information during MIR building.
     /// Only present if coverage is enabled and this function is eligible.
@@ -951,7 +982,10 @@ fn construct_error(tcx: TyCtxt<'_>, def_id: LocalDefId, guar: ErrorGuaranteed) -
         parent_scope: None,
         inlined: None,
         inlined_parent_scope: None,
-        local_data: ClearCrossCrate::Set(SourceScopeLocalData { lint_root: hir_id }),
+        local_data: ClearCrossCrate::Set(SourceScopeLocalData {
+            lint_root: hir_id,
+            trust_loop_hir_local_id: None,
+        }),
     });
 
     cfg.terminate(START_BLOCK, source_info, TerminatorKind::Unreachable);
@@ -994,6 +1028,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             tcx.hir_body_owner_kind(def),
             hir::BodyOwnerKind::Const { .. } | hir::BodyOwnerKind::Static(_)
         );
+        let mut trust_contracted_loop_ids = GrowableBitSet::new_empty();
+        if let Some(contract) = tcx.hir_body_owned_by(def).contract {
+            for clause in contract.loop_clauses {
+                trust_contracted_loop_ids.insert(clause.loop_id.local_id);
+            }
+        }
 
         let lint_level = LintLevel::Explicit(hir_id);
         let param_env = tcx.param_env(def);
@@ -1024,6 +1064,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             unit_temp: None,
             var_debug_info: vec![],
             lint_level_roots_cache: GrowableBitSet::new_empty(),
+            trust_contracted_loop_ids,
             coverage_info: coverageinfo::CoverageInfoBuilder::new_if_enabled(tcx, def),
         };
 
@@ -1221,6 +1262,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         } else {
                             let binding_mode = BindingMode(ByRef::No, mutability);
                             LocalInfo::User(BindingForm::Var(VarBindingForm {
+                                binding_hir_local_id: var.0.local_id,
                                 binding_mode,
                                 opt_ty_info: param.ty_span,
                                 opt_match_place: Some((None, span)),

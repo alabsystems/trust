@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::spec::SpecParseError;
-use crate::spec_parse::{Token, tokenize};
+use crate::spec_parse::{Token, literal_index_spellings_are_canonical, tokenize};
 use crate::{Formula, Sort};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,6 +326,12 @@ fn lower_spec_quantifier(
 fn parse_spec_expr(input: &str) -> Result<SpecExpr, SpecParseError> {
     if input.trim().is_empty() {
         return Err(SpecParseError::Empty);
+    }
+    if !literal_index_spellings_are_canonical(input) {
+        return Err(SpecParseError::UnexpectedToken {
+            position: 0,
+            expected: "canonical nonnegative literal index spelling".into(),
+        });
     }
 
     let tokens = tokenize(input)?;
@@ -1406,6 +1412,18 @@ mod tests {
                 }),
                 field: "1".to_string(),
             }
+        );
+        assert!(
+            parse_spec_attr("requires", "self.0[03].1 > 0").is_err(),
+            "the high-level parser must not erase an alternate literal-index spelling",
+        );
+        assert!(
+            parse_spec_attr("requires", "self.0[(3)].1 > 0").is_err(),
+            "the high-level parser must not erase literal-index parentheses",
+        );
+        assert!(
+            parse_spec_attr("requires", "self.00[3].1 > 0").is_err(),
+            "the high-level parser must not erase an alternate tuple-field spelling",
         );
     }
 

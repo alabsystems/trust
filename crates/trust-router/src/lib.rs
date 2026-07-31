@@ -47,14 +47,15 @@ pub use verifier_result::{
 pub(crate) mod error;
 pub use error::SolverProcessError;
 pub use full_verification::{
-    DirectTrustVcProofReceipt, FreshExactDirectChcPdrReceipt, FullVerificationEngine,
-    FullVerificationPolicy, FullVerificationRunWithFreshReceipts, LiveVerificationReceiptBatch,
-    NativeTrustMcTrustIrEngine, NativeTyEngine, required_native_engines,
+    DEFAULT_PER_OBLIGATION_TIMEOUT_MS, DirectTrustVcProofReceipt, FreshExactDirectChcPdrReceipt,
+    FullVerificationEngine, FullVerificationPolicy, FullVerificationRunWithFreshReceipts,
+    LiveVerificationReceiptBatch, NativeTrustMcTrustIrEngine, NativeTyEngine,
+    required_native_engines, required_native_engines_with_timeout_ms,
 };
 // Incremental AY session re-exports.
 pub use incremental_ay::{
     CommonAssertion, IncrementalAYSession, IncrementalAYStats, alloc_over_ceiling_forced,
-    violation_is_forced,
+    violation_is_forced, violation_is_modeling_gap_failclose,
 };
 // In-process ay-dpll SMT backend re-export.
 #[cfg(feature = "ay-backend")]

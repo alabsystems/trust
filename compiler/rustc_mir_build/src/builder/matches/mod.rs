@@ -2814,6 +2814,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             source_info,
             local_info: ClearCrossCrate::Set(Box::new(LocalInfo::User(BindingForm::Var(
                 VarBindingForm {
+                    binding_hir_local_id: var_id.0.local_id,
                     binding_mode: mode,
                     // hypothetically, `visit_primary_bindings` could try to unzip
                     // an outermost hir::Ty as we descend, matching up

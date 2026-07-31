@@ -230,15 +230,111 @@ pub(super) fn v2_input_free_locals(func: &VerifiableFunction) -> FxHashSet<usize
 /// signed (two's-complement two-sided wrap); `mul` (full nonlinear mod) and wider
 /// types (u128/i128) return `None`, leaving such asserts ungrounded (sound:
 /// dropped, never mis-decided).
-/// The bitvector op a recognized `wrapping_{add,sub}` method tail computes (the
-/// only pure wrapping ops modeled so far). `None` for anything else.
+/// The bitvector op and carrier carried by an authenticated
+/// `wrapping_{add,sub}` marker. Raw method suffixes are deliberately rejected:
+/// they are source-spellable and therefore cannot establish call identity.
+fn authenticated_wrapping_call(
+    callee: &str,
+) -> Option<(BinOp, trust_types::RustcWrappingRefutationCarrier)> {
+    if callee.starts_with(trust_types::TRUST_RUSTC_TOTAL_PRIMITIVE_METHOD_PATH_PREFIX) {
+        return match trust_types::RustcTotalPrimitiveMethod::classify(callee)? {
+            trust_types::RustcTotalPrimitiveMethod::WrappingAdd(width) => Some((
+                BinOp::Add,
+                trust_types::RustcWrappingRefutationCarrier::Fixed { width, signed: false },
+            )),
+            trust_types::RustcTotalPrimitiveMethod::WrappingSub(width) => Some((
+                BinOp::Sub,
+                trust_types::RustcWrappingRefutationCarrier::Fixed { width, signed: false },
+            )),
+            trust_types::RustcTotalPrimitiveMethod::WrappingMul(_) => None,
+        };
+    }
+    let method = trust_types::RustcWrappingRefutationMethod::classify(callee)?;
+    let op = match method.op {
+        trust_types::RustcWrappingRefutationOp::Add => BinOp::Add,
+        trust_types::RustcWrappingRefutationOp::Sub => BinOp::Sub,
+    };
+    Some((op, method.carrier))
+}
+
 pub(super) fn wrapping_call_tail_op(callee: &str) -> Option<BinOp> {
-    let tail = callee.rsplit("::").next().unwrap_or(callee);
-    let tail = tail.split('<').next().unwrap_or(tail).trim();
-    match tail {
-        "wrapping_add" => Some(BinOp::Add),
-        "wrapping_sub" => Some(BinOp::Sub),
+    authenticated_wrapping_call(callee).map(|(op, _)| op)
+}
+
+fn wrapping_carrier_destination(
+    carrier: trust_types::RustcWrappingRefutationCarrier,
+    destination: &Ty,
+) -> Option<(u32, bool)> {
+    match (carrier, destination) {
+        (
+            trust_types::RustcWrappingRefutationCarrier::Fixed {
+                width: expected_width,
+                signed: expected_signed,
+            },
+            Ty::Int { width, signed },
+        ) if *width == expected_width && *signed == expected_signed => Some((*width, *signed)),
+        (
+            trust_types::RustcWrappingRefutationCarrier::PointerSized {
+                signed: expected_signed,
+            },
+            Ty::PtrSizedInt { signed },
+        ) if *signed == expected_signed => Some((destination.int_width()?, *signed)),
+        // The production verifier extraction lane still carries usize/isize as
+        // its pinned 64-bit `Ty::Int` representation. The compiler-authenticated
+        // marker retains the lost pointer-sized identity; accepting that one
+        // legacy spelling preserves existing source precision. Fixed u64/i64
+        // and pointer-sized arithmetic have identical modular semantics at this
+        // width. Faithful serialized IR uses `PtrSizedInt` and is checked by the
+        // exact arm above.
+        (
+            trust_types::RustcWrappingRefutationCarrier::PointerSized {
+                signed: expected_signed,
+            },
+            Ty::Int { width: 64, signed },
+        ) if *signed == expected_signed => Some((64, *signed)),
         _ => None,
+    }
+}
+
+fn signed_constant_fits_width(value: i128, width: u32) -> bool {
+    if width == 128 {
+        return true;
+    }
+    if !(1..128).contains(&width) {
+        return false;
+    }
+    let bound = 1i128 << (width - 1);
+    (-bound..bound).contains(&value)
+}
+
+fn unsigned_constant_fits_width(value: u128, width: u32) -> bool {
+    (1..=128).contains(&width) && (width == 128 || value < (1u128 << width))
+}
+
+fn wrapping_operand_matches_destination(
+    func: &VerifiableFunction,
+    operand: &Operand,
+    destination: &Ty,
+    width: u32,
+    signed: bool,
+) -> bool {
+    match operand {
+        Operand::Copy(place) | Operand::Move(place) => {
+            crate::place_ty_cow(func, place).is_some_and(|actual| actual.as_ref() == destination)
+        }
+        // MIR integer constants retain their value but signed constants do not
+        // retain their narrow width, and legacy usize constants retain only the
+        // pinned target width. Validate representability against the
+        // authenticated destination rather than fabricating i64/u64 identity.
+        Operand::Constant(ConstValue::Int(value)) if signed => {
+            signed_constant_fits_width(*value, width)
+        }
+        Operand::Constant(ConstValue::Uint(value, encoded_width)) if !signed => {
+            *encoded_width == width && unsigned_constant_fits_width(*value, width)
+        }
+        // Typed opaque/const-param values still carry exact type metadata.
+        _ => crate::operand_ty_cow(func, operand)
+            .is_some_and(|actual| actual.as_ref() == destination),
     }
 }
 
@@ -247,11 +343,33 @@ pub(super) fn wrapping_call_assert_model(
     callee: &str,
     args: &[Operand],
     dest: &Place,
+    has_normal_return_target: bool,
+    has_atomic_metadata: bool,
+    is_foreign: bool,
+    is_unsafe_sig: bool,
 ) -> Option<(Formula, Vec<Formula>)> {
-    let op = wrapping_call_tail_op(callee)?;
+    // The marker authenticates the selected DefId, not independently mutable
+    // call-site metadata. A modular destination definition is valid only for
+    // the ordinary safe Rust call shape that the compiler actually extracted.
+    // `unwind` is deliberately not a gate: the authenticated method is total,
+    // and this refutation CFG follows only the normal-return target; rustc may
+    // retain an unreachable `Continue`/cleanup annotation on such a call.
+    if !has_normal_return_target || has_atomic_metadata || is_foreign || is_unsafe_sig {
+        return None;
+    }
+    let (op, carrier) = authenticated_wrapping_call(callee)?;
+    if args.len() != 2 {
+        return None;
+    }
     let lhs = args.first()?;
     let rhs = args.get(1)?;
-    let (width, signed) = int_op_type(func, lhs, rhs)?;
+    let dest_ty = crate::place_ty_cow(func, dest)?;
+    let (width, signed) = wrapping_carrier_destination(carrier, dest_ty.as_ref())?;
+    if !wrapping_operand_matches_destination(func, lhs, dest_ty.as_ref(), width, signed)
+        || !wrapping_operand_matches_destination(func, rhs, dest_ty.as_ref(), width, signed)
+    {
+        return None;
+    }
     // width <= 64 covers u8..=u64 / i8..=i64 / usize / isize. The cap keeps the
     // modulus `1i128 << width` (= 2^width) within i128 (it overflows near width 127);
     // u128/i128 wrapping stays unhandled (returns None -> dropped, sound).
@@ -305,6 +423,22 @@ pub(super) fn wrapping_call_assert_model(
         crate::range::input_range_constraint(&rhs_f, width, signed),
     ];
     Some((def, ranges))
+}
+
+fn wrapping_result_local_is_stable(
+    func: &VerifiableFunction,
+    dest: &Place,
+    call_def_count: usize,
+) -> bool {
+    dest.projections.is_empty()
+        && call_def_count == 1
+        // Counting call destinations alone is insufficient: a statement write
+        // on another path or mutation through `&mut` can give the assertion's
+        // reaching version a value unrelated to this wrapping call. The model
+        // is renamed at the assertion use point, so admitting such a local can
+        // manufacture a modular equation for the competing definition and a
+        // false SAT counterexample.
+        && !crate::guards::value_local_is_unstable(func, dest.local)
 }
 
 pub fn generate_full_assert_refutation_vcs(
@@ -398,9 +532,27 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
         .blocks
         .iter()
         .filter_map(|b| {
-            let Terminator::Call { func: callee, dest, .. } = &b.terminator else { return None };
-            (dest.projections.is_empty()
-                && wrap_call_def_count.get(&dest.local).copied().unwrap_or(0) == 1
+            let Terminator::Call {
+                func: callee,
+                dest,
+                target,
+                atomic,
+                is_foreign,
+                is_unsafe_sig,
+                ..
+            } = &b.terminator
+            else {
+                return None;
+            };
+            (wrapping_result_local_is_stable(
+                func,
+                dest,
+                wrap_call_def_count.get(&dest.local).copied().unwrap_or(0),
+            )
+                && target.is_some()
+                && atomic.is_none()
+                && !*is_foreign
+                && !*is_unsafe_sig
                 && wrapping_call_tail_op(callee).is_some())
             .then_some(dest.local)
         })
@@ -410,12 +562,24 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
         .blocks
         .iter()
         .filter_map(|b| {
-            let Terminator::Call { func: callee, args, dest, .. } = &b.terminator else {
+            let Terminator::Call {
+                func: callee,
+                args,
+                dest,
+                target,
+                atomic,
+                is_foreign,
+                is_unsafe_sig,
+                ..
+            } = &b.terminator
+            else {
                 return None;
             };
-            if !dest.projections.is_empty()
-                || wrap_call_def_count.get(&dest.local).copied().unwrap_or(0) != 1
-            {
+            if !wrapping_result_local_is_stable(
+                func,
+                dest,
+                wrap_call_def_count.get(&dest.local).copied().unwrap_or(0),
+            ) {
                 return None;
             }
             let operands_ok = args.iter().take(2).all(|a| match a {
@@ -433,7 +597,16 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
             if !operands_ok {
                 return None;
             }
-            wrapping_call_assert_model(func, callee, args, dest)
+            wrapping_call_assert_model(
+                func,
+                callee,
+                args,
+                dest,
+                target.is_some(),
+                atomic.is_some(),
+                *is_foreign,
+                *is_unsafe_sig,
+            )
         })
         .collect();
     // STRAIGHT-LINE definition grounding (XOR / cast / checked-arith assert path).
@@ -441,14 +614,16 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
     // intermediates (e.g. `r == (((a as u8) + ..) % 2 == 1)`) has free vars that are
     // NOT branch-merge Ites / enum payloads / wrapping-call models — they are the
     // ordinary straight-line statement results: bool `BitXor`/`Cast` defs and the
-    // `CheckedBinaryOp` result `_N.0` / overflow-flag `_N.1`. Without pinning them the
+    // `CheckedBinaryOp` overflow flag `_N.1`. The checked result `_N.0` is
+    // edge-sensitive: its unbounded mathematical equation is true only after the
+    // no-overflow Assert succeeds, so it comes exclusively from `path_defs` above.
+    // Without pinning the remaining straight-line values the
     // assert is dropped as ungrounded and the typed CHC/PDR route returns Unsupported
     // -> UNKNOWN. Collect each block's statement definitions (`extract_block_definitions`,
     // which already lowers bool `BitXor` to `dest == (l != r)` and bool->int casts to
     // `dest == Ite(b, 1, 0)`) PLUS the checked-add flag semantics
-    // (`extract_overflow_flag_semantics` — the `.0` result / `.1` overflow-flag defs the
-    // statement extractor deliberately skips), gated to function-wide SINGLE-ASSIGNMENT
-    // vars.
+    // (`extract_overflow_flag_semantics` — the `.1` overflow-flag def the statement
+    // extractor deliberately skips), gated to function-wide SINGLE-ASSIGNMENT vars.
     //
     // SOUNDNESS: each def is conjoined only after `version_rename_at` at the assert
     // use-point (below). For a var defined exactly once in the whole function its
@@ -527,9 +702,10 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
                 stmt_defs.push((d, Vec::new()));
             }
         }
-        // `extract_overflow_flag_semantics` = `[_N.0 == lhs OP rhs, _N.1 <=> overflow,
-        // lhs_range, rhs_range]`. Keep the two Eq defs (result + overflow flag),
-        // attaching the operand range facts so they ride along when a def is used.
+        // `extract_overflow_flag_semantics` = `[_N.1 <=> overflow, lhs_range,
+        // rhs_range]`. Keep the flag Eq, attaching the operand range facts so
+        // they ride along when it is used. The success-only `_N.0 == lhs OP rhs`
+        // equation must come from this assert site's edge-sensitive `path_defs`.
         let ofs = guards::extract_overflow_flag_semantics(func, b);
         let (eqs, ranges): (Vec<&Formula>, Vec<&Formula>) =
             ofs.iter().partition(|f| matches!(f, Formula::Eq(..)));
@@ -1325,5 +1501,183 @@ pub(crate) fn v2_terminator_targets(terminator: &Terminator) -> Vec<BlockId> {
             vec![]
         }
         _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod wrapping_identity_tests {
+    use trust_types::{
+        BasicBlock, LocalDecl, SourceSpan, Ty, VerifiableBody, VerifiableFunction,
+    };
+
+    use super::*;
+
+    fn binary_func(ty: Ty) -> VerifiableFunction {
+        let return_ty = ty.clone();
+        VerifiableFunction {
+            name: "wrap".into(),
+            def_path: "crate::wrap".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: ty.clone(), name: None },
+                    LocalDecl { index: 1, ty: ty.clone(), name: Some("a".into()) },
+                    LocalDecl { index: 2, ty, name: Some("b".into()) },
+                ],
+                blocks: Vec::new(),
+                arg_count: 2,
+                return_ty,
+            },
+            contracts: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            spec: Default::default(),
+        }
+    }
+
+    fn model(
+        func: &VerifiableFunction,
+        callee: &str,
+        args: &[Operand],
+        dest: &Place,
+    ) -> Option<(Formula, Vec<Formula>)> {
+        wrapping_call_assert_model(func, callee, args, dest, true, false, false, false)
+    }
+
+    #[test]
+    fn wrapping_refutation_model_requires_closed_identity_and_exact_call_shape() {
+        let func = binary_func(Ty::u64());
+        let args = vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))];
+        let marker = "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add";
+        assert!(model(&func, marker, &args, &Place::local(0)).is_some());
+
+        assert!(
+            model(&func, "attacker::wrapping_add", &args, &Place::local(0)).is_none(),
+            "a source-spellable suffix must not receive modular semantics"
+        );
+
+        let mut extra_arg = args.clone();
+        extra_arg.push(Operand::Copy(Place::local(1)));
+        assert!(
+            model(&func, marker, &extra_arg, &Place::local(0)).is_none(),
+            "the authenticated method has exactly two operands"
+        );
+        for (has_target, has_atomic, is_foreign, is_unsafe_sig, label) in [
+            (false, false, false, false, "missing normal-return target"),
+            (true, true, false, false, "atomic metadata"),
+            (true, false, true, false, "foreign metadata"),
+            (true, false, false, true, "unsafe-signature metadata"),
+        ] {
+            assert!(
+                wrapping_call_assert_model(
+                    &func,
+                    marker,
+                    &args,
+                    &Place::local(0),
+                    has_target,
+                    has_atomic,
+                    is_foreign,
+                    is_unsafe_sig,
+                )
+                .is_none(),
+                "{label} must not inherit the authenticated modular call model"
+            );
+        }
+
+        let signed = binary_func(Ty::Int { width: 32, signed: true });
+        let signed_args = vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))];
+        let signed_marker =
+            "@trust-rustc-wrapping-refutation-method::core::num::<impl i32>::wrapping_sub";
+        assert!(
+            model(&signed, signed_marker, &signed_args, &Place::local(0)).is_some(),
+            "the sealed refutation marker retains the prior signed lane"
+        );
+        let signed_literal_args =
+            vec![Operand::Copy(Place::local(1)), Operand::Constant(ConstValue::Int(1))];
+        assert!(
+            model(&signed, signed_marker, &signed_literal_args, &Place::local(0)).is_some(),
+            "a narrow signed literal is checked against the authenticated destination width"
+        );
+        assert!(
+            model(&signed, marker, &signed_args, &Place::local(0)).is_none(),
+            "marker carrier and extracted operand/destination types must agree"
+        );
+
+        let pointer = binary_func(Ty::PtrSizedInt { signed: false });
+        let pointer_args = vec![
+            Operand::Copy(Place::local(1)),
+            Operand::Constant(ConstValue::Uint(1, 64)),
+        ];
+        let pointer_marker =
+            "@trust-rustc-wrapping-refutation-method::core::num::<impl usize>::wrapping_add";
+        assert!(
+            model(&pointer, pointer_marker, &pointer_args, &Place::local(0)).is_some(),
+            "a pointer-sized literal is checked against its authenticated destination carrier"
+        );
+        let legacy_pointer = binary_func(Ty::usize());
+        let legacy_pointer_args = vec![
+            Operand::Copy(Place::local(1)),
+            Operand::Constant(ConstValue::Uint(1, 64)),
+        ];
+        assert!(
+            model(&legacy_pointer, pointer_marker, &legacy_pointer_args, &Place::local(0)).is_some(),
+            "the authenticated pointer marker restores identity lost by legacy verifier extraction"
+        );
+        assert!(
+            model(&pointer, marker, &pointer_args, &Place::local(0)).is_none(),
+            "a fixed-width marker must not authorize a faithful pointer-sized destination"
+        );
+
+        let fixed_u32 = binary_func(Ty::u32());
+        let fixed_u32_args =
+            vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))];
+        assert!(
+            model(&fixed_u32, pointer_marker, &fixed_u32_args, &Place::local(0)).is_none(),
+            "a pointer-sized marker must not authorize an arbitrary fixed-width destination"
+        );
+    }
+
+    #[test]
+    fn wrapping_result_model_requires_a_whole_function_stable_destination() {
+        let marker =
+            "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add";
+        let mut func = binary_func(Ty::u64());
+        func.body.blocks = vec![
+            BasicBlock {
+                id: BlockId(0),
+                stmts: Vec::new(),
+                terminator: Terminator::Call {
+                    func: marker.into(),
+                    args: vec![
+                        Operand::Copy(Place::local(1)),
+                        Operand::Copy(Place::local(2)),
+                    ],
+                    dest: Place::local(0),
+                    target: Some(BlockId(1)),
+                    span: SourceSpan::default(),
+                    atomic: None,
+                    is_foreign: false,
+                    is_unsafe_sig: false,
+                    unwind: trust_types::UnwindEdge::Continue,
+                },
+            },
+            BasicBlock { id: BlockId(1), stmts: Vec::new(), terminator: Terminator::Return },
+        ];
+        assert!(
+            wrapping_result_local_is_stable(&func, &Place::local(0), 1),
+            "an exact single call destination remains modelable even when rustc retains an \
+             unreachable unwind annotation"
+        );
+
+        func.body.blocks[0].stmts.push(Statement::Assign {
+            place: Place::local(0),
+            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 64))),
+            span: SourceSpan::default(),
+        });
+        assert!(
+            !wrapping_result_local_is_stable(&func, &Place::local(0), 1),
+            "a competing statement definition must prevent use-point renaming from assigning \
+             the wrapping equation to another reaching value"
+        );
     }
 }

@@ -178,11 +178,29 @@ pub use certified_temporal::{
     CertifiedTemporalPropertyClass, certify_liveness_with_ty, recheck_certified_temporal_evidence,
 };
 pub use clean_model_lane::{
-    CLEAN_SCALAR_MODEL_SCHEMA_V1, CleanScalarAction, CleanScalarConstant, CleanScalarExpr,
-    CleanScalarInvariant, CleanScalarModel, CleanScalarModelArtifact, CleanScalarModelCertificate,
-    CleanScalarModelError, CleanScalarStateVar, CleanScalarUpdate, FINITE_MODEL_PRELUDE,
-    certify_clean_scalar_model_with_ty, extract_clean_scalar_model,
-    recheck_clean_scalar_model_artifact, recheck_clean_scalar_model_with_ty,
+    CLEAN_APPLIED_MODEL_BINDING_SCHEMA_V1, CLEAN_APPLIED_MODEL_PROOF_SCHEMA_V1,
+    CLEAN_BOUND_FINITE_MODEL_SCHEMA_V2, CLEAN_BOUND_SCALAR_MODEL_SCHEMA_V2,
+    CLEAN_FINITE_MODEL_SCHEMA_V2, CLEAN_PROVED_BOUND_FINITE_MODEL_SCHEMA_V3,
+    CLEAN_PROVED_BOUND_SCALAR_MODEL_SCHEMA_V3, CLEAN_SCALAR_MODEL_SCHEMA_V1,
+    CleanAppliedModelBinding, CleanAppliedModelProof, CleanBoundFiniteModelCertificate,
+    CleanBoundScalarModelCertificate, CleanFiniteModel, CleanFiniteModelArtifact,
+    CleanFiniteModelCertificate, CleanFunctionVar, CleanProvedBoundFiniteModelCertificate,
+    CleanProvedBoundScalarModelCertificate, CleanScalarAction, CleanScalarConstant,
+    CleanScalarExpr, CleanScalarInvariant, CleanScalarModel, CleanScalarModelArtifact,
+    CleanScalarModelCertificate, CleanScalarModelError, CleanScalarStateVar, CleanScalarUpdate,
+    FINITE_MODEL_PRELUDE, bind_clean_finite_model_safety_claim,
+    bind_clean_scalar_model_safety_claim, certify_bound_clean_finite_model_with_ty,
+    certify_bound_clean_scalar_model_with_ty, certify_clean_finite_model_with_ty,
+    certify_clean_scalar_model_with_ty, certify_proved_bound_clean_finite_model_with_ty,
+    certify_proved_bound_clean_scalar_model_with_ty, extract_clean_finite_model,
+    extract_clean_scalar_model, prove_clean_finite_model_safety_claim,
+    prove_clean_scalar_model_safety_claim, recheck_bound_clean_finite_model_with_ty,
+    recheck_bound_clean_scalar_model_with_ty, recheck_clean_finite_model_artifact,
+    recheck_clean_finite_model_safety_claim_binding, recheck_clean_finite_model_safety_claim_proof,
+    recheck_clean_finite_model_with_ty, recheck_clean_scalar_model_artifact,
+    recheck_clean_scalar_model_safety_claim_binding, recheck_clean_scalar_model_safety_claim_proof,
+    recheck_clean_scalar_model_with_ty, recheck_proved_bound_clean_finite_model_with_ty,
+    recheck_proved_bound_clean_scalar_model_with_ty,
 };
 pub use clean_surface::{
     CLEAN_TEMPORAL_CERT_SCHEMA_V1, CLEAN_TEMPORAL_PRELUDE, CleanTemporalCertificate,
@@ -1271,7 +1289,8 @@ use std::process::Command;
 /// `trust_model!`'s capability — a bounded scalar-integer SAFETY machine — is
 /// `FullyReplaced` (owner policy flip 2026-07-21): the live Clean lane
 /// certifies byte-identically (author a temporal [`Model`], or a `clean { … }`
-/// island, and certify with [`certify_clean_scalar_model_with_ty`]), and its
+/// island, and certify with [`certify_bound_clean_scalar_model_with_ty`]), and
+/// bind the exact applied safety claim, and its
 /// formerly narrower admission domain now covers the owner-ratified
 /// operational macro-parity domain (interner + name caps deleted, depth cap
 /// widened to a decode-cost guard, positive near-cap vectors certified
@@ -3047,7 +3066,7 @@ fn valid_temporal_capability(capability: &str) -> bool {
 // evidence and unconditionally reject the automatic route with
 // unbound-evidence exit 2. Callers own their explicit model list and use
 // `check_models_or_exit` / `check_models_with_capability_or_exit` /
-// `certify_clean_scalar_model_with_ty` directly.
+// `certify_bound_clean_scalar_model_with_ty` directly.
 
 #[cfg(test)]
 #[allow(deprecated)]
@@ -4224,6 +4243,71 @@ Safety == x >= 0\n\
         );
         assert!(!tampered.kernel_rechecked);
         assert!(tampered.recheck_detail.is_empty());
+    }
+
+    /// A reachable-set proof does not imply that the authored safety predicate
+    /// is itself inductive. Here only `x = 0` and `x = 1` are reachable, so
+    /// TY's exact fixpoint proves safety. The safe but unreachable state
+    /// `x = 2`, however, has a real `Next` edge to unsafe `x = 3`.
+    ///
+    /// This is the load-bearing counterexample for R5 macro retirement:
+    /// automatically applying `FiniteModel.safetyClaimOfInductive` to the
+    /// authored invariants cannot cover the certifiable macro domain. A sound
+    /// bridge must transport TY's stronger reachable-set invariant `J` into
+    /// the exact applied `FiniteModel` proposition and prove J-initiation,
+    /// J-consecution, and J-to-safety preservation there.
+    #[test]
+    fn certified_reachable_safety_can_have_noninductive_authored_invariants() {
+        let model = trust_model! {
+            ReachableSafeNonInductive {
+                const Buggy = 0;
+                var x = 0;
+                action Reachable when (x == 0) {
+                    x = 1;
+                }
+                action EscapeFromUnreachableSafeState when (x == 2) {
+                    x = 3;
+                }
+                invariant NonVacuity: Buggy <= x;
+                invariant Safe: x <= 2;
+            }
+        };
+
+        let outcome = certify_model(&model);
+        assert_eq!(
+            outcome.verdict,
+            ModelVerdict::Proved,
+            "the exact reachable-set certificate must prove the safe model"
+        );
+        assert_eq!(outcome.non_vacuity, Some(ModelVerdict::Proved));
+        let bound = outcome.bound.expect("Proved requires replayable bound evidence");
+        assert!(bound.kernel_rechecked);
+        let reachable = bound
+            .cert
+            .explicit_fixpoint
+            .as_ref()
+            .and_then(|fixpoint| fixpoint.get("reachable"))
+            .and_then(serde_json::Value::as_array)
+            .expect("the accepted proof must carry its exact reachable set");
+        assert_eq!(
+            reachable.len(),
+            2,
+            "only x=0 and x=1 may occur in the certificate's reachable set"
+        );
+
+        // Concrete witness that the conjunction of authored invariants is not
+        // preserved by Next, despite holding on every reachable state.
+        let mut unreachable_safe = BTreeMap::from([("x", 2)]);
+        assert!(
+            model
+                .invariants
+                .iter()
+                .all(|invariant| model.check_invariant(invariant.name, &unreachable_safe))
+        );
+        assert!(model.action_enabled("EscapeFromUnreachableSafeState", &unreachable_safe));
+        assert!(model.fire("EscapeFromUnreachableSafeState", &mut unreachable_safe));
+        assert_eq!(unreachable_safe.get("x"), Some(&3));
+        assert!(!model.check_invariant("Safe", &unreachable_safe));
     }
 
     /// Constants transport round-trip: the one `TyConfigConstant` transport

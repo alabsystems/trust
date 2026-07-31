@@ -16,7 +16,8 @@ use rustc_middle::mir::trust_contract::{
     TrustContract, TrustContractBundle, TrustContractCitation, TrustContractKind,
     TrustContractPayloadType, TrustContractPredicate, TrustContractPredicateKind,
     TrustContractProposition, TrustContractPropositionDomain, TrustContractSource,
-    TrustContractSubject, TrustContractSummary, TrustContractVerifierSort, TrustLoopId,
+    TrustContractSourceBinding, TrustContractSubject, TrustContractSummary,
+    TrustContractVerifierSort, TrustLoopId,
 };
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeckResults};
 use rustc_span::def_id::LocalDefId;
@@ -26,6 +27,13 @@ const LOWERED_COMPILER_CONTRACT_PREFIX: &str = "__trust_lowered_compiler_contrac
 const ENSURES_RESULT_BINDING: &str = "result";
 
 #[derive(Clone, Copy)]
+struct LoweredCollectionDomain {
+    element: TrustContractPropositionDomain,
+    /// Exact type-level length for `[T; N]`; slices have no static upper bound.
+    fixed_length: Option<u128>,
+}
+
+#[derive(Clone, Copy)]
 struct AuthoredHirContractClause<'hir> {
     kind: TrustContractKind,
     clause: &'hir rustc_hir::ContractClause,
@@ -33,8 +41,17 @@ struct AuthoredHirContractClause<'hir> {
 
 #[derive(Clone, Copy)]
 enum ContractPayloadContext<'a> {
-    Function(&'a BTreeMap<String, trust_types::Sort>),
-    Loop(&'a BTreeMap<String, trust_types::Sort>),
+    Function {
+        source_sorts: &'a BTreeMap<String, trust_types::Sort>,
+        variable_domains: &'a [LoweredVariableDomain],
+        collection_domains: &'a BTreeMap<String, LoweredCollectionDomain>,
+    },
+    Loop {
+        source_sorts: &'a BTreeMap<String, trust_types::Sort>,
+        variable_domains: &'a [LoweredVariableDomain],
+        collection_domains: &'a BTreeMap<String, LoweredCollectionDomain>,
+        source_bindings: &'a [LoweredSourceBinding],
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -139,7 +156,7 @@ pub(crate) fn trust_contracts<'tcx>(
     // otherwise two distinct source meanings can become the same Formula leaf
     // and a false relation can collapse to reflexivity. The recursive pattern
     // visitor covers destructured parameters as well as direct bindings.
-    if reject_synthetic_contract_parameter_names(tcx, body) {
+    if reject_unrepresentable_contract_parameter_names(tcx, body) {
         return TrustContractBundle::empty(def_id);
     }
 
@@ -172,6 +189,8 @@ pub(crate) fn trust_contracts<'tcx>(
     let typeck_results = tcx.typeck(local_def_id);
     let signature_domains = signature_variable_domains(tcx, def_id, body, typeck_results);
     let function_source_sorts = function_source_sorts(body, typeck_results);
+    let function_collection_domains =
+        function_collection_element_domains(tcx, body, typeck_results);
     for authored_clause in authored_clauses {
         let clause = authored_clause.clause;
         let predicate = lower_predicate(
@@ -184,7 +203,11 @@ pub(crate) fn trust_contracts<'tcx>(
             authored_clause.kind,
             clause.origin,
             &signature_domains,
-            ContractPayloadContext::Function(&function_source_sorts),
+            ContractPayloadContext::Function {
+                source_sorts: &function_source_sorts,
+                variable_domains: &signature_domains,
+                collection_domains: &function_collection_domains,
+            },
         );
         if is_opaque_summary_predicate(&predicate.kind) {
             opaque += 1;
@@ -227,6 +250,15 @@ pub(crate) fn trust_contracts<'tcx>(
             clause.loop_id,
             &signature_domains,
         );
+        let (loop_variable_domains, loop_collection_domains, loop_source_bindings) =
+            visible_loop_variable_domains(
+                tcx,
+                local_def_id,
+                body,
+                typeck_results,
+                clause.loop_id,
+                &signature_domains,
+            );
         let predicate = lower_predicate(
             tcx,
             typeck_results,
@@ -237,7 +269,12 @@ pub(crate) fn trust_contracts<'tcx>(
             kind,
             ContractClauseOrigin::Native,
             &signature_domains,
-            ContractPayloadContext::Loop(&loop_source_sorts),
+            ContractPayloadContext::Loop {
+                source_sorts: &loop_source_sorts,
+                variable_domains: &loop_variable_domains,
+                collection_domains: &loop_collection_domains,
+                source_bindings: &loop_source_bindings,
+            },
         );
         if is_opaque_summary_predicate(&predicate.kind) {
             opaque += 1;
@@ -245,6 +282,7 @@ pub(crate) fn trust_contracts<'tcx>(
         let next_loop_id = TrustLoopId {
             index: u32::try_from(source_loops.len())
                 .expect("a function cannot contain more than u32::MAX source loops"),
+            hir_local_id: clause.loop_id.local_id.as_u32(),
         };
         let loop_id = *source_loops.entry(clause.loop_id).or_insert(next_loop_id);
         loop_contracts.push(TrustContract {
@@ -305,29 +343,45 @@ fn lower_predicate<'tcx>(
     // First-class native clauses are verifier-language parser islands rather
     // than Rust HIR expressions. Validate the exact supported roles with their
     // exact visible domains at this earliest always-on boundary.
-    let native_clause_sorts = match context {
-        ContractPayloadContext::Function(sorts)
-            if origin == ContractClauseOrigin::Native
-                && matches!(
-                    contract_kind,
-                    TrustContractKind::Requires | TrustContractKind::Decreases
-                ) =>
+    let native_clause_environment = match context {
+        ContractPayloadContext::Function {
+            source_sorts,
+            variable_domains,
+            collection_domains,
+        } if origin == ContractClauseOrigin::Native
+            && matches!(
+                contract_kind,
+                TrustContractKind::Requires | TrustContractKind::Decreases
+            ) =>
         {
-            Some(sorts.clone())
+            Some((source_sorts, variable_domains, collection_domains))
         }
-        ContractPayloadContext::Loop(sorts)
-            if origin == ContractClauseOrigin::Native
-                && matches!(
-                    contract_kind,
-                    TrustContractKind::LoopInvariant | TrustContractKind::Decreases
-                ) =>
+        ContractPayloadContext::Loop {
+            source_sorts,
+            variable_domains,
+            collection_domains,
+            ..
+        } if origin == ContractClauseOrigin::Native
+            && matches!(
+                contract_kind,
+                TrustContractKind::LoopInvariant | TrustContractKind::Decreases
+            ) =>
         {
-            Some(sorts.clone())
+            Some((source_sorts, variable_domains, collection_domains))
         }
-        ContractPayloadContext::Function(_) | ContractPayloadContext::Loop(_) => None,
+        ContractPayloadContext::Function { .. } | ContractPayloadContext::Loop { .. } => None,
     };
-    let validated_native_clause = native_clause_sorts.map(|source_sorts| {
-        lower_native_clause(tcx, span, payload, contract_kind, &source_sorts, signature_domains)
+    let validated_native_clause = native_clause_environment.map(
+        |(source_sorts, variable_domains, collection_domains)| {
+            lower_native_clause(
+                tcx,
+                span,
+                payload,
+                contract_kind,
+                source_sorts,
+                variable_domains,
+                collection_domains,
+            )
             .unwrap_or_else(|reason| {
                 let keyword = match contract_kind {
                     TrustContractKind::Requires => "requires",
@@ -337,7 +391,8 @@ fn lower_predicate<'tcx>(
                 tcx.dcx().span_err(span, format!("invalid `{keyword}` clause: {reason}"));
                 TrustContractPredicateKind::Unsupported { reason: Symbol::intern(&reason) }
             })
-    });
+        },
+    );
 
     let kind = if let Some(predicate_hir_id) = predicate_hir_id {
         // Typed clauses carry an exact identity from AST -> HIR lowering.
@@ -411,22 +466,31 @@ fn lower_predicate<'tcx>(
             })
         }
     };
-    TrustContractPredicate { ty, kind }
+    let source_bindings = match context {
+        ContractPayloadContext::Loop { source_bindings, .. }
+            if origin == ContractClauseOrigin::Native =>
+        {
+            exact_predicate_source_bindings(&kind, source_bindings)
+        }
+        ContractPayloadContext::Function { .. } | ContractPayloadContext::Loop { .. } => Vec::new(),
+    };
+    TrustContractPredicate { ty, kind, source_bindings }
 }
 
 /// Parse and type-check a supported first-class native clause at the earliest
 /// always-on compiler boundary. Native clauses are not Rust HIR expressions,
 /// so this uses the verifier-language elaborator and exact visible source domains.
-/// Successful validation deliberately keeps the authored text opaque for the
-/// downstream binder; the result here is admission/type evidence, not proof
-/// authority.
+/// When the complete expression fits the closed query vocabulary, successful
+/// validation also carries a structural proposition with exact free-variable
+/// domains. The authored spelling remains diagnostics, never proof authority.
 fn lower_native_clause(
     tcx: TyCtxt<'_>,
     span: Span,
     payload: Option<Symbol>,
     contract_kind: TrustContractKind,
     source_sorts: &BTreeMap<String, trust_types::Sort>,
-    signature_domains: &[LoweredVariableDomain],
+    visible_domains: &[LoweredVariableDomain],
+    collection_domains: &BTreeMap<String, LoweredCollectionDomain>,
 ) -> Result<TrustContractPredicateKind, String> {
     let snippet;
     let payload_text = native_clause_payload_text(span, payload);
@@ -448,56 +512,109 @@ fn lower_native_clause(
         }
     };
     let body = validate_native_clause_body(body, contract_kind, source_sorts)?;
-    // A native function Requires has already passed exact high-level source
-    // validation above. When its lowered Formula fits the query proposition
-    // vocabulary, carry that structural tree through metadata instead of
-    // leaving an Opaque spelling that the verifier API must reject. In
-    // particular, `xs.len()` lowers to the synthetic `xs_len` usize leaf;
-    // `native_requires_variable_domains` supplies its exact pointer-sized
-    // domain so the tree/text round-trip remains injective. Loop clauses stay
-    // in their dedicated E4/E5 transport, and any Requires outside this closed
-    // proposition subset remains honestly Opaque.
-    if contract_kind == TrustContractKind::Requires
-        && let Some(predicate) = typed_native_function_requires(
-            &body,
-            source_sorts,
-            signature_domains,
-            u32::try_from(tcx.data_layout.pointer_size().bits()).ok(),
-        )
-    {
+    // Every supported native role has already passed exact high-level source
+    // validation above. When its lowered Formula fits the query vocabulary,
+    // retain that structural tree instead of forcing E4/E5 or a function
+    // measure back through an opaque string. In particular, `xs.len()` lowers
+    // to `xs_len`; `native_clause_variable_domains` supplies the exact
+    // pointer-sized domain while visible loop locals retain their HIR-derived
+    // primitive widths and signedness.
+    if let Some(predicate) = typed_native_clause_with_collection_domains(
+        &body,
+        contract_kind,
+        source_sorts,
+        visible_domains,
+        collection_domains,
+        u32::try_from(tcx.data_layout.pointer_size().bits()).ok(),
+    ) {
         return Ok(predicate);
     }
     Ok(TrustContractPredicateKind::Opaque { text: Symbol::intern(&body) })
 }
 
-fn typed_native_function_requires(
+#[cfg(test)]
+fn typed_native_clause(
     body: &str,
+    contract_kind: TrustContractKind,
     source_sorts: &BTreeMap<String, trust_types::Sort>,
-    signature_domains: &[LoweredVariableDomain],
+    visible_domains: &[LoweredVariableDomain],
     pointer_width: Option<u32>,
 ) -> Option<TrustContractPredicateKind> {
+    typed_native_clause_with_collection_domains(
+        body,
+        contract_kind,
+        source_sorts,
+        visible_domains,
+        &BTreeMap::new(),
+        pointer_width,
+    )
+}
+
+fn typed_native_clause_with_collection_domains(
+    body: &str,
+    contract_kind: TrustContractKind,
+    source_sorts: &BTreeMap<String, trust_types::Sort>,
+    visible_domains: &[LoweredVariableDomain],
+    collection_domains: &BTreeMap<String, LoweredCollectionDomain>,
+    pointer_width: Option<u32>,
+) -> Option<TrustContractPredicateKind> {
+    let expected_class = if contract_kind == TrustContractKind::Decreases {
+        PropositionClass::Numeric
+    } else {
+        PropositionClass::Bool
+    };
     let formula = trust_types::parse_spec_expr(body)?;
-    let variable_domains =
-        native_requires_variable_domains(&formula, source_sorts, signature_domains, pointer_width)?;
-    match lowered_contract_text_with_domains(body.to_string(), &variable_domains) {
+    let variable_domains = native_clause_variable_domains(
+        &formula,
+        source_sorts,
+        visible_domains,
+        collection_domains,
+        pointer_width,
+    )?;
+    match lowered_contract_text_with_domains_for_class(
+        body.to_string(),
+        &variable_domains,
+        expected_class,
+    ) {
         typed @ TrustContractPredicateKind::Typed { .. } => Some(typed),
         _ => None,
     }
 }
 
+#[cfg(test)]
+fn typed_native_function_requires(
+    body: &str,
+    source_sorts: &BTreeMap<String, trust_types::Sort>,
+    signature_domains: &[LoweredVariableDomain],
+    collection_domains: &BTreeMap<String, LoweredCollectionDomain>,
+    pointer_width: Option<u32>,
+) -> Option<TrustContractPredicateKind> {
+    typed_native_clause_with_collection_domains(
+        body,
+        TrustContractKind::Requires,
+        source_sorts,
+        signature_domains,
+        collection_domains,
+        pointer_width,
+    )
+}
+
 /// Extend scalar signature domains with exact synthetic projection domains
 /// introduced by native source lowering. This is deliberately a closed lane:
-/// today only collection `.len()` is representable in the query proposition
-/// vocabulary, and only an exact Array-typed source base authorizes its usize
-/// leaf. Unknown projections return None and keep the clause Opaque.
+/// collection `.len()` and one canonical literal index are representable in the
+/// query proposition vocabulary. Only an exact, unshadowed collection parameter
+/// descriptor authorizes either synthetic leaf, and a fixed-array literal must
+/// be in range. Unknown or loop-local projections return None and keep the
+/// clause Opaque.
 // `Formula::free_variables` is a set, but its iteration order cannot affect
 // this query: the names are sorted immediately before any domain decision or
 // output is made.
 #[allow(rustc::potential_query_instability)]
-fn native_requires_variable_domains(
+fn native_clause_variable_domains(
     formula: &trust_types::Formula,
     source_sorts: &BTreeMap<String, trust_types::Sort>,
     signature_domains: &[LoweredVariableDomain],
+    collection_domains: &BTreeMap<String, LoweredCollectionDomain>,
     pointer_width: Option<u32>,
 ) -> Option<Vec<LoweredVariableDomain>> {
     let mut free_variables: Vec<_> = formula.free_variables().into_iter().collect();
@@ -520,19 +637,69 @@ fn native_requires_variable_domains(
             }
             continue;
         }
-        let base = name.strip_suffix("_len")?;
-        if !matches!(source_sorts.get(base), Some(trust_types::Sort::Array(..))) {
+        if let Some(base) = name.strip_suffix("_len") {
+            if !matches!(source_sorts.get(base), Some(trust_types::Sort::Array(..))) {
+                return None;
+            }
+            // A source sort proves only that some visible HIR binding with
+            // this spelling is a collection. The descriptor is minted only
+            // for the exact unshadowed parameter collection that downstream
+            // MIR can rebind without guessing source identity.
+            collection_domains.get(base)?;
+            domains.push(LoweredVariableDomain {
+                name,
+                domain: TrustContractPropositionDomain::PointerSizedInt {
+                    width: pointer_width?,
+                    signed: false,
+                },
+            });
+            continue;
+        }
+
+        let (base, index) = canonical_literal_collection_projection(&name)?;
+        let trust_types::Sort::Array(index_sort, element_sort) = source_sorts.get(base)? else {
+            return None;
+        };
+        if index_sort.as_ref() != &trust_types::Sort::Int {
             return None;
         }
-        domains.push(LoweredVariableDomain {
-            name,
-            domain: TrustContractPropositionDomain::PointerSizedInt {
-                width: pointer_width?,
-                signed: false,
-            },
-        });
+        let collection = *collection_domains.get(base)?;
+        if collection.fixed_length.is_some_and(|length| index >= length) {
+            return None;
+        }
+        let domain = collection.element;
+        let domain_sort = match domain {
+            TrustContractPropositionDomain::Bool => trust_types::Sort::Bool,
+            TrustContractPropositionDomain::MathematicalInt
+            | TrustContractPropositionDomain::PointerSizedInt { .. }
+            | TrustContractPropositionDomain::MachineInt { .. } => trust_types::Sort::Int,
+        };
+        if element_sort.as_ref() != &domain_sort {
+            return None;
+        }
+        domains.push(LoweredVariableDomain { name, domain });
     }
     canonical_variable_domains(domains)
+}
+
+/// Recover the base and index of exactly one canonical nonnegative literal
+/// collection projection (`xs[0]`). Source validation proves the visible base
+/// has Array sort; the parameter descriptor checked by the caller supplies
+/// source identity, exact element domain, and any fixed-array bound. Keeping
+/// those authorities separate prevents an arbitrary parser variable or a
+/// shadowing loop local from borrowing a parameter collection's identity.
+fn canonical_literal_collection_projection(name: &str) -> Option<(&str, u128)> {
+    let without_close = name.strip_suffix(']')?;
+    let (base, index) = without_close.rsplit_once('[')?;
+    if base.is_empty()
+        || base.contains(['[', ']'])
+        || index.is_empty()
+        || !index.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let parsed = index.parse::<u128>().ok()?;
+    (parsed.to_string() == index).then_some((base, parsed))
 }
 
 #[cfg(test)]
@@ -611,61 +778,96 @@ fn validate_native_clause_body(
     Ok(validated)
 }
 
-/// Reject Rust parameters whose names are also minted by contract lowering.
+/// Reject Rust parameter spellings that contract lowering cannot represent
+/// injectively.
 ///
 /// This is deliberately a query-level admission gate rather than a verifier
 /// diagnostic sweep: every consumer of `trust_contracts` then receives either
-/// an injectively named bundle or an empty bundle accompanied by a hard
-/// compiler error. Quantifier binders are guarded by the shared `trust-types`
-/// parser rule, and loop-local bindings are guarded by
-/// `validate_native_clause_body` using the exact visible environment.
-fn reject_synthetic_contract_parameter_names<'tcx>(
+/// an injectively named bundle or an empty bundle accompanied by a hard compiler
+/// error. Besides the generated namespace, Rust hygiene permits two distinct
+/// parameter HIR identities with one displayed name. Native proposition
+/// payloads retain only that displayed name, so such a function must fail
+/// before function-level clauses, monitors, or loop clauses can select either
+/// binding. Quantifier binders are guarded by the shared `trust-types` parser
+/// rule, and loop-local bindings are guarded by `validate_native_clause_body`
+/// using the exact visible environment.
+fn reject_unrepresentable_contract_parameter_names<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &'tcx rustc_hir::Body<'tcx>,
 ) -> bool {
     struct Collector<'tcx> {
         tcx: TyCtxt<'tcx>,
         rejected: bool,
+        parameter_ids: BTreeMap<String, u32>,
+        ambiguous_names: BTreeSet<String>,
     }
 
     impl<'tcx> Visitor<'tcx> for Collector<'tcx> {
         fn visit_pat(&mut self, pat: &'tcx Pat<'tcx>) {
             if let PatKind::Binding(_, canonical_id, ident, _) = pat.kind
                 && canonical_id == pat.hir_id
-                && let Some(collision) =
-                    trust_types::source_contract_synthetic_name_collision(ident.name.as_str())
             {
-                let name = ident.name.as_str();
-                let message = match collision {
-                    trust_types::SourceContractSyntheticNameCollision::ReturnPlace => format!(
-                        "parameter `{name}` collides with the source-contract return-place vocabulary"
-                    ),
-                    trust_types::SourceContractSyntheticNameCollision::OldValue => format!(
-                        "parameter `{name}` collides with the source-contract synthetic pre-state namespace"
-                    ),
-                    trust_types::SourceContractSyntheticNameCollision::Projection => format!(
-                        "parameter `{name}` collides with the source-contract synthetic projection namespace"
-                    ),
-                    trust_types::SourceContractSyntheticNameCollision::PositionalPlace => format!(
-                        "parameter `{name}` collides with the source-contract positional MIR-place namespace"
-                    ),
-                    trust_types::SourceContractSyntheticNameCollision::PredicateSymbol => format!(
-                        "parameter `{name}` collides with the source-contract predicate-symbol namespace"
-                    ),
-                    trust_types::SourceContractSyntheticNameCollision::GeneratedMetadata => {
+                let name = ident.name.to_string();
+                let id = canonical_id.local_id.as_u32();
+                if let Some(previous_id) = self.parameter_ids.get(&name).copied()
+                    && previous_id != id
+                    && self.ambiguous_names.insert(name.clone())
+                {
+                    self.tcx.dcx().span_err(
+                        pat.span,
                         format!(
-                            "parameter `{name}` collides with Trust's generated Formula metadata namespace"
-                        )
-                    }
-                };
-                self.tcx.dcx().span_err(pat.span, message);
-                self.rejected = true;
+                            "parameters named `{name}` have distinct hygienic identities; \
+                             source-contract propositions cannot select one by displayed name"
+                        ),
+                    );
+                    self.rejected = true;
+                } else {
+                    self.parameter_ids.entry(name.clone()).or_insert(id);
+                }
+
+                if let Some(collision) =
+                    trust_types::source_contract_synthetic_name_collision(&name)
+                {
+                    let message = match collision {
+                        trust_types::SourceContractSyntheticNameCollision::ReturnPlace => format!(
+                            "parameter `{name}` collides with the source-contract return-place vocabulary"
+                        ),
+                        trust_types::SourceContractSyntheticNameCollision::OldValue => format!(
+                            "parameter `{name}` collides with the source-contract synthetic pre-state namespace"
+                        ),
+                        trust_types::SourceContractSyntheticNameCollision::Projection => format!(
+                            "parameter `{name}` collides with the source-contract synthetic projection namespace"
+                        ),
+                        trust_types::SourceContractSyntheticNameCollision::PositionalPlace => {
+                            format!(
+                                "parameter `{name}` collides with the source-contract positional MIR-place namespace"
+                            )
+                        }
+                        trust_types::SourceContractSyntheticNameCollision::PredicateSymbol => {
+                            format!(
+                                "parameter `{name}` collides with the source-contract predicate-symbol namespace"
+                            )
+                        }
+                        trust_types::SourceContractSyntheticNameCollision::GeneratedMetadata => {
+                            format!(
+                                "parameter `{name}` collides with Trust's generated Formula metadata namespace"
+                            )
+                        }
+                    };
+                    self.tcx.dcx().span_err(pat.span, message);
+                    self.rejected = true;
+                }
             }
             intravisit::walk_pat(self, pat);
         }
     }
 
-    let mut collector = Collector { tcx, rejected: false };
+    let mut collector = Collector {
+        tcx,
+        rejected: false,
+        parameter_ids: BTreeMap::new(),
+        ambiguous_names: BTreeSet::new(),
+    };
     for param in body.params {
         collector.visit_pat(param.pat);
     }
@@ -2144,11 +2346,18 @@ fn lowered_contract_text_with_domains(
     text: String,
     variable_domains: &[LoweredVariableDomain],
 ) -> TrustContractPredicateKind {
+    lowered_contract_text_with_domains_for_class(text, variable_domains, PropositionClass::Bool)
+}
+
+fn lowered_contract_text_with_domains_for_class(
+    text: String,
+    variable_domains: &[LoweredVariableDomain],
+    expected_class: PropositionClass,
+) -> TrustContractPredicateKind {
     let canonical = Symbol::intern(&format!("{LOWERED_COMPILER_CONTRACT_PREFIX}{text}"));
-    if let Some(proposition) = trust_types::parse_spec_expr(&text)
-        .as_ref()
-        .and_then(|formula| query_proposition_from_formula(formula, variable_domains))
-    {
+    if let Some(proposition) = trust_types::parse_spec_expr(&text).as_ref().and_then(|formula| {
+        query_proposition_from_formula(formula, variable_domains, expected_class)
+    }) {
         TrustContractPredicateKind::Typed { text: canonical, proposition }
     } else {
         TrustContractPredicateKind::Opaque { text: canonical }
@@ -2161,6 +2370,7 @@ fn lowered_contract_text_with_domains(
 fn query_proposition_from_formula(
     formula: &trust_types::Formula,
     variable_domains: &[LoweredVariableDomain],
+    expected_class: PropositionClass,
 ) -> Option<TrustContractProposition> {
     let mut domains = FxHashMap::default();
     for variable in variable_domains {
@@ -2170,7 +2380,7 @@ fn query_proposition_from_formula(
     }
 
     let (proposition, class) = query_proposition_from_formula_inner(formula, &domains)?;
-    (class == PropositionClass::Bool).then_some(proposition)
+    (class == expected_class).then_some(proposition)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2314,6 +2524,78 @@ struct LoweredVariableDomain {
     domain: TrustContractPropositionDomain,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoweredSourceBinding {
+    name: String,
+    hir_local_id: u32,
+}
+
+/// Retain only exact source bindings actually used by this structural
+/// proposition. Missing candidates are intentional: synthesized/projection
+/// leaves remain statically meaningful but can never be rebound to a whole MIR
+/// local by the certified-monitor lane.
+fn exact_predicate_source_bindings(
+    kind: &TrustContractPredicateKind,
+    candidates: &[LoweredSourceBinding],
+) -> Vec<TrustContractSourceBinding> {
+    fn collect_names(proposition: &TrustContractProposition, names: &mut BTreeSet<String>) {
+        use TrustContractProposition as Proposition;
+        match proposition {
+            Proposition::Var { name, .. } => {
+                names.insert(name.to_string());
+            }
+            Proposition::Not(inner) | Proposition::Neg(inner) => collect_names(inner, names),
+            Proposition::And(terms) | Proposition::Or(terms) => {
+                for term in terms {
+                    collect_names(term, names);
+                }
+            }
+            Proposition::Implies(lhs, rhs)
+            | Proposition::Eq(lhs, rhs)
+            | Proposition::Lt(lhs, rhs)
+            | Proposition::Le(lhs, rhs)
+            | Proposition::Gt(lhs, rhs)
+            | Proposition::Ge(lhs, rhs)
+            | Proposition::Add(lhs, rhs)
+            | Proposition::Sub(lhs, rhs)
+            | Proposition::Mul(lhs, rhs)
+            | Proposition::Div(lhs, rhs)
+            | Proposition::Rem(lhs, rhs) => {
+                collect_names(lhs, names);
+                collect_names(rhs, names);
+            }
+            Proposition::Bool(_) | Proposition::Int(_) | Proposition::UInt(_) => {}
+        }
+    }
+
+    let TrustContractPredicateKind::Typed { proposition, .. } = kind else {
+        return Vec::new();
+    };
+    let mut used = BTreeSet::new();
+    collect_names(proposition, &mut used);
+    let mut by_name = BTreeMap::new();
+    let mut ambiguous = BTreeSet::new();
+    for candidate in candidates {
+        if !used.contains(&candidate.name) || ambiguous.contains(&candidate.name) {
+            continue;
+        }
+        if let Some(previous) = by_name.insert(candidate.name.clone(), candidate.hir_local_id)
+            && previous != candidate.hir_local_id
+        {
+            // An identity ambiguity cannot authorize either candidate.
+            by_name.remove(&candidate.name);
+            ambiguous.insert(candidate.name.clone());
+        }
+    }
+    by_name
+        .into_iter()
+        .map(|(name, hir_local_id)| TrustContractSourceBinding {
+            name: Symbol::intern(&name),
+            hir_local_id,
+        })
+        .collect()
+}
+
 fn proposition_domain_from_ty(
     tcx: TyCtxt<'_>,
     ty: Ty<'_>,
@@ -2361,6 +2643,32 @@ fn proposition_domain_from_ty(
         _ => return None,
     };
     Some(TrustContractPropositionDomain::MachineInt { width, signed })
+}
+
+fn collection_element_domain_from_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    name: String,
+    ty: Ty<'tcx>,
+) -> Option<(String, LoweredCollectionDomain)> {
+    let (source_name, collection_ty) = match ty.kind() {
+        ty::Ref(_, inner, _) => (name, *inner),
+        ty::RawPtr(inner, _) => (format!("{name}*"), *inner),
+        _ => (name, ty),
+    };
+    let (element, fixed_length) = match collection_ty.kind() {
+        ty::Array(element, length) => {
+            (*element, Some(u128::from(length.try_to_target_usize(tcx)?)))
+        }
+        ty::Slice(element) => (*element, None),
+        _ => return None,
+    };
+    Some((
+        source_name,
+        LoweredCollectionDomain {
+            element: proposition_domain_from_ty(tcx, element)?,
+            fixed_length,
+        },
+    ))
 }
 
 /// Source-level sort used to elaborate native E4/E5 clauses. Scalars retain
@@ -2451,6 +2759,81 @@ fn function_source_sorts<'tcx>(
     collector.sorts
 }
 
+/// Exact primitive element domains for collection parameters. This is kept
+/// separate from the logical source-sort environment: source elaboration
+/// intentionally treats every primitive integer as `Int`, while a structural
+/// compiler proposition must still distinguish (for example) `u8`, `i8`, and
+/// `usize` before it can authorize a monitor or a body-bound E4/E5 proof.
+fn function_collection_element_domains<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &'tcx rustc_hir::Body<'tcx>,
+    typeck_results: &TypeckResults<'tcx>,
+) -> BTreeMap<String, LoweredCollectionDomain> {
+    struct Collector<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        typeck_results: &'a TypeckResults<'tcx>,
+        domains: BTreeMap<String, LoweredCollectionDomain>,
+        ambiguous: BTreeSet<String>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
+        fn visit_pat(&mut self, pat: &'tcx Pat<'tcx>) {
+            if let PatKind::Binding(_, canonical_id, ident, _) = pat.kind
+                && canonical_id == pat.hir_id
+                && !ident.span.from_expansion()
+                && let Some((name, domain)) = collection_element_domain_from_ty(
+                    self.tcx,
+                    ident.name.to_string(),
+                    self.typeck_results.pat_ty(pat),
+                )
+                && !self.ambiguous.contains(&name)
+                && self.domains.insert(name.clone(), domain).is_some()
+            {
+                self.domains.remove(&name);
+                self.ambiguous.insert(name);
+            }
+            intravisit::walk_pat(self, pat);
+        }
+    }
+
+    let mut collector =
+        Collector { tcx, typeck_results, domains: BTreeMap::new(), ambiguous: BTreeSet::new() };
+    for param in body.params {
+        collector.visit_pat(param.pat);
+    }
+    collector.domains
+}
+
+/// Return the exact HIR identity for each uniquely named direct parameter.
+///
+/// A displayed spelling shared by distinct hygienic parameters is omitted,
+/// even though the query-level admission gate rejects the complete contract
+/// bundle first. Destructured parameters remain conservatively excluded.
+fn unique_simple_parameter_hir_local_ids(body: &rustc_hir::Body<'_>) -> BTreeMap<String, u32> {
+    let mut candidates = BTreeMap::<String, Option<u32>>::new();
+    for param in body.params {
+        let PatKind::Binding(_, canonical_id, ident, None) = param.pat.kind else {
+            continue;
+        };
+        if canonical_id != param.pat.hir_id {
+            continue;
+        }
+        let id = canonical_id.local_id.as_u32();
+        use std::collections::btree_map::Entry;
+        match candidates.entry(ident.name.to_string()) {
+            Entry::Vacant(entry) => {
+                entry.insert(Some(id));
+            }
+            Entry::Occupied(mut entry) => {
+                if entry.get().is_some_and(|previous| previous != id) {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    candidates.into_iter().filter_map(|(name, id)| id.map(|id| (name, id))).collect()
+}
+
 /// Recover the exact HIR bindings visible at a source loop. rustc's region
 /// scope tree is the authority here: a similarly named binding elsewhere in
 /// the body is never accepted, and a narrower visible binding correctly
@@ -2469,11 +2852,12 @@ fn visible_loop_source_sorts<'tcx>(
         typeck_results: &'a TypeckResults<'tcx>,
         scope_tree: &'a ScopeTree,
         target: Scope,
+        unique_parameter_hir_local_ids: &'a BTreeMap<String, u32>,
         // Key by the Rust identifier, not the verifier spelling. Keep visible
         // unsupported bindings as `None`: an inner aggregate/closure named `x`
         // must still shadow an outer supported integer `x` rather than
         // accidentally resurrecting the outer verifier binding.
-        bindings: BTreeMap<String, (Scope, Option<(String, trust_types::Sort)>)>,
+        bindings: BTreeMap<String, (Scope, u32, Option<(String, trust_types::Sort)>)>,
     }
 
     impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
@@ -2483,32 +2867,48 @@ fn visible_loop_source_sorts<'tcx>(
                 // id; visit that binding once rather than manufacturing an
                 // ambiguity from repeated pattern syntax.
                 && canonical_id == pat.hir_id
-                // Contract/ensures desugaring can inject hygienic bindings such
-                // as `__ret` into the enclosing HIR body. They are not source
-                // names visible to a native loop clause and must neither enter
-                // its exact environment nor trip the source-name collision
-                // gate. An authored macro-expanded binding is omitted too;
-                // referring to it from a clause then fails closed as an unknown
-                // source name instead of acquiring generated-name authority.
-                && !ident.span.from_expansion()
                 && let Some(scope) = self.scope_tree.var_scope(canonical_id.local_id)
                 && self.scope_tree.is_subscope_of(self.target, scope)
             {
-                let source_binding = loop_source_binding_from_ty(
-                    ident.name.to_string(),
-                    self.typeck_results.pat_ty(pat),
-                );
+                // Contract desugaring and macros can inject LOCAL bindings
+                // whose hygiene cannot be represented by the verifier's
+                // plain-text names. Retain such a name as an unsupported
+                // shadow instead of omitting it: omission could incorrectly
+                // resurrect an outer same-named parameter. A function
+                // parameter is different: its exact HIR binding and type are
+                // the signature environment itself, including when a proc
+                // macro emitted the whole function. Accept that exact
+                // parameter identity while keeping every hygienic local
+                // fail-closed. The `None` row never enters the source
+                // environment.
+                let rust_name = ident.name.to_string();
+                let exact_unique_parameter = self.unique_parameter_hir_local_ids.get(&rust_name)
+                    == Some(&canonical_id.local_id.as_u32());
+                let hygienic_non_parameter = ident.span.from_expansion() && !exact_unique_parameter;
+                let source_binding = if hygienic_non_parameter {
+                    None
+                } else {
+                    loop_source_binding_from_ty(rust_name.clone(), self.typeck_results.pat_ty(pat))
+                };
                 use std::collections::btree_map::Entry;
-                match self.bindings.entry(ident.name.to_string()) {
+                match self.bindings.entry(rust_name) {
                     Entry::Vacant(entry) => {
-                        entry.insert((scope, source_binding));
+                        entry.insert((scope, canonical_id.local_id.as_u32(), source_binding));
                     }
                     Entry::Occupied(mut entry) => {
-                        let (previous_scope, _) = entry.get();
-                        if scope != *previous_scope
+                        let (previous_scope, previous_id, _) = entry.get();
+                        if scope == *previous_scope
+                            && canonical_id.local_id.as_u32() != *previous_id
+                        {
+                            // Macro hygiene permits distinct same-spelled
+                            // bindings in one lexical scope. The verifier
+                            // payload carries only the displayed name, so
+                            // choosing either HIR identity would be unsound.
+                            entry.get_mut().2 = None;
+                        } else if scope != *previous_scope
                             && self.scope_tree.is_subscope_of(scope, *previous_scope)
                         {
-                            entry.insert((scope, source_binding));
+                            entry.insert((scope, canonical_id.local_id.as_u32(), source_binding));
                         }
                     }
                 }
@@ -2518,10 +2918,12 @@ fn visible_loop_source_sorts<'tcx>(
     }
 
     let scope_tree = tcx.region_scope_tree(local_def_id);
+    let unique_parameter_hir_local_ids = unique_simple_parameter_hir_local_ids(body);
     let mut collector = Collector {
         typeck_results,
         scope_tree,
         target: Scope { local_id: loop_id.local_id, data: ScopeData::Node },
+        unique_parameter_hir_local_ids: &unique_parameter_hir_local_ids,
         bindings: BTreeMap::new(),
     };
     collector.visit_body(body);
@@ -2529,7 +2931,7 @@ fn visible_loop_source_sorts<'tcx>(
     let mut sorts = collector
         .bindings
         .into_iter()
-        .filter_map(|(_, (_, binding))| binding)
+        .filter_map(|(_, (_, _, binding))| binding)
         .collect::<BTreeMap<_, _>>();
     // Region scope trees for closure owners may be redirected to the enclosing
     // function. Preserve exact scalar parameter domains as a conservative
@@ -2537,11 +2939,200 @@ fn visible_loop_source_sorts<'tcx>(
     // above.
     for (name, sort) in signature_input_source_sorts(signature_domains) {
         let rust_name = name.strip_suffix('*').unwrap_or(&name);
-        if !visible_rust_names.contains(rust_name) {
+        if !visible_rust_names.contains(rust_name)
+            && unique_parameter_hir_local_ids.contains_key(rust_name)
+        {
             sorts.entry(name).or_insert(sort);
         }
     }
     sorts
+}
+
+/// Recover exact primitive domains for the same visible HIR bindings accepted
+/// by [`visible_loop_source_sorts`]. This is intentionally independent of MIR
+/// debug info: ordinary builds may omit `var_debug_info`, while the query must
+/// still distinguish (for example) `u8`, `i8`, and `usize` before an E4/E5
+/// expression becomes a structural proposition.
+fn visible_loop_variable_domains<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    local_def_id: LocalDefId,
+    body: &'tcx rustc_hir::Body<'tcx>,
+    typeck_results: &TypeckResults<'tcx>,
+    loop_id: HirId,
+    signature_domains: &[LoweredVariableDomain],
+) -> (
+    Vec<LoweredVariableDomain>,
+    BTreeMap<String, LoweredCollectionDomain>,
+    Vec<LoweredSourceBinding>,
+) {
+    struct BindingDomains {
+        scalar: Option<(LoweredVariableDomain, Option<LoweredSourceBinding>)>,
+        collection: Option<(String, LoweredCollectionDomain)>,
+    }
+
+    fn binding_domain<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        name: String,
+        ty: Ty<'tcx>,
+        hir_local_id: u32,
+        collection_parameter: bool,
+    ) -> BindingDomains {
+        // Static E4 collection models are rooted in function arguments.
+        // A loop-local collection (including a same-named shadow) may be
+        // source-valid, but cannot receive structural proof authority until
+        // its exact HIR binding is transported to the corresponding MIR place.
+        let collection = collection_parameter
+            .then(|| collection_element_domain_from_ty(tcx, name.clone(), ty))
+            .flatten();
+        let (name, scalar_ty, is_whole_scalar) = match ty.kind() {
+            ty::Ref(_, inner, _) | ty::RawPtr(inner, _) => (format!("{name}*"), *inner, false),
+            _ => (name, ty, true),
+        };
+        let scalar = proposition_domain_from_ty(tcx, scalar_ty).map(|domain| {
+            let source_binding =
+                is_whole_scalar.then(|| LoweredSourceBinding { name: name.clone(), hir_local_id });
+            (LoweredVariableDomain { name, domain }, source_binding)
+        });
+        BindingDomains { scalar, collection }
+    }
+
+    struct Collector<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        typeck_results: &'a TypeckResults<'tcx>,
+        scope_tree: &'a ScopeTree,
+        target: Scope,
+        unique_parameter_hir_local_ids: &'a BTreeMap<String, u32>,
+        bindings: BTreeMap<String, (Scope, u32, Option<BindingDomains>)>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
+        fn visit_pat(&mut self, pat: &'tcx Pat<'tcx>) {
+            if let PatKind::Binding(_, canonical_id, ident, _) = pat.kind
+                && canonical_id == pat.hir_id
+                && let Some(scope) = self.scope_tree.var_scope(canonical_id.local_id)
+                && self.scope_tree.is_subscope_of(self.target, scope)
+            {
+                // Mirror the source-sort collector exactly: a hygienic local
+                // is an unsupported shadow, not permission to fall through to
+                // an outer same-named scalar domain. An exact function
+                // parameter remains admissible when a proc macro emitted the
+                // whole function.
+                let rust_name = ident.name.to_string();
+                let exact_unique_parameter = self.unique_parameter_hir_local_ids.get(&rust_name)
+                    == Some(&canonical_id.local_id.as_u32());
+                let hygienic_non_parameter = ident.span.from_expansion() && !exact_unique_parameter;
+                let domain = if hygienic_non_parameter {
+                    None
+                } else {
+                    Some(binding_domain(
+                        self.tcx,
+                        rust_name.clone(),
+                        self.typeck_results.pat_ty(pat),
+                        canonical_id.local_id.as_u32(),
+                        exact_unique_parameter,
+                    ))
+                };
+                use std::collections::btree_map::Entry;
+                match self.bindings.entry(rust_name) {
+                    Entry::Vacant(entry) => {
+                        entry.insert((scope, canonical_id.local_id.as_u32(), domain));
+                    }
+                    Entry::Occupied(mut entry) => {
+                        let (previous_scope, previous_id, _) = entry.get();
+                        if scope == *previous_scope
+                            && canonical_id.local_id.as_u32() != *previous_id
+                        {
+                            entry.get_mut().2 = None;
+                        } else if scope != *previous_scope
+                            && self.scope_tree.is_subscope_of(scope, *previous_scope)
+                        {
+                            entry.insert((scope, canonical_id.local_id.as_u32(), domain));
+                        }
+                    }
+                }
+            }
+            intravisit::walk_pat(self, pat);
+        }
+    }
+
+    let scope_tree = tcx.region_scope_tree(local_def_id);
+    let unique_parameter_hir_local_ids = unique_simple_parameter_hir_local_ids(body);
+    let mut collector = Collector {
+        tcx,
+        typeck_results,
+        scope_tree,
+        target: Scope { local_id: loop_id.local_id, data: ScopeData::Node },
+        unique_parameter_hir_local_ids: &unique_parameter_hir_local_ids,
+        bindings: BTreeMap::new(),
+    };
+    collector.visit_body(body);
+    let visible_rust_names = collector.bindings.keys().cloned().collect::<BTreeSet<_>>();
+    let mut domains = Vec::new();
+    let mut collection_domains = BTreeMap::new();
+    let mut source_bindings = Vec::new();
+    for (_, _, binding) in collector.bindings.into_values() {
+        let Some(binding) = binding else { continue };
+        if let Some((domain, source_binding)) = binding.scalar {
+            domains.push(domain);
+            source_bindings.extend(source_binding);
+        }
+        if let Some((name, domain)) = binding.collection {
+            collection_domains.insert(name, domain);
+        }
+    }
+
+    // The signature fallback below is needed only for redirected closure
+    // region-scope trees. Keep a parallel exact identity map for simple whole
+    // primitive parameters; reference/projection aliases are deliberately
+    // absent.
+    let signature_source_bindings = body
+        .params
+        .iter()
+        .filter_map(|param| {
+            let PatKind::Binding(_, canonical_id, ident, None) = param.pat.kind else {
+                return None;
+            };
+            (unique_parameter_hir_local_ids.get(ident.name.as_str())
+                == Some(&canonical_id.local_id.as_u32())
+                && proposition_domain_from_ty(tcx, typeck_results.pat_ty(param.pat)).is_some())
+            .then(|| {
+                (
+                    ident.name.to_string(),
+                    LoweredSourceBinding {
+                        name: ident.name.to_string(),
+                        hir_local_id: canonical_id.local_id.as_u32(),
+                    },
+                )
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    // Match the conservative closure-owner fallback in
+    // `visible_loop_source_sorts`, but never revive a shadowed parameter.
+    for domain in signature_domains.iter().filter(|domain| domain.name != "_0") {
+        let rust_name = domain.name.strip_suffix('*').unwrap_or(&domain.name);
+        if !visible_rust_names.contains(rust_name)
+            && unique_parameter_hir_local_ids.contains_key(rust_name)
+        {
+            domains.push(domain.clone());
+            if let Some(binding) = signature_source_bindings.get(&domain.name) {
+                source_bindings.push(binding.clone());
+            }
+        }
+    }
+    for (name, domain) in function_collection_element_domains(tcx, body, typeck_results) {
+        let rust_name = name.strip_suffix('*').unwrap_or(&name);
+        if !visible_rust_names.contains(rust_name)
+            && unique_parameter_hir_local_ids.contains_key(rust_name)
+        {
+            collection_domains.entry(name).or_insert(domain);
+        }
+    }
+    (
+        canonical_variable_domains(domains).unwrap_or_default(),
+        collection_domains,
+        canonical_source_bindings(source_bindings).unwrap_or_default(),
+    )
 }
 
 fn signature_variable_domains<'tcx>(
@@ -2655,6 +3246,25 @@ fn canonical_variable_domains(
         }
     }
     Some(by_name.into_iter().map(|(name, domain)| LoweredVariableDomain { name, domain }).collect())
+}
+
+fn canonical_source_bindings(
+    bindings: Vec<LoweredSourceBinding>,
+) -> Option<Vec<LoweredSourceBinding>> {
+    let mut by_name = BTreeMap::new();
+    for binding in bindings {
+        if let Some(previous) = by_name.insert(binding.name.clone(), binding.hir_local_id)
+            && previous != binding.hir_local_id
+        {
+            return None;
+        }
+    }
+    Some(
+        by_name
+            .into_iter()
+            .map(|(name, hir_local_id)| LoweredSourceBinding { name, hir_local_id })
+            .collect(),
+    )
 }
 
 fn merge_variable_domains(
@@ -3492,9 +4102,9 @@ fn island_cited_callee(tcx: TyCtxt<'_>, snippet: &str) -> Option<String> {
             );
         }
         let env = state.env.as_ref()?;
-        candidates.into_iter().find(|name| {
-            trust_certify::clean_island::island_definition_value(env, name).is_some()
-        })
+        candidates
+            .into_iter()
+            .find(|name| trust_certify::clean_island::island_definition_value(env, name).is_some())
     })
 }
 

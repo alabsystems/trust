@@ -20,7 +20,8 @@ use rustc_hir::def::DefKind;
 use rustc_interface::interface;
 use rustc_interface::interface::Compiler;
 use rustc_middle::mir::trust_contract::{
-    TrustContractKind, TrustContractPayloadType, TrustContractPredicateKind, TrustContractSource,
+    TrustContractKind, TrustContractPayloadType, TrustContractPredicateKind,
+    TrustContractProposition, TrustContractPropositionDomain, TrustContractSource,
     TrustContractSubject, TrustContractVerifierSort,
 };
 use rustc_middle::ty::TyCtxt;
@@ -226,7 +227,19 @@ impl rustc_driver::Callbacks for MetadataCallbacks {
             TrustContractPayloadType::Verifier(TrustContractVerifierSort::Int)
         );
         match &decreases_contract.predicate.kind {
-            TrustContractPredicateKind::Opaque { text } => assert_eq!(text.as_str(), "n"),
+            TrustContractPredicateKind::Typed { text, proposition } => {
+                assert_eq!(text.as_str(), "__trust_lowered_compiler_contract__:n",);
+                assert_eq!(
+                    proposition,
+                    &TrustContractProposition::Var {
+                        name: rustc_span::Symbol::intern("n"),
+                        domain: TrustContractPropositionDomain::MachineInt {
+                            width: 32,
+                            signed: false,
+                        },
+                    },
+                );
+            }
             other => panic!("unexpected native decreases payload: {other:?}"),
         }
 

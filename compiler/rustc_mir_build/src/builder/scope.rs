@@ -693,6 +693,15 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             let parent_id =
                 self.source_scopes[source_scope].local_data.as_ref().unwrap_crate_local().lint_root;
             self.maybe_new_source_scope(source_info.span, current_hir_id, parent_id);
+            // A THIR `Scope` can be consumed by several lowering entry paths
+            // (statement, destination, operand, temporary, and place). Stamp
+            // contracted loops here at their shared boundary so none of those
+            // paths can discard the compiler-owned HIR identity before the
+            // natural MIR backedge is built.
+            if self.trust_contracted_loop_ids.contains(current_hir_id.local_id) {
+                self.source_scope =
+                    self.new_trust_loop_source_scope(source_info.span, current_hir_id);
+            }
         }
         self.push_scope(region_scope);
         let mut block;
@@ -1347,6 +1356,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             } else {
                 self.source_scopes[parent].local_data.as_ref().unwrap_crate_local().lint_root
             },
+            // The outermost source scope is created through this same helper
+            // while `source_scopes` is still empty. Nested scopes inherit the
+            // authenticated loop identity; the outermost scope has none.
+            trust_loop_hir_local_id: self.source_scopes.get(parent).and_then(|scope| {
+                scope.local_data.as_ref().unwrap_crate_local().trust_loop_hir_local_id
+            }),
         };
         self.source_scopes.push(SourceScopeData {
             span,
@@ -1355,6 +1370,22 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             inlined_parent_scope: None,
             local_data: ClearCrossCrate::Set(scope_local_data),
         })
+    }
+
+    /// Create a source scope that authenticates the nearest source loop even
+    /// when ordinary MIR source scopes are collapsed to lint roots.
+    pub(crate) fn new_trust_loop_source_scope(
+        &mut self,
+        span: Span,
+        loop_hir_id: HirId,
+    ) -> SourceScope {
+        let scope = self.new_source_scope(span, LintLevel::Inherited);
+        self.source_scopes[scope]
+            .local_data
+            .as_mut()
+            .unwrap_crate_local()
+            .trust_loop_hir_local_id = Some(loop_hir_id.local_id);
+        scope
     }
 
     /// Given a span and the current source scope, make a SourceInfo.

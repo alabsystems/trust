@@ -63,6 +63,7 @@ ay-allsat = {{ path = "{root}/first-party/ay/crates/ay-allsat" }}
 ay-chc = {{ path = "{root}/first-party/ay/crates/ay-chc" }}
 ay-sat = {{ path = "{root}/first-party/ay/crates/ay-sat" }}
 ay-frontend = {{ path = "{root}/first-party/ay/crates/ay-frontend" }}
+ay-translate = {{ path = "{root}/first-party/ay/crates/ay-translate" }}
 ay-encode = {{ path = "{root}/first-party/ay/crates/ay-encode" }}
 
 [patch."https://github.com/alabsystems/trust-cg.git"]

@@ -1260,13 +1260,18 @@ impl FrontendTrustPolicy {
 /// typed policy that cannot lower TrustIR or publish Trust evidence.
 ///
 /// This entry point is for Tippy-like lint frontends whose callbacks change
-/// proof-relevant semantics. Every explicit `-Ztrust-*` control and every
-/// compiler-managed dynamic LLVM loading route is rejected; the typed
-/// `trust_verify` switch is then forced off and `trust_ir_lower` forced off
-/// before callbacks or artifact target acquisition. The callback authority
-/// snapshot prevents either field or any evidence output from being re-enabled
-/// later. The argument vector itself is not rewritten, so getopts retains exact
-/// response-file, option-value, and `--` ownership semantics.
+/// proof-relevant semantics. Every authority-bearing `-Ztrust-*` control and
+/// every compiler-managed dynamic LLVM loading route is rejected. The sole
+/// accepted Trust selection is the exact semantic option/value
+/// `trust-verify=off` (including getopts-equivalent joined, split, and
+/// dash/underscore spellings): it redundantly selects the same evidence-inert
+/// policy and is needed when a build coordinator stamps all Rust units
+/// uniformly. The typed `trust_verify` switch is then forced off and
+/// `trust_ir_lower` forced off before callbacks or artifact target acquisition.
+/// The callback authority snapshot prevents either field or any evidence
+/// output from being re-enabled later. The argument vector itself is not
+/// rewritten, so getopts retains exact response-file, option-value, and `--`
+/// ownership semantics.
 ///
 /// Compiler-owned entry points are process-tracked: this route fails closed if
 /// an earlier compiler invocation could have initialized backend state and
@@ -1325,14 +1330,22 @@ fn frontend_forbidden_option(
     let forbidden_z = matches
         .opt_strs("Z")
         .into_iter()
-        .map(|option| raw_trust_option_name(&option))
-        .find(|name| {
-            name.starts_with("trust_")
-                || (frontend_policy.requires_evidence_inert_backend()
+        .find_map(|option| {
+            let name = raw_trust_option_name(&option);
+            // Both typed deauthorization routes force this value to Off below.
+            // Accepting the caller's identical semantic value is monotonic and
+            // lets a coordinator stamp dependency and workspace units
+            // uniformly. The exact-value check deliberately excludes a bare
+            // selector, malformed values, and every enabling value.
+            let redundant_deauthorization = name == "trust_verify"
+                && option.split_once('=').is_some_and(|(_, value)| value == "off");
+            (name.starts_with("trust_") && !redundant_deauthorization
+                || frontend_policy.requires_evidence_inert_backend()
                     && matches!(
                         name.as_str(),
                         "autodiff" | "autodiff_post_passes" | "codegen_backend" | "llvm_plugins"
                     ))
+            .then_some(name)
         });
     if let Some(name) = forbidden_z {
         return Some(format!("-Z{}", name.replace('_', "-")));
@@ -2281,8 +2294,19 @@ fn version_at_macro_invocation_with_frontend_policy(
     // (`src/version` -> CFG_TRUST_VERSION), reported as `trust:` below and by
     // `targo trust version`. Keeping them apart is what lets Trust be 0.1.0
     // without a build script concluding the compiler predates Rust 1.0.
-    let trust_brand =
-        if display_binary == "rustc" { String::new() } else { format!(" ({display_binary})") };
+    // The parenthetical carries the toolchain's OWN identity and version
+    // (`(trustc 0.1.0)`) — the leading `rustc` token is untouchable (the
+    // ecosystem's version-sniffing build scripts assert it; see the block
+    // comment above), so this parenthetical is where trustc introduces
+    // itself honestly instead of wearing the compat token as its name.
+    let trust_brand = if display_binary == "rustc" {
+        String::new()
+    } else {
+        match option_env!("CFG_TRUST_VERSION") {
+            Some(trust_version) => format!(" ({display_binary} {trust_version})"),
+            None => format!(" ({display_binary})"),
+        }
+    };
     safe_println!("rustc {version}{trust_brand}");
 
     if verbose {

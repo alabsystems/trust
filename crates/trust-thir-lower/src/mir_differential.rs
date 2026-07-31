@@ -566,6 +566,81 @@ fn benign_unwind<'tcx>(body: &mir::Body<'tcx>, ua: &mir::UnwindAction) -> Result
 /// unwind; `FalseEdge`/`FalseUnwind` follow their REAL target — exactly the extraction's
 /// convention (`convert_terminator`), so this walk visits the same blocks the semantic
 /// channel reasons about. Any other terminator fails closed.
+/// Trust (B4 de-risk pre-tranche, RFC TRUST_IR_V2 §B4): the borrow kind of ONE callee
+/// parameter, read from the callee's instantiated signature.
+///
+/// `NotARef` is a POSITIVE claim ("this parameter is not a reference"), so it is only ever
+/// minted where the signature was actually consulted. "We could not consult a signature" is
+/// spelled by a `None` ENTRY in [`arg_borrow_kinds_in_dfs_order`], never by a vec of `NotARef`
+/// — an absent record must deny the consumer a permission, not grant one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Trust: INERT until the escape classifier consumes it (see below).
+pub(crate) enum ArgBorrowKind {
+    /// Not a reference (`i32`, `String`, a raw pointer, ...). A RAW POINTER is deliberately
+    /// here and not in `Shared`: `*const T` carries no no-write guarantee (the callee may cast
+    /// away constness), so it must never receive the shared-parameter exemption.
+    NotARef,
+    /// `&T` — the callee provably cannot write through it.
+    Shared,
+    /// `&mut T` — the callee may write through it.
+    Mut,
+}
+
+/// Trust (B4 de-risk pre-tranche): per-ARG borrow kinds for every call, in the SAME canonical
+/// DFS preorder [`raw_calls_in_dfs_order`] produces — index `i` here describes call `#i` there.
+///
+/// WHY THIS EXISTS. `mir_differential` has two walks over two types: the call channel walks a
+/// rustc `mir::Body` WITH `tcx`, while `canonicalize` — which owns the escape classification
+/// ("ref local _N used by value (escape) outside fragment") — walks a `VerifiableBody` with no
+/// `tcx` and no rustc types. A signature fact the classifier needs must therefore be CARRIED.
+/// The eventual use is B4's pre-tranche: a scalar slot whose address reaches a `&T` parameter
+/// cannot be written through, so the conservative set can shrink per ARG instead of per CALL.
+///
+/// WHY IT DERIVES FROM `raw_calls_in_dfs_order` RATHER THAN RE-WALKING. Keying these facts to
+/// the wrong argument would hand a no-write exemption to a parameter that IS written — the
+/// manufactured-agreement failure mode, the one this comparator exists to prevent. Deriving
+/// from the same list that pins callee identity makes the alignment hold BY CONSTRUCTION
+/// rather than by a second traversal that has to be kept in sync: the caller collects `b_calls`
+/// and `d_calls` in this same order and has already proven them equal callee-for-callee, so
+/// ordinal `i` denotes the same callee on both sides.
+///
+/// A `None` entry means NOT RECORDED — a non-`FnDef` callee (fn pointer / indirect call), or a
+/// signature whose inputs cannot be read. Consumers must treat `None` as
+/// conservative-everything. Never returns a partial vec for a call.
+///
+/// INERT AS OF THIS COMMIT: nothing reads the result yet. It is landed and proved
+/// behaviour-neutral first so the classifier change that consumes it is a small diff with a
+/// clean before/after — the same two-step used for the topological intern (#174).
+#[allow(dead_code)] // Trust: INERT — see above.
+fn arg_borrow_kinds_in_dfs_order<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    calls: &[RawCall<'tcx>],
+) -> Vec<Option<Vec<ArgBorrowKind>>> {
+    calls
+        .iter()
+        .map(|(fn_ty, _arity, _normal)| {
+            let rustc_middle::ty::TyKind::FnDef(def_id, args) = fn_ty.kind() else {
+                return None;
+            };
+            let sig = tcx.fn_sig(*def_id).instantiate(tcx, args).skip_binder();
+            Some(
+                sig.inputs()
+                    .iter()
+                    .map(|t| match t.kind() {
+                        rustc_middle::ty::TyKind::Ref(_, _, rustc_hir::Mutability::Not) => {
+                            ArgBorrowKind::Shared
+                        }
+                        rustc_middle::ty::TyKind::Ref(_, _, rustc_hir::Mutability::Mut) => {
+                            ArgBorrowKind::Mut
+                        }
+                        _ => ArgBorrowKind::NotARef,
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
 fn raw_calls_in_dfs_order<'tcx>(
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
     body: &mir::Body<'tcx>,

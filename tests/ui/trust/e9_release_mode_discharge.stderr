@@ -1,28 +1,40 @@
-note: Clean island kernel-checked: 2 declaration(s) registered (min2_case, min2_le_left)
-  --> $DIR/e9_release_mode_discharge.rs:14:5
+note: Clean island kernel-checked: 2 declaration(s) registered (composed_isl, min2_le_left)
+  --> $DIR/e9_release_mode_discharge.rs:15:5
    |
-LL | /     theorem min2_case : forall (x y : UInt64) (d : Bool),
-LL | |         Eq Bool (Nat.ble (UInt64.toNat y) (UInt64.toNat x)) d ->
-LL | |         Nat.le (UInt64.toNat (Bool.rec (fun _ => UInt64) y x (Bool.not d))) (UInt64.toNat x) :=
-LL | |         fun x y d => Bool.rec
+LL | /     def composed_isl (x : UInt64) : UInt64 := (x + 1) * 2
+LL | |
+LL | |     theorem min2_le_left : forall (x : UInt64) (y : UInt64),
+LL | |         Nat.le (UInt64.toNat (if x < y then x else y)) (UInt64.toNat x) :=
 ...  |
-LL | |         fun x y => min2_case x y (Nat.ble (UInt64.toNat y) (UInt64.toNat x))
-LL | |             (Eq.refl Bool (Nat.ble (UInt64.toNat y) (UInt64.toNat x)))
-   | |______________________________________________________________________^
+LL | |             (fun h => Iff.mp (Nat.not_lt (UInt64.toNat x) (UInt64.toNat y)) h)
+LL | |             (fun h => Nat.le.refl (UInt64.toNat x))
+   | |___________________________________________________^
 
 
 === Trust Verification Report (e9_release_mode_discharge) ===
 
 note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
-  --> $DIR/e9_release_mode_discharge.rs:33:1
+  --> $DIR/e9_release_mode_discharge.rs:30:1
    |
 LL | pub fn caller(x: u64, y: u64) -> u64 ensures min2(x, y) <= x by min2_le_left { x }
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
    = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
 
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_release_mode_discharge.rs:32:1
+   |
+LL | / pub fn composed(x: u64) -> u64
+LL | |     ensures result == composed_isl(x)
+LL | | {
+LL | |     x.wrapping_add(1).wrapping_mul(2)
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
 note: citation `min2_le_left` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `caller`, with a clean certification audit
-  --> $DIR/e9_release_mode_discharge.rs:33:65
+  --> $DIR/e9_release_mode_discharge.rs:30:65
    |
 LL | pub fn caller(x: u64, y: u64) -> u64 ensures min2(x, y) <= x by min2_le_left { x }
    |                                                                 ^^^^^^^^^^^^

@@ -154,7 +154,7 @@ impl fmt::Display for CleanTemporalCertificateError {
 
 impl std::error::Error for CleanTemporalCertificateError {}
 
-fn elaborate_unit(
+pub(crate) fn elaborate_unit(
     environment: &mut Environment,
     context: &mut FileContext,
     source: &str,
@@ -186,6 +186,84 @@ fn elaborate_unit(
         }
     }
     Ok(())
+}
+
+/// Parse an authored suffix in the same parser session as its fixed notation
+/// prelude, but elaborate only the suffix into an already-prepared context.
+///
+/// Clean's parser registers `notation` declarations while parsing a file;
+/// `FileContext` alone is not sufficient to teach a new `parse_file` call
+/// about `□`, `◇`, `~>`, or `⊨`. Re-parsing the fixed prefix is cheap and
+/// preserves the required parser state, while the cached kernel/environment
+/// context avoids re-elaborating it. The byte boundary also lets the extension
+/// gate distinguish canonical declarations from authored ones.
+pub(crate) fn elaborate_suffix_with_parser_prelude(
+    environment: &mut Environment,
+    context: &mut FileContext,
+    parser_prelude: &str,
+    source: &str,
+    unit: &'static str,
+) -> Result<(), CleanTemporalCertificateError> {
+    let mut combined = String::with_capacity(parser_prelude.len() + source.len() + 1);
+    combined.push_str(parser_prelude);
+    combined.push('\n');
+    let authored_start = combined.len();
+    combined.push_str(source);
+
+    let declarations = parse_file(&combined).map_err(|error| {
+        CleanTemporalCertificateError::Parse { unit, detail: format!("{error:?}") }
+    })?;
+    reject_authored_parser_extensions(&declarations, authored_start)?;
+    for declaration in
+        declarations.iter().filter(|declaration| declaration.span().start >= authored_start)
+    {
+        let processed = preprocess_decl_with_context(declaration, context);
+        let result = elaborate_decl_and_register_with_context(environment, &processed, context)
+            .map_err(|error| CleanTemporalCertificateError::Elaborate {
+                unit,
+                detail: error.to_string(),
+            })?;
+        let mut leaves = Vec::new();
+        result.leaf_decls(&mut leaves);
+        if let Some(ElabResult::Failed { name, error, .. }) =
+            leaves.into_iter().find(|leaf| matches!(leaf, ElabResult::Failed { .. }))
+        {
+            return Err(CleanTemporalCertificateError::Elaborate {
+                unit,
+                detail: format!("declaration `{name}` failed: {error:?}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Return an isolated temporal-prelude environment together with the parser /
+/// elaborator context that gives the canonical notation its meaning.
+///
+/// `FileContext` owns the dynamic notation registry, so caching only the kernel
+/// environment would force every authored check to parse and elaborate the
+/// prelude again. Both values are persistent/cloneable; callers receive owned
+/// clones and cannot leak declarations or parser state into another check.
+pub(crate) fn fresh_temporal_prelude_context()
+-> Result<(Environment, FileContext), CleanTemporalCertificateError> {
+    static TEMPORAL_PRELUDE: OnceLock<
+        Result<(Environment, FileContext), CleanTemporalCertificateError>,
+    > = OnceLock::new();
+    TEMPORAL_PRELUDE
+        .get_or_init(|| {
+            let mut environment = fresh_kernel_prelude_environment();
+            let mut context = FileContext::new();
+            context.disable_external_import_search();
+            elaborate_unit(
+                &mut environment,
+                &mut context,
+                CLEAN_TEMPORAL_PRELUDE,
+                "temporal prelude",
+                None,
+            )?;
+            Ok((environment, context))
+        })
+        .clone()
 }
 
 /// Reject parser-state mutations from the authored suffix of the combined
@@ -244,28 +322,16 @@ fn reject_authored_parser_extensions(
 pub(crate) fn elaborate_temporal_definitions(
     source: &str,
 ) -> Result<Environment, CleanTemporalCertificateError> {
-    // Parse the user file together with the prelude because Clean's dynamic
-    // notation registry is parser-local: `□`, `◇`, `~>`, and `⊨` must be
-    // declared earlier in the same parse. The separate prelude-only pass lives
-    // in `elaborate_authored_source`, where it is needed to distinguish a
-    // requested prelude theorem from an authored theorem. Repeating that pass
-    // here would validate and then discard an environment without adding a
-    // security check for definition elaboration.
-    let mut combined_source =
-        String::with_capacity(CLEAN_TEMPORAL_PRELUDE.len() + source.len() + 1);
-    combined_source.push_str(CLEAN_TEMPORAL_PRELUDE);
-    combined_source.push('\n');
-    let authored_start = combined_source.len();
-    combined_source.push_str(source);
-    let mut environment = fresh_kernel_prelude_environment();
-    let mut context = FileContext::new();
-    context.disable_external_import_search();
-    elaborate_unit(
+    // Dynamic notation is parser-local, so retain the fixed temporal prefix in
+    // the parse while elaborating only the authored suffix into the isolated
+    // clone of the cached prelude context.
+    let (mut environment, mut context) = fresh_temporal_prelude_context()?;
+    elaborate_suffix_with_parser_prelude(
         &mut environment,
         &mut context,
-        &combined_source,
+        CLEAN_TEMPORAL_PRELUDE,
+        source,
         "authored source",
-        Some(authored_start),
     )?;
     Ok(environment)
 }
@@ -277,16 +343,7 @@ fn elaborate_authored_source(
     // Keep the prelude-name collision diagnostic specific for theorem
     // certification. Generic definition elaboration below is used by the
     // Clean→ty router and remains fresh-environment checked as well.
-    let mut prelude_environment = fresh_kernel_prelude_environment();
-    let mut prelude_context = FileContext::new();
-    prelude_context.disable_external_import_search();
-    elaborate_unit(
-        &mut prelude_environment,
-        &mut prelude_context,
-        CLEAN_TEMPORAL_PRELUDE,
-        "temporal prelude",
-        None,
-    )?;
+    let (prelude_environment, _) = fresh_temporal_prelude_context()?;
     let theorem_name = Name::from_string(theorem);
     if prelude_environment.get_const(&theorem_name).is_some() {
         return Err(CleanTemporalCertificateError::ReservedTheorem(theorem.to_owned()));
@@ -294,7 +351,7 @@ fn elaborate_authored_source(
     elaborate_temporal_definitions(source)
 }
 
-fn checked_theorem<'environment>(
+pub(crate) fn checked_theorem<'environment>(
     environment: &'environment Environment,
     theorem: &str,
 ) -> Result<(&'environment Expr, &'environment Expr), CleanTemporalCertificateError> {
@@ -441,6 +498,37 @@ end Trust
 "#;
     const ALL_OPERATORS_THEOREM: &str = "Trust.Temporal.certified_all_operators";
 
+    const GENERAL_FAIR_LEADSTO_SOURCE: &str = r#"
+namespace GeneralTemporal
+
+def Machine : Trust.Temporal.StateMachine Nat :=
+  { init := fun _ => True, next := fun _ _ => True }
+
+def Constraints (strong : Bool) : Trust.Temporal.FairnessConstraint Nat :=
+  match strong with
+  | false => Trust.Temporal.FairnessConstraint.weak Machine.next
+  | true => Trust.Temporal.FairnessConstraint.strong Machine.next
+
+def F : Trust.Temporal.Formula Nat :=
+  □ ◇ (Trust.Temporal.Lift
+    (Trust.Temporal.Enabled Machine.next))
+def G : Trust.Temporal.Formula Nat :=
+  Trust.Temporal.LiftAction Machine.next
+
+theorem mixed_constraints_expose_weak_and_strong
+    (behavior : Trust.Temporal.Behavior Nat)
+    (fair : Trust.Temporal.FairFamily Constraints behavior) :
+    Trust.Temporal.WeakFair Machine.next behavior ∧
+      Trust.Temporal.StrongFair Machine.next behavior :=
+  And.intro (fair false) (fair true)
+
+theorem arbitrary_leads_to_under_mixed_fairness
+    : Trust.Temporal.SatisfiesUnderFairness Machine Constraints (F ~> G) :=
+  fun behavior _runs fair => fair true
+
+end GeneralTemporal
+"#;
+
     #[test]
     fn cached_kernel_prelude_matches_fresh_build_and_cannot_leak_authored_state() {
         fn constant_image(environment: &Environment) -> Vec<(String, Vec<u8>)> {
@@ -536,6 +624,40 @@ end TrustTemporalCacheIsolation
         wrong_source.source.push('\n');
         assert_eq!(
             recheck_clean_temporal_certificate(&wrong_source, ALL_OPERATORS_SOURCE),
+            Err(CleanTemporalCertificateError::SourceMismatch)
+        );
+    }
+
+    #[test]
+    fn arbitrary_authored_leadsto_and_mixed_fairness_kernel_replay() {
+        let theorem = "GeneralTemporal.arbitrary_leads_to_under_mixed_fairness";
+        let certificate = certify_clean_temporal_source(GENERAL_FAIR_LEADSTO_SOURCE, theorem)
+            .expect("arbitrary authored F ~> G proof under mixed action fairness must certify");
+        recheck_clean_temporal_certificate(&certificate, GENERAL_FAIR_LEADSTO_SOURCE)
+            .expect("the arbitrary leads-to proof must freshly kernel-replay");
+
+        let distinction = certify_clean_temporal_source(
+            GENERAL_FAIR_LEADSTO_SOURCE,
+            "GeneralTemporal.mixed_constraints_expose_weak_and_strong",
+        )
+        .expect("the indexed family must expose genuinely distinct weak and strong obligations");
+        recheck_clean_temporal_certificate(&distinction, GENERAL_FAIR_LEADSTO_SOURCE)
+            .expect("the mixed weak/strong denotation proof must freshly replay");
+
+        let drifted = GENERAL_FAIR_LEADSTO_SOURCE.replace(
+            "FairnessConstraint.strong Machine.next",
+            "FairnessConstraint.weak Machine.next",
+        );
+        assert!(
+            certify_clean_temporal_source(
+                &drifted,
+                "GeneralTemporal.mixed_constraints_expose_weak_and_strong",
+            )
+            .is_err(),
+            "collapsing the strong constraint to weak must invalidate the distinction proof",
+        );
+        assert_eq!(
+            recheck_clean_temporal_certificate(&certificate, &drifted),
             Err(CleanTemporalCertificateError::SourceMismatch)
         );
     }

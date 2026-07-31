@@ -11,9 +11,10 @@
 //! env var. Clause shapes are copied from the green native_clause_semantics.rs
 //! fixture so verification outcomes are unchanged. Over `u64` the machine-int
 //! equality certifies a monitor (monitored, via UInt64.decEq +
-//! of_decide_eq_true); over `i32` the domain is outside the elaborator's
-//! unsigned machine-int fragment, so the clause is unmonitored — not
-//! runtime-checked, never a fake value (design §1.1). The verification-report
+//! of_decide_eq_true); the signed `i32` lane uses an equivalent exact
+//! machine-int decision certificate, so it is monitored as well. Together
+//! they pin both signed and unsigned monitor carriers; neither status is a
+//! runtime-check verdict (design §1.1). The verification-report
 //! annotations are deliberately LOOSE (no proved/unknown counts): this fixture
 //! pins the MONITOR notes; prover capability for these obligations is pinned
 //! by the native_clause_semantics fixtures and churns independently.
@@ -29,7 +30,7 @@ pub fn f_machine(x: u64) -> u64
 
 pub fn identity(x: i32) -> i32
     ensures result == x
-    //~^ NOTE contract clause #0 (Ensures) is unmonitored (unsupported clause variable type `i32`)
+    //~^ NOTE contract clause #0 (Ensures) is monitored: a kernel-certified runtime monitor exists
     //~^^^ NOTE Trust verification:
     //~| NOTE of which 1 kernel-certified
 {

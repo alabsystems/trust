@@ -1,5 +1,7 @@
 use trust_types::*;
-use trust_vcgen::{bind_compiler_loop_contracts, generate_vcs_with_discharge};
+use trust_vcgen::{
+    bind_compiler_loop_contract_bundle, bind_compiler_loop_contracts, generate_vcs_with_discharge,
+};
 
 fn span(line_start: u32, line_end: u32) -> SourceSpan {
     SourceSpan {
@@ -82,10 +84,57 @@ fn loop_spec(kind: LoopContractKind, body: &str) -> LoopContractSpec {
     LoopContractSpec {
         kind,
         source_loop_id: 0,
+        source_hir_local_id: None,
+        mir_header: None,
         loop_head: span(9, 15),
         header_span: span(9, 11),
         span: span(11, 11),
         body: body.to_string(),
+    }
+}
+
+fn exact_typed_loop_bundle() -> CompilerContractBundle {
+    let mut spec =
+        loop_spec(LoopContractKind::Invariant, "__trust_lowered_compiler_contract__:true");
+    spec.source_hir_local_id = Some(10);
+    spec.mir_header = Some(1);
+    let proposition = CompilerContractProposition {
+        source_contract_index: 0,
+        kind: ContractKind::LoopInvariant,
+        body: spec.body.clone(),
+        formula: Formula::Bool(true),
+        variable_domains: vec![],
+    };
+    CompilerContractBundle::new(vec![])
+        .with_typed_propositions(vec![proposition])
+        .with_loop_contracts(vec![spec])
+}
+
+#[test]
+fn compiler_loop_binding_requires_one_exact_typed_catalog_row() {
+    let exact = exact_typed_loop_bundle();
+    let mut func = counted_loop();
+    assert!(
+        bind_compiler_loop_contract_bundle(&mut func, &exact).is_empty(),
+        "the exact compiler-typed loop proposition must bind"
+    );
+    assert_eq!(func.contracts[0].body, "bb1: __trust_lowered_compiler_contract__:true");
+
+    let mut missing = exact.clone();
+    missing.typed_propositions.clear();
+    let mut tampered = exact.clone();
+    tampered.typed_propositions[0].formula = Formula::Bool(false);
+    let mut duplicate = exact.clone();
+    duplicate.typed_propositions.push(duplicate.typed_propositions[0].clone());
+
+    for (case, bundle) in [("missing", missing), ("tampered", tampered), ("duplicate", duplicate)] {
+        let mut func = counted_loop();
+        let failures = bind_compiler_loop_contract_bundle(&mut func, &bundle);
+        assert_eq!(failures.len(), 1, "{case}: {failures:?}");
+        assert!(
+            failures[0].1.contains("no unique exact compiler-typed proposition"),
+            "{case} catalog authority must fail closed: {failures:?}"
+        );
     }
 }
 
@@ -202,12 +251,44 @@ fn contains_increment(formula: &Formula) -> bool {
         Formula::Add(lhs, rhs)
             if matches!(lhs.as_ref(), Formula::Var(name, _) if name == "i")
                 && matches!(rhs.as_ref(), Formula::Int(1))
+    ) || matches!(
+        formula,
+        Formula::BvAdd(lhs, rhs, 32)
+            if matches!(lhs.as_ref(), Formula::Var(name, Sort::BitVec(32)) if name == "i")
+                && matches!(rhs.as_ref(), Formula::BitVec { value: 1, width: 32 })
     ) || formula.children().into_iter().any(contains_increment)
 }
 
 fn contains_negated_post_increment(formula: &Formula) -> bool {
     matches!(formula, Formula::Not(post) if contains_increment(post))
         || formula.children().into_iter().any(contains_negated_post_increment)
+}
+
+fn contains_bv_addend(formula: &Formula, expected: i128) -> bool {
+    matches!(
+        formula,
+        Formula::BvAdd(_, rhs, 32)
+            if matches!(
+                rhs.as_ref(),
+                Formula::BitVec { value, width: 32 } if *value == expected
+            )
+    ) || formula.children().into_iter().any(|child| contains_bv_addend(child, expected))
+}
+
+fn loop_unsupported_details<'a>(
+    solver_vcs: &'a [VerificationCondition],
+    preclassified: &'a [(VerificationCondition, VerificationResult)],
+) -> Vec<&'a str> {
+    solver_vcs
+        .iter()
+        .chain(preclassified.iter().map(|(vc, _)| vc))
+        .filter_map(|vc| match &vc.kind {
+            VcKind::UnsupportedMir { kind, detail } if kind == "UserLoopContractUnsupported" => {
+                Some(detail.as_str())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
@@ -314,6 +395,8 @@ fn inner_loop_exact_header_never_pairs_to_containing_outer_natural_loop() {
     let specs = vec![LoopContractSpec {
         kind: LoopContractKind::Invariant,
         source_loop_id: 1,
+        source_hir_local_id: None,
+        mir_header: None,
         loop_head: span(28, 35),
         header_span: span(28, 29),
         span: span(29, 29),
@@ -343,6 +426,8 @@ fn spanless_outer_loop_with_nested_candidate_fails_even_when_source_order_differ
     let specs = vec![LoopContractSpec {
         kind: LoopContractKind::Invariant,
         source_loop_id: 0,
+        source_hir_local_id: None,
+        mir_header: None,
         loop_head: span(18, 45),
         header_span: span(18, 19),
         span: span(19, 19),
@@ -364,6 +449,37 @@ fn spanless_outer_loop_with_nested_candidate_fails_even_when_source_order_differ
 }
 
 #[test]
+fn authenticated_exact_header_overrides_ambiguous_nested_span_and_rejects_stale_header() {
+    let mut func = nested_spanless_header_loops();
+    let exact = LoopContractSpec {
+        kind: LoopContractKind::Invariant,
+        source_loop_id: 0,
+        source_hir_local_id: Some(42),
+        mir_header: Some(1),
+        loop_head: span(18, 45),
+        header_span: span(18, 19),
+        span: span(19, 19),
+        body: "i <= n".to_string(),
+    };
+    let failures = bind_compiler_loop_contracts(&mut func, std::slice::from_ref(&exact));
+    assert!(
+        failures.is_empty(),
+        "the compiler-authenticated outer header must be consumed without span fallback: {failures:#?}",
+    );
+    assert_eq!(func.contracts[0].body, "bb1: i <= n");
+
+    let mut stale_func = nested_spanless_header_loops();
+    let stale = LoopContractSpec { mir_header: Some(2), ..exact };
+    let failures = bind_compiler_loop_contracts(&mut stale_func, &[stale]);
+    assert_eq!(failures.len(), 1);
+    assert!(
+        failures[0].1.contains("e45.loop-source.stale-mir-header"),
+        "a non-header block cannot consume compiler provenance: {failures:#?}",
+    );
+    assert!(stale_func.contracts[0].body.starts_with("__trust_unpaired_loop_contract__:"));
+}
+
+#[test]
 fn outer_spanless_loop_with_only_nested_source_evidence_fails_closed() {
     let mut func = nested_spanless_header_loops();
     // Remove every source-bearing statement exclusive to the outer natural
@@ -375,6 +491,8 @@ fn outer_spanless_loop_with_only_nested_source_evidence_fails_closed() {
     let specs = vec![LoopContractSpec {
         kind: LoopContractKind::Invariant,
         source_loop_id: 0,
+        source_hir_local_id: None,
+        mir_header: None,
         loop_head: span(18, 45),
         header_span: span(18, 19),
         span: span(19, 19),
@@ -396,7 +514,7 @@ fn outer_spanless_loop_with_only_nested_source_evidence_fails_closed() {
 }
 
 #[test]
-fn decreases_rejects_a_body_that_mutates_its_upper_bound() {
+fn decreases_models_a_mutated_upper_bound_in_the_exact_post_state() {
     let mut func = counted_loop();
     func.body.blocks[2].stmts.push(Statement::Assign {
         place: Place::local(1),
@@ -411,28 +529,32 @@ fn decreases_rejects_a_body_that_mutates_its_upper_bound() {
         .is_empty()
     );
 
-    let (solver_vcs, preclassified) = generate_vcs_with_discharge(&func);
-    assert!(
-        !solver_vcs.iter().any(|vc| {
+    let (mut all, preclassified) = generate_vcs_with_discharge(&func);
+    all.extend(preclassified.into_iter().map(|(vc, _)| vc));
+    let decreases = all
+        .iter()
+        .find(|vc| {
             matches!(&vc.kind, VcKind::NonTermination { context, .. }
                 if context == "loop-decreases")
-        }),
-        "a pre-state guard must not authorize post-state `0 - (i + 1)`: {solver_vcs:#?}",
-    );
-    let unsupported: Vec<_> = preclassified
-        .iter()
-        .filter(|(vc, result)| {
-            matches!(&vc.kind, VcKind::UnsupportedMir { kind, .. }
-                if kind == "UserLoopContractUnsupported")
-                && matches!(result, VerificationResult::Unknown { .. })
         })
-        .collect();
-    assert_eq!(
-        unsupported.len(),
-        1,
-        "the rejected E5 clause must remain as one visible fail-closed Unknown: {preclassified:#?}",
+        .expect("exact E5 row");
+    let mut post_zero_minus_increment = false;
+    decreases.formula.visit(&mut |formula| {
+        post_zero_minus_increment |= matches!(
+            formula,
+            Formula::BvSub(lhs, rhs, 32)
+                if matches!(lhs.as_ref(), Formula::BitVec { value: 0, width: 32 })
+                    && matches!(rhs.as_ref(), Formula::BvAdd(_, _, 32))
+        );
+    });
+    assert!(
+        post_zero_minus_increment,
+        "the E5 post-state must include exact `0 - (i + 1)` wrapping semantics: {decreases:#?}",
     );
-    assert_eq!(unsupported[0].0.formula, Formula::Bool(true));
+    assert!(
+        all.iter().all(|vc| !matches!(vc.kind, VcKind::UnsupportedMir { .. })),
+        "the fully modeled mutation must not degrade: {all:#?}",
+    );
 }
 
 #[test]
@@ -450,18 +572,9 @@ fn wrong_invariant_is_not_preserved_by_a_tautological_contradiction() {
         .iter()
         .find(|vc| matches!(vc.kind, VcKind::LoopInvariantConsecution { .. }))
         .expect("preservation VC");
-    let Formula::And(parts) = &preservation.formula else {
-        panic!("preservation must be a transition conjunction: {:?}", preservation.formula);
-    };
     assert!(
-        parts.iter().any(contains_negated_post_increment),
-        "post-state invariant must contain i+1: {parts:#?}"
-    );
-    assert!(
-        !parts.iter().any(|left| {
-            parts.iter().any(|right| matches!(right, Formula::Not(inner) if inner.as_ref() == left))
-        }),
-        "a wrong invariant must not become the unsat P && !P shortcut"
+        contains_negated_post_increment(&preservation.formula),
+        "post-state invariant must contain exact wrapping i+1: {preservation:#?}"
     );
 }
 
@@ -534,6 +647,8 @@ fn loop_span_pairing_does_not_leak_clause_to_later_loop() {
     let second = LoopContractSpec {
         kind: LoopContractKind::Invariant,
         source_loop_id: 1,
+        source_hir_local_id: None,
+        mir_header: None,
         loop_head: span(20, 25),
         header_span: span(20, 22),
         span: span(22, 22),
@@ -604,6 +719,8 @@ fn broad_fallback_span_does_not_choose_first_independent_loop() {
     let spec = LoopContractSpec {
         kind: LoopContractKind::Invariant,
         source_loop_id: 2,
+        source_hir_local_id: None,
+        mir_header: None,
         loop_head: span(9, 25),
         header_span: span(9, 10),
         span: span(10, 10),
@@ -639,8 +756,243 @@ fn multiple_backedges_to_one_header_are_one_binding_candidate() {
 
     let failures = bind_compiler_loop_contracts(
         &mut func,
-        &[loop_spec(LoopContractKind::Invariant, "i <= n")],
+        &[
+            loop_spec(LoopContractKind::Invariant, "i <= n"),
+            loop_spec(LoopContractKind::Decreases, "n - i"),
+        ],
     );
     assert!(failures.is_empty(), "duplicate backedge rows are not ambiguous: {failures:#?}");
     assert_eq!(func.contracts[0].body, "bb1: i <= n");
+    assert_eq!(func.contracts[1].body, "bb1: n - i");
+
+    let (mut solver, discharged) = generate_vcs_with_discharge(&func);
+    solver.extend(discharged.into_iter().map(|(vc, _)| vc));
+    assert_eq!(
+        solver
+            .iter()
+            .filter(|vc| match &vc.kind {
+                VcKind::LoopInvariantInitiation { .. }
+                | VcKind::LoopInvariantConsecution { .. } => true,
+                VcKind::NonTermination { context, .. } => context == "loop-decreases",
+                _ => false,
+            })
+            .count(),
+        3,
+        "one E4 pair and one E5 row must cover both latches: {solver:#?}",
+    );
+    assert!(
+        solver.iter().all(|vc| !matches!(vc.kind, VcKind::UnsupportedMir { .. })),
+        "a bounded two-latch loop must not silently drop either backedge: {solver:#?}",
+    );
+}
+
+#[test]
+fn distinct_latches_contribute_distinct_e4_and_e5_transition_formulas() {
+    let mut func = counted_loop();
+    func.body.locals.push(LocalDecl {
+        index: 4,
+        ty: Ty::Bool,
+        name: Some("choose_two".to_string()),
+    });
+    func.body.blocks[2].stmts.clear();
+    func.body.blocks[2].terminator = Terminator::SwitchInt {
+        discr: Operand::Copy(Place::local(4)),
+        targets: vec![(1, BlockId(4))],
+        otherwise: BlockId(5),
+        exhaustive_enum_unreachable: false,
+        span: span(12, 12),
+    };
+    for (id, increment) in [(4, 1), (5, 2)] {
+        func.body.blocks.push(BasicBlock {
+            id: BlockId(id),
+            stmts: vec![Statement::Assign {
+                place: Place::local(2),
+                rvalue: Rvalue::BinaryOp(
+                    BinOp::Add,
+                    Operand::Copy(Place::local(2)),
+                    Operand::Constant(ConstValue::Uint(increment, 32)),
+                ),
+                span: span(13 + id as u32 - 4, 13 + id as u32 - 4),
+            }],
+            terminator: Terminator::Goto(BlockId(1)),
+        });
+    }
+
+    let failures = bind_compiler_loop_contracts(
+        &mut func,
+        &[
+            loop_spec(LoopContractKind::Invariant, "i <= n"),
+            loop_spec(LoopContractKind::Decreases, "n - i"),
+        ],
+    );
+    assert!(failures.is_empty(), "both authenticated latches must bind: {failures:#?}");
+
+    let (solver, preclassified) = generate_vcs_with_discharge(&func);
+    assert!(
+        loop_unsupported_details(&solver, &preclassified).is_empty(),
+        "both supported latches must be modeled together: {preclassified:#?}",
+    );
+    let preservation = solver
+        .iter()
+        .find(|vc| matches!(vc.kind, VcKind::LoopInvariantConsecution { .. }))
+        .expect("one E4 consecution row");
+    let decreases = solver
+        .iter()
+        .find(|vc| {
+            matches!(
+                &vc.kind,
+                VcKind::NonTermination { context, .. } if context == "loop-decreases"
+            )
+        })
+        .expect("one E5 row");
+    for (name, formula) in [("E4", &preservation.formula), ("E5", &decreases.formula)] {
+        assert!(
+            contains_bv_addend(formula, 1) && contains_bv_addend(formula, 2),
+            "{name} must retain the distinct post-state of every latch: {formula:#?}",
+        );
+    }
+}
+
+#[test]
+fn exact_loop_path_limit_fails_the_whole_e4_lane_closed() {
+    const FIRST_TREE_BLOCK: usize = 2;
+    const INTERNAL_NODES: usize = 127;
+    const TOTAL_TREE_NODES: usize = 255;
+    const EXIT_BLOCK: usize = FIRST_TREE_BLOCK + TOTAL_TREE_NODES;
+
+    let mut blocks = vec![
+        BasicBlock { id: BlockId(0), stmts: vec![], terminator: Terminator::Goto(BlockId(1)) },
+        BasicBlock {
+            id: BlockId(1),
+            stmts: vec![Statement::Assign {
+                place: Place::local(3),
+                rvalue: Rvalue::BinaryOp(
+                    BinOp::Lt,
+                    Operand::Copy(Place::local(2)),
+                    Operand::Copy(Place::local(1)),
+                ),
+                span: span(10, 10),
+            }],
+            terminator: Terminator::SwitchInt {
+                discr: Operand::Copy(Place::local(3)),
+                targets: vec![(1, BlockId(FIRST_TREE_BLOCK))],
+                otherwise: BlockId(EXIT_BLOCK),
+                exhaustive_enum_unreachable: false,
+                span: span(10, 10),
+            },
+        },
+    ];
+    for node in 0..TOTAL_TREE_NODES {
+        let id = FIRST_TREE_BLOCK + node;
+        let terminator = if node < INTERNAL_NODES {
+            Terminator::SwitchInt {
+                discr: Operand::Copy(Place::local(4)),
+                targets: vec![(1, BlockId(FIRST_TREE_BLOCK + 2 * node + 1))],
+                otherwise: BlockId(FIRST_TREE_BLOCK + 2 * node + 2),
+                exhaustive_enum_unreachable: false,
+                span: span(13, 13),
+            }
+        } else {
+            Terminator::Goto(BlockId(1))
+        };
+        blocks.push(BasicBlock { id: BlockId(id), stmts: vec![], terminator });
+    }
+    blocks.push(BasicBlock {
+        id: BlockId(EXIT_BLOCK),
+        stmts: vec![],
+        terminator: Terminator::Return,
+    });
+    let mut func = VerifiableFunction {
+        name: "path_explosion".to_string(),
+        def_path: "test::path_explosion".to_string(),
+        span: span(1, 20),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: Some("_0".to_string()) },
+                LocalDecl { index: 1, ty: Ty::u32(), name: Some("n".to_string()) },
+                LocalDecl { index: 2, ty: Ty::u32(), name: Some("i".to_string()) },
+                LocalDecl { index: 3, ty: Ty::Bool, name: Some("cond".to_string()) },
+                LocalDecl { index: 4, ty: Ty::Bool, name: Some("choose".to_string()) },
+            ],
+            blocks,
+            arg_count: 1,
+            return_ty: Ty::Unit,
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+    assert!(
+        bind_compiler_loop_contracts(
+            &mut func,
+            &[loop_spec(LoopContractKind::Invariant, "i <= n")],
+        )
+        .is_empty()
+    );
+
+    let (solver, preclassified) = generate_vcs_with_discharge(&func);
+    let details = loop_unsupported_details(&solver, &preclassified);
+    assert!(
+        details.iter().any(|detail| detail.contains("e45.transition.path-limit")),
+        "more than 64 exact paths must reject the entire E4 transition: {details:#?}",
+    );
+    assert!(
+        !solver.iter().any(|vc| matches!(vc.kind, VcKind::LoopInvariantConsecution { .. })),
+        "a bounded prefix of the paths must never mint an E4 row",
+    );
+}
+
+#[test]
+fn nested_cycle_fails_the_outer_e4_transition_closed() {
+    let mut func = nested_spanless_header_loops();
+    let spec = LoopContractSpec {
+        kind: LoopContractKind::Invariant,
+        source_loop_id: 0,
+        source_hir_local_id: Some(42),
+        mir_header: Some(1),
+        loop_head: span(18, 45),
+        header_span: span(18, 19),
+        span: span(19, 19),
+        body: "i <= n".to_string(),
+    };
+    assert!(bind_compiler_loop_contracts(&mut func, &[spec]).is_empty());
+
+    let (solver, preclassified) = generate_vcs_with_discharge(&func);
+    let details = loop_unsupported_details(&solver, &preclassified);
+    assert!(
+        details.iter().any(|detail| detail.contains("e45.transition.nested-or-cyclic-subpath")),
+        "an inner cycle must reject the outer transition instead of being summarized: {details:#?}",
+    );
+    assert!(
+        !solver.iter().any(|vc| matches!(vc.kind, VcKind::LoopInvariantConsecution { .. })),
+        "no partial outer-loop path may receive E4 authority",
+    );
+}
+
+#[test]
+fn an_unmodeled_direct_backedge_rejects_all_other_latches() {
+    let mut func = counted_loop();
+    let Terminator::SwitchInt { targets, .. } = &mut func.body.blocks[1].terminator else {
+        unreachable!("counted loop header is a SwitchInt")
+    };
+    targets.push((0, BlockId(1)));
+    assert!(
+        bind_compiler_loop_contracts(
+            &mut func,
+            &[loop_spec(LoopContractKind::Invariant, "i <= n")],
+        )
+        .is_empty()
+    );
+
+    let (solver, preclassified) = generate_vcs_with_discharge(&func);
+    let details = loop_unsupported_details(&solver, &preclassified);
+    assert!(
+        details.iter().any(|detail| detail.contains("e45.transition.uncovered-backedges")),
+        "the direct header backedge must remain visible as uncovered: {details:#?}",
+    );
+    assert!(
+        !solver.iter().any(|vc| matches!(vc.kind, VcKind::LoopInvariantConsecution { .. })),
+        "modeling the ordinary latch cannot authorize a loop with another uncovered latch",
+    );
 }

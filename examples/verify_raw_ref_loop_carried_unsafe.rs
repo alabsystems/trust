@@ -1,7 +1,8 @@
 // Trust test: raw-pointer deref loop-carried (under-free) -- unsafe variant
-// VcKind: Assertion
-// Expected: Assertion FAILED
-// The assertion finding is the fail-closed catch for the loop-carried dangle.
+// VcKind: Assertion { message: "[unsafe...]" } -- transports as the hardened
+//   unsafe-operation family (`hardened_unsafe_operation`), not `assert`.
+// Expected: HardenedBoundary(UnsafeOperation) FAILED
+// The unsafe-demand finding is the fail-closed catch for the loop-carried dangle.
 // Counterexample: `p` holds the PREVIOUS iteration's `&x`, whose local `x`
 //   has already been dropped at the loop back-edge.
 //

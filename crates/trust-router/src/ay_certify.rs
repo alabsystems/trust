@@ -107,6 +107,11 @@ fn lt_int(a: &Expr, b: &Expr) -> Expr {
 /// `Not False` — the negated goal for a proof-by-contradiction whose conclusion
 /// is `False` (the reconstructor closes the empty clause into a proof of the
 /// negated goal; here the goal is literally `False`).
+/// The proposition `False` — what a refutation's proof term must inhabit.
+fn false_prop() -> Expr {
+    Expr::const_(Name::from_string("False"), vec![])
+}
+
 fn negated_false_goal() -> Expr {
     Expr::app(
         Expr::const_(Name::from_string("Not"), vec![]),
@@ -229,7 +234,16 @@ fn build_lia_two_bound_proof(
     let int_ty = Expr::const_(Name::from_string("Int"), vec![]);
     let lo_e = int_ofnat(lo);
     let hi_e = int_ofnat(hi);
-    let test_x = Expr::const_(Name::from_string("testX"), vec![]);
+    // The VC's `∀x` is a LOCAL of the obligation, not a global axiom. Binding it
+    // as an fvar in the `LocalContext` — exactly as the two hypotheses below are
+    // bound — keeps it out of the environment's axiom set entirely, so the
+    // kernel-bridge purity gate never sees a non-foundational axiom to reject.
+    // Modelling it as `Expr::const_` previously made it an `Axiom` declaration,
+    // which `axiom_deps_subset_foundational` rejects unless the caller can name
+    // it in `allowed_params` — and the `reconstruct_and_certify_ay_proof` entry
+    // point exposes no way to do that.
+    let x_fvar = FVarId::new(12);
+    let test_x = Expr::fvar(x_fvar);
 
     let mut terms = TermStore::new();
     let mut map = VariableMapping::new();
@@ -238,7 +252,7 @@ fn build_lia_two_bound_proof(
     let ay_hi = terms.mk_int(num_bigint::BigInt::from(hi));
     let ay_x = terms.mk_var("testX", ay::Sort::Int);
 
-    map.register_var("testX", test_x.clone(), int_ty);
+    map.register_var("testX", test_x.clone(), int_ty.clone());
 
     let lt_lo_x = terms.mk_lt(ay_lo, ay_x);
     let lt_x_hi = terms.mk_lt(ay_x, ay_hi);
@@ -269,6 +283,8 @@ fn build_lia_two_bound_proof(
     }
 
     let mut ctx = LocalContext::new();
+    // `x : Int` must precede the hypotheses that mention it.
+    ctx.push_with_id(x_fvar, Name::from_string("x"), int_ty.clone(), BinderInfo::Default);
     ctx.push_with_id(h1, Name::from_string("h_lo_lt_x"), lt_lo_x_prop, BinderInfo::Default);
     ctx.push_with_id(h2, Name::from_string("h_x_lt_hi"), lt_x_hi_prop, BinderInfo::Default);
 
@@ -887,6 +903,211 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// D.9 — the typed envelope and its replay
+// ---------------------------------------------------------------------------
+//
+// WHERE THE AUTHORITY LIVES. A `CertifiedPayload` is a proof of `False` from
+// the hypotheses of a *particular* local context. The goal is always `False`,
+// so the goal binds nothing: everything that makes the term a proof of THIS
+// obligation lives in the context. Consequently the replayer must never check
+// against a context it was handed. It recognizes the two-bound fragment in the
+// VC in hand, rebuilds the context with the same `build_lia_two_bound_proof`
+// the producer used, and checks the carried term against THAT. A term proving
+// `False` from `h : False` — or from some other obligation's hypotheses — then
+// fails to typecheck here, which is the binding.
+//
+// So the envelope's `context_bytes` artifact is AUDIT MATERIAL ONLY. It is
+// carried so an offline reader can see what the producer claimed to have
+// checked; it is never fed to the kernel. `claim_payload` likewise correlates
+// only. Neither is consulted as a verdict, per the `NativeProofEnvelope`
+// constitution (U1/U6): authority is the replayer's own re-derivation plus its
+// own `check_type` verdict.
+
+/// Artifact label for the `bincode` kernel proof term inside a
+/// [`NativeProofEnvelopeKind::CleanKernelRefutation`] envelope.
+pub const CLEAN_KERNEL_TERM_ARTIFACT: &str = "clean-kernel-term";
+
+/// Artifact label for the producer's reduced local context. **Audit material
+/// only** — [`replay_certified_envelope`] rebuilds its own context from the VC
+/// and never deserializes this.
+pub const CLEAN_KERNEL_CONTEXT_ARTIFACT: &str = "clean-kernel-context";
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Canonical audit rendering of the obligation an envelope claims to discharge.
+///
+/// Correlation only. The replayer does not compare this — it re-recognizes the
+/// fragment from the live `Formula` — so a forged payload buys nothing.
+fn claim_payload_for(formula: &trust_types::Formula) -> String {
+    serde_json::to_string(formula).unwrap_or_else(|_| String::from("<unrenderable>"))
+}
+
+/// Normalized-input digest input: the recognized fragment in normal form.
+fn normalized_fragment_string(frag: &LiaTwoBoundFragment) -> String {
+    format!("lia-two-bound:{}<{}<{}", frag.lo, frag.var, frag.hi)
+}
+
+/// Build the zero-authority transport envelope for a kernel-certified
+/// refutation of `formula`.
+///
+/// Returns `None` when `formula` is not the recognized fragment (nothing to
+/// bind the payload to, so nothing honest to ship).
+#[must_use]
+pub fn certified_envelope_for(
+    formula: &trust_types::Formula,
+    payload: &CertifiedPayload,
+) -> Option<trust_types::NativeProofEnvelope> {
+    let frag = recognize_lia_two_bound(formula)?;
+    let claim_payload = claim_payload_for(formula);
+    let envelope = trust_types::NativeProofEnvelope {
+        schema: trust_types::NATIVE_PROOF_ENVELOPE_SCHEMA.to_string(),
+        kind: trust_types::NativeProofEnvelopeKind::CleanKernelRefutation,
+        claim_digest_sha256: sha256_hex(claim_payload.as_bytes()),
+        claim_payload,
+        normalized_input_sha256: sha256_hex(normalized_fragment_string(&frag).as_bytes()),
+        transport_identity: trust_types::NativeProofTransportIdentity {
+            suite: "ay-certify".to_string(),
+            request_id: 0,
+            proof_id: 0,
+            native_id: normalized_fragment_string(&frag),
+        },
+        artifacts: vec![
+            trust_types::NativeProofArtifact {
+                kind: CLEAN_KERNEL_TERM_ARTIFACT.to_string(),
+                sha256: sha256_hex(&payload.term_bytes),
+                bytes: payload.term_bytes.clone(),
+            },
+            trust_types::NativeProofArtifact {
+                kind: CLEAN_KERNEL_CONTEXT_ARTIFACT.to_string(),
+                sha256: sha256_hex(&payload.context_bytes),
+                bytes: payload.context_bytes.clone(),
+            },
+        ],
+    };
+    // An envelope that cannot pass the structural gate is not shippable
+    // material; refuse rather than emit something consumers must treat as
+    // absent anyway.
+    envelope.accepted().then_some(envelope)
+}
+
+/// Why a replay did not reproduce a kernel-certified refutation.
+///
+/// Every variant is FAIL-CLOSED: the caller keeps whatever verdict it held
+/// without the envelope. Only [`ReplayOutcome::Replayed`] is a positive result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayOutcome {
+    /// The replayer rebuilt this VC's context from the VC itself, and the
+    /// carried term kernel-checked against `False` in that context with an
+    /// axiom residue `⊆` the 3 Lean-core axioms.
+    Replayed,
+    /// Envelope failed [`trust_types::NativeProofEnvelope::accepted`], or is
+    /// not a [`NativeProofEnvelopeKind::CleanKernelRefutation`].
+    ///
+    /// [`NativeProofEnvelopeKind::CleanKernelRefutation`]: trust_types::NativeProofEnvelopeKind::CleanKernelRefutation
+    NotReplayable,
+    /// The VC in hand is not the recognized two-bound fragment, or is
+    /// satisfiable, so there is no context to rebuild and nothing this
+    /// envelope could be a proof of.
+    NoFragment,
+    /// No `clean-kernel-term` artifact, or its recomputed SHA-256 disagrees
+    /// with the producer's claim (reject-only pre-filter).
+    ArtifactUnusable,
+    /// The carried bytes are not a deserializable kernel term.
+    TermUndeserializable,
+    /// The kernel REFUSED the carried term against `False` in the context
+    /// rebuilt from this VC. This is the binding failing, and is the expected
+    /// outcome for a term lifted from a different obligation.
+    KernelRejected,
+    /// The term checked, but its transitive constant closure retains a
+    /// non-foundational axiom or a trust marker.
+    AxiomResidueImpure(Vec<String>),
+    /// Environment construction failed (a kernel-setup error, not a verdict).
+    EnvironmentUnavailable,
+}
+
+impl ReplayOutcome {
+    /// True iff the replay independently reproduced the kernel certification.
+    #[must_use]
+    pub fn is_replayed(&self) -> bool {
+        matches!(self, ReplayOutcome::Replayed)
+    }
+}
+
+/// Independently replay a [`NativeProofEnvelopeKind::CleanKernelRefutation`]
+/// envelope against the verification condition it claims to discharge.
+///
+/// This is the D.9 consumer gate. It grants a `Certified` reading ONLY when it
+/// has itself rebuilt the obligation's local context from `formula` and itself
+/// watched the Clean kernel accept the carried term as a proof of `False` in
+/// that context. Nothing the envelope asserts is believed: the kind, digests,
+/// claim payload and carried context are pre-filters and audit material.
+///
+/// [`NativeProofEnvelopeKind::CleanKernelRefutation`]: trust_types::NativeProofEnvelopeKind::CleanKernelRefutation
+#[must_use]
+pub fn replay_certified_envelope(
+    formula: &trust_types::Formula,
+    envelope: &trust_types::NativeProofEnvelope,
+) -> ReplayOutcome {
+    if !envelope.accepted()
+        || envelope.kind != trust_types::NativeProofEnvelopeKind::CleanKernelRefutation
+    {
+        return ReplayOutcome::NotReplayable;
+    }
+
+    // (1) Re-derive the obligation from the VC IN HAND. The carried context is
+    //     deliberately not consulted.
+    let Some(frag) = recognize_lia_two_bound(formula) else {
+        return ReplayOutcome::NoFragment;
+    };
+    if frag.hi > frag.lo {
+        return ReplayOutcome::NoFragment;
+    }
+    let (Ok(lo), Ok(hi)) = (u64::try_from(frag.lo), u64::try_from(frag.hi)) else {
+        return ReplayOutcome::NoFragment;
+    };
+    let Ok(env) = int_arith_env() else {
+        return ReplayOutcome::EnvironmentUnavailable;
+    };
+    let (_, _, _, ctx) = build_lia_two_bound_proof(lo, hi, /* complete */ true);
+
+    // (2) Take ONLY the term bytes, and only if they match their claimed digest.
+    let Some(artifact) =
+        envelope.artifacts.iter().find(|a| a.kind == CLEAN_KERNEL_TERM_ARTIFACT)
+    else {
+        return ReplayOutcome::ArtifactUnusable;
+    };
+    if sha256_hex(&artifact.bytes) != artifact.sha256 {
+        return ReplayOutcome::ArtifactUnusable;
+    }
+    let Ok(term) = clean_auto::bridge::ay_contract::deserialize_term(&artifact.bytes) else {
+        return ReplayOutcome::TermUndeserializable;
+    };
+
+    // (3) OUR kernel check, in OUR context, against `False`.
+    let mut checker = TypeChecker::with_context_and_caches(
+        &env,
+        ctx,
+        clean_kernel::tc::TcCaches::default(),
+    );
+    if checker.check_type(&term, &false_prop()).is_err() {
+        return ReplayOutcome::KernelRejected;
+    }
+
+    // (4) Purity: no domain axiom or trust marker may survive in the closure.
+    let residue = scan_axiom_residue(&term, &env);
+    if residue.is_empty() {
+        ReplayOutcome::Replayed
+    } else {
+        ReplayOutcome::AxiomResidueImpure(residue)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -934,6 +1155,110 @@ mod tests {
             residue.is_empty(),
             "certified term must depend only on the 3 Lean-core axioms (modulo 3); \
              found non-foundational residue: {residue:?}"
+        );
+    }
+
+    /// D.9 acceptance criterion: a >=500-mutant certificate-corruption battery
+    /// must be rejected 100%.
+    ///
+    /// A certificate is only worth anything if CORRUPTING it is caught. This
+    /// mutates the serialized kernel term byte-by-byte and requires every mutant
+    /// to fail to reproduce a clean `Certified` seal — either the bytes no longer
+    /// deserialize, or the deserialized term no longer has an empty axiom residue.
+    ///
+    /// The battery is deliberately EXHAUSTIVE over single-byte edits rather than
+    /// random: a random sample can miss the one offset that happens to round-trip,
+    /// and "we tried 500 random mutations" is a weaker claim than "every
+    /// single-byte edit in the first N bytes is caught".
+    ///
+    /// SCOPE, stated so it is not over-read: this pins that a corrupted TERM does
+    /// not survive re-checking. It does NOT yet pin payload-to-VC binding — the
+    /// live carrier cannot bind and replay a `CertifiedPayload` for an exact VC
+    /// (see the module gate comment), which is the remaining half of D.9. When
+    /// that lands, this battery needs a sibling that corrupts the BINDING rather
+    /// than the term.
+    #[test]
+    fn certified_payload_corruption_battery_is_rejected() {
+        let env = int_arith_env().expect("env");
+        let (terms, map, proof, ctx) = build_lia_two_bound_proof(10, 5, true);
+        let negated_goal = negated_false_goal();
+        let payload =
+            reconstruct_and_certify_ay_proof(&proof, &terms, &map, &negated_goal, &env, &ctx)
+                .expect("baseline must certify");
+        // The term mentions the VC's local `x`, so it must be checked IN ITS
+        // CONTEXT — the same "matching context" the certifier's gate (e) uses.
+        let checker = || {
+            clean_kernel::tc::TypeChecker::with_context_and_caches(
+                &env,
+                ctx.clone(),
+                clean_kernel::tc::TcCaches::default(),
+            )
+        };
+
+        // Baseline: the pristine payload IS clean. Without this the battery could
+        // pass vacuously by rejecting everything, including the truth.
+        let pristine = clean_auto::bridge::ay_contract::deserialize_term(&payload.term_bytes)
+            .expect("pristine term must deserialize");
+        checker()
+            .check_type(&pristine, &false_prop())
+            .expect("baseline term must kernel-check against `False`");
+        assert!(
+            scan_axiom_residue(&pristine, &env).is_empty(),
+            "baseline payload must be clean, else the battery proves nothing"
+        );
+
+        let original = payload.term_bytes.clone();
+        assert!(
+            original.len() >= 64,
+            "term is only {} bytes; too small for a meaningful battery",
+            original.len()
+        );
+
+        let mut mutants = 0usize;
+        let mut survivors: Vec<String> = Vec::new();
+        // Exhaustive single-byte edits over a prefix, several bit-patterns each,
+        // until comfortably past the 500-mutant floor.
+        'outer: for offset in 0..original.len() {
+            for delta in [0x01u8, 0x80, 0xff] {
+                let mut bytes = original.clone();
+                bytes[offset] ^= delta;
+                if bytes == original {
+                    continue;
+                }
+                mutants += 1;
+                // A mutant SURVIVES only if it would still be accepted as a
+                // certificate — i.e. it deserializes, the KERNEL still checks the
+                // term against the goal `False` (gate (e), the real proof
+                // obligation), AND its axiom residue is still clean.
+                //
+                // The kernel check is the load-bearing half. An earlier version of
+                // this battery tested residue ALONE and reported 96 "survivors" —
+                // which proved nothing, because a corrupted term can trivially keep
+                // a clean axiom set while ceasing to be a proof of anything. A
+                // corruption battery is only as strong as the re-check it runs.
+                let survived = match clean_auto::bridge::ay_contract::deserialize_term(&bytes) {
+                    Ok(term) => {
+                        checker().check_type(&term, &false_prop()).is_ok()
+                            && scan_axiom_residue(&term, &env).is_empty()
+                    }
+                    // Did not deserialize: correctly rejected.
+                    Err(_) => false,
+                };
+                if survived {
+                    survivors.push(format!("offset {offset} ^ {delta:#04x}"));
+                }
+                if mutants >= 600 {
+                    break 'outer;
+                }
+            }
+        }
+
+        assert!(mutants >= 500, "battery must run >=500 mutants, ran {mutants}");
+        assert!(
+            survivors.is_empty(),
+            "{} of {mutants} corrupted certificates survived re-checking: {:?}",
+            survivors.len(),
+            &survivors[..survivors.len().min(10)]
         );
     }
 
@@ -1004,6 +1329,258 @@ mod tests {
         assert!(
             outcome.is_none(),
             "a satisfiable fragment must be DECLINED (None), got {outcome:?}"
+        );
+    }
+
+    // ───────────────────── D.9 — envelope binding and replay ─────────────────
+
+    /// `lo < x ∧ x < hi` as a Trust `Formula` (violation form: `x > lo ∧ x < hi`).
+    fn two_bound(lo: i128, hi: i128) -> Formula {
+        Formula::And(vec![
+            Formula::Gt(Box::new(Formula::Var("x".into(), Sort::Int)), Box::new(Formula::Int(lo))),
+            Formula::Lt(Box::new(Formula::Var("x".into(), Sort::Int)), Box::new(Formula::Int(hi))),
+        ])
+    }
+
+    /// Certify `formula` and package the envelope, or panic — test helper.
+    fn envelope_for(formula: &Formula) -> trust_types::NativeProofEnvelope {
+        let outcome = certify_lia_violation_formula(formula)
+            .expect("env setup")
+            .expect("fragment must be recognized");
+        let CertifyOutcome::Certified(payload) = outcome else {
+            panic!("fixture must certify, got {outcome:?}");
+        };
+        certified_envelope_for(formula, &payload).expect("envelope must be shippable")
+    }
+
+    /// D.9 POSITIVE: an envelope produced for a VC replays against that VC.
+    ///
+    /// Without this the binding battery below could pass vacuously by rejecting
+    /// everything — including the truth.
+    #[test]
+    fn certified_envelope_replays_against_its_own_vc() {
+        let formula = two_bound(10, 5);
+        let envelope = envelope_for(&formula);
+        assert_eq!(envelope.kind, trust_types::NativeProofEnvelopeKind::CleanKernelRefutation);
+        assert_eq!(
+            replay_certified_envelope(&formula, &envelope),
+            ReplayOutcome::Replayed,
+            "an honest envelope must replay against the VC it was built for"
+        );
+    }
+
+    /// D.9 BINDING — the battery the module gate comment named as the missing
+    /// half. A kernel-valid proof term lifted from a DIFFERENT obligation must
+    /// be refused.
+    ///
+    /// This is the attack that a term-corruption battery cannot see: the bytes
+    /// are pristine and the term genuinely proves `False` — from *its own*
+    /// hypotheses. Binding is enforced because the replayer rebuilds the local
+    /// context from the VC in hand, so the donor term's hypotheses no longer
+    /// have the types it needs and the kernel refuses it.
+    #[test]
+    fn certified_envelope_from_another_vc_is_rejected() {
+        let donor = two_bound(10, 5);
+        let victim = two_bound(20, 7);
+        // Both are independently certifiable, so a rejection below is the
+        // BINDING talking, not one side being uncertifiable.
+        assert_eq!(replay_certified_envelope(&donor, &envelope_for(&donor)), ReplayOutcome::Replayed);
+        assert_eq!(
+            replay_certified_envelope(&victim, &envelope_for(&victim)),
+            ReplayOutcome::Replayed
+        );
+
+        let stolen = envelope_for(&donor);
+        assert_eq!(
+            replay_certified_envelope(&victim, &stolen),
+            ReplayOutcome::KernelRejected,
+            "a term proving a DIFFERENT obligation must not replay against this VC"
+        );
+    }
+
+    /// D.9 BINDING, exhaustive: every distinct two-bound VC in a grid rejects
+    /// every other VC's certificate, and accepts only its own.
+    #[test]
+    fn envelope_binding_is_exact_across_a_vc_grid() {
+        let vcs: Vec<Formula> =
+            [(10i128, 5i128), (20, 7), (30, 1), (9, 0), (100, 42)].iter().map(|&(lo, hi)| two_bound(lo, hi)).collect();
+        let envelopes: Vec<_> = vcs.iter().map(envelope_for).collect();
+
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for (i, vc) in vcs.iter().enumerate() {
+            for (j, env) in envelopes.iter().enumerate() {
+                let outcome = replay_certified_envelope(vc, env);
+                if i == j {
+                    assert_eq!(outcome, ReplayOutcome::Replayed, "VC {i} must accept its OWN certificate");
+                    accepted += 1;
+                } else {
+                    assert_eq!(
+                        outcome,
+                        ReplayOutcome::KernelRejected,
+                        "VC {i} must reject VC {j}'s certificate"
+                    );
+                    rejected += 1;
+                }
+            }
+        }
+        assert_eq!(accepted, 5, "exactly the diagonal replays");
+        assert_eq!(rejected, 20, "every off-diagonal pair is refused");
+    }
+
+    /// D.9: the carried CONTEXT artifact is audit material and is never used as
+    /// the checking context.
+    ///
+    /// The attack this forecloses: ship a context asserting `h : False` plus the
+    /// one-line term `h`. That pair kernel-checks perfectly *against the shipped
+    /// context* and proves nothing whatever about the obligation. Because the
+    /// replayer builds its own context from the VC, the forged bytes are inert —
+    /// swapping them for garbage cannot change a verdict either way.
+    #[test]
+    fn carried_context_artifact_cannot_influence_the_verdict() {
+        let formula = two_bound(10, 5);
+        let mut forged = envelope_for(&formula);
+        for artifact in &mut forged.artifacts {
+            if artifact.kind == CLEAN_KERNEL_CONTEXT_ARTIFACT {
+                artifact.bytes = vec![0xde, 0xad, 0xbe, 0xef];
+                artifact.sha256 = sha256_hex(&artifact.bytes);
+            }
+        }
+        assert_eq!(
+            replay_certified_envelope(&formula, &forged),
+            ReplayOutcome::Replayed,
+            "the context artifact is inert audit material — replacing it changes nothing"
+        );
+
+        // And the converse: it cannot RESCUE a foreign term either.
+        let mut stolen = envelope_for(&two_bound(20, 7));
+        let honest_ctx = forged
+            .artifacts
+            .iter()
+            .find(|a| a.kind == CLEAN_KERNEL_CONTEXT_ARTIFACT)
+            .expect("context artifact")
+            .clone();
+        for artifact in &mut stolen.artifacts {
+            if artifact.kind == CLEAN_KERNEL_CONTEXT_ARTIFACT {
+                *artifact = honest_ctx.clone();
+            }
+        }
+        assert_eq!(
+            replay_certified_envelope(&formula, &stolen),
+            ReplayOutcome::KernelRejected,
+            "attaching the right context to the wrong term must not replay"
+        );
+    }
+
+    /// D.9: a term artifact whose bytes disagree with the producer's own digest
+    /// is refused before the kernel is asked (reject-only pre-filter).
+    #[test]
+    fn term_artifact_digest_mismatch_is_refused() {
+        let formula = two_bound(10, 5);
+        let mut tampered = envelope_for(&formula);
+        for artifact in &mut tampered.artifacts {
+            if artifact.kind == CLEAN_KERNEL_TERM_ARTIFACT {
+                artifact.bytes.push(0x00); // digest now stale
+            }
+        }
+        assert_eq!(
+            replay_certified_envelope(&formula, &tampered),
+            ReplayOutcome::ArtifactUnusable
+        );
+    }
+
+    /// D.9: single-byte corruption of the TERM, with the digest recomputed so
+    /// the pre-filter cannot catch it, must still never replay. Exhaustive over
+    /// the leading bytes rather than sampled.
+    #[test]
+    fn term_corruption_with_repaired_digest_never_replays() {
+        let formula = two_bound(10, 5);
+        let honest = envelope_for(&formula);
+        let term_bytes = honest
+            .artifacts
+            .iter()
+            .find(|a| a.kind == CLEAN_KERNEL_TERM_ARTIFACT)
+            .expect("term artifact")
+            .bytes
+            .clone();
+
+        let span = term_bytes.len().min(120);
+        let mut mutants = 0usize;
+        for offset in 0..span {
+            for delta in [1u8, 0x80] {
+                let mut bytes = term_bytes.clone();
+                bytes[offset] ^= delta;
+                if bytes == term_bytes {
+                    continue;
+                }
+                let mut mutant = honest.clone();
+                for artifact in &mut mutant.artifacts {
+                    if artifact.kind == CLEAN_KERNEL_TERM_ARTIFACT {
+                        artifact.sha256 = sha256_hex(&bytes);
+                        artifact.bytes = bytes.clone();
+                    }
+                }
+                mutants += 1;
+                let outcome = replay_certified_envelope(&formula, &mutant);
+                assert!(
+                    !outcome.is_replayed(),
+                    "corrupted term at offset {offset} (xor {delta:#x}) replayed: {outcome:?}"
+                );
+            }
+        }
+        assert!(mutants >= 200, "battery must be substantive, ran {mutants} mutants");
+    }
+
+    /// D.9: structural gates. A wrong kind, a wrong schema, or a missing term
+    /// artifact is not replayable — and none of them reaches the kernel.
+    #[test]
+    fn structurally_invalid_envelopes_are_not_replayable() {
+        let formula = two_bound(10, 5);
+
+        let mut wrong_kind = envelope_for(&formula);
+        wrong_kind.kind = trust_types::NativeProofEnvelopeKind::SmtUnsatBundle;
+        assert_eq!(replay_certified_envelope(&formula, &wrong_kind), ReplayOutcome::NotReplayable);
+
+        let mut wrong_schema = envelope_for(&formula);
+        wrong_schema.schema = "trust.native-proof-envelope.v99".to_string();
+        assert_eq!(replay_certified_envelope(&formula, &wrong_schema), ReplayOutcome::NotReplayable);
+
+        let mut no_term = envelope_for(&formula);
+        no_term.artifacts.retain(|a| a.kind != CLEAN_KERNEL_TERM_ARTIFACT);
+        assert_eq!(replay_certified_envelope(&formula, &no_term), ReplayOutcome::ArtifactUnusable);
+    }
+
+    /// D.9: an envelope replayed against a VC outside the fragment — or against
+    /// a SATISFIABLE one — declines without consulting the kernel. A satisfiable
+    /// obligation has no refutation, so no certificate may ever replay for it.
+    #[test]
+    fn out_of_fragment_and_satisfiable_vcs_decline() {
+        let envelope = envelope_for(&two_bound(10, 5));
+
+        let single_bound =
+            Formula::Gt(Box::new(Formula::Var("x".into(), Sort::Int)), Box::new(Formula::Int(10)));
+        assert_eq!(
+            replay_certified_envelope(&single_bound, &envelope),
+            ReplayOutcome::NoFragment
+        );
+
+        // `x > 2 ∧ x < 9` is SAT — there is nothing to refute.
+        assert_eq!(
+            replay_certified_envelope(&two_bound(2, 9), &envelope),
+            ReplayOutcome::NoFragment,
+            "a satisfiable obligation must never accept a refutation certificate"
+        );
+    }
+
+    /// D.9: a satisfiable VC has no shippable envelope in the first place —
+    /// `certified_envelope_for` is only reachable through a `CertifiedPayload`,
+    /// and the certifier declines SAT fragments.
+    #[test]
+    fn satisfiable_fragment_produces_no_certificate_to_ship() {
+        let sat = two_bound(2, 9);
+        assert!(
+            certify_lia_violation_formula(&sat).expect("env").is_none(),
+            "a SAT fragment must yield no CertifyOutcome, hence no envelope"
         );
     }
 

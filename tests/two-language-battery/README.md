@@ -9,8 +9,11 @@ is flattering.
 Run it:
 
 ```bash
-python3 tests/two-language-battery/run.py           # full battery -> results.json
-python3 tests/two-language-battery/run.py --filter lane-c
+STAGE2=$(cd build/host/stage2 && pwd -P)
+TRUST_PROBE_TRUSTC="$STAGE2/bin/trustc" \
+  python3 tests/two-language-battery/run.py         # full battery -> results.json
+python3 tests/two-language-battery/run.py --filter lane-c \
+  --output /tmp/two-language-lane-c.json
 ```
 
 ## Why this exists separately from `tests/ui/trust/`
@@ -79,11 +82,21 @@ an alarm: the tool would be claiming a true clause is false.
 
 **2. Nothing is scored from a stale toolchain.**
 
-`trustc`'s version stamp embeds the superproject HEAD. The runner records the
-toolchain commit and the repo HEAD in every scorecard and warns when they
-differ, with the commit distance. A re-run against a compiler built before the
+`trustc`'s version stamp embeds the superproject HEAD. The runner requires an
+exact commit match, a clean superproject, and exact recursive submodule pins
+before running or writing canonical results. An explicit
+`--allow-unsealed-toolchain` escape hatch is exploratory-only and requires a
+non-canonical output path. Filtered runs likewise require a scratch output and
+cannot truncate `results.json`. A re-run against a compiler built before the
 fixes under test is the single easiest way to produce impressive, meaningless
 numbers.
+
+The canonical run also requires the reviewed 25-file path/directive manifest,
+compiles read-only snapshots of those exact bytes, and records their digest.
+Trustc and Tippy must be executable siblings in this checkout's physical
+stage2 tree; both binaries are hashed, both version preflights must succeed,
+and checkout, submodule, binary, and fixture identities are rechecked before
+the scorecard is atomically replaced.
 
 ## Lanes expected to fail today, by design
 
@@ -107,13 +120,17 @@ They are specifications, and their failure is the measurement:
   of what remains to build before "both languages feed the same TrustIr
   module" is true.
 
-## Measured result (2026-07-25, toolchain `c6be27eb88`, matches HEAD)
+## Archived measured result (generated 2026-07-26, toolchain `c6be27eb88`)
 
-24 programs. **0 false accepts. 0 rejected-for-the-wrong-reason.**
+This section and `results.json` record a historical run whose toolchain was
+already 24 commits behind its recorded repository HEAD (`f2b7299212`). They do
+not describe the current checkout. Regenerate the scorecard after the final
+dependency pins and stage2 binaries are sealed. In that archived run, 25
+programs produced **0 false accepts** and **0 rejected-for-the-wrong-reason**.
 
 | verdict | n | meaning |
 |---|---|---|
-| `pass` | 8 | verified end-to-end |
+| `pass` | 9 | verified end-to-end |
 | `reject-correct` | 5 | a negative control refuted, for the right reason |
 | `frontier-confirmed` | 3 | correct program the lane cannot model yet |
 | `unexpected-reject` (frontier) | 3 | expected pass; landed on an unmodelled row |
@@ -122,24 +139,24 @@ They are specifications, and their failure is the measurement:
 | `tippy-fires-but-no-lean` | 2 | lane D target unimplemented |
 | `ir-rust-only` | 1 | lane E spine gap |
 
-**What works.** Lane B 4/4 and lane C 5/5. Both discharge modes of the combo —
-cited (`by thm`) and uncited kernel defeq — verify on real programs, and the
-kernel refuses both a bogus `Nat.le 1 0` proof and a well-typed citation that
-does not prove the goal. Those two refusals are what make the passes mean
-something.
+**What was as specified.** Lane B was 4/4 and lane C was 6/6. Both discharge
+modes of the combo — cited (`by thm`) and uncited kernel defeq — verify on real
+programs, and the kernel refuses both a bogus `Nat.le 1 0` proof and a
+well-typed citation that does not prove the goal. Those two refusals are what
+make the passes mean something.
 
-**Where lane A actually stands.** 8 of 12 as specified. The gaps are not wrong
-answers: `a6`/`a9`/`a10` land on unsupported rows, and the recurring blocker is
-the single-path loop-transition fragment — any loop body doing more than a
-trivial statement falls outside it. `a7` is the one genuine refutation of a
-program believed correct and is worth a look on its own.
+**Where lane A stood in that run.** 7 of 12 were as specified. The gaps were
+not wrong answers: `a6`/`a9`/`a10` landed on unsupported rows, and the recurring
+blocker was the single-path loop-transition fragment. `a7` was the one genuine
+refutation of a program believed correct and is worth a look on its own.
 
 **Two findings the battery produced that are worth more than its score:**
 
-1. *A false loop invariant is currently neither proved nor refuted* (`a8`). It
-   lands as `UserLoopContractUnsupported`. Not a false accept — strict policy
-   still fails the build — but the E4 surface has no working refutation control
-   until the fragment covers a two-statement body.
+1. *At that snapshot, a false loop invariant was neither proved nor refuted*
+   (`a8`). It landed as `UserLoopContractUnsupported`. This is resolved in the
+   current fixture: both transition bodies are modeled and the bad initiation
+   and bad consecution are genuinely refuted, so `a8` is again an ordinary
+   negative control. The next sealed run will update the scorecard.
 2. *A fragment gap does not stay contained* (`a12`). When the invariant is
    unmodelled, the obligations depending on it are reported **FAILED**, not
    unknown: binary search's `xs[mid]` is refuted even though `mid < hi <=

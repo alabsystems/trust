@@ -396,9 +396,17 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let cast = root.join("fixtures/census-rung2-2026-07-07/cast");
         let rp = root.join("fixtures/census-m6-cleankernel-2026-07-08/real-partial");
+        // Trust (2026-07-29 ladder re-freeze): the `cast` rows are re-keyed to
+        // the crate-root-qualified `def_path` the current producer emits
+        // (`<Error as core::clone::Clone>::clone` →
+        // `<lib::Error as core::clone::Clone>::clone`, filename convention
+        // `def_path.replace("::","__") + ".json"` following it). The
+        // `real-partial` rows are a DIFFERENT corpus that was not re-frozen and
+        // keep their spelling. Both arrays open with `unwrap_or_else(panic!)`,
+        // never a fallible skip — a rename must FAIL here, not go quiet.
         let accepted = [
-            (cast.join("<Error as core__clone__Clone>__clone.json"), true),
-            (cast.join("<Error as core__cmp__PartialEq>__eq.json"), false),
+            (cast.join("<lib__Error as core__clone__Clone>__clone.json"), true),
+            (cast.join("<lib__Error as core__cmp__PartialEq>__eq.json"), false),
         ];
         let declined = [
             rp.join("<cert__metadata__TrustLevel as std__clone__Clone>__clone.json"),
@@ -515,14 +523,18 @@ mod tests {
             }
         }
         assert!(parsed > 0, "required legacy corpora unexpectedly contained no JSON rows");
+        // Trust (2026-07-29 ladder re-freeze): re-keyed to the crate-root-qualified
+        // `def_path` spelling. The ALLOWLIST IS UNCHANGED IN CONTENT — still
+        // exactly the two migrated `cast` `Error` operations, still nothing from
+        // the two historical `variants: []` corpora. Only the spelling moved.
         assert_eq!(
             got_clone,
-            BTreeSet::from(["<Error as core::clone::Clone>::clone".to_owned()]),
+            BTreeSet::from(["<lib::Error as core::clone::Clone>::clone".to_owned()]),
             "fieldless clone recognizer accepted an unexpected corpus row",
         );
         assert_eq!(
             got_eq,
-            BTreeSet::from(["<Error as core::cmp::PartialEq>::eq".to_owned()]),
+            BTreeSet::from(["<lib::Error as core::cmp::PartialEq>::eq".to_owned()]),
             "fieldless eq recognizer accepted an unexpected corpus row",
         );
     }

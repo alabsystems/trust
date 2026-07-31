@@ -56,7 +56,7 @@ fn two_recursive_calls_with_decreases() -> VerifiableFunction {
         contracts: vec![Contract {
             kind: ContractKind::Decreases,
             span: contract_span,
-            body: "n".to_string(),
+            body: "__trust_lowered_compiler_contract__:n".to_string(),
         }],
         preconditions: Vec::new(),
         postconditions: Vec::new(),

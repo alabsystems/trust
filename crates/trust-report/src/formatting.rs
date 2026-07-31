@@ -333,9 +333,9 @@ pub fn proof_evidence_label(strength: &ProofStrength) -> String {
 /// Human-readable multi-axis proof label with the exact clause monitor status
 /// attached to the independent executability axis.
 ///
-/// Static proof and runtime executability are deliberately orthogonal.  In
-/// particular, a proved E4 loop invariant remains `execution=unmonitored`
-/// until per-iteration placement itself is certified.
+/// Static proof and runtime executability are deliberately orthogonal. A
+/// clause can be statically proved yet explicitly unmonitored, or carry a
+/// distinct E5 `measured` evaluator/placement record.
 pub fn proof_evidence_label_with_monitor(
     strength: &ProofStrength,
     monitor: Option<&TransportMonitorEvidence>,
@@ -387,6 +387,7 @@ pub fn proof_evidence_label_with_monitor(
     };
     let execution = match grade.executability {
         Executability::Monitored => "monitored",
+        Executability::Measured => "measured",
         Executability::Unmonitored => "unmonitored",
         Executability::Unrecorded => "unrecorded",
         _ => "unknown",
@@ -413,6 +414,7 @@ pub fn monitor_evidence_label(monitor: &TransportMonitorEvidence) -> String {
 pub fn monitor_executability_label(monitor: &TransportMonitorEvidence) -> &'static str {
     match monitor.status.executability() {
         Executability::Monitored => "monitored",
+        Executability::Measured => "measured",
         Executability::Unmonitored => "unmonitored",
         Executability::Unrecorded => "unrecorded",
         _ => "unknown",
@@ -436,10 +438,10 @@ mod multi_axis_grade_output_tests {
     }
 
     #[test]
-    fn e4_static_proof_reports_explicitly_unmonitored_execution() {
+    fn unmatched_e4_row_reports_explicitly_unmonitored_execution() {
         let monitor = TransportMonitorEvidence {
             status: TransportMonitorStatus::Unmonitored,
-            reason: "per-iteration loop-invariant monitor placement is not certified".into(),
+            reason: "no kernel-certified loop monitor evidence matched this row".into(),
             predicate_digest: format!("sha256:{}", "e".repeat(64)),
         };
         let label = proof_evidence_label_with_monitor(&ProofStrength::inductive(), Some(&monitor));
@@ -447,6 +449,20 @@ mod multi_axis_grade_output_tests {
         assert!(label.contains("INDUCTIVE"));
         assert!(label.contains("execution=unmonitored"));
         assert!(!label.contains("execution=monitored"));
+    }
+
+    #[test]
+    fn e5_scalar_binding_reports_measured_not_boolean_monitored() {
+        let measure = TransportMonitorEvidence {
+            status: TransportMonitorStatus::Measured,
+            reason: "kernel-bound scalar plus authenticated transition placement".into(),
+            predicate_digest: format!("sha256:{}", "f".repeat(64)),
+        };
+        let label = proof_evidence_label_with_monitor(&ProofStrength::inductive(), Some(&measure));
+
+        assert!(label.contains("execution=measured"));
+        assert_eq!(monitor_executability_label(&measure), "measured");
+        assert!(monitor_evidence_label(&measure).contains("executability: measured"));
     }
 }
 

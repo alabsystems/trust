@@ -14,8 +14,10 @@ The battery's integrity rests on two rules:
    is not evidence about verification — it is a broken test that would
    otherwise read as a pass. Those are reported as `reject-wrong-reason` and
    count as failures of the battery, not successes of the compiler.
-2. Nothing is scored from a stale toolchain. The trustc version stamp embeds
-   the superproject HEAD; the runner records both and flags a mismatch.
+2. Nothing is scored from a stale or unsealed toolchain. The trustc version
+   stamp embeds the superproject HEAD; the runner requires an exact match plus
+   a clean superproject and exact submodule pins before writing canonical
+   results.
 
 Usage:
     python3 tests/two-language-battery/run.py [--filter PAT] [--output FILE]
@@ -24,16 +26,123 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
+
+
+@lru_cache(maxsize=1)
+def _trustc_path() -> Path:
+    """Resolve the one physical stage2 trustc used by every battery lane.
+
+    Relative explicit paths are interpreted against the repository root, not
+    the caller's current directory. Without an override, ask rustup for the
+    physical binary once; Tippy is always its sibling.
+    """
+    explicit = os.environ.get("TRUST_PROBE_TRUSTC")
+    if explicit:
+        path = Path(explicit)
+        if not path.is_absolute():
+            path = REPO_ROOT / path
+    else:
+        rustup = shutil.which("rustup")
+        if rustup is None:
+            fallback = Path.home() / ".cargo" / "bin" / "rustup"
+            rustup = str(fallback) if fallback.is_file() else None
+        if rustup is None:
+            raise RuntimeError(
+                "cannot resolve the trust toolchain: rustup is not on PATH and "
+                "TRUST_PROBE_TRUSTC is unset"
+            )
+        resolved = subprocess.run(
+            [rustup, "which", "--toolchain", "trust", "trustc"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=REPO_ROOT,
+        )
+        if resolved.returncode != 0 or not resolved.stdout.strip():
+            detail = resolved.stderr.strip() or f"exit {resolved.returncode}"
+            raise RuntimeError(f"rustup could not resolve trustc: {detail}")
+        path = Path(resolved.stdout.strip())
+
+    try:
+        path = path.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"cannot resolve measured trustc {path}: {exc}") from exc
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise RuntimeError(f"measured trustc is not a regular executable: {path}")
+    return path
+
+
+def _tippy_path() -> Path:
+    direct = _trustc_path().parent / "tippy-driver"
+    if not direct.is_file() or not os.access(direct, os.X_OK):
+        raise RuntimeError(
+            "the measured trustc stage2 directory has no regular executable "
+            f"tippy-driver sibling: {direct}"
+        )
+    return direct
+
+
+def _trustc_cmd() -> list[str]:
+    return [str(_trustc_path())]
+
+
+def _tippy_cmd() -> list[str]:
+    return [str(_tippy_path())]
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
 
 BATTERY_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BATTERY_DIR.parent.parent
+
+CANONICAL_FIXTURES = {
+    "lane-a-rust/a10_saturating_fold.rs": ("A-rust", "pass", "trustc"),
+    "lane-a-rust/a11_FRONTIER_rem_measure.rs": ("A-rust", "frontier", "trustc"),
+    "lane-a-rust/a12_FRONTIER_multipath_loop.rs": ("A-rust", "frontier", "trustc"),
+    "lane-a-rust/a1_saturating_accumulator.rs": ("A-rust", "pass", "trustc"),
+    "lane-a-rust/a2_ring_index.rs": ("A-rust", "pass", "trustc"),
+    "lane-a-rust/a3_NEG_false_ensures.rs": ("A-rust", "reject", "trustc"),
+    "lane-a-rust/a4_gcd_decreases.rs": ("A-rust", "pass", "trustc"),
+    "lane-a-rust/a5_NEG_no_descent.rs": ("A-rust", "reject", "trustc"),
+    "lane-a-rust/a6_binary_search_loop.rs": ("A-rust", "pass", "trustc"),
+    "lane-a-rust/a7_checked_arith.rs": ("A-rust", "pass", "trustc"),
+    "lane-a-rust/a8_NEG_wrong_invariant.rs": ("A-rust", "reject", "trustc"),
+    "lane-a-rust/a9_bounds_safety.rs": ("A-rust", "pass", "trustc"),
+    "lane-b-lean/b1_arith_lemmas.rs": ("B-lean", "pass", "trustc"),
+    "lane-b-lean/b2_NEG_bad_proof.rs": ("B-lean", "reject", "trustc"),
+    "lane-b-lean/b3_library_composition.rs": ("B-lean", "pass", "trustc"),
+    "lane-b-lean/b4_bool_reasoning.rs": ("B-lean", "pass", "trustc"),
+    "lane-c-combo/c1_cited_min2.rs": ("C-combo", "pass", "trustc"),
+    "lane-c-combo/c2_uncited_defeq.rs": ("C-combo", "pass", "trustc"),
+    "lane-c-combo/c3_NEG_divergent_defeq.rs": ("C-combo", "reject", "trustc"),
+    "lane-c-combo/c4_island_in_requires.rs": ("C-combo", "frontier", "trustc"),
+    "lane-c-combo/c5_NEG_wrong_citation.rs": ("C-combo", "reject", "trustc"),
+    "lane-c-combo/c6_readable_select.rs": ("C-combo", "pass", "trustc"),
+    "lane-d-legacy/d1_kani_contracts.rs": ("D-legacy", "tippy-emits-lean", "tippy"),
+    "lane-d-legacy/d2_kani_nondet.rs": ("D-legacy", "tippy-emits-lean", "tippy"),
+    "lane-e-ir-spine/e1_both_languages_in_ir.rs": (
+        "E-ir-spine",
+        "ir-carries-both-languages",
+        "trustc",
+    ),
+}
 
 DIRECTIVE_RE = re.compile(r"^//@\s*(battery-[a-z-]+)\s*:\s*(.*?)\s*$", re.MULTILINE)
 
@@ -110,30 +219,107 @@ def diagnostic_prose(stderr: str) -> str:
 LEAN_EMISSION_MARKERS = ("clean {", "clean{", "theorem ", ":= fun", "rfl")
 
 
+def is_toolchain_sealed(stamp: dict) -> bool:
+    return (
+        stamp.get("rustc_vV_exit_code") == 0
+        and stamp.get("toolchain_binary") == "trustc"
+        and stamp.get("trust_brand_present") is True
+        and stamp.get("trustc_sha256") is not None
+        and stamp.get("tippy_version_exit_code") == 0
+        and stamp.get("tippy_driver_sha256") is not None
+        and stamp.get("toolchain_matches_head") is True
+        and stamp.get("repo_clean") is True
+        and stamp.get("submodules_clean") is True
+    )
+
+
+def submodule_drift_lines(status_output: str) -> list[str]:
+    return [
+        line
+        for line in status_output.splitlines()
+        if line.startswith(("+", "-", "U"))
+    ]
+
+
 def toolchain_stamp() -> dict:
-    """Record which compiler produced these results, and whether it is HEAD."""
+    """Record and validate the exact checkout/compiler identity."""
     out = {}
     try:
+        trustc = _trustc_path()
+        out["trustc_sha256"] = _sha256_file(trustc)
         v = subprocess.run(
-            ["rustup", "run", "trust", "rustc", "-vV"],
+            [str(trustc), "-vV"],
             capture_output=True, text=True, timeout=60, cwd=REPO_ROOT,
         )
+        out["rustc_vV_exit_code"] = v.returncode
         out["rustc_vV"] = v.stdout.strip()
-        m = re.search(r"commit-hash:\s*([0-9a-f]+)", v.stdout)
+        m = re.search(r"commit-hash:\s*([0-9a-f]{40})", v.stdout)
         out["toolchain_commit"] = m.group(1) if m else None
+        binary = re.search(r"^binary:\s*(\S+)\s*$", v.stdout, re.MULTILINE)
+        out["toolchain_binary"] = binary.group(1) if binary else None
+        out["trust_brand_present"] = bool(
+            re.search(r"^trust:\s*\S+\s*$", v.stdout, re.MULTILINE)
+        )
+        if v.returncode != 0:
+            out["rustc_vV_error"] = v.stderr.strip() or f"exit {v.returncode}"
     except Exception as exc:  # noqa: BLE001 - recorded, not raised
         out["rustc_vV_error"] = str(exc)
         out["toolchain_commit"] = None
+        out["trustc_sha256"] = None
 
-    head = subprocess.run(
+    try:
+        tippy = _tippy_path()
+        out["tippy_driver_sha256"] = _sha256_file(tippy)
+        tippy_version = subprocess.run(
+            [str(tippy), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=REPO_ROOT,
+        )
+        out["tippy_version_exit_code"] = tippy_version.returncode
+        out["tippy_version"] = next(
+            (line.strip() for line in tippy_version.stdout.splitlines() if line.strip()),
+            None,
+        )
+    except Exception as exc:  # noqa: BLE001 - recorded, not raised
+        out["tippy_version_error"] = str(exc)
+        out["tippy_version_exit_code"] = None
+        out["tippy_driver_sha256"] = None
+
+    head_proc = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         capture_output=True, text=True, cwd=REPO_ROOT,
-    ).stdout.strip()
+    )
+    head = head_proc.stdout.strip() if head_proc.returncode == 0 else ""
     out["repo_head"] = head
+    if head_proc.returncode != 0:
+        out["repo_head_error"] = head_proc.stderr.strip() or f"exit {head_proc.returncode}"
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        capture_output=True, text=True, cwd=REPO_ROOT,
+    )
+    out["repo_clean"] = status.returncode == 0 and not status.stdout
+    if status.returncode != 0:
+        out["repo_status_error"] = status.stderr.strip() or f"exit {status.returncode}"
+
+    submodules = subprocess.run(
+        ["git", "submodule", "status", "--recursive"],
+        capture_output=True, text=True, cwd=REPO_ROOT,
+    )
+    drift = submodule_drift_lines(submodules.stdout)
+    out["submodules_clean"] = submodules.returncode == 0 and not drift
+    if drift:
+        out["submodule_drift"] = drift
+    if submodules.returncode != 0:
+        out["submodule_status_error"] = (
+            submodules.stderr.strip() or f"exit {submodules.returncode}"
+        )
 
     tc = out.get("toolchain_commit")
     if tc and head:
-        out["toolchain_matches_head"] = head.startswith(tc) or tc.startswith(head[:len(tc)])
+        out["toolchain_matches_head"] = tc == head
         if not out["toolchain_matches_head"]:
             behind = subprocess.run(
                 ["git", "rev-list", "--count", f"{tc}..HEAD"],
@@ -142,11 +328,156 @@ def toolchain_stamp() -> dict:
             out["toolchain_commits_behind_head"] = behind or None
     else:
         out["toolchain_matches_head"] = None
+    out["toolchain_sealed"] = is_toolchain_sealed(out)
     return out
+
+
+def same_measurement_identity(before: dict, after: dict) -> bool:
+    """Whether the checkout/compiler identity stayed fixed for the whole run."""
+    fields = (
+        "rustc_vV_exit_code",
+        "rustc_vV",
+        "trustc_sha256",
+        "toolchain_commit",
+        "toolchain_binary",
+        "trust_brand_present",
+        "tippy_version_exit_code",
+        "tippy_version",
+        "tippy_driver_sha256",
+        "repo_head",
+        "repo_clean",
+        "submodules_clean",
+        "submodule_drift",
+        "toolchain_matches_head",
+        "toolchain_sealed",
+    )
+    return all(before.get(field) == after.get(field) for field in fields)
 
 
 def parse_directives(text: str) -> dict:
     return {k: v for k, v in DIRECTIVE_RE.findall(text)}
+
+
+def validate_fixture_directives(path: Path, text: str) -> tuple[str, str, str]:
+    pairs = DIRECTIVE_RE.findall(text)
+    known = {
+        "battery-expect",
+        "battery-flags",
+        "battery-ir-lean-marker",
+        "battery-ir-rust-marker",
+        "battery-lane",
+        "battery-tool",
+    }
+    unknown = sorted({key for key, _ in pairs} - known)
+    if unknown:
+        raise RuntimeError(f"{path}: unknown battery directive(s): {', '.join(unknown)}")
+
+    counts = {key: sum(1 for found, _ in pairs if found == key) for key in known}
+    for required in ("battery-lane", "battery-expect", "battery-flags"):
+        if counts[required] != 1:
+            raise RuntimeError(
+                f"{path}: expected exactly one {required}, found {counts[required]}"
+            )
+    for optional in known - {"battery-lane", "battery-expect", "battery-flags"}:
+        if counts[optional] > 1:
+            raise RuntimeError(f"{path}: duplicate {optional} directive")
+
+    directives = dict(pairs)
+    return (
+        directives["battery-lane"],
+        directives["battery-expect"],
+        directives.get("battery-tool", "trustc"),
+    )
+
+
+def capture_fixture_inventory(files: list[Path], canonical: bool) -> dict[Path, bytes]:
+    actual = {}
+    captured = {}
+    for path in files:
+        if canonical and path.is_symlink():
+            raise RuntimeError(f"canonical battery fixture must not be a symlink: {path}")
+        try:
+            relative = path.relative_to(BATTERY_DIR).as_posix()
+            contents = path.read_bytes()
+            text = contents.decode("utf-8")
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise RuntimeError(f"cannot read battery fixture {path}: {exc}") from exc
+        if relative in actual:
+            raise RuntimeError(f"duplicate battery fixture path: {relative}")
+        actual[relative] = validate_fixture_directives(path, text)
+        captured[path] = contents
+
+    if canonical and actual != CANONICAL_FIXTURES:
+        missing = sorted(CANONICAL_FIXTURES.keys() - actual.keys())
+        extra = sorted(actual.keys() - CANONICAL_FIXTURES.keys())
+        changed = sorted(
+            path
+            for path in CANONICAL_FIXTURES.keys() & actual.keys()
+            if CANONICAL_FIXTURES[path] != actual[path]
+        )
+        detail = []
+        if missing:
+            detail.append(f"missing={missing}")
+        if extra:
+            detail.append(f"extra={extra}")
+        if changed:
+            detail.append(f"directive_mismatch={changed}")
+        raise RuntimeError(
+            "canonical battery inventory differs from the reviewed 25-fixture "
+            f"manifest: {'; '.join(detail)}"
+        )
+    return captured
+
+
+def fixture_snapshot(captured: dict[Path, bytes]) -> str:
+    digest = hashlib.sha256()
+    for path, contents in captured.items():
+        relative = path.relative_to(BATTERY_DIR).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(len(contents).to_bytes(8, "big"))
+        digest.update(contents)
+    return digest.hexdigest()
+
+
+def validate_output_policy(
+    filter_pat: str | None,
+    output: Path,
+    canonical_output: Path,
+    explicit_trustc: bool,
+) -> None:
+    if filter_pat and output == canonical_output:
+        raise ValueError(
+            "--filter requires a non-canonical --output; refusing to truncate "
+            "results.json"
+        )
+    if output == canonical_output and not explicit_trustc:
+        raise ValueError(
+            "canonical results require TRUST_PROBE_TRUSTC to name the exact "
+            "stage2 trustc; this also binds Tippy to the sibling driver"
+        )
+
+
+def write_scorecard_atomic(output: Path, document: dict) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output_mode = output.stat().st_mode & 0o777 if output.exists() else 0o644
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), output_mode)
+            json.dump(document, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, output)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def discover(filter_pat: str | None) -> list[Path]:
@@ -220,8 +551,9 @@ def classify_failure(stderr: str) -> str:
     return "unclassified"
 
 
-def run_one(path: Path, timeout: int) -> dict:
-    text = path.read_text(encoding="utf-8", errors="replace")
+def run_one(path: Path, timeout: int, source_path: Path | None = None) -> dict:
+    measured_source = source_path or path
+    text = measured_source.read_text(encoding="utf-8")
     d = parse_directives(text)
     expect = d.get("battery-expect", "pass")
     lane = d.get("battery-lane", "unknown")
@@ -237,24 +569,23 @@ def run_one(path: Path, timeout: int) -> dict:
     }
 
     with tempfile.TemporaryDirectory(prefix="two-lang-battery-") as td:
-        # The rustup `trust` toolchain is a SYMLINK to build/host/stage2, and
-        # the branded frontend-identity check refuses a toolchain directory
-        # that traverses a symlink ("invalid branded Tippy driver identity").
-        # Invoke the real binary directly so lane D measures the lint rather
-        # than the launcher.
         if tool == "tippy":
-            # .resolve() matters twice over: `build/host` is itself a symlink
-            # to `build/<triple>`, and the identity check rejects ANY symlink
-            # in the toolchain path, not just the rustup one.
-            direct = (REPO_ROOT / "build" / "host" / "stage2" / "bin" / "tippy-driver").resolve()
-            cmd = [str(direct)] if direct.exists() else ["rustup", "run", "trust", "tippy-driver"]
+            cmd = _tippy_cmd()
         else:
-            cmd = ["rustup", "run", "trust", "trustc"]
+            cmd = _trustc_cmd()
 
         # `-Ztrust-dump=ir:` with the direct TrustIr frontend requires an
         # explicit crate name; harmless everywhere else, so it is unconditional.
         crate_name = re.sub(r"[^A-Za-z0-9_]", "_", path.stem)
-        cmd += [str(path), "--edition", "2021", "--crate-name", crate_name, "--out-dir", td] + flags
+        cmd += [
+            str(measured_source),
+            "--edition",
+            "2021",
+            "--crate-name",
+            crate_name,
+            "--out-dir",
+            td,
+        ] + flags
 
         ir_dir = None
         if expect == "ir-carries-both-languages":
@@ -269,7 +600,12 @@ def run_one(path: Path, timeout: int) -> dict:
         # STORED copies are normalized — classification below runs on the raw
         # `_full_*` streams, so verdicts are unaffected.
         def portable(s: str) -> str:
-            return s.replace(str(REPO_ROOT), "<repo>").replace(td, "<tmp>")
+            authored = f"<repo>/{rec['file']}"
+            return (
+                s.replace(str(measured_source), authored)
+                .replace(str(REPO_ROOT), "<repo>")
+                .replace(td, "<tmp>")
+            )
 
         rec["command"] = portable(" ".join(cmd))
         try:
@@ -321,7 +657,6 @@ def run_one(path: Path, timeout: int) -> dict:
     # scorecard for humans.
     stderr = rec.pop("_full_stderr", rec["stderr"])
     stdout = rec.pop("_full_stdout", rec["stdout"])
-    combined = (stdout + "\n" + stderr).lower()
     compiled = rec["exit_code"] == 0
 
     if expect == "pass":
@@ -402,11 +737,20 @@ def run_one(path: Path, timeout: int) -> dict:
             rec["battery_ok"] = False
 
     elif expect == "tippy-emits-lean":
-        emits_lean = any(m in combined for m in LEAN_EMISSION_MARKERS)
-        fired = "legacy" in combined or "spec_sugar" in combined or "spec sugar" in combined
+        tippy_prose = diagnostic_prose(stdout + "\n" + stderr)
+        emits_lean = any(m in tippy_prose for m in LEAN_EMISSION_MARKERS)
+        fired = (
+            "legacy" in tippy_prose
+            or "spec_sugar" in tippy_prose
+            or "spec sugar" in tippy_prose
+        )
         rec["lint_fired"] = fired
         rec["emits_lean"] = emits_lean
-        if emits_lean:
+        if not compiled:
+            rec["verdict"] = "tippy-compile-failed"
+            rec["failure_kind"] = classify_failure(stderr)
+            rec["battery_ok"] = False
+        elif emits_lean:
             rec["verdict"] = "tippy-emits-lean"
             rec["battery_ok"] = True
         elif fired:
@@ -428,26 +772,118 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument(
         "--output",
-        default=str(BATTERY_DIR / "results.json"),
-        help="Scorecard JSON path",
+        default=None,
+        help="Scorecard JSON path (default: canonical results.json for full runs)",
+    )
+    ap.add_argument(
+        "--allow-unsealed-toolchain",
+        action="store_true",
+        help=(
+            "permit an exploratory run with a stale/dirty toolchain; requires "
+            "a non-canonical --output"
+        ),
     )
     args = ap.parse_args()
 
+    canonical_output = (BATTERY_DIR / "results.json").resolve()
+    output = Path(args.output).resolve() if args.output else canonical_output
+    try:
+        validate_output_policy(
+            args.filter,
+            output,
+            canonical_output,
+            bool(os.environ.get("TRUST_PROBE_TRUSTC")),
+        )
+    except ValueError as exc:
+        ap.error(str(exc))
+
+    canonical_run = output == canonical_output
+    files = discover(args.filter)
+    if not files:
+        print("ERROR: battery selection contains no Rust fixtures", file=sys.stderr)
+        return 2
+    try:
+        captured = capture_fixture_inventory(files, canonical_run)
+        captured_digest = fixture_snapshot(captured)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if canonical_run:
+        expected_stage2_bin = (REPO_ROOT / "build" / "host" / "stage2" / "bin").resolve()
+        try:
+            measured_stage2_bin = _trustc_path().parent
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        if measured_stage2_bin != expected_stage2_bin:
+            print(
+                "ERROR: canonical results must use this checkout's physical "
+                f"stage2 bin directory ({expected_stage2_bin}), got "
+                f"{measured_stage2_bin}",
+                file=sys.stderr,
+            )
+            return 2
+
     stamp = toolchain_stamp()
-    if stamp.get("toolchain_matches_head") is False:
+    if stamp.get("toolchain_sealed") is not True:
+        reasons = []
+        if stamp.get("rustc_vV_exit_code") != 0:
+            reasons.append("trustc -vV did not exit successfully")
+        if stamp.get("toolchain_binary") != "trustc":
+            reasons.append("version stamp is not branded as binary: trustc")
+        if stamp.get("trust_brand_present") is not True:
+            reasons.append("version stamp has no Trust brand")
+        if stamp.get("trustc_sha256") is None:
+            reasons.append("trustc binary identity is unavailable")
+        if stamp.get("tippy_version_exit_code") != 0:
+            reasons.append("sibling tippy-driver --version did not exit successfully")
+        if stamp.get("tippy_driver_sha256") is None:
+            reasons.append("Tippy binary identity is unavailable")
+        if stamp.get("toolchain_matches_head") is not True:
+            reasons.append(
+                "toolchain commit does not exactly match HEAD"
+                + (
+                    f" ({stamp.get('toolchain_commits_behind_head')} commits behind)"
+                    if stamp.get("toolchain_commits_behind_head")
+                    else ""
+                )
+            )
+        if stamp.get("repo_clean") is not True:
+            reasons.append("superproject worktree is dirty or unreadable")
+        if stamp.get("submodules_clean") is not True:
+            reasons.append("submodule pins are dirty, missing, or drifted")
+        detail = "; ".join(reasons)
+        if not args.allow_unsealed_toolchain:
+            print(f"ERROR: refusing unsealed battery run: {detail}", file=sys.stderr)
+            return 2
+        if output == canonical_output:
+            print(
+                "ERROR: --allow-unsealed-toolchain requires a non-canonical "
+                "--output; refusing to overwrite results.json",
+                file=sys.stderr,
+            )
+            return 2
         print(
-            f"WARNING: toolchain is {stamp.get('toolchain_commits_behind_head')} "
-            f"commits behind HEAD — results are about the OLD compiler.",
+            f"WARNING: exploratory unsealed run: {detail}",
             file=sys.stderr,
         )
 
-    files = discover(args.filter)
     results = []
-    for p in files:
-        rec = run_one(p, args.timeout)
-        results.append(rec)
-        flag = "ok " if rec.get("battery_ok") else "BAD"
-        print(f"[{flag}] {rec['lane']:9s} {rec['verdict']:26s} {rec['file']}")
+    with tempfile.TemporaryDirectory(prefix="two-lang-battery-input-") as snapshot_dir:
+        snapshot_root = Path(snapshot_dir)
+        measured_paths = {}
+        for path, contents in captured.items():
+            measured = snapshot_root / path.relative_to(BATTERY_DIR)
+            measured.parent.mkdir(parents=True, exist_ok=True)
+            measured.write_bytes(contents)
+            measured.chmod(0o444)
+            measured_paths[path] = measured
+
+        for path in files:
+            rec = run_one(path, args.timeout, measured_paths[path])
+            results.append(rec)
+            flag = "ok " if rec.get("battery_ok") else "BAD"
+            print(f"[{flag}] {rec['lane']:9s} {rec['verdict']:26s} {rec['file']}")
 
     by_lane: dict[str, dict[str, int]] = {}
     for r in results:
@@ -465,13 +901,71 @@ def main() -> int:
         "by_lane": by_lane,
     }
 
+    # D and E are explicit target-spec measurements. Their one known,
+    # fail-closed current verdict is permitted alongside the target actually
+    # closing; every other result in those lanes is a regression. All A/B/C
+    # rows must satisfy their per-file directive.
+    permitted_target_verdicts = {
+        "D-legacy": {"tippy-fires-but-no-lean", "tippy-emits-lean"},
+        "E-ir-spine": {"ir-rust-only", "ir-carries-both-languages"},
+    }
+    blocking = []
+    for rec in results:
+        permitted = permitted_target_verdicts.get(rec["lane"])
+        if permitted is not None:
+            bad = rec.get("verdict") not in permitted
+        else:
+            bad = rec.get("battery_ok") is not True
+        if bad:
+            blocking.append({"file": rec["file"], "verdict": rec.get("verdict")})
+    summary["blocking_failures"] = len(blocking)
+    summary["blocking_rows"] = blocking
+
+    # Recheck after every compiler invocation and before creating the
+    # scorecard. This detects a concurrent pull/edit/submodule move or stage2
+    # replacement with a different version stamp; mixed-identity rows never
+    # reach even a scratch output.
+    final_stamp = toolchain_stamp()
+    if not same_measurement_identity(stamp, final_stamp):
+        print(
+            "ERROR: checkout or compiler identity changed during the battery; "
+            "discarding mixed-identity results",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        final_files = discover(args.filter)
+        final_captured = capture_fixture_inventory(final_files, canonical_run)
+        final_digest = fixture_snapshot(final_captured)
+    except RuntimeError as exc:
+        print(f"ERROR: postflight fixture audit failed: {exc}", file=sys.stderr)
+        return 2
+    if [path.relative_to(BATTERY_DIR) for path in final_files] != [
+        path.relative_to(BATTERY_DIR) for path in files
+    ] or final_digest != captured_digest:
+        print(
+            "ERROR: battery fixture inventory or content changed during the run; "
+            "discarding results",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.allow_unsealed_toolchain and final_stamp.get("toolchain_sealed") is not True:
+        print(
+            "ERROR: toolchain lost its sealed identity during the battery; "
+            "discarding results",
+            file=sys.stderr,
+        )
+        return 2
+    stamp["end_identity_revalidated"] = True
+    stamp["fixture_manifest_sha256"] = captured_digest
+
     doc = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "toolchain": stamp,
         "summary": summary,
         "results": results,
     }
-    Path(args.output).write_text(json.dumps(doc, indent=2), encoding="utf-8")
+    write_scorecard_atomic(output, doc)
 
     print()
     print(f"battery: {summary['ok']}/{summary['total']} as specified")
@@ -484,11 +978,16 @@ def main() -> int:
             f"  !! rejected for the wrong reason: {summary['reject_wrong_reason']} "
             "(battery integrity)"
         )
-    print(f"scorecard: {args.output}")
+    if blocking:
+        print(f"  !! blocking semantic rows: {len(blocking)}")
+        for row in blocking:
+            print(f"     {row['verdict']}: {row['file']}")
+    print(f"scorecard: {output}")
 
-    # Exit non-zero ONLY on soundness breaks or broken controls; a documented
-    # unimplemented lane (lane D) is a measurement, not a runner error.
-    return 1 if (summary["false_accepts"] or summary["reject_wrong_reason"]) else 0
+    # Known D/E target measurements are non-blocking; every other row must
+    # satisfy its directive. Staleness and partial-canonical runs have already
+    # been rejected before execution.
+    return 1 if blocking else 0
 
 
 if __name__ == "__main__":

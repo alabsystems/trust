@@ -1333,7 +1333,11 @@ fn prepare_source_tarball<'a>(builder: &'a Builder<'a>, name: &str) -> Tarball<'
     let mut tarball = Tarball::new(builder, "trust", name);
     tarball.permit_symlinks(true);
     let plain_dst_src = tarball.image_dir();
-    let source_exclude_dirs = ["targo-trust/target"];
+    // Trust: `first-party/trust` is a developer-convenience symlink back to the
+    // superproject root (`first-party/trust -> ..`), not a submodule — it is absent
+    // from `.gitmodules` and from the root workspace's member list. Copying it would
+    // plant a self-referential symlink at the top of the source tarball.
+    let source_exclude_dirs = ["targo-trust/target", "first-party/trust"];
 
     // This is the set of root paths which will become part of the source package
     let src_files = [
@@ -1356,7 +1360,27 @@ fn prepare_source_tarball<'a>(builder: &'a Builder<'a>, name: &str) -> Tarball<'
     ];
     // Trust: `crates`, `targo-trust`, and `LICENSES` are Trust-owned trees that must
     // reach the source tarball alongside the inherited ones.
-    let src_dirs = ["src", "compiler", "library", "tests", "crates", "targo-trust", "LICENSES"];
+    //
+    // `first-party` and `vendor` are load-bearing for *resolution*, not just for the
+    // eventual build. The nine `first-party/*` submodules are `exclude`d from the root
+    // workspace (each is its own workspace), but the root, `crates/` and `targo-trust/`
+    // manifests all carry `[patch.*]` tables that redirect the sibling Git sources to
+    // `path =` targets under `first-party/` and `vendor/`, so `crates/*` members reach
+    // them as ordinary path dependencies. Without those trees the `cargo vendor` run
+    // below cannot even load the graph ("failed to load manifest for dependency
+    // `trust-ir`"). Nothing else materializes them: `build.submodules = false` is
+    // deliberate in this fork, so the tarball contains exactly what is copied here.
+    let src_dirs = [
+        "src",
+        "compiler",
+        "library",
+        "tests",
+        "crates",
+        "targo-trust",
+        "first-party",
+        "vendor",
+        "LICENSES",
+    ];
 
     copy_src_dirs(builder, &builder.src, &src_dirs, &source_exclude_dirs, plain_dst_src);
 

@@ -3262,18 +3262,22 @@ const MAX_RECHECKABLE_MUL_WIDTH: u32 = 8;
 /// native-stack limit; it is a practical TIME+MEMORY budget for an in-gate
 /// re-check.
 ///
-/// MEASURED post-trampoline on the gate's EXACT emitted shapes (release, serial,
+/// MEASURED post-trampoline on the then-pinned emitted shapes (release, serial,
 /// `/usr/bin/time -l`, via the real `try_kernel_recheckable_proof` path with the
-/// frontier raised; each kernel-re-checked to `Unsat3` with ZERO domain axioms,
-/// EXIT=0, no overflow/OOM):
+/// frontier raised; each measured row kernel-re-checked to `Unsat3` with ZERO
+/// domain axioms, EXIT=0, no overflow/OOM):
 ///   * bitwise `and`/`or`/`xor` (no carry chain): 934 steps  -> ~8 s;
 ///   * `sext`: 164 steps;
 ///   * `slt`:  7326 steps -> 34 s @ 2.97 GB;   `sle`: 7717 -> 19 s @ 3.11 GB;
 ///   * `ult`:  7846 steps -> 38 s @ 3.02 GB;   `ule`: 8288 -> 17 s @ 3.18 GB;
 ///   * `eq`:   9677 steps -> 28 s @ 4.07 GB;
-///   * `add`: 11228 steps -> 65 s @ 3.93 GB;   `neg`: 11317 -> 42 s @ 4.05 GB;
+///   * `add`: current AY 0e35 shape is 17854 steps (`proof.validate()` green;
+///     the prior kernel time/memory measurement is stale and is not claimed);
+///     `neg`: 11317 -> 42 s @ 4.05 GB;
 ///   * `sub`: 19389 steps -> 101 s @ 4.96 GB  (the deepest carry/borrow chain).
-/// All re-check at < 5 GB — far under any reasonable memory ceiling (≤ ~24 GB).
+/// Every row with a cited current measurement re-checks at < 5 GB — far under
+/// any reasonable memory ceiling (≤ ~24 GB). No resource claim is made here
+/// for the current 17854-step add artifact.
 /// The barrel-shifter shapes — `shl`: 108825 steps, `lshr`: 129008 steps (~5.6–6.6×
 /// `sub`) — exceed this SLOW-path frontier. HISTORICAL NOTE: shifts USED to stay
 /// [VALIDATED] here. They are now KERNEL-[PROVED] via the O(1) coercion-identity
@@ -3293,14 +3297,15 @@ const MAX_RECHECKABLE_MUL_WIDTH: u32 = 8;
 /// HISTORY + CURRENT MEANING (ledger #21-CORRECTION + #23): this was briefly 20480
 /// (an over-claim — the deep ops then STACK-OVERFLOWED a 256 MiB re-check; retracted
 /// to 2048). The STACK barrier is now FIXED (clean `get_nat_bignat_whnf` succ-peeling
-/// iterativized, clean pin ≥ b0af96a7): the deep ops `slt`@7326 / `add`@11228 /
-/// `sub`@19389 VERIFIABLY kernel-re-check to `Unsat3` at the shipped 256 MiB stack
-/// with NO overflow/OOM (independently re-run on a fresh build). So this frontier is
-/// now a **TIME/MEMORY BUDGET, not a stack limit**: the deep re-checks are slow
-/// (slt ~45 s, add ~90 s, sub ~192 s @ 3–5 GB), impractical to run per-function on
-/// every routine compile, so the DEFAULT stays low (the fast shallow ops). The deep
-/// ops are `[PROVED]`-CAPABLE in dedicated measurement builds with a reviewed higher
-/// compiled value. 2048 covers the by-default-fast ops (and/or/xor @934,
+/// iterativized, clean pin ≥ b0af96a7): the measured `slt`@7326 and
+/// `sub`@19389 artifacts VERIFIABLY kernel-re-check to `Unsat3` at the shipped
+/// 256 MiB stack with NO overflow/OOM. AY 0e35's current `add` artifact is
+/// 17854 steps and passes the producer's structural `proof.validate()` gate;
+/// its exact full Clean re-check has not been resource-remeasured. This
+/// frontier is a **TIME/MEMORY BUDGET, not a stack limit**: the measured deep
+/// re-checks are slow (slt ~45 s, sub ~192 s @ 3–5 GB), impractical to run
+/// per-function on every routine compile, so the DEFAULT stays low (the fast
+/// shallow ops). 2048 covers the by-default-fast ops (and/or/xor @934,
 /// sext @164) with margin.
 #[cfg(feature = "kernel-recheck")]
 const MAX_RECHECKABLE_REFUTATION_STEPS: usize = 2048;
@@ -3868,12 +3873,13 @@ mod tests {
     //     succ-peeling recursion in the kernel (`get_nat_bignat_whnf`) overflowed the
     //     256 MiB re-check on the deep ops — so they were retracted to [VALIDATED].
     //     That residual recursion is now FIXED (clean `get_nat_bignat_whnf` iterativized,
-    //     clean pin ≥ b0af96a7). INDEPENDENTLY RE-VERIFIED on a fresh build: slt 7326,
-    //     add 11228, sub 19389 kernel-re-check to Unsat3 at the shipped 256 MiB stack
-    //     with NO overflow/OOM (the bracket slt..sub covers sle/ult/ule/eq/neg between).
-    //     They stay [VALIDATED] BY DEFAULT only because the re-check is SLOW (45–192 s),
-    //     above the 2048-step TIME budget — NOT a stack barrier. A dedicated measurement
-    //     build may raise the compiled frontier; these tests assert the production default
+    //     clean pin ≥ b0af96a7). INDEPENDENTLY RE-VERIFIED on a fresh build:
+    //     slt 7326 and sub 19389 kernel-re-check to Unsat3 at the shipped
+    //     256 MiB stack with NO overflow/OOM. AY 0e35's current add artifact is
+    //     17854 steps and passes `proof.validate()`; its prior full-kernel
+    //     resource measurement is stale. They stay [VALIDATED] BY DEFAULT
+    //     because the slow path exceeds the 2048-step TIME budget — NOT due to
+    //     a stack barrier. These tests assert the production default
     //     (declined → [VALIDATED]). ---
 
     #[cfg(feature = "kernel-recheck")]
@@ -7012,14 +7018,15 @@ mod tests {
     // feature the gate fails closed to [VALIDATED] (it will not rest [PROVED] on
     // ay's `validate()` alone). Run: `--features kernel-recheck`.
     /// `a + b` (i32) — B4 PROMOTION (the before/after evidence). The SLOW
-    /// SAT-reflection emits an 11228-step refutation, ABOVE the 2048-step frontier
-    /// (overflows the re-check stack) — so PRE-B4 add stayed [VALIDATED] (RETRACTION
-    /// #21). POST-B4 the O(1) structured-instantiation path discharges the REAL
+    /// SAT-reflection emits a 17854-step refutation on AY 0e35, ABOVE the
+    /// 2048-step production frontier — so PRE-B4 add stayed [VALIDATED]
+    /// (RETRACTION #21). POST-B4 the O(1) structured-instantiation path discharges the REAL
     /// add@32 obligation in the kernel FIRST (no SAT reflection), so add is now
     /// fast default-[PROVED] via `KernelInstantiated`. This test asserts the FLIP:
     /// `is_kernel_proved()` is now TRUE, and the grade is `KernelInstantiated`
     /// (NOT the slow `KernelRecheckable`, so `kernel_proof()` — the BvBlastProof
-    /// accessor — is still None). The frontier shape (clauses=1522, steps=11228)
+    /// accessor — is still None). The validated current frontier shape
+    /// (clauses=1522, steps=17854; no current full-kernel resource measurement)
     /// is the slow path the O(1) path REPLACES for add.
     #[cfg(feature = "kernel-recheck")]
     #[test]

@@ -100,6 +100,18 @@ impl Step for Vendor {
             let mut cmd = command(&builder.initial_cargo);
             cmd.arg("vendor");
 
+            // Trust: upstream treats `vendor/` as cargo's private output directory, so
+            // cargo is free to delete anything in it that is not in the current
+            // vendored set. In this fork `vendor/` is *also* where hand-vendored
+            // path-source trees live (`vendor/carcara_1_1_0`, `vendor/lean-core-oleans`,
+            // `vendor/rustc_version_0_4_1`), referenced by `[patch.*]` `path =` entries
+            // in the root, `crates/` and `targo-trust/` manifests. Cargo only spares a
+            // directory it resolved as a path source *exactly* — `vendor/carcara_1_1_0`
+            // is one level above its crate (`.../carcara`) and `vendor/lean-core-oleans`
+            // is data, not a crate — so the default prune would silently strip both from
+            // the source tarball. Keep them.
+            cmd.arg("--no-delete");
+
             if self.versioned_dirs {
                 cmd.arg("--versioned-dirs");
             }

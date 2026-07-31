@@ -18,7 +18,7 @@ use rustc_session::config::{
     LinkSelfContained, LinkerPluginLto, LocationDetail, LtoCli, MirIncludeSpans, NextSolverConfig,
     Offload, Options, OutFileName, OutputType, OutputTypes, PAuthKey, PacRet, Passes,
     PatchableFunctionEntry, Polonius, ProcMacroExecutionStrategy, Strip, SwitchWithOptPath,
-    SymbolManglingVersion, TrustPolicy, TrustVerify, TrustWitness, WasiExecModel,
+    SymbolManglingVersion, TrustIrLower, TrustPolicy, TrustVerify, TrustWitness, WasiExecModel,
     build_configuration, build_session_options, rustc_optgroups,
 };
 use rustc_session::lint::Level;
@@ -99,7 +99,7 @@ fn direct_interface_no_trust_evidence_policy_forces_off_and_rejects_outputs() {
     opts.unstable_opts.trust_verify = TrustVerify::On;
     apply_no_trust_evidence_typed_policy(&mut opts).unwrap();
     assert_eq!(opts.unstable_opts.trust_verify, TrustVerify::Off);
-    assert_eq!(opts.unstable_opts.trust_ir_lower, Some(false));
+    assert_eq!(opts.unstable_opts.trust_ir_lower, Some(TrustIrLower::Off));
 
     let mut custom_backend = Options::default();
     custom_backend.unstable_opts.codegen_backend = Some("custom-embedded-backend".to_string());
@@ -109,7 +109,7 @@ fn direct_interface_no_trust_evidence_policy_forces_off_and_rejects_outputs() {
         Some("custom-embedded-backend"),
     );
     assert_eq!(custom_backend.unstable_opts.trust_verify, TrustVerify::Off);
-    assert_eq!(custom_backend.unstable_opts.trust_ir_lower, Some(false));
+    assert_eq!(custom_backend.unstable_opts.trust_ir_lower, Some(TrustIrLower::Off),);
 
     let mut llvm_plugin = Options::default();
     llvm_plugin.unstable_opts.llvm_plugins.push("/tmp/plugin".to_string());
@@ -131,7 +131,7 @@ fn direct_interface_no_trust_evidence_policy_forces_off_and_rejects_outputs() {
     assert_eq!(no_trust_evidence_typed_backend_control(&llvm_args), Some("-Cllvm-args"),);
 
     let mut lowering = Options::default();
-    lowering.unstable_opts.trust_ir_lower = Some(true);
+    lowering.unstable_opts.trust_ir_lower = Some(TrustIrLower::On);
     assert_eq!(
         apply_no_trust_evidence_typed_policy(&mut lowering),
         Err("-Ztrust-ir-lower".to_string()),
@@ -139,10 +139,7 @@ fn direct_interface_no_trust_evidence_policy_forces_off_and_rejects_outputs() {
 
     let mut output = Options::default();
     output.unstable_opts.trust_dump.ir = Some(PathBuf::from("must-not-publish"));
-    assert_eq!(
-        apply_no_trust_evidence_typed_policy(&mut output),
-        Err("-Ztrust-dump".to_string()),
-    );
+    assert_eq!(apply_no_trust_evidence_typed_policy(&mut output), Err("-Ztrust-dump".to_string()),);
 
     let mut session = Options::default();
     session.unstable_opts.trust_verify_session = Some("must-not-prove".to_string());
@@ -1159,7 +1156,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(trust_certified_test_monitors, true);
     tracked!(trust_cg_output_gate, "allow-unknown".to_string());
     tracked!(trust_ir_flip, false);
-    tracked!(trust_ir_lower, Some(true));
+    tracked!(trust_ir_lower, Some(TrustIrLower::On));
     tracked!(trust_no_r1, true);
     tracked!(trust_policy, TrustPolicy::Advisory);
     tracked!(trust_targo_test_monitor, true);

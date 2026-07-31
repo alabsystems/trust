@@ -1606,17 +1606,33 @@ impl SepEngine {
         });
 
         // Opt-in: also model the temporal hazard for `ty`. The `Truncate` env
-        // action makes an access-while-stale reachable UNLESS a single-writer
-        // invariant holds — so by default (`single_writer = false`) `ty` CATCHES
-        // it with the `Mapped → truncate → stale_access` trace. Re-validation is
-        // deliberately NOT modeled as a fix (TOCTOU); only a declared
-        // single-writer invariant would flip this to provable.
+        // action makes an access-while-stale reachable unless a single-writer
+        // invariant holds, so `ty` CATCHES it with the
+        // `Mapped → truncate → stale_access` trace. Re-validation is deliberately
+        // NOT modeled as a fix (TOCTOU).
+        //
+        // SOUNDNESS: `#[trust::single_writer]` is DECLARED, never verified — the
+        // compiler sets it from a bare `item_has_trust_attr` presence test. It is
+        // therefore passed as `SingleWriterEvidence::Declared`, which does NOT
+        // disable `Truncate`. Previously this site forwarded the raw bool, so the
+        // attribute deleted the bad state from the model outright and a complete
+        // exploration of the reduced model was graded `AssuranceLevel::Sound` —
+        // an unverified caller promise laundered into a proof. The declaration is
+        // a real obligation ON THE CALLER (it is exactly what `map_mut`'s
+        // `unsafe` contract asks for); it is not a discharged one. When a checked
+        // single-writer proof exists it should pass `Verified` here, and that is
+        // the ONLY thing that may re-enable the reduction.
         if self.emit_temporal_mmap {
+            let single_writer_evidence = if self.temporal_single_writer {
+                trust_types::SingleWriterEvidence::Declared
+            } else {
+                trust_types::SingleWriterEvidence::None
+            };
             self.vcs.push(VerificationCondition {
                 kind: VcKind::Temporal {
                     property: "AG !bad".into(),
                     machine: Some(trust_types::StateMachineMetadata::mmap_temporal_model(
-                        self.temporal_single_writer,
+                        single_writer_evidence,
                     )),
                 },
                 function: self.func_name.clone().into(),
@@ -2297,6 +2313,47 @@ fn detect_field_backing(func: &VerifiableFunction) -> Vec<(usize, usize)> {
 /// field), but also surfaces the struct NAME so the use site can look up whether
 /// that struct's backing invariant is interprocedurally certified
 /// ([`crate::is_backing_struct_certified`]).
+/// Every backing-shaped struct this function mentions, as `(name, ptr, len)`.
+///
+/// SOUNDNESS: [`detect_backing_struct`] returns only the FIRST match, which is
+/// fine for a single-struct analysis but wrong for the interprocedural
+/// certification scan. There, a function is only examined for struct `S` when
+/// detection returns `S` — so a decoy local of the same shape appearing earlier
+/// in `locals` makes the function be skipped for `S` entirely, taking its
+/// backing-field mutation check with it. The mutator becomes invisible and `S`
+/// certifies, which publishes the use-site ASSUME `alloc_size >= self.len`.
+///
+/// Callers deciding whether a function is RELEVANT to a named struct must use
+/// this; only callers that genuinely want "the one struct this function is
+/// about" may use the singular form.
+pub(crate) fn detect_backing_structs(func: &VerifiableFunction) -> Vec<(String, usize, usize)> {
+    let mut found: Vec<(String, usize, usize)> = Vec::new();
+    for local in &func.body.locals {
+        let mut ty = &local.ty;
+        while let Ty::Ref { inner, .. } = ty {
+            ty = inner;
+        }
+        if let Ty::Adt { name, fields, .. } = ty {
+            let ptrs: Vec<usize> = fields
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, t))| matches!(t, Ty::RawPtr { .. }))
+                .map(|(i, _)| i)
+                .collect();
+            let lens: Vec<usize> = fields
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, t))| matches!(t, Ty::Int { signed: false, .. }))
+                .map(|(i, _)| i)
+                .collect();
+            if ptrs.len() == 1 && lens.len() == 1 && !found.iter().any(|(n, _, _)| n == name) {
+                found.push((name.clone(), ptrs[0], lens[0]));
+            }
+        }
+    }
+    found
+}
+
 pub(crate) fn detect_backing_struct(func: &VerifiableFunction) -> Option<(String, usize, usize)> {
     for local in &func.body.locals {
         let mut ty = &local.ty;
@@ -3127,26 +3184,58 @@ fn is_trusted_std_file(file: &str) -> bool {
     // Normalize separators so path-segment matching is platform-independent.
     let norm = file.replace('\\', "/");
 
-    // (1) The sysroot standard-library source tree always lives under a
-    // `library/` directory segment.
-    if norm == "library" || norm.starts_with("library/") || norm.contains("/library/") {
-        return true;
+    // The sysroot crates whose sources this gate may trust. A crate whose name
+    // is not on this list is somebody else's code, wherever it happens to sit.
+    const STD_CRATES: [&str; 9] = [
+        "core",
+        "alloc",
+        "std",
+        "proc_macro",
+        "test",
+        "panic_abort",
+        "panic_unwind",
+        "std_detect",
+        "unwind",
+    ];
+    let is_std_crate_root = |rest: &str| {
+        STD_CRATES
+            .iter()
+            .any(|krate| rest.strip_prefix(krate).is_some_and(|tail| tail.starts_with("/src/")))
+    };
+
+    // (1) The sysroot standard-library source tree: a `library/` segment
+    // IMMEDIATELY followed by a known std crate and its `src/`.
+    //
+    // SOUNDNESS: this used to accept ANY path containing a `library/` segment.
+    // That is a text test on a user-controlled value — `SourceSpan.file` is the
+    // unremapped local path (`prefer_local_unconditionally`, see
+    // trust-mir-extract's `convert_span`). Trusting a span here DELETES every
+    // `[unsafe:sep:*]` obligation for it, and the compiler's fail-closed
+    // unsafe-call net deliberately yields to this engine (`call_has_unsafe_model`
+    // => `continue`), so nothing else re-covers those operations. A crate laid
+    // out under `library/` is not exotic — `first-party/trust-mc` declares
+    // `members = ["library/trust-mc", ...]` and that tree contains real `unsafe`
+    // — so in-tree code was silently having its memory-safety obligations
+    // dropped by a path substring.
+    //
+    // Residual, deliberately accepted and recorded rather than papered over: a
+    // non-sysroot crate literally laid out as `library/core/src/...` still
+    // matches. Closing that needs rustc-authenticated provenance
+    // (`SourceFile::cnum` / `SourceFile::is_imported()`) carried into
+    // `SourceSpan`, which is a schema change across trust-types and
+    // trust-mir-extract. Narrowing to the known crate names removes every
+    // trigger reachable by accident.
+    if let Some(rest) =
+        norm.strip_prefix("library/").or_else(|| norm.split_once("/library/").map(|(_, a)| a))
+    {
+        if is_std_crate_root(rest) {
+            return true;
+        }
     }
 
     // (2) Remapped bare crate root (`library/` prefix stripped). Only the known
     // sysroot crate roots, matched as a LEADING `<crate>/src/` segment.
-    const STD_CRATE_ROOTS: [&str; 9] = [
-        "core/src/",
-        "alloc/src/",
-        "std/src/",
-        "proc_macro/src/",
-        "test/src/",
-        "panic_abort/src/",
-        "panic_unwind/src/",
-        "std_detect/src/",
-        "unwind/src/",
-    ];
-    STD_CRATE_ROOTS.iter().any(|root| norm.starts_with(root))
+    is_std_crate_root(&norm)
 }
 
 /// Check if a callee is an allocation function.
@@ -7399,6 +7488,59 @@ mod tests {
             "binary:0x1000",
         ] {
             assert!(!is_trusted_std_file(user_file), "should NOT be trusted std: {user_file}");
+        }
+    }
+
+    /// SOUNDNESS REGRESSION: a `library/` path segment is NOT by itself evidence
+    /// of sysroot std.
+    ///
+    /// Trusting a span deletes every `[unsafe:sep:*]` obligation for it, and
+    /// nothing else re-covers those operations — the compiler's unsafe-call net
+    /// yields to this engine. The gate previously accepted any path containing a
+    /// `library/` segment, so a crate laid out that way had its memory-safety
+    /// obligations silently dropped. `first-party/trust-mc` declares
+    /// `members = ["library/trust-mc", ...]` and that tree contains real
+    /// `unsafe`, so this was reachable in-tree rather than hypothetical.
+    #[test]
+    fn library_segment_alone_is_not_trusted_std() {
+        for user_file in [
+            // The in-tree layout that made this reachable.
+            "first-party/trust-mc/library/trust-mc/src/futures.rs",
+            "library/trust-mc/src/futures.rs",
+            // A workspace that simply uses `library/` as a directory name.
+            "library/mycrate/src/raw.rs",
+            "/home/dev/proj/library/thing/src/lib.rs",
+            "library",
+            "library/",
+            // A std crate NAME without the `src/` segment is not a crate root.
+            "library/core/lib.rs",
+            "core/lib.rs",
+            // Superstrings of std crate names must not match as segments.
+            "library/coreutils/src/main.rs",
+            "testing/src/lib.rs",
+        ] {
+            assert!(
+                !is_trusted_std_file(user_file),
+                "a `library/` segment alone must not confer std trust: {user_file}"
+            );
+        }
+    }
+
+    /// The legitimate sysroot layouts must keep working — this gate exists so
+    /// std's own `unsafe` is not re-verified, and over-tightening it would flood
+    /// every build with std obligations.
+    #[test]
+    fn sysroot_std_layouts_remain_trusted() {
+        for std_file in [
+            "library/core/src/ptr/mod.rs",
+            "library/std/src/vec/mod.rs",
+            "/home/dev/checkout/library/alloc/src/boxed.rs",
+            "/rustc/abcdef0123/library/core/src/slice/mod.rs",
+            // Remapped bare crate roots (the `library/` prefix stripped).
+            "core/src/ptr/mod.rs",
+            "test/src/lib.rs",
+        ] {
+            assert!(is_trusted_std_file(std_file), "should remain trusted std: {std_file}");
         }
     }
 

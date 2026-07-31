@@ -67,17 +67,25 @@ use crate::types::{OutputFormat, Subcommand, VerificationResult};
 const COMPILER_PROCESS_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const COMPILER_OUTPUT_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn certified_test_execution_platform_blocker() -> Option<&'static str> {
-    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+const CERTIFIED_TEST_EXECUTION_PLATFORM_BLOCKER: &str = "evidence-grade Cargo test execution \
+requires Linux sealed-memfd execveat or macOS suspended CDHash-authenticated execution on \
+x86-64/aarch64; this platform has no implemented authenticated launch backend";
+
+fn certified_test_execution_platform_blocker_for(
+    target_os: &str,
+    target_arch: &str,
+) -> Option<&'static str> {
+    if matches!(target_os, "linux" | "macos")
+        && matches!(target_arch, "x86_64" | "aarch64")
     {
         None
+    } else {
+        Some(CERTIFIED_TEST_EXECUTION_PLATFORM_BLOCKER)
     }
-    #[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
-    {
-        Some(
-            "evidence-grade Cargo test execution requires Linux x86-64/aarch64 sealed-memfd execveat; this platform has no implemented immutable execution handle",
-        )
-    }
+}
+
+fn certified_test_execution_platform_blocker() -> Option<&'static str> {
+    certified_test_execution_platform_blocker_for(std::env::consts::OS, std::env::consts::ARCH)
 }
 
 fn record_certified_test_execution_error(
@@ -541,7 +549,7 @@ fn trust_verify_disable_option(z_value: &str) -> Option<&'static str> {
         // Unlike the Boolean opt-outs below, either value (or even a malformed
         // value) is forbidden: the retired projection is not a Targo mode.
         "contract-checks" => Some("-Z contract-checks"),
-        "trust-verify=off" if rustc_bool_value(value).unwrap_or(true) => Some("-Z trust-verify=off"),
+        "trust-verify" if value == Some("off") => Some("-Z trust-verify=off"),
         "trust-verify" if rustc_bool_value(value) == Some(false) => Some("-Z trust-verify=false"),
         "trust-verify-full" if rustc_bool_value(value) == Some(false) => {
             Some("-Z trust-verify-full=false")
@@ -2138,6 +2146,17 @@ fn apply_crate_memory_coordination(
     let inherited_token = env::var_os(TRUST_MEMORY_JOBSERVER_ENV);
     #[cfg(unix)]
     {
+        #[cfg(test)]
+        if TEST_MEMORY_COORDINATOR_READY.with(std::cell::Cell::get) {
+            return apply_crate_memory_coordination_with(
+                cmd,
+                args,
+                resolved_target_dir,
+                inherited_token.as_deref(),
+                true,
+                |_| true,
+            );
+        }
         if trustd_disabled() {
             cmd.env_remove(TRUST_MEMORY_JOBSERVER_SOCK_ENV);
             cmd.env_remove(TRUST_MEMORY_JOBSERVER_ENV);
@@ -2165,6 +2184,34 @@ fn apply_crate_memory_coordination(
             |_| false,
         )
     }
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static TEST_MEMORY_COORDINATOR_READY: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Run a unit-test closure with daemon provisioning injected as successful.
+///
+/// This is a thread-local test seam, so transport/report regressions can reach
+/// their intended post-launch gate without creating a process-global fake
+/// daemon at the real per-user socket. Production builds contain no bypass.
+#[cfg(all(test, unix))]
+pub(super) fn with_test_memory_coordinator_ready<T>(body: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_MEMORY_COORDINATOR_READY.with(|ready| ready.set(self.0));
+        }
+    }
+
+    TEST_MEMORY_COORDINATOR_READY.with(|ready| {
+        let previous = ready.replace(true);
+        let _reset = Reset(previous);
+        body()
+    })
 }
 
 fn apply_crate_memory_coordination_with<F>(
@@ -2723,10 +2770,12 @@ pub(crate) fn run_compiler(run: CompilerRun<'_>) -> ExitCode {
     // compiled all non-doc test targets under the unique proof session and the
     // parser authenticated their transport. Only then may phase B ask the same
     // Targo/RUSTC/session configuration to replay Fresh jobs. The Cargo fork
-    // copies each byte-identical authorized test artifact into a sealed
-    // anonymous image and executes that handle. Unsupported platforms fail
-    // closed before the phase-B Cargo child is spawned; Cargo repeats that gate
-    // as defense in depth. There is no pathname fallback.
+    // copies each byte-identical authorized test artifact into an authenticated
+    // execution snapshot: Linux launches a sealed anonymous image by handle;
+    // macOS authenticates a private signed snapshot and the suspended live
+    // process's CDHash before resume. Unsupported platforms fail closed before
+    // the phase-B Cargo child is spawned; Cargo repeats that gate as defense in
+    // depth. There is no unauthenticated pathname fallback.
     if cargo_test_mode && !cargo_test_compile_only && post_phase_a_orchestration_error.is_none() {
         let phase_a_coverage_overflowed = coverage_accounting_overflowed(&coverage_rows);
         let phase_a_coverage = aggregate_coverage(&coverage_rows);
@@ -4181,11 +4230,12 @@ mod selection_and_control_tests {
         cargo_rustflags_with_controls, cargo_target_dir, cargo_target_dir_arg,
         cargo_test_compile_only_args, cargo_test_execution_args,
         cargo_test_execution_evidence_blocker, certified_test_execution_platform_blocker,
-        child_signal_exit_code, child_status_code, configured_verified_cargo_child_with_memory,
-        prepare_ephemeral_single_file_output, record_certified_test_execution_error,
-        scrub_proof_compiler_authority_env, selected_package_names_from_selection,
-        temp_single_file_output_path, validate_direct_custom_target_extension_tcb,
-        verification_cache_target_dir, write_test_execution_authority,
+        certified_test_execution_platform_blocker_for, child_signal_exit_code, child_status_code,
+        configured_verified_cargo_child_with_memory, prepare_ephemeral_single_file_output,
+        record_certified_test_execution_error, scrub_proof_compiler_authority_env,
+        selected_package_names_from_selection, temp_single_file_output_path,
+        validate_direct_custom_target_extension_tcb, verification_cache_target_dir,
+        write_test_execution_authority,
     };
     use crate::config::TrustConfig;
     use crate::pipeline::transport::{CargoTargetIdentity, CargoTestExecutable};
@@ -4196,16 +4246,58 @@ mod selection_and_control_tests {
     }
 
     #[test]
-    fn certified_test_execution_platform_gate_matches_the_handle_backend() {
+    fn certified_test_execution_platform_gate_matches_the_current_authenticated_backend() {
         let blocker = certified_test_execution_platform_blocker();
-        if cfg!(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))) {
+        if cfg!(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )) {
             assert!(blocker.is_none(), "supported host was blocked: {blocker:?}");
         } else {
             assert!(
                 blocker.is_some_and(|message| {
-                    message.contains("requires Linux x86-64/aarch64 sealed-memfd execveat")
+                    message.contains("requires Linux sealed-memfd execveat or macOS suspended")
                 }),
                 "unsupported host did not fail closed: {blocker:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn certified_test_execution_platform_gate_matches_cargo_target_matrix() {
+        for (target_os, target_arch) in [
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("macos", "x86_64"),
+            ("macos", "aarch64"),
+        ] {
+            assert_eq!(
+                certified_test_execution_platform_blocker_for(target_os, target_arch),
+                None,
+                "{target_os}-{target_arch} has an authenticated Cargo launch backend"
+            );
+        }
+
+        for (target_os, target_arch) in [
+            ("linux", "x86"),
+            ("linux", "powerpc64"),
+            ("macos", "x86"),
+            ("macos", "powerpc64"),
+            ("windows", "x86_64"),
+            ("freebsd", "aarch64"),
+        ] {
+            let blocker = certified_test_execution_platform_blocker_for(target_os, target_arch);
+            assert!(
+                blocker.is_some_and(|message| {
+                    message.contains("no implemented authenticated launch backend")
+                }),
+                "{target_os}-{target_arch} must fail closed: {blocker:?}"
             );
         }
     }

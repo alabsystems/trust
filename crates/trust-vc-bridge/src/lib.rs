@@ -700,6 +700,7 @@ impl TrustVcVerificationEngine {
             obligation_id: obligation.obligation_id.clone(),
             engine: self.manifest().clone(),
             status: EvidenceStatus::Proved,
+            decline: None,
             proof_strength: Some(ProofStrength::certified(
                 if requires_trust_vc_contract_frame(&obligation.kind) {
                     ReasoningKind::Deductive
@@ -753,6 +754,7 @@ impl TrustVcVerificationEngine {
             obligation_id: obligation.obligation_id.clone(),
             engine: self.manifest().clone(),
             status: EvidenceStatus::Unsupported,
+            decline: None,
             proof_strength: None,
             artifacts: Vec::new(),
             counterexample: None::<Counterexample>,
@@ -807,6 +809,7 @@ impl TrustVcVerificationEngine {
             obligation_id: obligation.obligation_id.clone(),
             engine: self.manifest().clone(),
             status: EvidenceStatus::Timeout,
+            decline: None,
             proof_strength: None,
             artifacts: Vec::new(),
             counterexample: None::<Counterexample>,
@@ -869,6 +872,7 @@ impl TrustVcVerificationEngine {
             obligation_id: obligation.obligation_id.clone(),
             engine: self.manifest.clone(),
             status: EvidenceStatus::Unsupported,
+            decline: None,
             proof_strength: None,
             artifacts: Vec::new(),
             counterexample: None::<Counterexample>,
@@ -1059,6 +1063,7 @@ impl TrustVcVerificationEngine {
             obligation_id: obligation.obligation_id.clone(),
             engine: self.manifest().clone(),
             status: EvidenceStatus::Failed,
+            decline: None,
             proof_strength: None,
             artifacts: Vec::new(),
             counterexample: Some(Counterexample {
@@ -1207,6 +1212,7 @@ impl TrustVcVerificationEngine {
             obligation_id: obligation.obligation_id.clone(),
             engine: self.manifest().clone(),
             status: EvidenceStatus::Proved,
+            decline: None,
             proof_strength: Some(ProofStrength::certified(reasoning)),
             artifacts,
             counterexample: None,
@@ -3908,6 +3914,7 @@ pub fn trust_vc_obligation_evidence_from_native_report(
         obligation_id: obligation.obligation_id.clone(),
         engine: engine.manifest().clone(),
         status: EvidenceStatus::Proved,
+        decline: None,
         proof_strength: Some(proof_strength),
         artifacts,
         counterexample: None,
@@ -6820,6 +6827,7 @@ mod tests {
             obligation_id: obligation.obligation_id.clone(),
             engine: engine.manifest().clone(),
             status: EvidenceStatus::Proved,
+            decline: None,
             proof_strength: Some(ProofStrength::certified(reasoning)),
             artifacts,
             counterexample: None,

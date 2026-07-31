@@ -718,13 +718,9 @@ fn deauthorized_frontends_reject_trust_controls_but_only_tippy_rejects_backends(
     );
     assert_eq!(frontend_forbidden_option(FrontendTrustPolicy::EvidenceInert, &ordinary), None,);
 
-    // Trust: `-Ztrust-verify=on` is NOT an ordinary line for a deauthorized frontend. This test
-    // asserted that it was, and never ran to find out otherwise: the module did not compile (it
-    // used bare `config::` paths with no `use rustc_session::config;`), so the expectation froze
-    // at whatever was true when it was written while `frontend_forbidden_option` tightened to a
-    // blanket ban on every `-Ztrust-*`. The blanket ban is the correct behaviour — letting a
-    // frontend that was stripped of evidence authority turn verification back on is exactly what
-    // deauthorization exists to prevent — so the ASSERTION was corrected, not the code.
+    // `-Ztrust-verify=on` is not an ordinary line for a deauthorized frontend. Letting a frontend
+    // that was stripped of evidence authority turn verification back on is exactly what
+    // deauthorization exists to prevent.
     let (_, verify_on) = parsed_matches(&["-Ztrust-verify=on", "--crate-type=lib", "input.rs"]);
     assert_eq!(
         frontend_forbidden_option(FrontendTrustPolicy::EmbeddedNoOfficialEvidence, &verify_on)
@@ -753,6 +749,72 @@ fn deauthorized_frontends_reject_trust_controls_but_only_tippy_rejects_backends(
         no_trust_evidence_callback_backend_error(FrontendTrustPolicy::CanonicalTrustc, true),
         None
     );
+}
+
+#[test]
+fn deauthorized_frontends_accept_only_exact_redundant_trust_verify_off() {
+    for args in [
+        &["-Ztrust-verify=off", "--crate-type=lib", "input.rs"][..],
+        &["-Z", "trust-verify=off", "--crate-type=lib", "input.rs"][..],
+        &["-Z", "trust_verify=off", "--crate-type=lib", "input.rs"][..],
+    ] {
+        let (_, matches) = parsed_matches(args);
+        assert_eq!(
+            frontend_forbidden_option(FrontendTrustPolicy::EvidenceInert, &matches),
+            None,
+            "the evidence-inert frontend rejected redundant {args:?}",
+        );
+        assert_eq!(
+            frontend_forbidden_option(
+                FrontendTrustPolicy::EmbeddedNoOfficialEvidence,
+                &matches,
+            ),
+            None,
+            "an embedded deauthorized frontend rejected redundant {args:?}",
+        );
+    }
+
+    for args in [
+        &["-Ztrust-verify=on", "--crate-type=lib", "input.rs"][..],
+        &["-Ztrust-verify", "--crate-type=lib", "input.rs"][..],
+        &["-Ztrust-verify=invalid", "--crate-type=lib", "input.rs"][..],
+        &[
+            "-Ztrust-verify=off",
+            "-Ztrust-verify=on",
+            "--crate-type=lib",
+            "input.rs",
+        ][..],
+        &[
+            "-Ztrust-verify=on",
+            "-Ztrust-verify=off",
+            "--crate-type=lib",
+            "input.rs",
+        ][..],
+        &[
+            "-Ztrust-verify=off",
+            "-Ztrust-ir-lower",
+            "--crate-type=lib",
+            "input.rs",
+        ][..],
+    ] {
+        let (_, matches) = parsed_matches(args);
+        let expected = Some(if args.contains(&"-Ztrust-ir-lower") {
+            "-Ztrust-ir-lower"
+        } else {
+            "-Ztrust-verify"
+        });
+        for policy in [
+            FrontendTrustPolicy::EmbeddedNoOfficialEvidence,
+            FrontendTrustPolicy::EvidenceInert,
+        ] {
+            assert_eq!(
+                frontend_forbidden_option(policy, &matches).as_deref(),
+                expected,
+                "{} accepted authority-bearing {args:?}",
+                policy.diagnostic_name(),
+            );
+        }
+    }
 }
 
 #[test]

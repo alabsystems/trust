@@ -143,8 +143,10 @@ fn main() {
         // Policy is one domain, so the settings cannot be combined at all:
         // the invalid pair is now rejected by the parser, not by a downstream
         // cross-check that had to be kept in step with the callers.
-        ("-Ztrust-policy=memory-safe,advisory", "one of `strict`, `advisory`, or `memory-safe`"),
-        ("-Ztrust-policy=survey", "one of `strict`, `advisory`, or `memory-safe`"),
+        // Trust: `certify` joined the policy vocabulary (tcb-closure campaign), so the
+        // rejection banner enumerates four values now, not three.
+        ("-Ztrust-policy=memory-safe,advisory", "one of `strict`, `certify`, `advisory`, or `memory-safe`"),
+        ("-Ztrust-policy=survey", "one of `strict`, `certify`, `advisory`, or `memory-safe`"),
         ("-Ztrust-verify", "requires one of `on` or `off`"),
         ("-Ztrust-verify=yes", "one of `on` or `off`"),
         ("-Ztrust-witness=mint", "one of `auto`, `off`, `mint:<dir>`, or `replay:<dir>`"),
@@ -374,12 +376,19 @@ pub fn push_slot(len: usize) -> usize {
     // downstream consumer, not just `targo trust prove --source`.
     rfs::write("not-a-directory", "occupied\n");
     cmd(&trustc)
+        // Trust: `mir-only` now refuses to run at all without the nonfatal advisory
+        // policy (it skips proof dispatch, so a fatal policy would claim coverage it
+        // never computed). Pass the policy so this probe reaches what it actually
+        // tests: an uncreatable dump directory must still fail the build loudly.
+        .arg("-Ztrust-policy=advisory")
         .arg("-Ztrust-dump=mir-only:not-a-directory")
         .arg("empty.rs")
         .arg("-o")
         .arg("dump-probe")
         .run_fail()
-        .assert_stderr_contains("failed to create -Ztrust-dump=mir:<dir> directory");
+        // Trust: the diagnostic now interpolates the actual directory rather than printing a
+        // literal `<dir>` placeholder, so the needle must stop before the name.
+        .assert_stderr_contains("failed to create -Ztrust-dump=mir: directory `not-a-directory`");
 
     // The crate-level TrustIr finalizer must surface publication failures as a
     // compiler error. It used to hide them in a debug-only summary.

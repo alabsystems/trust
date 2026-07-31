@@ -132,6 +132,26 @@ case "$HOST_OS:$HOST_ARCH" in
         ;;
 esac
 
+# Keep hashing inside the fixed system-tool boundary while using the native
+# utility each supported host actually ships. Stock macOS has
+# `/usr/bin/shasum`, not GNU `sha256sum`; relying on a Homebrew/coreutils copy
+# would both break the clean release environment and import caller-controlled
+# tool authority.
+case "$HOST_OS" in
+    Darwin)
+        SHA256_TOOL=/usr/bin/shasum
+        SHA256_ARGS=(-a 256)
+        ;;
+    Linux)
+        SHA256_TOOL=/usr/bin/sha256sum
+        SHA256_ARGS=()
+        ;;
+esac
+if [[ ! -f "$SHA256_TOOL" || -L "$SHA256_TOOL" || ! -x "$SHA256_TOOL" ]]; then
+    echo "error: supported host lacks its fixed-system SHA-256 tool: $SHA256_TOOL" >&2
+    exit 1
+fi
+
 stable_file_identity() {
     local path="$1"
     if [[ "$HOST_OS" == "Darwin" ]]; then
@@ -300,7 +320,7 @@ hash_stable_regular_file() {
         echo "error: could not inspect $label before hashing: $path" >&2
         return 1
     }
-    digest_line="$(sha256sum -- "$path")" || {
+    digest_line="$("$SHA256_TOOL" "${SHA256_ARGS[@]}" -- "$path")" || {
         echo "error: could not hash $label: $path" >&2
         return 1
     }
@@ -394,7 +414,7 @@ hash_stable_stage2_tree() {
                         exit 1
                     fi
                 done
-        ) | sha256sum
+        ) | "$SHA256_TOOL" "${SHA256_ARGS[@]}"
     )" || {
         echo "error: could not hash the complete stage2 sysroot: $root" >&2
         return 1
@@ -888,7 +908,10 @@ done
 # The prefix is the reviewed release-boundary namespace. Require equality,
 # not merely inclusion: otherwise a newly added real-Targo monitor regression
 # could remain ignored forever while this gate continued to report 3/3.
-mapfile -t INVENTORIED_RELEASE_TESTS < <(
+INVENTORIED_RELEASE_TESTS=()
+while IFS= read -r inventory_name; do
+    INVENTORIED_RELEASE_TESTS+=("$inventory_name")
+done < <(
     grep -E "^${RELEASE_TEST_PREFIX}.*: test$" "$LIST_LOG" \
         | sed 's/: test$//' \
         | sort

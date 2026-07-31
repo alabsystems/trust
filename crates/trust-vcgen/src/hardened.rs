@@ -559,10 +559,10 @@ fn append_assert_panic_vcs(func: &VerifiableFunction, vcs: &mut Vec<Verification
     // Without it, `_7.0` is a free var the `width <= 127` path guard cannot
     // bound, and the hardened Shl boundary false-FAILs (`_6 = 200`). Sound: the
     // result def `_N.0 == lhs OP rhs` holds EXACTLY on the no-overflow path the
-    // map threads it to (the overflow edge is a `ClauseTarget::Panic` the
-    // fixpoint skips), so conjoining a genuinely-true fact is monotone — it can
-    // only turn a false-FAIL into a PROVE for safe code, never make a real
-    // panic PROVE.
+    // map threads it to. Assert cleanup receives the base outflow without that
+    // success fact, and the abstract panic exit is not an in-CFG successor, so
+    // conjoining a genuinely-true fact is monotone — it can only turn a
+    // false-FAIL into a PROVE for safe code, never make a real panic PROVE.
     let reaching_defs = cross_block_reaching_defs(func);
 
     // Slice-chunking yield facts (`for c in s.chunks_exact(N) { c[k] }` => the
@@ -729,7 +729,15 @@ fn append_assert_panic_vcs(func: &VerifiableFunction, vcs: &mut Vec<Verification
                 Some((in_range, hyps)) => {
                     let mut conj = Vec::with_capacity(hyps.len() + 1);
                     conj.push(Formula::Not(Box::new(in_range.clone())));
-                    conj.extend(hyps.iter().cloned());
+                    // `extract_assert_passed_semantics` also carries the
+                    // success-only `_N.0 ==` unbounded-result equation. MIR's
+                    // value field wraps on overflow, so that Eq is false on the
+                    // failure path modeled here. Keep only unconditional
+                    // operand/source range facts; the exact overflow-flag
+                    // biconditional is conjoined separately below.
+                    conj.extend(
+                        hyps.iter().filter(|fact| !matches!(fact, Formula::Eq(..))).cloned(),
+                    );
                     Formula::And(conj)
                 }
                 None => assert_failure_formula(func, cond, *expected),
@@ -871,9 +879,10 @@ fn assert_failure_formula(func: &VerifiableFunction, cond: &Operand, expected: b
 ///
 /// Reuses the v2 path-definition fixpoint, which propagates each block's
 /// `extract_assert_passed_semantics` (the no-overflow `_N.0 == lhs OP rhs`
-/// result def plus operand ranges) ONLY along the assert-success edge — the
-/// overflow edge is a `ClauseTarget::Panic` the fixpoint skips, so the result
-/// def never reaches a block where the operation actually wrapped. Returns the
+/// result def plus operand ranges) ONLY in normal-success outflow. An Assert
+/// cleanup edge receives the base outflow without those facts; the abstract
+/// panic exit is not an in-CFG successor. Thus the result def never reaches a
+/// block where the operation actually wrapped. Returns the
 /// facts that hold on EVERY path reaching each block (the join intersection),
 /// which is the sound direction: a fact retained here was true along every
 /// incoming path, so assuming it as a VC hypothesis cannot mask a real panic.

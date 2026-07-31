@@ -94,6 +94,18 @@ pub(crate) fn reference_vcgen(func: &VerifiableFunction) -> Vec<VcKind> {
                             kinds.push(VcKind::FloatOverflowToInfinity { op: *op, operand_ty });
                         }
                     }
+                    // Trust: NOT A VC PRODUCER (2026-07-30, round-4 claim audit). This
+                    // line pushes a bare kind into the cross-check REFERENCE list and
+                    // emits no `VerificationCondition`, so a census of NegationOverflow
+                    // *producers* must exclude it.
+                    //
+                    // No global count is asserted here on purpose. Two successive drafts
+                    // of this note stated one ("five sites", then "six") and both were
+                    // wrong, because `VcKind::NegationOverflow` also appears in match
+                    // arms and in `#[cfg(test)]` fixtures, and the intended denominator
+                    // was never written down. A census that cannot be reproduced from a
+                    // stated command does not belong in a comment: re-run the grep and
+                    // classify each hit as construction / pattern / test.
                     Rvalue::UnaryOp(UnOp::Neg, operand) => {
                         let ty = operand_ty_owned(operand, func);
                         if ty.is_signed() {

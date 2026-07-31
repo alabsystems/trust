@@ -4,16 +4,17 @@ use std::collections::BTreeSet;
 use trust_types::fx::FxHashSet;
 use trust_types::{
     AggregateKind, AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, Formula, LocalDecl,
-    Operand, Place, Projection, Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, VcKind,
-    VerifiableBody, VerifiableFunction,
+    Operand, Place, Projection, Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, VariantDef,
+    VcKind, VerifiableBody, VerifiableFunction,
 };
 
 use super::{
     StmtVersionCtx, VersionCtx, accumulator_init_const, block_def_establish_subsumes_kill,
     build_semantic_guard_map, flip_matches_kill_stmt, flip_token_distinctness_violations,
-    formula_survives_redefs, reaching_def_versions, shadow_parity_disagreements,
-    shadow_parity_disagreements_overlap, v2_build_path_definition_map, v2_live_path_defs,
-    v2_may_reassigned_per_block, version_rename_at,
+    formula_survives_redefs, generate_full_assert_refutation_vcs, reaching_def_versions,
+    shadow_parity_disagreements, shadow_parity_disagreements_overlap,
+    v2_build_path_definition_map, v2_live_path_defs, v2_may_reassigned_per_block,
+    version_rename_at,
 };
 
 /// `fn(a, b) { let m = if a < b { a } else { b }; if m < 1000 { .. } else { .. } }`
@@ -121,6 +122,286 @@ fn defines_as_ite(defs: &[Formula], var: &str) -> bool {
         matches!(f, Formula::Eq(lhs, rhs)
             if lhs.var_name() == Some(var) && matches!(rhs.as_ref(), Formula::Ite(..)))
     })
+}
+
+fn mentions(defs: &[Formula], var: &str) -> bool {
+    defs.iter().any(|f| f.free_variables().contains(var))
+}
+
+fn checked_assert_with_cleanup(cleanup: BlockId) -> VerifiableFunction {
+    VerifiableFunction {
+        name: "checked_assert_cleanup".into(),
+        def_path: "test::checked_assert_cleanup".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: Some("ret".into()) },
+                LocalDecl { index: 1, ty: Ty::u32(), name: Some("a".into()) },
+                LocalDecl { index: 2, ty: Ty::u32(), name: Some("b".into()) },
+                LocalDecl {
+                    index: 3,
+                    ty: Ty::Tuple(vec![Ty::u32(), Ty::Bool]),
+                    name: Some("checked".into()),
+                },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(3),
+                        rvalue: Rvalue::CheckedBinaryOp(
+                            BinOp::Add,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Copy(Place::local(2)),
+                        ),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Assert {
+                        cond: Operand::Copy(Place::field(3, 1)),
+                        expected: false,
+                        msg: AssertMessage::Overflow(BinOp::Add),
+                        target: BlockId(1),
+                        span: SourceSpan::default(),
+                        unwind: UnwindEdge::Cleanup(cleanup),
+                    },
+                },
+                BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Resume },
+            ],
+            arg_count: 2,
+            return_ty: Ty::Unit,
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+fn option_u64_ty() -> Ty {
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        name: "core::option::Option".into(),
+        fields: vec![
+            ("__tag".into(), Ty::Int { width: 64, signed: true }),
+            ("__v1_0".into(), Ty::u64()),
+        ],
+        variants: vec![
+            VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
+            VariantDef {
+                name: "Some".into(),
+                discriminant: 1,
+                fields: vec![("0".into(), Ty::u64())],
+            },
+        ],
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
+}
+
+fn probe_call_with_cleanup(cleanup: BlockId) -> VerifiableFunction {
+    let option = option_u64_ty();
+    VerifiableFunction {
+        name: "probe_call_cleanup".into(),
+        def_path: "test::probe_call_cleanup".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: Some("ret".into()) },
+                LocalDecl { index: 1, ty: option.clone(), name: Some("o".into()) },
+                LocalDecl {
+                    index: 2,
+                    ty: Ty::Ref { mutable: false, inner: Box::new(option) },
+                    name: Some("recv".into()),
+                },
+                LocalDecl { index: 3, ty: Ty::Bool, name: Some("g".into()) },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(2),
+                        rvalue: Rvalue::Ref { mutable: false, place: Place::local(1) },
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Call {
+                        func: "core::option::Option::<T>::is_some".into(),
+                        args: vec![Operand::Move(Place::local(2))],
+                        dest: Place::local(3),
+                        target: Some(BlockId(1)),
+                        span: SourceSpan::default(),
+                        atomic: None,
+                        is_unsafe_sig: false,
+                        is_foreign: false,
+                        unwind: UnwindEdge::Cleanup(cleanup),
+                    },
+                },
+                BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Resume },
+            ],
+            arg_count: 1,
+            return_ty: Ty::Unit,
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+#[test]
+fn assert_success_facts_never_flow_to_cleanup_or_mixed_join() {
+    let distinct = v2_build_path_definition_map(&checked_assert_with_cleanup(BlockId(2)));
+    let normal = distinct.get(&BlockId(1)).cloned().unwrap_or_default();
+    let cleanup = distinct.get(&BlockId(2)).cloned().unwrap_or_default();
+    assert!(
+        mentions(&normal, "checked.0"),
+        "normal Assert successor must receive the checked result equation: {normal:?}"
+    );
+    assert!(
+        !mentions(&cleanup, "checked.0"),
+        "Assert cleanup must not receive success-only checked facts: {cleanup:?}"
+    );
+
+    let coincident = v2_build_path_definition_map(&checked_assert_with_cleanup(BlockId(1)));
+    let joined = coincident.get(&BlockId(1)).cloned().unwrap_or_default();
+    assert!(
+        !mentions(&joined, "checked.0"),
+        "normal==cleanup joins both outcomes and must intersect away success facts: {joined:?}"
+    );
+}
+
+#[test]
+fn call_return_facts_never_flow_to_cleanup_or_mixed_join() {
+    let distinct = v2_build_path_definition_map(&probe_call_with_cleanup(BlockId(2)));
+    let normal = distinct.get(&BlockId(1)).cloned().unwrap_or_default();
+    let cleanup = distinct.get(&BlockId(2)).cloned().unwrap_or_default();
+    assert!(
+        mentions(&normal, "g") && mentions(&normal, "o.0"),
+        "normal Call successor must receive modeled post-return facts: {normal:?}"
+    );
+    assert!(
+        !mentions(&cleanup, "g"),
+        "Call cleanup must not observe a returned destination value: {cleanup:?}"
+    );
+
+    let coincident = v2_build_path_definition_map(&probe_call_with_cleanup(BlockId(1)));
+    let joined = coincident.get(&BlockId(1)).cloned().unwrap_or_default();
+    assert!(
+        !mentions(&joined, "g"),
+        "normal==cleanup joins both outcomes and must intersect away call-return facts: {joined:?}"
+    );
+}
+
+fn overflow_cleanup_asserts_wrapped_result() -> VerifiableFunction {
+    VerifiableFunction {
+        name: "overflow_cleanup_asserts_wrapped_result".into(),
+        def_path: "test::overflow_cleanup_asserts_wrapped_result".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: Some("ret".into()) },
+                LocalDecl { index: 1, ty: Ty::u32(), name: Some("a".into()) },
+                LocalDecl { index: 2, ty: Ty::u32(), name: Some("b".into()) },
+                LocalDecl {
+                    index: 3,
+                    ty: Ty::Tuple(vec![Ty::u32(), Ty::Bool]),
+                    name: Some("checked".into()),
+                },
+                LocalDecl { index: 4, ty: Ty::Bool, name: Some("wrapped_is_zero".into()) },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(3),
+                        rvalue: Rvalue::CheckedBinaryOp(
+                            BinOp::Add,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Copy(Place::local(2)),
+                        ),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Assert {
+                        cond: Operand::Copy(Place::field(3, 1)),
+                        expected: false,
+                        msg: AssertMessage::Overflow(BinOp::Add),
+                        target: BlockId(1),
+                        span: SourceSpan::default(),
+                        unwind: UnwindEdge::Cleanup(BlockId(2)),
+                    },
+                },
+                BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(4),
+                        rvalue: Rvalue::BinaryOp(
+                            BinOp::Eq,
+                            Operand::Copy(Place::field(3, 0)),
+                            Operand::Constant(ConstValue::Uint(0, 32)),
+                        ),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Copy(Place::local(4)),
+                        targets: vec![(0, BlockId(4))],
+                        otherwise: BlockId(3),
+                        exhaustive_enum_unreachable: false,
+                        span: SourceSpan::default(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    stmts: vec![],
+                    terminator: Terminator::Call {
+                        func: "core::panicking::panic_fmt".into(),
+                        args: vec![],
+                        dest: Place::local(0),
+                        target: None,
+                        span: SourceSpan::default(),
+                        atomic: None,
+                        is_unsafe_sig: false,
+                        is_foreign: false,
+                        unwind: UnwindEdge::Terminate,
+                    },
+                },
+                BasicBlock { id: BlockId(4), stmts: vec![], terminator: Terminator::Resume },
+            ],
+            arg_count: 2,
+            return_ty: Ty::Unit,
+        },
+        contracts: vec![],
+        preconditions: vec![
+            Formula::Eq(
+                Box::new(Formula::Var("a".into(), Sort::Int)),
+                Box::new(Formula::Int(u32::MAX as i128)),
+            ),
+            Formula::Eq(
+                Box::new(Formula::Var("b".into(), Sort::Int)),
+                Box::new(Formula::Int(1)),
+            ),
+        ],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+#[test]
+fn overflow_cleanup_never_gets_false_unbounded_result_equation() {
+    let func = overflow_cleanup_asserts_wrapped_result();
+    let defs = super::guards::extract_overflow_flag_semantics(&func, &func.body.blocks[0]);
+    assert!(
+        !mentions(&defs, "checked.0") && mentions(&defs, "checked.1"),
+        "failure-edge semantics may define only the exact flag, never the wrapped value: {defs:?}"
+    );
+    assert!(
+        generate_full_assert_refutation_vcs(&func).is_empty(),
+        "a cleanup assertion over wrapped checked.0 must stay ungrounded; a global \
+         checked.0 == unbounded(a+b) equation would falsely prove it unreachable"
+    );
 }
 
 #[test]

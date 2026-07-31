@@ -31,6 +31,8 @@ use super::run::{
     resolve_cargo_selection_for_compiler, rewrite_iteration_success, run_compiler,
     single_file_report_subject,
 };
+#[cfg(unix)]
+use super::run::with_test_memory_coordinator_ready;
 use super::standalone::standalone_hardened_help;
 use super::surface::{LINKED_TRUST_SURFACE_TOOLS, detect_linked_trust_cargo_surface_with_search};
 use super::transport::{CargoTargetIdentity, ParsedCompilerOutput};
@@ -957,7 +959,6 @@ fn parse_compiler_stderr_without_coverage_row_reports_coverage_unknown() {
 }
 
 #[test]
-#[test]
 fn gate_strict_tolerates_runtime_checked_but_nothing_else() {
     // The completeness-gap ruling (Andrew, 2026-07-25) in one test.
     //
@@ -1006,6 +1007,7 @@ fn gate_strict_tolerates_runtime_checked_but_nothing_else() {
     }
 }
 
+#[test]
 fn gate_certify_is_byte_identical_to_compiler_verification_success() {
     // MIGRATED from `gate_strict_*` by the completeness-gap ruling (2026-07-25):
     // the historical predicate is now the CERTIFY lane. The default `Strict` lane
@@ -1673,27 +1675,29 @@ fn test_run_compiler_crate_mode_without_trust_json_rows_is_hard_error() {
     let cmd_args = vec![fake_targo.display().to_string(), "build".to_string()];
     let report_dir = root.join("report");
     let report_dir_str = report_dir.to_str().expect("report dir utf-8");
-    let status = run_compiler(CompilerRun {
-        cmd_args: &cmd_args,
-        rustc_path: &fake_trustc,
-        config: &TrustConfig::default(),
-        selected_codegen_backend: None,
-        supports_json_transport: true,
-        strict_artifact_policy: false,
-        strict_result_gate: false,
-        certify_gate: false,
-        allow_l0_gaps: false,
-        memory_safe_policy: false,
-        survey: false,
-        hardened: false,
-        trust_profile: None,
-        ay_path: None,
-        format: OutputFormat::Terminal,
-        report_dir: Some(report_dir_str),
-        unsafe_memory_report: None,
-        live_report_consumer: None,
-        render_output: true,
-        ephemeral_single_file_output: false,
+    let status = with_test_memory_coordinator_ready(|| {
+        run_compiler(CompilerRun {
+            cmd_args: &cmd_args,
+            rustc_path: &fake_trustc,
+            config: &TrustConfig::default(),
+            selected_codegen_backend: None,
+            supports_json_transport: true,
+            strict_artifact_policy: false,
+            strict_result_gate: false,
+            certify_gate: false,
+            allow_l0_gaps: false,
+            memory_safe_policy: false,
+            survey: false,
+            hardened: false,
+            trust_profile: None,
+            ay_path: None,
+            format: OutputFormat::Terminal,
+            report_dir: Some(report_dir_str),
+            unsafe_memory_report: None,
+            live_report_consumer: None,
+            render_output: true,
+            ephemeral_single_file_output: false,
+        })
     });
 
     assert_eq!(

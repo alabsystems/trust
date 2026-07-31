@@ -69,12 +69,90 @@ pub fn parse_spec_expr_result(input: &str) -> Result<Formula, SpecParseError> {
     if input.trim().is_empty() {
         return Err(SpecParseError::Empty);
     }
+    if !literal_index_spellings_are_canonical(input) {
+        return Err(SpecParseError::UnexpectedToken {
+            position: 0,
+            expected: "canonical nonnegative literal index spelling".into(),
+        });
+    }
 
     let tokens = tokenize(input)?;
     let mut parser = Parser::new(tokens);
     let formula = parser.parse_implies()?;
 
     if parser.is_eof() { Ok(formula) } else { Err(SpecParseError::TrailingTokens) }
+}
+
+/// Reject alternate decimal spellings before tokenization erases them.
+///
+/// A literal index is lowered to a stable-place leaf such as `xs[0]`. If
+/// `xs[00]` were accepted, both source spellings would become the same leaf and
+/// could borrow one compiler-minted place identity. Parentheses around a lone
+/// literal are rejected for the same reason. Genuinely computed indices remain
+/// structural `Select` expressions and therefore do not need this restriction.
+pub(crate) fn literal_index_spellings_are_canonical(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'[' {
+            cursor += 1;
+            continue;
+        }
+        let Some(close) = bytes[cursor + 1..].iter().position(|byte| *byte == b']') else {
+            cursor += 1;
+            continue;
+        };
+        let content = input[cursor + 1..cursor + 1 + close].trim();
+        if let Some((spelling, parenthesized)) = parenthesized_decimal_literal(content) {
+            let Ok(value) = spelling.parse::<u128>() else {
+                return false;
+            };
+            if parenthesized || value.to_string() != spelling {
+                return false;
+            }
+        }
+        cursor += 1;
+    }
+    true
+}
+
+fn parenthesized_decimal_literal(mut text: &str) -> Option<(&str, bool)> {
+    let mut parenthesized = false;
+    loop {
+        text = text.trim();
+        if !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Some((text, parenthesized));
+        }
+        if !outer_parentheses_cover_entire_text(text) {
+            return None;
+        }
+        parenthesized = true;
+        text = &text[1..text.len() - 1];
+    }
+}
+
+fn outer_parentheses_cover_entire_text(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.first() != Some(&b'(') || bytes.last() != Some(&b')') {
+        return false;
+    }
+    let mut depth = 0usize;
+    for (index, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                let Some(next_depth) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next_depth;
+                if depth == 0 && index + 1 != bytes.len() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SpecParseError> {
@@ -155,6 +233,21 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SpecParseError> {
                 })?;
                 tokens.push(Token::Float(value.to_bits()));
                 continue;
+            }
+
+            if field_index_context {
+                let spelling = &input[start..index];
+                let value =
+                    spelling.parse::<u128>().map_err(|_| SpecParseError::UnexpectedToken {
+                        position: start,
+                        expected: "canonical tuple-field index".into(),
+                    })?;
+                if value.to_string() != spelling {
+                    return Err(SpecParseError::UnexpectedToken {
+                        position: start,
+                        expected: "canonical tuple-field index".into(),
+                    });
+                }
             }
 
             let value = input[start..index].parse::<i128>().map_err(|_| {
@@ -1381,6 +1474,30 @@ mod tests {
             Some(Formula::Le(Box::new(var("x[0]")), Box::new(int(5)))),
         );
         assert_eq!(parse_spec_expr("x[0][1]"), Some(var("x[0][1]")));
+        assert_eq!(
+            parse_spec_expr("x[00]"),
+            None,
+            "alternate decimal spellings must not alias a canonical place leaf",
+        );
+        assert_eq!(
+            parse_spec_expr("x[(0)]"),
+            None,
+            "parentheses must not be erased while minting a literal place leaf",
+        );
+        assert_eq!(
+            parse_spec_expr("self.00"),
+            None,
+            "alternate tuple-field spellings must not alias a canonical place leaf",
+        );
+        assert_eq!(
+            parse_spec_expr("x[y[00]]"),
+            None,
+            "a nested alternate spelling must not hide inside a computed index",
+        );
+        assert!(
+            matches!(parse_spec_expr("x[(0 + 0)]"), Some(Formula::Select(_, _))),
+            "a genuinely computed index remains structural and supported",
+        );
     }
 
     #[test]

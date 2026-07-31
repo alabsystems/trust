@@ -198,6 +198,7 @@ fn drop_ladder_declines_zero_write_in_ladder() {
                     name: "core::option::Option".into(),
                     variant: 0,
                     active_field: None,
+                    args: None,
                 },
                 vec![],
             ),

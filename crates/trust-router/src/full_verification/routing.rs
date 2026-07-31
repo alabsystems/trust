@@ -1,7 +1,8 @@
 //! Obligation → primary-engine routing tables for the full verifier.
 
 use trust_verifier_api::{
-    EngineManifest, ObligationKind, ProofStrength, ReasoningKind, TrustObligation,
+    DeclineClass, EngineManifest, EvidenceStatus, ObligationKind, ProofStrength, ReasoningKind,
+    TrustObligation,
 };
 
 use super::policy::{
@@ -262,6 +263,129 @@ pub(super) fn obligation_route(obligation: &TrustObligation) -> Option<Obligatio
         }
     }
     obligation_route_for_kind(&obligation.kind)
+}
+
+/// A designated deductive-fallback route.
+///
+/// Newtyped so a PRIMARY route can never be handed to the fallback path by
+/// mistake. A fallback is adjudicated AS ITSELF — its own engine, its own proof
+/// family, its own assurance floor — because `route` is the sole anchor for the
+/// artifact policy, the accepted reasoning family, and the native suite
+/// identity. Reusing the primary's family would let a foreign proof satisfy a
+/// requirement written to forbid it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct FallbackRoute(pub(super) ObligationRoute);
+
+/// The deductive-fallback table.
+///
+/// **EMPTY BY DESIGN.** The mechanism ships as a provable no-op; each row added
+/// here is its own reviewed commit with its own verdict-flip check.
+///
+/// A row must NEVER be written as "the primary's route with `primary` swapped" —
+/// see [`FallbackRoute`]. Write a complete route, and re-derive the proof family
+/// and assurance floor for the engine that will actually run.
+///
+/// Adding the first row is additionally blocked on work outside this module:
+/// `TrustVcVerificationMode` has no solve variant, so trust-vc cannot be asked to
+/// derive on the native lane, and the compiler-side suite stamp is one of four
+/// tables that must agree.
+pub(super) fn fallback_route(_obligation: &TrustObligation) -> Option<FallbackRoute> {
+    None
+}
+
+/// Why a declined obligation is, or is not, eligible for a second engine.
+///
+/// Pure and total so the rules are testable without standing up a dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FallbackEligibility {
+    /// Every rule held. The obligation may be re-attempted by the fallback.
+    Eligible,
+    /// The decline is terminal. The reason is kept for the audit trail.
+    Terminal(FallbackRefusal),
+}
+
+/// The specific rule that made a decline terminal.
+///
+/// Enumerated so a refusal can be explained in a diagnostic rather than
+/// silently doing nothing — "engine A declined, and here is why nobody else was
+/// allowed to try" is the audit trail this mechanism owes a reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FallbackRefusal {
+    /// The primary produced a definitive verdict, or a sibling row did.
+    /// A refutation is settled; re-litigating it is laundering.
+    Definitive,
+    /// The primary's evidence was accepted. Nothing to retry.
+    Accepted,
+    /// Not an `Unsupported` decline (Timeout, Canceled, Unknown, ...). None of
+    /// these is a capability gap.
+    NotADecline,
+    /// No decline class, or a class that is not retryable. This is the default
+    /// for every router-minted decline, every engine that has not been taught
+    /// the distinction, and every older wire payload — terminal by construction.
+    Unclassified,
+    /// No fallback route is designated for this obligation.
+    NoRoute,
+    /// The designated fallback is the engine that already declined.
+    SameEngine,
+    /// The verification budget is exhausted; a retry would be unbounded work.
+    BudgetExceeded,
+}
+
+/// Adjudicate whether a declined obligation may be re-attempted.
+///
+/// SOUNDNESS: this is written so that EVERY path not explicitly proven safe
+/// returns `Terminal`. The rules are conjunctive and each is a positive test.
+///
+/// The caller must additionally establish, structurally, that the row came from
+/// a real engine batch rather than one of the pre-dispatch declines — those are
+/// router-minted and carry `decline: None`, so they are already caught by the
+/// `Unclassified` arm, but relying on that alone would be relying on an
+/// accident.
+pub(super) fn fallback_eligibility(
+    accepted: bool,
+    status: EvidenceStatus,
+    decline: Option<DeclineClass>,
+    sibling_rows_are_definitive: bool,
+    route: Option<FallbackRoute>,
+    primary_engine_index: usize,
+    fallback_engine_index: Option<usize>,
+    budget_exceeded: bool,
+) -> FallbackEligibility {
+    use FallbackEligibility::{Eligible, Terminal};
+    use FallbackRefusal as R;
+
+    // A definitive verdict anywhere for this obligation ends the matter. This is
+    // checked FIRST and covers the ladder hole: `rejected_primary_evidence` ranks
+    // `Unsupported` above `Proved`, so an engine that returned BOTH a capability
+    // decline and a Proved row the router rejected would present the decline as
+    // the final row. Retrying there would erase the rejected proof that poisons
+    // strict acceptance downstream.
+    if sibling_rows_are_definitive {
+        return Terminal(R::Definitive);
+    }
+    if matches!(status, EvidenceStatus::Proved | EvidenceStatus::Failed) {
+        return Terminal(R::Definitive);
+    }
+    if accepted {
+        return Terminal(R::Accepted);
+    }
+    if status != EvidenceStatus::Unsupported {
+        return Terminal(R::NotADecline);
+    }
+    if !DeclineClass::is_retryable(decline) {
+        return Terminal(R::Unclassified);
+    }
+    if budget_exceeded {
+        return Terminal(R::BudgetExceeded);
+    }
+    let Some(_route) = route else {
+        return Terminal(R::NoRoute);
+    };
+    match fallback_engine_index {
+        None => Terminal(R::NoRoute),
+        Some(index) if index == primary_engine_index => Terminal(R::SameEngine),
+        Some(_) => Eligible,
+    }
 }
 
 pub(super) fn obligation_route_for_kind(kind: &ObligationKind) -> Option<ObligationRoute> {

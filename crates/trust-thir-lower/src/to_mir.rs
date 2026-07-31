@@ -143,7 +143,7 @@ use rustc_middle::mir::interpret::CTFE_ALLOC_SALT;
 use rustc_middle::mir::{
     AggregateKind, AssertKind, BasicBlock, BasicBlockData, BinOp as MirBinOp, Body, BorrowKind,
     CallSource, CastKind, ClearCrossCrate, Const as MirConst, ConstOperand, ConstValue, Local,
-    LocalDecl, MirSource, Operand, Place, Rvalue, SourceInfo, SourceScopeData,
+    LocalDecl, MirSource, Operand, Place, Rvalue, SourceInfo, SourceScope, SourceScopeData,
     SourceScopeLocalData, Statement, StatementKind, Terminator, TerminatorKind, UnOp as MirUnOp,
     UnwindAction, VarDebugInfo, VarDebugInfoContents, WithRetag,
 };
@@ -810,6 +810,11 @@ struct ShimCx<'tcx> {
     /// Trust (C2-spans, consumption): the Module's file table, for resolving each
     /// `InstrNode.span` back to a rustc `Span`. See `set_span_from_node`.
     files: Vec<String>,
+    /// Trust (C2-scopes): how many entries the rebuilt `source_scopes` table has, so a node's
+    /// stamped index can be range-checked before it becomes a `SourceScope`. Always >= 1 (the
+    /// outermost scope always exists), which is why a producer that stamps nothing still
+    /// yields a valid body.
+    scope_count: u32,
     local_decls: IndexVec<Local, LocalDecl<'tcx>>,
     blocks: IndexVec<BasicBlock, BasicBlockData<'tcx>>,
     /// trust-ir SSA value -> its MIR denotation. SSA ids are function-unique, so one flat map.
@@ -858,6 +863,146 @@ struct ShimCx<'tcx> {
     overflow_checks: bool,
 }
 
+/// Trust (C2-scopes, consumption): rebuild MIR's `source_scopes` from the Module's tree.
+///
+/// Entry 0 is always minted HERE, from the body span `tcx` already gave us, rather than from
+/// the producer — one location, one owner, nothing to disagree about. Producer entry 0 is the
+/// same root and contributes only its (absent) span.
+///
+/// FAILS CLOSED on any topology violation. A malformed tree is a producer bug, and the
+/// alternative — flattening to a single scope and carrying on — would hand a debugger a body
+/// claiming every binding is visible everywhere. Refusing the flip for that body costs an
+/// optimization opportunity; the flattening costs correctness of the thing being built.
+///
+/// `lint_root` is the fn's own `HirId` for every entry: the producer only ever opens
+/// `let`-visibility scopes, which built creates with `LintLevel::Inherited`, and inheriting
+/// through a chain rooted at the fn yields exactly the fn's lint root at every depth.
+/// The scope table's structural invariant, as a pure check so it can be TESTED — the rest of
+/// `build_source_scopes` needs a `TyCtxt` and cannot be. Returns the failing rule's name, or
+/// `None` when the table is well-formed.
+///
+/// `parent < index` is doing double duty: it forbids cycles (a cycle needs some edge pointing
+/// forward or to itself) AND it guarantees a single forward pass suffices, because a scope's
+/// parent is always already built when the scope is reached.
+fn scope_topology_error(scopes: &[trust_ir::ScopeData]) -> Option<&'static str> {
+    match scopes.first() {
+        None => return Some("scope table present but empty"),
+        Some(root) if root.parent.is_some() => return Some("scope 0 is not the root"),
+        Some(_) => {}
+    }
+    for (i, sc) in scopes.iter().enumerate().skip(1) {
+        match sc.parent {
+            None => return Some("non-root scope without a parent"),
+            Some(p) if p as usize >= i => {
+                return Some("scope parent is not earlier than the scope");
+            }
+            Some(_) => {}
+        }
+    }
+    None
+}
+
+fn build_source_scopes<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    hir_id: rustc_hir::HirId,
+    body_span: Span,
+    files: &[String],
+    scopes: Option<&[trust_ir::ScopeData]>,
+) -> Result<IndexVec<SourceScope, SourceScopeData<'tcx>>, Unsupported> {
+    let mk = |span: Span, parent: Option<SourceScope>| SourceScopeData {
+        span,
+        parent_scope: parent,
+        inlined: None,
+        inlined_parent_scope: None,
+        // These scopes are reconstructed from TrustIR lexical metadata, not
+        // minted from an authored Rust loop query. They must never supply E4/E5
+        // source-loop identity authority.
+        local_data: ClearCrossCrate::Set(SourceScopeLocalData {
+            lint_root: hir_id,
+            trust_loop_hir_local_id: None,
+        }),
+    };
+    let mut out: IndexVec<SourceScope, SourceScopeData<'tcx>> = IndexVec::new();
+    out.push(mk(body_span, None));
+    let Some(scopes) = scopes else { return Ok(out) };
+    if let Some(err) = scope_topology_error(scopes) {
+        return unsup(err);
+    }
+    for (i, sc) in scopes.iter().enumerate().skip(1) {
+        // Sound by `scope_topology_error` above: entry `i > 0` has a parent, and it is `< i`,
+        // so the parent's `SourceScopeData` is already pushed and readable.
+        let parent = SourceScope::from_u32(sc.parent.unwrap_or(0));
+        let _ = i;
+        // A scope whose location did not survive inherits its parent's. Unlike an instruction
+        // span there is no "current location" to keep, and a `DUMMY_SP` scope would make
+        // codegen mint a lexical block at line 0.
+        let span = sc
+            .span
+            .and_then(|s| span_from_source_span(tcx, files, s))
+            .unwrap_or(out[parent].span);
+        out.push(mk(span, Some(parent)));
+    }
+    Ok(out)
+}
+
+/// Trust (C2-spans): a trust-ir `SourceSpan` -> a zero-length rustc `Span` at that point.
+/// Shared by instruction spans and scope spans so the two can never drift apart.
+///
+/// `SourceSpan.col` counts CHARS (`lookup_char_pos` returns `CharPos`); a rustc `BytePos`
+/// needs the byte offset of that char within the line — approximating chars as bytes lies on
+/// any non-ASCII line, so the line text is walked.
+///
+/// `col == <chars in line>` is a REAL position — one past the last character, before the
+/// newline — and it is the one built MIR uses most: `shrink_to_hi()` on a body span lands
+/// exactly there for the fn-end return terminator. It is resolved exactly, to the line's byte
+/// length. Only `col >` that is out of range, and that fails closed (returns `None`, caller
+/// keeps whatever location it had) rather than approximating: a span pointing at a
+/// plausible-but-wrong column is worse than no span, because the debugger reports it with
+/// confidence and the reader cannot tell it is fiction.
+///
+/// This distinction is recorded because getting it wrong is measurable in both directions,
+/// and both mistakes were made here in turn. The original code ended with
+/// `unwrap_or(line_text.len())`, which is correct for `col == len` and fiction beyond it.
+/// Reading built's epilogue rows (legitimately at `len + 1` in 1-based DWARF columns) as
+/// evidence of that fallback firing, I removed the whole branch — which turned the single
+/// most common end-of-line span into "no span", and `llvm-dwarfdump` immediately showed
+/// derived epilogue rows collapsing onto the previous statement's line. Reject what is out
+/// of range; resolve what is merely at the edge.
+fn span_from_source_span(
+    tcx: TyCtxt<'_>,
+    files: &[String],
+    sp: trust_ir::SourceSpan,
+) -> Option<Span> {
+    let path = files.get(sp.file as usize)?;
+    let sm = tcx.sess.source_map();
+    let file = sm
+        .files()
+        .iter()
+        .find(|f| f.name.prefer_local_unconditionally().to_string() == *path)
+        .cloned()?;
+    if sp.line == 0 {
+        return None;
+    }
+    let line_idx = (sp.line - 1) as usize;
+    if line_idx >= file.count_lines() {
+        return None;
+    }
+    let bounds = file.line_bounds(line_idx);
+    let line_text = file.get_line(line_idx)?;
+    let col = sp.col as usize;
+    let byte_in_line = match line_text.char_indices().nth(col) {
+        Some((byte, _)) => byte,
+        // Exactly one past the last char: the end-of-line position, not an overrun.
+        None if col == line_text.chars().count() => line_text.len(),
+        None => return None,
+    };
+    let lo = bounds.start + rustc_span::BytePos(u32::try_from(byte_in_line).ok()?);
+    if lo >= bounds.end {
+        return None;
+    }
+    Some(Span::with_root_ctxt(lo, lo))
+}
+
 impl<'tcx> ShimCx<'tcx> {
     /// Trust (C2-spans, consumption): re-point `source_info` at an instruction's stamped
     /// location. Unstamped nodes (terminators; pre-span producers) keep the CURRENT span —
@@ -868,42 +1013,19 @@ impl<'tcx> ShimCx<'tcx> {
     /// on any non-ASCII line, so the line text is walked. Every failure keeps the current
     /// `source_info` (metadata must never fail a body).
     fn set_span_from_node(&mut self, node: &InstrNode) {
+        // Trust (C2-scopes): scope FIRST and independently of the span. The two halves fail
+        // separately — an unlocatable instruction may still have a known scope, and vice
+        // versa — so an early return on one must not silently skip the other. An index past
+        // the table is dropped, not clamped: the producer and consumer disagreeing about the
+        // tree is exactly when guessing does damage.
+        if let Some(scope) = node.scope {
+            if scope < self.scope_count {
+                self.source_info.scope = SourceScope::from_u32(scope);
+            }
+        }
         let Some(sp) = node.span else { return };
-        let Some(path) = self.files.get(sp.file as usize) else { return };
-        let sm = self.tcx.sess.source_map();
-        let Some(file) = sm
-            .files()
-            .iter()
-            .find(|f| f.name.prefer_local_unconditionally().to_string() == *path)
-            .cloned()
-        else {
-            return;
-        };
-        if sp.line == 0 {
-            return;
-        }
-        let line_idx = (sp.line - 1) as usize;
-        if line_idx >= file.count_lines() {
-            return;
-        }
-        let bounds = file.line_bounds(line_idx);
-        let Some(line_text) = file.get_line(line_idx) else { return };
-        // FAIL CLOSED, do not approximate. The previous `unwrap_or(line_text.len())` invented
-        // an end-of-line column whenever the char lookup missed, and that fabrication was
-        // measurable: `llvm-dwarfdump` showed derived rows at 30/34/33 against built's
-        // 25/25/27 on a three-fn probe — exactly `line_len + 1` for lines of 29/33/32 chars,
-        // i.e. every wrong row WAS the fallback. A span that points at a plausible-but-wrong
-        // column is worse than no span: the debugger reports a location with confidence and
-        // the reader has no way to know it is fiction. Keeping the current `source_info`
-        // instead means the statement inherits its neighbour's honest location.
-        let Some((byte_in_line, _)) = line_text.char_indices().nth(sp.col as usize) else {
-            return;
-        };
-        let lo = bounds.start + rustc_span::BytePos(u32::try_from(byte_in_line).unwrap_or(0));
-        if lo >= bounds.end {
-            return;
-        }
-        self.source_info = SourceInfo::outermost(Span::with_root_ctxt(lo, lo));
+        let Some(span) = span_from_source_span(self.tcx, &self.files, sp) else { return };
+        self.source_info.span = span;
     }
 
     fn temp(&mut self, ty: RustcTy<'tcx>) -> Place<'tcx> {
@@ -1584,11 +1706,22 @@ pub fn lower_ir_to_mir<'tcx>(
         param_opacity.push(opaque);
     }
 
+    // Trust (C2-scopes): built BEFORE the walk, because `set_span_from_node` range-checks
+    // every stamped index against it — a scope table assembled afterwards could only be
+    // checked afterwards, i.e. never on the path that uses it.
+    let source_scopes = build_source_scopes(
+        tcx,
+        tcx.local_def_id_to_hir_id(def),
+        span,
+        &module.files,
+        func.scopes.as_deref(),
+    )?;
     let mut cx = ShimCx {
         tcx,
         span,
         source_info,
         files: module.files.clone(),
+        scope_count: u32::try_from(source_scopes.len()).unwrap_or(u32::MAX),
         local_decls: IndexVec::new(),
         blocks: IndexVec::new(),
         env: HashMap::new(),
@@ -2229,13 +2362,38 @@ pub fn lower_ir_to_mir<'tcx>(
                 // fragment")` arm and fail closed cleanly (NO ICE). Float casts are out of scope for
                 // wave-FL (which admits float params/returns/arithmetic/consts only); this defensive
                 // arm is now load-bearing, not hypothetical.
-                Inst::Cast { op, src_ty: _, dst_ty, operand } => {
+                Inst::Cast { op, src_ty, dst_ty, operand } => {
                     let r = match node.results.first() {
                         Some(r) => *r,
                         None => return unsup("Cast without result"),
                     };
                     match op {
                         CastOp::Trunc | CastOp::ZExt | CastOp::SExt => {}
+                        // Trust (#164 follow-through): an EQUAL-WIDTH integer reinterpret.
+                        //
+                        // `1861805e6b` fixed the producer to emit `Bitcast` rather than `Trunc`
+                        // at equal width — the trust-ir validator rejects `trunc i32 -> u32`
+                        // outright, so those modules were ill-formed. But the shim's admission
+                        // list was not widened with it, so from that commit every body carrying a
+                        // same-width int cast began failing closed HERE, and the flip it used to
+                        // earn silently disappeared. Measured: `pub fn d(x: u64) -> u64 { x >> 1 }`
+                        // went from flipping to `DerivedUnsupported "shim: Cast op Bitcast outside
+                        // integer fragment"`, taking the flip5 baseline from 4 to 3. A producer
+                        // correctness fix outran its consumer; this is the consumer catching up.
+                        //
+                        // Lowering is IDENTICAL to the other three ops — built MIR spells an
+                        // equal-width reinterpret as the same `Rvalue::Cast(CastKind::IntToInt)`
+                        // ("equal-width reinterprets alike", per the `-Zdump-mir` note above), so
+                        // no new shape reaches the comparator.
+                        //
+                        // GATED, deliberately, rather than admitting `Bitcast` wholesale: the op
+                        // also spells pointer and float bit-reinterprets, which are NOT `IntToInt`
+                        // and must keep failing closed. Both sides must be integer-like AND the
+                        // same width — exactly the condition under which the producer chooses it
+                        // (`int_to_int_cast_op`, lib.rs).
+                        CastOp::Bitcast
+                            if int_width(src_ty).is_some()
+                                && int_width(src_ty) == int_width(dst_ty) => {}
                         _ => return unsup(format!("Cast op {op:?} outside integer fragment")),
                     }
                     let rty = match cx.scalar_ty(dst_ty) {
@@ -3910,17 +4068,8 @@ pub fn lower_ir_to_mir<'tcx>(
         );
     }
 
-    // One outermost source scope, exactly like `construct_error` builds its minimal valid body.
-    let hir_id = tcx.local_def_id_to_hir_id(def);
-    let mut source_scopes: IndexVec<rustc_middle::mir::SourceScope, SourceScopeData<'tcx>> =
-        IndexVec::new();
-    source_scopes.push(SourceScopeData {
-        span,
-        parent_scope: None,
-        inlined: None,
-        inlined_parent_scope: None,
-        local_data: ClearCrossCrate::Set(SourceScopeLocalData { lint_root: hir_id }),
-    });
+    // `source_scopes` was built up front (see `build_source_scopes`); a body whose Module
+    // carries no tree gets exactly the one outermost scope this used to hard-code.
 
     // Trust (C2-names, consumption): mint `var_debug_info` from the Module's `value_names`.
     //
@@ -4276,7 +4425,15 @@ fn shift_idiom(nodes: &[InstrNode], i: usize) -> Option<ShiftIdiom> {
     let mut k = i;
     // Optional leading range cast: the signed amount reinterpreted as its unsigned twin.
     let lead: Option<(ValueId, Ty, ValueId, Ty)> = match &nodes.get(k)?.inst {
-        Inst::Cast { op: CastOp::Trunc, src_ty, dst_ty, operand }
+        // Trust (#164 follow-through): `Bitcast`, NOT `Trunc`. This arm is guarded on
+        // `int_width(src) == int_width(dst)`, and since 1861805e6b the producer spells an
+        // equal-width reinterpret `Bitcast` — `trunc i32 -> u32` is REJECTED by the trust-ir
+        // validator. So the old `Trunc` spelling here could only ever match a module that is
+        // ill-formed by the format's own rules: a dead arm, and its deadness is what silently
+        // withdrew the flip for every guarded shift (measured on
+        // `pub fn d(x: u64) -> u64 { x >> 1 }`). Matching only the well-formed spelling keeps
+        // the arm honest rather than accepting both and pretending the invalid one is legal.
+        Inst::Cast { op: CastOp::Bitcast, src_ty, dst_ty, operand }
             if is_signed_int(src_ty)
                 && is_unsigned_int(dst_ty)
                 && int_width(src_ty) == int_width(dst_ty) =>
@@ -4322,8 +4479,11 @@ fn shift_idiom(nodes: &[InstrNode], i: usize) -> Option<ShiftIdiom> {
     };
     // Optional value retype cast (amount → the shifted type; trust-ir's same-type contract).
     let val_cast: Option<(ValueId, Ty)> = match nodes.get(k).map(|n| &n.inst) {
+        // Trust (#164 follow-through): `Bitcast` joins the three width-changing spellings.
+        // This cast's width is NOT constrained by the pattern, so all four are reachable —
+        // an amount already at the shifted type's width retypes with `Bitcast`.
         Some(Inst::Cast {
-            op: CastOp::Trunc | CastOp::SExt | CastOp::ZExt,
+            op: CastOp::Trunc | CastOp::SExt | CastOp::ZExt | CastOp::Bitcast,
             src_ty,
             dst_ty,
             operand,
@@ -4388,8 +4548,13 @@ fn shift_value_cast_pair(
     i: usize,
 ) -> Option<(ValueId, ValueId, Ty, MirBinOp, ValueId)> {
     let (amt, cast_res, dst_ty) = match &nodes.get(i)?.inst {
-        Inst::Cast { op: CastOp::Trunc | CastOp::SExt | CastOp::ZExt, src_ty, dst_ty, operand }
-            if is_int(src_ty) && is_int(dst_ty) =>
+        // Trust (#164 follow-through): `Bitcast` is the equal-width spelling (see `shift_idiom`).
+        Inst::Cast {
+            op: CastOp::Trunc | CastOp::SExt | CastOp::ZExt | CastOp::Bitcast,
+            src_ty,
+            dst_ty,
+            operand,
+        } if is_int(src_ty) && is_int(dst_ty) =>
         {
             (*operand, *nodes[i].results.first()?, dst_ty.clone())
         }
@@ -4426,5 +4591,86 @@ mod u128_v24_reconstruction_tests {
     fn u128_switch_case_cannot_narrow() {
         assert_eq!(integer_switch_case_bits(&Constant::U128(u128::MAX), 64), None);
         assert_eq!(integer_switch_case_bits(&Constant::Int(-1), 64), Some(u128::MAX));
+    }
+}
+
+
+#[cfg(test)]
+mod scope_topology_tests {
+    use super::scope_topology_error;
+    use trust_ir::ScopeData;
+
+    fn sc(parent: Option<u32>) -> ScopeData {
+        ScopeData { parent, span: None }
+    }
+
+    #[test]
+    fn well_formed_chain_and_fan_out_are_accepted() {
+        assert_eq!(scope_topology_error(&[sc(None)]), None, "lone root");
+        // The `let`-chain shape the producer actually emits.
+        assert_eq!(
+            scope_topology_error(&[sc(None), sc(Some(0)), sc(Some(1))]),
+            None,
+            "nested chain"
+        );
+        // Sibling scopes under one parent — two blocks at the same depth.
+        assert_eq!(
+            scope_topology_error(&[sc(None), sc(Some(0)), sc(Some(0)), sc(Some(2))]),
+            None,
+            "fan-out"
+        );
+    }
+
+    #[test]
+    fn every_malformed_shape_is_rejected() {
+        // Each case is a way a buggy producer could hand us a tree that a naive
+        // consumer would either hang on or silently flatten.
+        assert!(scope_topology_error(&[]).is_some(), "empty table");
+        assert!(scope_topology_error(&[sc(Some(0))]).is_some(), "root claims a parent");
+        assert!(
+            scope_topology_error(&[sc(None), sc(None)]).is_some(),
+            "second root"
+        );
+        assert!(
+            scope_topology_error(&[sc(None), sc(Some(1))]).is_some(),
+            "self-parent: the one-node cycle"
+        );
+        assert!(
+            scope_topology_error(&[sc(None), sc(Some(2)), sc(Some(1))]).is_some(),
+            "forward reference: the two-node cycle"
+        );
+        assert!(
+            scope_topology_error(&[sc(None), sc(Some(9))]).is_some(),
+            "parent past the end of the table"
+        );
+    }
+}
+
+
+#[cfg(test)]
+mod emission_chokepoint_tests {
+    /// Trust (C2 repair): `LowerCx::push_node` is documented as "the ONLY instruction-emission
+    /// chokepoint" — it is where `cur_span` and `cur_scope` are stamped. That claim was FALSE
+    /// for most of C2's life: `emit_call` and four static/global sites pushed to `self.cur`
+    /// directly, so every `Inst::Call` shipped with no span and no scope, and the consumer
+    /// silently inherited the previous node's location.
+    ///
+    /// Nothing in the type system prevents the next author from writing `self.cur.push(..)`
+    /// again, and the failure is invisible — no error, no ICE, just debug info that quietly
+    /// points at the wrong line. So the invariant is pinned at the SOURCE: exactly one
+    /// `self.cur.push(` may exist in the producer, the one inside `push_node` itself.
+    ///
+    /// A source-text guard is crude, and it is the honest tool here: the alternative is an
+    /// invariant stated only in a doc comment, which is precisely what failed.
+    #[test]
+    fn push_node_is_the_only_emission_site() {
+        let src = include_str!("lib.rs");
+        let sites = src.matches("self.cur.push(").count();
+        assert_eq!(
+            sites, 1,
+            "found {sites} `self.cur.push(` sites in trust-thir-lower/src/lib.rs; exactly one \
+             is allowed (the body of `push_node`). A new direct push bypasses span/scope \
+             stamping — route it through `self.push_node(..)` instead."
+        );
     }
 }

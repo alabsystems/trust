@@ -149,6 +149,7 @@ quick.robust-smoke|quick|compatibility|true|never|bash tests/run_trust_robust_su
 quick.crates-lib-tests|quick|crates|true|never|RUSTC_BOOTSTRAP=1 cargo test --manifest-path crates/Cargo.toml --workspace --lib --locked --no-fail-fast
 quick.targo-trust-tests|quick|crates|true|never|RUSTC_BOOTSTRAP=1 cargo test --manifest-path targo-trust/Cargo.toml --locked --no-fail-fast
 quick.compiler-unit-tests|quick|compile|true|never|RUSTC_BOOTSTRAP=1 python3 x.py test --stage 1 compiler/rustc_driver_impl compiler/rustc_session compiler/rustc_mir_transform
+quick.falsification-classifier|quick|compile|true|never|bash tests/trust-falsification/classify_verdict_test.sh
 trust.added.quick|release|blocked-release-inventory|true|never|TRUST_RELEASE_GATE=1 bash tests/run_trust_robust_suite.sh quick
 stage2.build|release|bootstrap|true|never|python3 x.py build --stage 2
 upstream.trust-compat|release|upstream|true|never|TRUST_STRICT=1 TRUST_SUPERSET_ASSUME_STAGE2=1 bash tests/run_trust_superset_suite.sh trust-compat

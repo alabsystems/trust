@@ -36,12 +36,49 @@ pub(crate) fn sort_to_smt2(sort: &Sort) -> String {
 /// Quantifier-bound variables are excluded.
 #[must_use]
 pub(crate) fn emit_declarations(formula: &Formula) -> Vec<String> {
-    let mut decls: Vec<String> = collect_free_vars(formula)
-        .into_iter()
-        .map(|(name, sort)| {
-            format!("(declare-fun {} () {})", escape_smtlib_symbol(&name), sort_to_smt2(&sort))
-        })
-        .collect();
+    let vars = collect_free_vars(formula);
+
+    // Lever A: datatype sorts must be DECLARED before any `declare-fun` that
+    // uses them. Gather every datatype declaration reachable from the free
+    // vars' sorts, de-duplicated and topologically ordered (a referenced
+    // datatype before the one that uses it). A datatype that appears only as a
+    // BY-NAME reference (empty constructors — a recursive back-edge whose full
+    // definition is modeled by the flat-`Ty::Adt` encoding, not as a real SMT
+    // datatype) has no `declare-datatype`; it is declared as an uninterpreted
+    // sort (`declare-sort … 0`) so the referencing `declare-fun` is well-formed.
+    // Without this, a `(declare-fun e () Expr)` over an undeclared sort `Expr`
+    // makes the whole SMT query malformed.
+    let mut decls: Vec<String> = Vec::new();
+    let mut datatype_decls: Vec<String> = Vec::new();
+    for (_, sort) in &vars {
+        for d in sort.datatype_declarations() {
+            if !datatype_decls.contains(&d) {
+                datatype_decls.push(d);
+            }
+        }
+    }
+    // Record full-datatype names so a name that has a real definition is NOT
+    // also emitted as an uninterpreted sort (which would be a redeclaration).
+    let mut defined_dt: BTreeSet<String> = BTreeSet::new();
+    for d in &datatype_decls {
+        if let Some(name) =
+            d.strip_prefix("(declare-datatype ").and_then(|r| r.split_whitespace().next())
+        {
+            defined_dt.insert(name.to_string());
+        }
+    }
+    let mut uninterpreted_names: BTreeSet<String> = BTreeSet::new();
+    for (_, sort) in &vars {
+        collect_uninterpreted_datatype_refs(sort, &defined_dt, &mut uninterpreted_names);
+    }
+    for name in &uninterpreted_names {
+        decls.push(format!("(declare-sort {} 0)", escape_smtlib_symbol(name)));
+    }
+    decls.extend(datatype_decls);
+
+    decls.extend(vars.into_iter().map(|(name, sort)| {
+        format!("(declare-fun {} () {})", escape_smtlib_symbol(&name), sort_to_smt2(&sort))
+    }));
 
     // safe-api: uninterpreted predicate symbols (Formula::Pred) need an
     // ARITY declare-fun returning Bool. Their argument Vars are already declared
@@ -62,6 +99,36 @@ pub(crate) fn emit_declarations(formula: &Formula) -> Vec<String> {
     decls
 }
 
+/// Collect the names of BY-NAME datatype references (empty-constructor
+/// `Sort::Datatype`) reachable from `sort`, EXCLUDING any name that already has
+/// a full definition (in `defined`). These are the recursive back-edges that
+/// need a `(declare-sort … 0)` so the referencing declaration is well-formed.
+fn collect_uninterpreted_datatype_refs(
+    sort: &Sort,
+    defined: &BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    match sort {
+        Sort::Datatype { name, constructors } if constructors.is_empty() => {
+            if !defined.contains(name) {
+                out.insert(name.clone());
+            }
+        }
+        Sort::Datatype { constructors, .. } => {
+            for (_, fields) in constructors {
+                for (_, fsort) in fields {
+                    collect_uninterpreted_datatype_refs(fsort, defined, out);
+                }
+            }
+        }
+        Sort::Array(idx, elem) => {
+            collect_uninterpreted_datatype_refs(idx, defined, out);
+            collect_uninterpreted_datatype_refs(elem, defined, out);
+        }
+        _ => {}
+    }
+}
+
 /// Detect the appropriate SMT-LIB2 logic string for a formula.
 ///
 /// Analyzes the formula structure to select the most specific logic:
@@ -73,6 +140,17 @@ pub(crate) fn emit_declarations(formula: &Formula) -> Vec<String> {
 /// - `ALL` as fallback for mixed theories
 #[must_use]
 pub(crate) fn detect_logic(formula: &Formula) -> &'static str {
+    // Lever A: if any free variable carries a datatype (or datatype-back-edge
+    // uninterpreted) sort, the query needs the datatype theory. Rather than
+    // enumerate every datatype×theory combination (QF_DT / QF_UFDT / AUFDT / …),
+    // select `ALL` — ay accepts it and it admits datatypes alongside the BV/Int/
+    // UF scalar fields a recursive ADT's leaves produce. SOUNDNESS: `ALL` only
+    // WIDENS the admissible theory set; it never changes a formula's models, so
+    // it cannot turn a SAT violation into UNSAT (no false-prove).
+    if formula_has_datatype_sort(formula) {
+        return "ALL";
+    }
+
     let features = analyze_formula(formula);
 
     // SMT-LIB has no small standard logic name for the mixed FP/BV/array/UF
@@ -118,6 +196,20 @@ pub(crate) fn detect_logic(formula: &Formula) -> &'static str {
 }
 
 // --- Internal helpers ---
+
+/// True iff any `Var`/`SymVar` in `formula` carries a sort that is (or
+/// transitively contains) a datatype sort — including a by-name datatype
+/// back-edge reference. Drives the `ALL`-logic selection in `detect_logic`.
+fn formula_has_datatype_sort(formula: &Formula) -> bool {
+    let mut found = false;
+    formula.visit(&mut |node| match node {
+        Formula::Var(_, sort) | Formula::SymVar(_, sort) if sort.contains_datatype() => {
+            found = true;
+        }
+        _ => {}
+    });
+    found
+}
 
 /// Formula features relevant to logic detection.
 struct FormulaFeatures {
@@ -299,6 +391,82 @@ mod tests {
 
     fn bv_var(name: &str, w: u32) -> Formula {
         Formula::Var(name.into(), Sort::BitVec(w))
+    }
+
+    // -- Lever A: datatype preamble emission --------------------------------
+
+    /// A by-name recursive-datatype reference (the shape the minimal Lever A
+    /// lowering produces for a recursive ADT value) must (1) select a
+    /// datatype-capable logic and (2) be DECLARED — as an uninterpreted sort —
+    /// BEFORE the `declare-fun` that uses it, so the SMT query is well-formed.
+    #[test]
+    fn by_name_datatype_var_emits_declare_sort_before_declare_fun() {
+        let dt = Sort::Datatype { name: "Expr".into(), constructors: Vec::new() };
+        let f = Formula::Eq(
+            Box::new(Formula::Var("e".into(), dt.clone())),
+            Box::new(Formula::Var("e".into(), dt)),
+        );
+        assert_eq!(detect_logic(&f), "ALL", "a datatype var must select a datatype-capable logic");
+
+        let decls = emit_declarations(&f);
+        let sort_pos = decls.iter().position(|d| d.contains("(declare-sort Expr 0)"));
+        let fun_pos = decls.iter().position(|d| d.contains("(declare-fun e () Expr)"));
+        assert!(sort_pos.is_some(), "Expr must be declared as a sort: {decls:?}");
+        assert!(fun_pos.is_some(), "e must be declared with sort Expr: {decls:?}");
+        assert!(
+            sort_pos < fun_pos,
+            "the sort declaration must precede the const that uses it: {decls:?}"
+        );
+    }
+
+    /// A FULL datatype sort emits a `declare-datatype` (not a bare sort), and the
+    /// recursive self-reference inside it stays a by-name `Expr` (finite output).
+    #[test]
+    fn full_datatype_var_emits_declare_datatype() {
+        let expr_ref = Sort::Datatype { name: "Expr".into(), constructors: Vec::new() };
+        let full = Sort::Datatype {
+            name: "Expr".into(),
+            constructors: vec![
+                ("Const".into(), vec![("c".into(), Sort::BitVec(32))]),
+                ("App".into(), vec![("f".into(), expr_ref.clone()), ("x".into(), expr_ref)]),
+            ],
+        };
+        let f = Formula::Eq(
+            Box::new(Formula::Var("e".into(), full.clone())),
+            Box::new(Formula::Var("e".into(), full)),
+        );
+        let decls = emit_declarations(&f);
+        let dt_pos = decls.iter().position(|d| d.contains("(declare-datatype Expr"));
+        assert!(dt_pos.is_some(), "a full datatype var must emit a declare-datatype: {decls:?}");
+        // Exactly one datatype declaration (self-recursion is by-name, not expanded).
+        assert_eq!(
+            decls.iter().filter(|d| d.contains("declare-datatype")).count(),
+            1,
+            "self-recursion must not duplicate the datatype declaration: {decls:?}"
+        );
+        // And NOT also a redundant (declare-sort Expr 0).
+        assert!(
+            !decls.iter().any(|d| d.contains("(declare-sort Expr 0)")),
+            "a fully-defined datatype must not also be declared as an uninterpreted sort: {decls:?}"
+        );
+        // The definition still precedes the const that uses it.
+        let fun_pos = decls.iter().position(|d| d.contains("(declare-fun e () Expr)"));
+        assert!(fun_pos.is_some(), "e must be declared with sort Expr: {decls:?}");
+        assert!(dt_pos < fun_pos, "declare-datatype must precede its uses: {decls:?}");
+    }
+
+    /// A formula with NO datatype content keeps its precise (non-`ALL`) logic and
+    /// emits no sort-declaration preamble — Lever A must not perturb the
+    /// existing scalar path.
+    #[test]
+    fn non_datatype_formula_keeps_precise_logic_and_empty_preamble() {
+        let f = Formula::BvAdd(Box::new(bv_var("x", 32)), Box::new(bv_var("y", 32)), 32);
+        assert_eq!(detect_logic(&f), "QF_BV");
+        let decls = emit_declarations(&f);
+        assert!(
+            !decls.iter().any(|d| d.contains("declare-sort") || d.contains("declare-datatype")),
+            "no datatype content must emit no datatype preamble: {decls:?}"
+        );
     }
 
     // --- formula_to_smt2 tests ---

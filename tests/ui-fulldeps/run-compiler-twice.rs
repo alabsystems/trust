@@ -76,7 +76,7 @@ fn compile(code: String, output: PathBuf, sysroot: Sysroot, linker: Option<&Path
 
     interface::run_compiler(config, |compiler| {
         assert!(!compiler.sess.trust_verification_enabled());
-        assert!(compiler.sess.opts.unstable_opts.no_trust_verify);
+        assert!(!compiler.sess.opts.unstable_opts.trust_verify.is_on());
         assert!(!compiler.sess.trust_ir_lower_enabled());
         let krate = rustc_interface::passes::parse(&compiler.sess);
         let linker = rustc_interface::create_and_enter_global_ctxt(&compiler, krate, |tcx| {

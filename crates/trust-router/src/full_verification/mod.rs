@@ -20,7 +20,10 @@ mod util;
 pub use engine::{
     FullVerificationEngine, FullVerificationRunWithFreshReceipts, LiveVerificationReceiptBatch,
 };
-pub use engines::{NativeTrustMcTrustIrEngine, NativeTyEngine, required_native_engines};
+pub use engines::{
+    DEFAULT_PER_OBLIGATION_TIMEOUT_MS, NativeTrustMcTrustIrEngine, NativeTyEngine,
+    required_native_engines, required_native_engines_with_timeout_ms,
+};
 pub use native_trust_ir::{
     DirectTrustVcProofReceipt, FreshExactDirectChcPdrReceipt, NativeTrustIrBindingIndex,
     trust_wp_native_replay_metadata_entries_for_request,

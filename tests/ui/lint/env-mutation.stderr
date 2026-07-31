@@ -28,3 +28,4 @@ LL |     let indirect = std::env::set_var::<&str, &str>;
    = help: route the mutation through a lock-scoped helper that sets and restores the variable under a global lock, and bless that single call site with `#[allow(env_mutation)]`
 
 error: aborting due to 3 previous errors
+

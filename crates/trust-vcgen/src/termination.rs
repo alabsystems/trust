@@ -339,11 +339,20 @@ pub(crate) fn extract_decreases_contracts(func: &VerifiableFunction) -> Vec<Decr
                 && !c.body.starts_with(crate::contracts::UNPAIRED_LOOP_CONTRACT_PREFIX)
         })
         .map(|c| DecreasesClause {
-            measure: c.body.clone(),
+            // Compiler-native clauses retain a schema marker in `Contract::body`
+            // so their query provenance cannot be confused with compatibility
+            // source text.  The marker is not part of the authored numeric
+            // expression, however, and must never enter parameter lookup or
+            // recursive-call substitution.
+            measure: recursion_decreases_measure(&c.body).to_string(),
             span: c.span.clone(),
             kind: DecreasesKind::Recursion,
         })
         .collect()
+}
+
+fn recursion_decreases_measure(body: &str) -> &str {
+    body.strip_prefix(crate::contracts::LOWERED_CONTRACT_PREFIX).unwrap_or(body).trim()
 }
 
 /// Generate termination verification conditions for a function.
@@ -673,7 +682,7 @@ fn unique_recursion_decreases_contract_index(
 ) -> Option<usize> {
     let mut matches = func.contracts.iter().enumerate().filter_map(|(index, contract)| {
         (matches!(contract.kind, ContractKind::Decreases)
-            && contract.body == clause.measure
+            && recursion_decreases_measure(&contract.body) == clause.measure
             && contract.span == clause.span
             && crate::contracts::loop_contract_body(&contract.body).is_none()
             && !contract.body.starts_with(crate::contracts::UNPAIRED_LOOP_CONTRACT_PREFIX))
@@ -2776,6 +2785,34 @@ mod tests {
         assert_eq!(clauses.len(), 1);
         assert_eq!(clauses[0].measure, "n");
         assert!(matches!(clauses[0].kind, DecreasesKind::Recursion));
+
+        let mut compiler_native = func;
+        compiler_native.contracts[0].body =
+            format!("{}n", crate::contracts::LOWERED_CONTRACT_PREFIX);
+        let clauses = extract_decreases_contracts(&compiler_native);
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(
+            clauses[0].measure, "n",
+            "the compiler schema marker is provenance, not part of the numeric measure",
+        );
+        let mut vcs = Vec::new();
+        check_termination(&compiler_native, &mut vcs);
+        assert!(
+            vcs.iter().any(|vc| matches!(
+                &vc.kind,
+                VcKind::NonTermination { context, measure }
+                    if context == "recursion" && measure == "n"
+            )),
+            "a compiler-native direct-self clause must generate its exact recursion VC: {vcs:#?}",
+        );
+        assert!(
+            !vcs.iter().any(|vc| matches!(
+                &vc.kind,
+                VcKind::UnsupportedMir { detail, .. }
+                    if detail.contains("outside the exact supported fragment")
+            )),
+            "the schema prefix must not demote a supported parameter measure: {vcs:#?}",
+        );
     }
 
     #[test]

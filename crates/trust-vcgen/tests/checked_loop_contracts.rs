@@ -98,6 +98,8 @@ fn loop_spec(kind: LoopContractKind, body: &str) -> LoopContractSpec {
     LoopContractSpec {
         kind,
         source_loop_id: 0,
+        source_hir_local_id: None,
+        mir_header: None,
         loop_head: SourceSpan { line_end: 14, ..span(10) },
         header_span: span(10),
         span: span(11),
@@ -152,7 +154,7 @@ fn checked_unsigned_unit_decrement_under_positive_otherwise_guard_is_exact() {
 }
 
 #[test]
-fn non_positive_guard_does_not_authorize_unsigned_decrement() {
+fn non_positive_guard_uses_exact_wrapping_unsigned_decrement() {
     let mut func = checked_countdown(BinOp::Ge, 1);
     assert!(
         bind_compiler_loop_contracts(&mut func, &[loop_spec(LoopContractKind::Invariant, "true")],)
@@ -160,12 +162,15 @@ fn non_positive_guard_does_not_authorize_unsigned_decrement() {
     );
 
     let (all, unsupported) = loop_unknowns(&func);
-    assert!(!all.iter().any(|vc| matches!(vc.kind, VcKind::LoopInvariantConsecution { .. })));
-    assert_eq!(unsupported.len(), 1, "n >= 0 still permits n == 0: {unsupported:#?}");
+    assert!(all.iter().any(|vc| matches!(vc.kind, VcKind::LoopInvariantConsecution { .. })));
+    assert!(
+        unsupported.is_empty(),
+        "the guard need not prove non-underflow when the transition keeps exact wrapping semantics: {unsupported:#?}",
+    );
 }
 
 #[test]
-fn positive_guard_does_not_authorize_a_wider_decrement() {
+fn positive_guard_uses_exact_wrapping_wider_decrement() {
     let mut func = checked_countdown(BinOp::Gt, 2);
     assert!(
         bind_compiler_loop_contracts(&mut func, &[loop_spec(LoopContractKind::Invariant, "true")],)
@@ -173,8 +178,42 @@ fn positive_guard_does_not_authorize_a_wider_decrement() {
     );
 
     let (all, unsupported) = loop_unknowns(&func);
-    assert!(!all.iter().any(|vc| matches!(vc.kind, VcKind::LoopInvariantConsecution { .. })));
-    assert_eq!(unsupported.len(), 1, "n > 0 still permits n == 1: {unsupported:#?}");
+    assert!(all.iter().any(|vc| matches!(vc.kind, VcKind::LoopInvariantConsecution { .. })));
+    assert!(
+        unsupported.is_empty(),
+        "a wider step remains exact in declared-width BV even when it may wrap: {unsupported:#?}",
+    );
+}
+
+#[test]
+fn checked_shift_accepts_an_independently_typed_integer_rhs() {
+    let mut func = checked_countdown(BinOp::Gt, 1);
+    let Statement::Assign { rvalue: Rvalue::CheckedBinaryOp(op, _, rhs), .. } =
+        &mut func.body.blocks[2].stmts[0]
+    else {
+        unreachable!()
+    };
+    *op = BinOp::Shl;
+    *rhs = Operand::Constant(ConstValue::Uint(1, 16));
+    let Terminator::Assert { msg, .. } = &mut func.body.blocks[2].terminator else {
+        unreachable!()
+    };
+    *msg = AssertMessage::Overflow(BinOp::Shl);
+
+    assert!(
+        bind_compiler_loop_contracts(&mut func, &[loop_spec(LoopContractKind::Invariant, "true")],)
+            .is_empty()
+    );
+    let (all, unsupported) = loop_unknowns(&func);
+    assert!(
+        unsupported.is_empty(),
+        "MIR permits a checked u32 shift with a u16 count; its exact type must not fail-close: \
+         {unsupported:#?}",
+    );
+    assert!(
+        all.iter().any(|vc| matches!(vc.kind, VcKind::LoopInvariantConsecution { .. })),
+        "the authenticated checked shift must retain its exact E4 transition: {all:#?}",
+    );
 }
 
 fn assert_checked_shape_declines(mut func: VerifiableFunction, case: &str) {

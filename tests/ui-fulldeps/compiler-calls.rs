@@ -17,8 +17,14 @@ struct TestCalls<'a> {
 
 impl rustc_driver::Callbacks for TestCalls<'_> {
     fn config(&mut self, config: &mut interface::Config) {
-        assert!(config.opts.unstable_opts.no_trust_verify);
-        assert_eq!(config.opts.unstable_opts.trust_ir_lower, Some(false));
+        assert!(!config.opts.unstable_opts.trust_verify.is_on());
+        assert!(
+            config
+                .opts
+                .unstable_opts
+                .trust_ir_lower
+                .is_some_and(|request| !request.runs())
+        );
         *self.count *= 2;
     }
 }

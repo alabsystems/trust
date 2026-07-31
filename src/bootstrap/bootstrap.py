@@ -1289,8 +1289,8 @@ def trust_verifier_controls(value, encoded=False):
     return controls
 
 
-def rustc_supports_trust_bootstrap_no_verify(rustc, env):
-    """Capability-probe the concrete Stage0 driver without compiling input."""
+def stage0_z_help(rustc, env):
+    """`rustc -Z help` output for the concrete Stage0 driver, or None."""
     try:
         result = subprocess.run(
             [rustc, "-Z", "help"],
@@ -1302,12 +1302,39 @@ def rustc_supports_trust_bootstrap_no_verify(rustc, env):
             timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return False
+        return None
     if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def rustc_supports_trust_bootstrap_no_verify(rustc, env):
+    """Capability-probe the concrete Stage0 driver without compiling input."""
+    help_text = stage0_z_help(rustc, env)
+    if help_text is None:
         return False
     return any(
         re.match(r"^\s*-Z\s+trust-verify(?:=|\s|$)", line)
-        for line in result.stdout.splitlines()
+        for line in help_text.splitlines()
+    )
+
+
+def rustc_advertises_retired_no_verify(rustc, env):
+    """Detect a PRE-RENAME Trust Stage0 by its retired off-switch spelling.
+
+    A driver that advertises neither spelling is stock upstream (no Trust
+    machinery; nothing to disable). One that advertises only the retired
+    `-Zno-trust-verify` is a Trust seed older than the flag-surface
+    consolidation that renamed the off-switch — its batteries-on default
+    would otherwise verify the whole bootstrap dependency tree and abort on
+    the first verification-refused dep (memchr's SIMD paths, ~700 errors).
+    """
+    help_text = stage0_z_help(rustc, env)
+    if help_text is None:
+        return False
+    return any(
+        re.match(r"^\s*-Z\s+no-trust-verify(?:=|\s|$)", line)
+        for line in help_text.splitlines()
     )
 
 
@@ -1315,11 +1342,18 @@ def apply_trust_bootstrap_compiler_policy(rustc, env):
     """Disable batteries-on verification only for a capable Trust Stage0.
 
     Bootstrap establishes compiler lineage; it is deliberately not a self-proof
-    session. A stock/genesis driver does not advertise the Trust-only flag and is
-    left untouched. Conflicting verifier controls fail closed instead of relying
-    on unstable-option ordering.
+    session. A stock upstream driver advertises no Trust off-switch spelling
+    and is left untouched; a PRE-RENAME Trust seed (advertises only the
+    retired `-Zno-trust-verify`) is addressed through the version-invariant
+    nested-process transport `TRUST_NO_VERIFY=1`, which every Trust vintage
+    translates before option parsing — appending the current flag spelling
+    would abort it with `unknown unstable option`, and appending the retired
+    spelling would abort every post-rename seed. Conflicting verifier controls
+    fail closed instead of relying on unstable-option ordering.
     """
     if not rustc_supports_trust_bootstrap_no_verify(rustc, env):
+        if rustc_advertises_retired_no_verify(rustc, env):
+            env["TRUST_NO_VERIFY"] = "1"
         return False
 
     flag_sources = (
@@ -1420,8 +1454,14 @@ class RustBuild(object):
         tarball which has the stage0 compiler used to then bootstrap the Rust
         compiler itself.
 
-        Each downloaded tarball is extracted, after that, the script
-        will move all the content to the right place.
+        Fail-closed contract (2026-07-29 seed-destruction incident): the live
+        stage0 seed is only ever replaced by an atomic rename of a fully
+        downloaded, extracted, and surface-verified staging tree. Any failure
+        to download, unpack, or validate aborts BEFORE the existing seed is
+        touched. A refresh always re-images the complete component surface:
+        the old code deleted the whole seed but downloaded only the
+        need-scoped half, so a Targo-only trigger deleted trustc/trust-std
+        and never reinstalled them.
         """
         rustc_channel = self.stage0_compiler.version
         bin_root = self.bin_root()
@@ -1436,98 +1476,114 @@ class RustBuild(object):
             not os.path.exists(self.cargo()) or is_outdated or surface_needs_refresh
         )
 
-        if need_rustc or need_cargo:
-            if os.path.exists(bin_root):
-                # HACK: On Windows, we can't delete the proc-macro server while it's
-                # running. Kill it.
-                if platform_is_win32():
-                    print(
-                        "Killing trust-analyzer-proc-macro-srv before deleting stage0 toolchain"
-                    )
-                    regex = "{}\\\\(host|{})\\\\stage0\\\\libexec".format(
-                        os.path.basename(self.build_dir), self.build
-                    )
-                    script = (
-                        # NOTE: can't use `taskkill` or `Get-Process -Name` because they error if
-                        # the server isn't running.
-                        "Get-Process | "
-                        + 'Where-Object {$_.Name -eq "trust-analyzer-proc-macro-srv" '
-                        + '-or $_.Name -eq "rust-analyzer-proc-macro-srv"} |'
-                        + 'Where-Object {{$_.Path -match "{}"}} |'.format(regex)
-                        + "Stop-Process"
-                    )
-                    run_powershell([script])
-                shutil.rmtree(bin_root)
+        if not (need_rustc or need_cargo):
+            return
 
-            cache_dst = self.get_toml("bootstrap-cache-path", "build") or os.path.join(
-                self.build_dir, "cache"
-            )
-
-            rustc_cache = os.path.join(cache_dst, key)
-            if not os.path.exists(rustc_cache):
-                os.makedirs(rustc_cache)
-
-            tarball_suffix = ".tar.gz" if lzma is None else ".tar.xz"
-
-            toolchain_suffix = "{}-{}{}".format(
-                rustc_channel, self.build, tarball_suffix
-            )
-
-            tarballs_to_download = []
-            legacy_targo_components = []
-            translate_legacy_tippy = False
-
-            if need_rustc:
-                tarballs_to_download.append(
-                    ("trust-std-{}".format(toolchain_suffix), "trust-std-{}".format(self.build))
-                )
-                tarballs_to_download.append(
-                    ("trustc-{}".format(toolchain_suffix), "trustc")
+        # A configured tool path under bin_root whose basename is a FORBIDDEN
+        # stage0 name (e.g. a stale `cargo = .../bin/tcargo` pin left in
+        # bootstrap.toml from before the tcargo->targo rename) can never be
+        # satisfied by a refresh: assert_stage0_tool_surface guarantees the
+        # canonical surface does not contain it, so the trigger would re-fire
+        # on every run, re-imaging the seed forever. This exact loop is what
+        # destroyed the 2026-07-13 seed on 2026-07-29. Reject with guidance
+        # instead of refreshing.
+        for config_key, tool_path in (("rustc", self.rustc()), ("cargo", self.cargo())):
+            if not tool_path.startswith(bin_root):
+                continue
+            basename = os.path.basename(tool_path)
+            if EXE_SUFFIX and basename.endswith(EXE_SUFFIX):
+                basename = basename[: -len(EXE_SUFFIX)]
+            if basename in STAGE0_FORBIDDEN_BINS:
+                raise RuntimeError(
+                    "bootstrap.toml [build] {} points at {}, but `{}` is a "
+                    "forbidden legacy stage0 name that a refresh can never "
+                    "produce; update the pin to the canonical binary "
+                    "(e.g. bin/targo) instead of re-imaging the seed on "
+                    "every run.".format(config_key, tool_path, basename)
                 )
 
-            if need_cargo:
-                for component in ("targo", "targo-trust"):
-                    filename, selected_pattern, selected_legacy = (
-                        select_stage0_targo_component(
-                            self.stage0_data,
-                            self.stage0_compiler.date,
-                            toolchain_suffix,
-                            component,
-                        )
-                    )
-                    tarballs_to_download.append((filename, selected_pattern))
-                    if selected_legacy:
-                        legacy_targo_components.append(component)
+        cache_dst = self.get_toml("bootstrap-cache-path", "build") or os.path.join(
+            self.build_dir, "cache"
+        )
 
-            for component, pattern in STAGE0_EXTRA_COMPONENTS:
-                filename, selected_pattern, selected_legacy = select_stage0_extra_component(
+        rustc_cache = os.path.join(cache_dst, key)
+        if not os.path.exists(rustc_cache):
+            os.makedirs(rustc_cache)
+
+        tarball_suffix = ".tar.gz" if lzma is None else ".tar.xz"
+
+        toolchain_suffix = "{}-{}{}".format(
+            rustc_channel, self.build, tarball_suffix
+        )
+
+        # The refresh replaces the ENTIRE seed tree, so the download list is
+        # always the full component surface, never scoped to whichever of
+        # need_rustc/need_cargo fired: assert_stage0_tool_surface demands
+        # every required bin regardless of the trigger.
+        tarballs_to_download = []
+        legacy_targo_components = []
+        translate_legacy_tippy = False
+
+        tarballs_to_download.append(
+            ("trust-std-{}".format(toolchain_suffix), "trust-std-{}".format(self.build))
+        )
+        tarballs_to_download.append(
+            ("trustc-{}".format(toolchain_suffix), "trustc")
+        )
+
+        for component in ("targo", "targo-trust"):
+            filename, selected_pattern, selected_legacy = (
+                select_stage0_targo_component(
                     self.stage0_data,
                     self.stage0_compiler.date,
                     toolchain_suffix,
                     component,
-                    pattern,
                 )
-                tarballs_to_download.append((filename, selected_pattern))
-                if component == "tippy" and selected_legacy:
-                    translate_legacy_tippy = True
+            )
+            tarballs_to_download.append((filename, selected_pattern))
+            if selected_legacy:
+                legacy_targo_components.append(component)
 
-            tarballs_download_info = [
-                DownloadInfo(
-                    base_download_url=self.download_url,
-                    download_path="dist/{}/{}".format(
-                        self.stage0_compiler.date, filename
-                    ),
-                    bin_root=self.bin_root(),
-                    tarball_path=os.path.join(rustc_cache, filename),
-                    tarball_suffix=tarball_suffix,
-                    stage0_data=self.stage0_data,
-                    pattern=pattern,
-                    verbose=self.verbose,
-                )
-                for filename, pattern in tarballs_to_download
-            ]
+        for component, pattern in STAGE0_EXTRA_COMPONENTS:
+            filename, selected_pattern, selected_legacy = select_stage0_extra_component(
+                self.stage0_data,
+                self.stage0_compiler.date,
+                toolchain_suffix,
+                component,
+                pattern,
+            )
+            tarballs_to_download.append((filename, selected_pattern))
+            if component == "tippy" and selected_legacy:
+                translate_legacy_tippy = True
 
-            # Download the components serially to show the progress bars properly.
+        # Stage the replacement seed NEXT TO the live one (same filesystem,
+        # so the final swap is a rename) and only touch bin_root once the
+        # staged tree has passed the full surface assertion.
+        staging_root = bin_root + ".staging"
+        if os.path.exists(staging_root):
+            shutil.rmtree(staging_root)
+        os.makedirs(staging_root)
+
+        tarballs_download_info = [
+            DownloadInfo(
+                base_download_url=self.download_url,
+                download_path="dist/{}/{}".format(
+                    self.stage0_compiler.date, filename
+                ),
+                bin_root=staging_root,
+                tarball_path=os.path.join(rustc_cache, filename),
+                tarball_suffix=tarball_suffix,
+                stage0_data=self.stage0_data,
+                pattern=pattern,
+                verbose=self.verbose,
+            )
+            for filename, pattern in tarballs_to_download
+        ]
+
+        try:
+            # Download the components serially to show the progress bars
+            # properly. A missing or checksum-failing archive raises HERE,
+            # before the live seed has been touched.
             for download_info in tarballs_download_info:
                 download_component(download_info)
 
@@ -1555,21 +1611,26 @@ class RustBuild(object):
 
             if legacy_targo_components:
                 translate_legacy_targo_stage0_surface(
-                    bin_root, legacy_targo_components
+                    staging_root, legacy_targo_components
                 )
             if translate_legacy_tippy:
-                translate_legacy_tippy_stage0_surface(bin_root)
+                translate_legacy_tippy_stage0_surface(staging_root)
 
-            self.assert_stage0_tool_surface()
+            # Verify the replacement surface is complete BEFORE swapping it
+            # in. An incomplete extraction aborts with the working seed
+            # still in place.
+            self.assert_stage0_tool_surface(staging_root)
 
             if self.should_fix_bins_and_dylibs():
                 for name in STAGE0_REQUIRED_BINS:
-                    self.fix_bin_or_dylib("{}/bin/{}{}".format(bin_root, name, EXE_SUFFIX))
+                    self.fix_bin_or_dylib(
+                        "{}/bin/{}{}".format(staging_root, name, EXE_SUFFIX)
+                    )
                 for name in STAGE0_REQUIRED_LIBEXEC_BINS:
                     self.fix_bin_or_dylib(
-                        "{}/libexec/{}{}".format(bin_root, name, EXE_SUFFIX)
+                        "{}/libexec/{}{}".format(staging_root, name, EXE_SUFFIX)
                     )
-                lib_dir = "{}/lib".format(bin_root)
+                lib_dir = "{}/lib".format(staging_root)
                 rustlib_bin_dir = "{}/rustlib/{}/bin".format(lib_dir, self.build)
                 self.fix_bin_or_dylib("{}/rust-lld".format(rustlib_bin_dir))
                 self.fix_bin_or_dylib("{}/gcc-ld/ld.lld".format(rustlib_bin_dir))
@@ -1582,12 +1643,52 @@ class RustBuild(object):
                             # Patchelf will skip non-ELF files, but issue a warning.
                             if magic == b"\x7fELF":
                                 self.fix_bin_or_dylib(elf_path)
+        except BaseException:
+            shutil.rmtree(staging_root, ignore_errors=True)
+            raise
 
-            with output(self.rustc_stamp()) as rust_stamp:
-                rust_stamp.write(key)
+        # Swap the verified staging tree into place. This is the only block
+        # that touches the existing seed, and it rolls back on failure.
+        if os.path.exists(bin_root):
+            # HACK: On Windows, we can't rename the proc-macro server's tree
+            # while it's running. Kill it.
+            if platform_is_win32():
+                print(
+                    "Killing trust-analyzer-proc-macro-srv before replacing stage0 toolchain"
+                )
+                regex = "{}\\\\(host|{})\\\\stage0\\\\libexec".format(
+                    os.path.basename(self.build_dir), self.build
+                )
+                script = (
+                    # NOTE: can't use `taskkill` or `Get-Process -Name` because they error if
+                    # the server isn't running.
+                    "Get-Process | "
+                    + 'Where-Object {$_.Name -eq "trust-analyzer-proc-macro-srv" '
+                    + '-or $_.Name -eq "rust-analyzer-proc-macro-srv"} |'
+                    + 'Where-Object {{$_.Path -match "{}"}} |'.format(regex)
+                    + "Stop-Process"
+                )
+                run_powershell([script])
+            previous_root = bin_root + ".previous"
+            if os.path.exists(previous_root):
+                shutil.rmtree(previous_root)
+            os.rename(bin_root, previous_root)
+            try:
+                os.rename(staging_root, bin_root)
+            except BaseException:
+                # Roll the working seed back; never leave the tree seedless.
+                os.rename(previous_root, bin_root)
+                raise
+            shutil.rmtree(previous_root)
+        else:
+            os.rename(staging_root, bin_root)
 
-    def stage0_tool_surface_needs_refresh(self):
-        bin_root = self.bin_root()
+        with output(self.rustc_stamp()) as rust_stamp:
+            rust_stamp.write(key)
+
+    def stage0_tool_surface_needs_refresh(self, bin_root=None):
+        if bin_root is None:
+            bin_root = self.bin_root()
         bin_dir = os.path.join(bin_root, "bin")
         for name in STAGE0_REQUIRED_BINS:
             if not os.path.exists(os.path.join(bin_dir, name + EXE_SUFFIX)):
@@ -1604,8 +1705,15 @@ class RustBuild(object):
                 return True
         return False
 
-    def assert_stage0_tool_surface(self):
-        bin_root = self.bin_root()
+    def assert_stage0_tool_surface(self, bin_root=None):
+        """Validate a stage0 surface tree (the live seed by default).
+
+        download_toolchain also runs this against the STAGING tree before the
+        atomic swap, so an incomplete replacement can never displace a
+        working seed.
+        """
+        if bin_root is None:
+            bin_root = self.bin_root()
         bin_dir = os.path.join(bin_root, "bin")
         for name in STAGE0_REQUIRED_BINS:
             path = os.path.join(bin_dir, name + EXE_SUFFIX)
@@ -1988,6 +2096,29 @@ exec "$trustc" "$@"
         if "GITHUB_ACTIONS" in env:
             print("::endgroup::")
 
+    def targo_supports_unverified_lane(self):
+        """Does the configured cargo implement Targo's two-lane policy?
+
+        Asks the binary rather than sniffing a version, so the check stays
+        correct across seed refreshes. Cached per invocation.
+        """
+        cached = getattr(self, "_targo_unverified_lane", None)
+        if cached is not None:
+            return cached
+        supported = False
+        try:
+            proc = subprocess.Popen(
+                [self.cargo(), "--help"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            out, _ = proc.communicate()
+            supported = b"--unverified" in (out or b"")
+        except Exception:
+            supported = False
+        self._targo_unverified_lane = supported
+        return supported
+
     def build_bootstrap_cmd(self, env):
         """For tests."""
         build_dir = os.path.join(self.build_dir, "bootstrap")
@@ -2082,8 +2213,18 @@ exec "$trustc" "$@"
                 "create a Trust-named stage0 wrapper around your installed Rust "
                 "toolchain (see README.md Build section).".format(self.cargo())
             )
-        args = [
-            self.cargo(),
+        args = [self.cargo()]
+        # Targo's two-lane policy: a targo new enough to have it REFUSES a bare
+        # `targo build`, because that would mint an artifact carrying no proof
+        # claim while looking like it might. Bootstrap builds compiler tooling,
+        # which is unverified by definition, so `--unverified` is the honest
+        # lane — and stating it explicitly is the point of the policy.
+        #
+        # Probed rather than assumed, so a seed targo predating the policy keeps
+        # working: an unknown global flag would be a hard error there.
+        if self.targo_supports_unverified_lane():
+            args.append("--unverified")
+        args += [
             "build",
             "--jobs=" + self.jobs,
             "--manifest-path",

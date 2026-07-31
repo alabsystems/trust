@@ -28,20 +28,31 @@
 //!   3. no function writes a backing field of `S` outside construction (a write
 //!      could break `R` after it was established).
 //!
-//! **SOUNDNESS CONTRACT.** The caller MUST pass the COMPLETE set of functions
+//! **SOUNDNESS CONTRACT.** The caller MUST pass the COMPLETE set of bodies
 //! that can construct or mutate `S`. For a struct with PRIVATE backing fields
-//! this is exactly the functions of `S`'s defining crate — Rust forbids external
+//! this is exactly the bodies of `S`'s defining crate — Rust forbids external
 //! code from constructing or mutating private fields — so a whole-crate analysis
 //! is complete. The `#[trust::backing]` attribute is the developer's declaration
 //! that the fields are sealed; Trust then VERIFIES that every in-crate
 //! constructor establishes `R`. If the set is incomplete (an unseen constructor
-//! could violate `R`), the certificate is NOT sound to rely on — so the compiler
-//! integration must pass all crate bodies and only certify private-field structs.
+//! could violate `R`), the certificate is NOT sound to rely on — this function
+//! starts from `all_establish = true` / `broken_by_mutation = false` and only
+//! WEAKENS them from evidence it sees, so an omitted body pushes TOWARD
+//! certification, never away from it. "Every body" is wider than the crate's
+//! `fn` items: a `const`/`static` initializer (`const B: S = S { ptr, len }`),
+//! a tuple-ctor shim used as a function value, a closure, a `promoted_mir`
+//! fragment (promotion moves a `&S { .. }` aggregate out of its parent body),
+//! and a `#[rustc_comptime]` fn are all constructor-capable. The compiler
+//! integration (`trust_init_backing_certificates` in `rustc_mir_transform`)
+//! therefore inventories every `mir_keys` body owner — recovering already-stolen
+//! const-context bodies through `mir_for_ctfe` — and withholds the certificate
+//! entirely (fail closed) if any body cannot be inventoried, and only certifies
+//! private-field structs.
 
 use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::{AggregateKind, Formula, Projection, Rvalue, Statement, VerifiableFunction};
 
-use crate::sep_engine::{detect_backing_struct, establish_formulas};
+use crate::sep_engine::{detect_backing_struct, detect_backing_structs, establish_formulas};
 
 /// Certify the backing invariants provable from `functions`, returning the set
 /// of struct names whose invariant is established by every constructor and
@@ -67,9 +78,19 @@ pub fn certify_backing_invariants(functions: &[VerifiableFunction]) -> FxHashSet
 
         for func in functions {
             // Only functions that touch THIS struct shape/name are relevant.
-            match detect_backing_struct(func) {
-                Some((n, _, _)) if n == name => {}
-                _ => continue,
+            //
+            // SOUNDNESS: this must consider EVERY backing-shaped struct the
+            // function mentions, not just the first one. `detect_backing_struct`
+            // returns the first matching local, so a decoy of the same shape
+            // (one raw pointer, one unsigned integer) appearing earlier in
+            // `locals` used to make this `continue` — skipping the function for
+            // `name` entirely, and taking its `writes_backing_field` check with
+            // it. A mutator of `name` sitting in a function that also mentions
+            // another backing struct was therefore invisible, `name` certified,
+            // and the use-site ASSUME `alloc_size >= self.len` was published on
+            // a struct whose length could be changed after construction.
+            if !detect_backing_structs(func).iter().any(|(n, _, _)| *n == name) {
+                continue;
             }
 
             if constructs_struct(func) {
@@ -116,19 +137,42 @@ fn constructs_struct(func: &VerifiableFunction) -> bool {
     })
 }
 
-/// Whether `func` WRITES a backing field (`(*x).ptr = …` or `(*x).len = …`)
-/// outside of whole-struct construction. The destination place of such a write
-/// carries a `Field(ptr_field)` / `Field(len_field)` projection; a field LOAD
-/// (`_t = (*x).len`) puts the field projection on the rvalue source instead, so
-/// it is not flagged. Conservative: any such write denies certification, since a
-/// post-construction mutation could break the established invariant.
+/// Whether `func` can MUTATE a backing field outside whole-struct construction —
+/// either by storing to it (`(*x).len = …`) or by letting a `&mut` to it escape
+/// (`&mut self.len`). Either denies certification, since a post-construction
+/// mutation could break the established invariant.
+///
+/// A field LOAD (`_t = (*x).len`) and a shared borrow (`&self.len`) also put the
+/// field projection on the rvalue, and are deliberately NOT flagged: neither can
+/// mutate.
 fn writes_backing_field(func: &VerifiableFunction, ptr_field: usize, len_field: usize) -> bool {
-    func.body.blocks.iter().flat_map(|b| b.stmts.iter()).any(|stmt| {
-        let Statement::Assign { place, .. } = stmt else { return false };
+    let touches_backing = |place: &trust_types::Place| {
         place
             .projections
             .iter()
             .any(|proj| matches!(proj, Projection::Field(i) if *i == ptr_field || *i == len_field))
+    };
+    func.body.blocks.iter().flat_map(|b| b.stmts.iter()).any(|stmt| {
+        let Statement::Assign { place, rvalue, .. } = stmt else { return false };
+        if touches_backing(place) {
+            return true;
+        }
+        // SOUNDNESS: a direct store is not the only way a backing field is
+        // mutated. Handing out `&mut self.len` lowers to
+        // `_0 = &mut ((*_1).1)` — an `Rvalue::Ref` whose Field projection sits on
+        // the SOURCE place — so a destination-only scan never sees it, the struct
+        // still certifies, and callers can then set `len` to anything while the
+        // published ASSUME still claims `alloc_size >= self.len`. That ASSUME is
+        // what makes an out-of-bounds obligation come back PROVED, so an escape
+        // must deny certification exactly as a store does.
+        //
+        // Shared borrows are fine and deliberately not flagged: `&self.len`
+        // cannot mutate. Only `&mut` / `&raw mut` escapes count.
+        match rvalue {
+            Rvalue::Ref { mutable: true, place } => touches_backing(place),
+            Rvalue::AddressOf(true, place) => touches_backing(place),
+            _ => false,
+        }
     })
 }
 
@@ -687,6 +731,168 @@ mod tests {
         );
         let certified = certify_backing_invariants(&[establishing_ctor(), mutator, as_slice()]);
         assert!(!certified.contains("Buf"), "a backing-field write ⇒ must NOT certify");
+    }
+
+    /// SOUNDNESS REGRESSION: handing out `&mut self.len` must deny certification
+    /// exactly as a direct store does.
+    ///
+    /// `fn len_mut(&mut self) -> &mut usize { &mut self.len }` lowers to
+    /// `_0 = &mut ((*_1).1)` — an `Rvalue::Ref` whose `Field` projection sits on
+    /// the SOURCE place. The mutation scan looked only at destination places, so
+    /// this was invisible: the struct certified, and the certificate licenses the
+    /// use-site ASSUME `alloc_size >= self.len`. A caller could then set `len` to
+    /// anything while that ASSUME stood, which turns a CAUGHT out-of-bounds
+    /// obligation into PROVED.
+    #[test]
+    fn not_certified_when_a_backing_field_escapes_by_mut_reference() {
+        let escaper = func(
+            "Buf::len_mut",
+            1,
+            vec![
+                LocalDecl {
+                    index: 0,
+                    ty: Ty::Ref {
+                        mutable: true,
+                        inner: Box::new(Ty::Int { width: 64, signed: false }),
+                    },
+                    name: None,
+                },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::Ref { mutable: true, inner: Box::new(buf_ty()) },
+                    name: Some("self".into()),
+                },
+            ],
+            vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Ref {
+                        mutable: true,
+                        place: Place {
+                            local: 1,
+                            projections: vec![Projection::Deref, Projection::Field(1)],
+                        },
+                    },
+                    span: span(),
+                }],
+                terminator: Terminator::Return,
+            }],
+        );
+        let certified = certify_backing_invariants(&[establishing_ctor(), escaper, as_slice()]);
+        assert!(
+            !certified.contains("Buf"),
+            "a `&mut` escape of a backing field ⇒ must NOT certify"
+        );
+    }
+
+    /// SOUNDNESS REGRESSION: a decoy struct must not hide a real mutator.
+    ///
+    /// The relevance test used `detect_backing_struct`, which returns the FIRST
+    /// backing-shaped local. A mutator of `Buf` that also mentions another
+    /// backing-shaped struct EARLIER in its locals resolved to that other struct,
+    /// hit the `continue`, and was never scanned for `Buf` — so
+    /// `broken_by_mutation` stayed false, `Buf` certified, and the use-site
+    /// ASSUME `alloc_size >= self.len` was published on a struct whose length a
+    /// caller could change after construction.
+    #[test]
+    fn a_decoy_backing_struct_cannot_hide_a_mutator() {
+        let other_ty = || Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            variants: Vec::new(),
+            name: "Other".into(),
+            fields: vec![
+                ("p".into(), Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u8()) }),
+                ("n".into(), Ty::Int { width: 64, signed: false }),
+            ],
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
+        // Mutates `Buf::len`, but `Other` occupies an earlier local.
+        let hidden_mutator = func(
+            "evil",
+            2,
+            vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::Ref { mutable: true, inner: Box::new(other_ty()) },
+                    name: Some("decoy".into()),
+                },
+                LocalDecl {
+                    index: 2,
+                    ty: Ty::Ref { mutable: true, inner: Box::new(buf_ty()) },
+                    name: Some("buf".into()),
+                },
+            ],
+            vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place {
+                        local: 2,
+                        projections: vec![Projection::Deref, Projection::Field(1)],
+                    },
+                    rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(9999))),
+                    span: span(),
+                }],
+                terminator: Terminator::Return,
+            }],
+        );
+        let certified =
+            certify_backing_invariants(&[establishing_ctor(), hidden_mutator, as_slice()]);
+        assert!(
+            !certified.contains("Buf"),
+            "a decoy backing struct in an earlier local must not hide a mutator of Buf"
+        );
+    }
+
+    /// The counterpart: a SHARED borrow of a backing field cannot mutate, so it
+    /// must not deny certification. Without this, the fix above would be an
+    /// over-tightening that silently disables the whole backing lane for any
+    /// struct with a `fn len(&self) -> &usize`.
+    #[test]
+    fn shared_borrow_of_a_backing_field_still_certifies() {
+        let reader = func(
+            "Buf::len_ref",
+            1,
+            vec![
+                LocalDecl {
+                    index: 0,
+                    ty: Ty::Ref {
+                        mutable: false,
+                        inner: Box::new(Ty::Int { width: 64, signed: false }),
+                    },
+                    name: None,
+                },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::Ref { mutable: false, inner: Box::new(buf_ty()) },
+                    name: Some("self".into()),
+                },
+            ],
+            vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Ref {
+                        mutable: false,
+                        place: Place {
+                            local: 1,
+                            projections: vec![Projection::Deref, Projection::Field(1)],
+                        },
+                    },
+                    span: span(),
+                }],
+                terminator: Terminator::Return,
+            }],
+        );
+        let certified = certify_backing_invariants(&[establishing_ctor(), reader, as_slice()]);
+        assert!(
+            certified.contains("Buf"),
+            "a shared borrow cannot mutate, so it must not deny certification"
+        );
     }
 
     #[test]

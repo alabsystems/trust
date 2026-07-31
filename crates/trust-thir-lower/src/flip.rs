@@ -85,7 +85,12 @@ pub enum FlipAttempt<'tcx> {
     Rejected { reason: String },
     /// The derived body, `MirPhase::Built`, gates passed, assert spans stitched.
     /// `asserts` is the number of (span-stitched) assert terminators, for observability.
-    Derived { body: Body<'tcx>, asserts: usize },
+    /// `lineage` is the record-time lineage digest of the (mini-module, callee ledger)
+    /// this body was derived from ([`crate::lineage`]), RE-DERIVED and checked equal
+    /// against the taken payload before this variant is constructed — the flip event logs
+    /// it so the selected body can be matched, by digest equality, to the registry object
+    /// and the published artifact row.
+    Derived { body: Body<'tcx>, asserts: usize, lineage: trust_ir::ProofDigest },
 }
 
 fn rejected<'tcx>(reason: impl Into<String>) -> FlipAttempt<'tcx> {
@@ -111,9 +116,32 @@ pub fn derive_flip_body<'tcx>(
     // ICEs on a 600-file scorecard, zero on the five-body probe whose bodies were all
     // green-recorded. The probe could not see it; the scorecard could. Recorded here so the
     // arm does not come back: THIR IS NOT AVAILABLE AT FLIP TIME.
-    let Some((module, callees)) = flip_registry::take(tcx, def) else {
+    let Some(flip_registry::GreenBody { module, callees, lineage }) = flip_registry::take(tcx, def)
+    else {
         return FlipAttempt::NotCandidate;
     };
+
+    // Trust (L1, artifact-lineage attestation): RE-DERIVE the lineage digest from the taken
+    // (module, ledger) and require it to equal the value minted at `record_green`. The
+    // registry is in-process Session state, so this is not a tamper check — it is the
+    // standing obligation that the digest the flip event publishes actually describes the
+    // bytes the flip is about to compile. A future producer that mutates a registry entry
+    // between record and take, or a `GreenBody` minted by some other path with a digest that
+    // does not match its own payload, fails CLOSED here (falls back to built MIR) instead of
+    // emitting an attestation for an object that no longer exists. Cost is one module
+    // serialization per FLIPPED body — the small set, not every lowered body.
+    match crate::lineage::body_lineage_digest(&module, &callees) {
+        Ok(rederived) if rederived == lineage => {}
+        Ok(rederived) => {
+            return rejected(format!(
+                "lineage digest mismatch: registry entry carries {lineage}, its own \
+                 (module, callee ledger) digests to {rederived}"
+            ));
+        }
+        Err(error) => {
+            return rejected(format!("lineage digest could not be re-derived at flip: {error}"));
+        }
+    }
 
     // ---- def-level gates ----
     // `record_green` applies this gate before inserting. Re-check after taking
@@ -244,7 +272,7 @@ pub fn derive_flip_body<'tcx>(
     // Body-level span fidelity for dumps/diagnostics (semantics-free).
     body.span = normal.span;
 
-    FlipAttempt::Derived { body, asserts }
+    FlipAttempt::Derived { body, asserts, lineage }
 }
 
 // ---------------------------------------------------------------------------

@@ -832,6 +832,40 @@ fn build_options<O: Default>(
             Some((k, v)) => (k.to_string(), Some(v)),
         };
 
+        // BOOTSTRAP-ONLY COMPAT ALIAS: `-Zno-trust-verify` -> `-Ztrust-verify=off`.
+        //
+        // The flag surface was deliberately consolidated to the single
+        // `trust_verify` domain (`576db732cd`, "one flag surface, one taxonomy,
+        // one gate"), and `no_trust_verify` was removed. But the bootstrap seed
+        // ships a targo that still emits the OLD spelling, and bootstrap
+        // necessarily drives the NEWLY built rustc with that OLD cargo when it
+        // builds stage1 std — so stage1 rustc must understand it or the build
+        // cannot complete. It is a matched-pair problem: the reverse assignment
+        // fails symmetrically, because the new targo emits `trust-verify=off`
+        // which the seed's stage0 rustc does not know.
+        //
+        // `#[cfg(bootstrap)]` is what keeps this from re-forking the flag
+        // surface it is working around. Bootstrap sets `--cfg=bootstrap` only
+        // when compiling WITH stage0 (`bootstrap/src/core/builder/cargo.rs:977`),
+        // i.e. only for the stage1 artifacts the seed's targo drives. Stage 2 —
+        // the compiler that actually ships — is compiled by stage1, without the
+        // cfg, so this alias does not exist there and `-Zno-trust-verify` remains
+        // an unknown option for every real user.
+        //
+        // DELETE THIS the moment the bootstrap seed is advanced past the rename.
+        // It is a bridge for exactly one seed generation, not a supported name.
+        //
+        // The rewrite is exact, not approximate: the removed flag meant "do not
+        // verify", which is precisely `trust_verify = off`. Its only possible
+        // effect is to turn verification OFF, so it can never manufacture a
+        // proof claim.
+        #[cfg(bootstrap)]
+        let (key, value) = if prefix == "Z" && key.replace('-', "_") == "no_trust_verify" {
+            ("trust-verify".to_string(), Some("off"))
+        } else {
+            (key, value)
+        };
+
         let option_to_lookup = key.replace('-', "_");
         match descrs.iter().find(|opt_desc| opt_desc.name == option_to_lookup) {
             Some(OptionDesc { name: _, setter, type_desc, desc, removed, tmod, mitigation }) => {

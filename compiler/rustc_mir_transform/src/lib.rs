@@ -20,9 +20,9 @@ use rustc_hir::def::{CtorKind, DefKind};
 use rustc_hir::def_id::LocalDefId;
 use rustc_index::IndexVec;
 use rustc_middle::mir::{
-    AnalysisPhase, Body, CallSource, ClearCrossCrate, ConstOperand, ConstQualifs, LocalDecl,
-    MirPhase, Operand, Place, ProjectionElem, Promoted, RuntimePhase, Rvalue, START_BLOCK,
-    SourceInfo, Statement, StatementKind, TerminatorKind, WithRetag,
+    AnalysisPhase, BindingForm, Body, CallSource, ClearCrossCrate, ConstOperand, ConstQualifs,
+    LocalDecl, LocalInfo, MirPhase, Operand, Place, ProjectionElem, Promoted, RuntimePhase, Rvalue,
+    START_BLOCK, SourceInfo, Statement, StatementKind, TerminatorKind, WithRetag,
 };
 use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
 use rustc_middle::util::Providers;
@@ -775,10 +775,33 @@ fn run_runtime_cleanup_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         pm::Optimizations::Allowed,
     );
 
-    // Clear this by anticipation. Optimizations and runtime MIR have no reason to look
-    // into this information, which is meant for borrowck diagnostics.
+    // Clear diagnostic binding data by anticipation. A body with first-class
+    // Trust loop contracts is the one exception: certified runtime monitor
+    // placement needs a compact compiler-owned binding identity after
+    // `var_debug_info` has been omitted or stripped. Preserve only that HIR
+    // identity; all diagnostic-only VarBindingForm fields are still discarded.
+    let retain_trust_source_bindings = body
+        .source
+        .def_id()
+        .as_local()
+        .and_then(|local| tcx.hir_maybe_body_owned_by(local))
+        .and_then(|body| body.contract)
+        .is_some_and(|contract| !contract.loop_clauses.is_empty());
     for decl in &mut body.local_decls {
-        decl.local_info = ClearCrossCrate::Clear;
+        let trust_source_binding = retain_trust_source_bindings
+            .then(|| match &decl.local_info {
+                ClearCrossCrate::Set(info) => match &**info {
+                    LocalInfo::User(BindingForm::Var(binding)) => {
+                        Some(binding.binding_hir_local_id.as_u32())
+                    }
+                    _ => None,
+                },
+                ClearCrossCrate::Clear => None,
+            })
+            .flatten();
+        decl.local_info = trust_source_binding.map_or(ClearCrossCrate::Clear, |hir_local_id| {
+            ClearCrossCrate::Set(Box::new(LocalInfo::TrustSourceBinding { hir_local_id }))
+        });
     }
 }
 

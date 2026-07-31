@@ -51,12 +51,44 @@ def WeakFair {State : Type} (A : State → State → Prop) : Formula State :=
   Always (fun b =>
     Eventually (Always (Lift (Enabled A))) b → Eventually (LiftAction A) b)
 
+-- Strong fairness is the complementary, recurring-enablement obligation:
+-- whenever a non-stuttering action remains enabled infinitely often, that
+-- action must eventually occur.  Both notions are formulas so they compose
+-- with the same suffix semantics as `□`, `◇`, and `~>`.
+def StrongFair {State : Type} (A : State → State → Prop) : Formula State :=
+  Always (fun b =>
+    Always (Eventually (Lift (Enabled A))) b → Eventually (LiftAction A) b)
+
+-- Fairness assumptions are action-scoped.  An indexed family is deliberately
+-- more general than a `List`: it expresses any finite authored action list,
+-- named action families, and proof-oriented infinite families without adding a
+-- second temporal semantics.
+inductive FairnessConstraint (State : Type) where
+  | weak : (State → State → Prop) → FairnessConstraint State
+  | strong : (State → State → Prop) → FairnessConstraint State
+
+def HoldsFairness {State : Type} (constraint : FairnessConstraint State) :
+    Formula State :=
+  match constraint with
+  | FairnessConstraint.weak action => WeakFair action
+  | FairnessConstraint.strong action => StrongFair action
+
+def FairFamily {State Index : Type}
+    (constraints : Index → FairnessConstraint State) : Formula State :=
+  fun b => ∀ index, HoldsFairness (constraints index) b
+
 def Satisfies {State : Type} (M : StateMachine State) (F : Formula State) : Prop :=
   ∀ b, Runs M b → F b
 
 def SatisfiesUnderWeakFairness {State : Type}
     (M : StateMachine State) (F : Formula State) : Prop :=
   ∀ b, Runs M b → WeakFair M.next b → F b
+
+def SatisfiesUnderFairness {State Index : Type}
+    (M : StateMachine State)
+    (constraints : Index → FairnessConstraint State)
+    (F : Formula State) : Prop :=
+  ∀ b, Runs M b → FairFamily constraints b → F b
 
 -- Notation expansion happens at the use site, so force every expansion target
 -- through Clean's root-namespace escape.  A merely dotted name such as
@@ -87,6 +119,10 @@ theorem drop_zero {State : Type} (b : Behavior State) : drop b 0 = b :=
 theorem leadsto_refl {State : Type} (F : Formula State) (b : Behavior State) :
     (F ~> F) b :=
   fun n h => ⟨0, Eq.mpr (congrArg F (drop_zero (drop b n))) h⟩
+
+theorem always_implies_leadsto {State : Type} (F G : Formula State)
+    (b : Behavior State) (h : (□ G) b) : (F ~> G) b :=
+  fun n _ => ⟨0, Eq.mpr (congrArg G (drop_zero (drop b n))) (h n)⟩
 
 end Temporal
 end Trust

@@ -664,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn test_terminal_e4_static_row_is_explicitly_unmonitored() {
+    fn test_terminal_unmatched_e4_row_is_explicitly_unmonitored() {
         let mut report = runtime_checked_report();
         let obligation = &mut report.functions[0].obligations[0];
         obligation.kind = "loop_invariant".into();
@@ -681,7 +681,7 @@ mod tests {
             proof_evidence: None,
             monitor: Some(TransportMonitorEvidence {
                 status: TransportMonitorStatus::Unmonitored,
-                reason: "per-iteration loop-invariant monitor placement is not certified".into(),
+                reason: "no kernel-certified loop monitor evidence matched this row".into(),
                 predicate_digest: format!("sha256:{}", "f".repeat(64)),
             }),
         });

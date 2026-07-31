@@ -1,6 +1,6 @@
 extern crate proc_macro;
 
-use proc_macro::{Group, Span, TokenStream, TokenTree};
+use proc_macro::{Group, Ident, Span, TokenStream, TokenTree};
 
 fn signature(stream: TokenStream) -> Vec<String> {
     stream
@@ -43,12 +43,10 @@ fn collapse_to_call_site(stream: TokenStream) -> TokenStream {
         .into_iter()
         .map(|tree| {
             let mut tree = match tree {
-                TokenTree::Group(group) => {
-                    TokenTree::Group(Group::new(
-                        group.delimiter(),
-                        collapse_to_call_site(group.stream()),
-                    ))
-                }
+                TokenTree::Group(group) => TokenTree::Group(Group::new(
+                    group.delimiter(),
+                    collapse_to_call_site(group.stream()),
+                )),
                 tree => tree,
             };
             tree.set_span(Span::call_site());
@@ -65,6 +63,65 @@ pub fn emit_collapsed_native_contract(_input: TokenStream) -> TokenStream {
         "pub fn collapsed_native_contract(mut n: u32, by: u32) requires by == by ensures result == () { while n > 0 decreases n invariant n <= 1 { n -= 1; } }"
             .parse()
             .expect("native-contract fixture must tokenize"),
+    )
+}
+
+/// A macro-emitted local with the same call-site identity as an outer
+/// parameter is an actual lexical shadow. Native clauses must not recover the
+/// hidden parameter merely because the verifier spelling erases that shadow.
+#[proc_macro]
+pub fn emit_collapsed_native_shadow(_input: TokenStream) -> TokenStream {
+    collapse_to_call_site(
+        "pub fn collapsed_native_shadow(mut n: u32, bound: u32) { let bound = 1u32; while n > 0 invariant bound > 0 decreases n { n -= 1; let _ = bound; } }"
+            .parse()
+            .expect("native-shadow fixture must tokenize"),
+    )
+}
+
+fn rewrite_mixed_bound(stream: TokenStream) -> TokenStream {
+    stream
+        .into_iter()
+        .map(|tree| match tree {
+            TokenTree::Ident(ident) if ident.to_string() == "__mixed_bound" => {
+                TokenTree::Ident(Ident::new("bound", Span::mixed_site()))
+            }
+            TokenTree::Group(group) => {
+                let mut tree = TokenTree::Group(Group::new(
+                    group.delimiter(),
+                    rewrite_mixed_bound(group.stream()),
+                ));
+                tree.set_span(Span::call_site());
+                tree
+            }
+            mut tree => {
+                tree.set_span(Span::call_site());
+                tree
+            }
+        })
+        .collect()
+}
+
+/// Rust hygiene can keep a mixed-site local distinct from a call-site
+/// parameter even though both render as `bound`. The verifier language has no
+/// syntax-context spelling, so accepting either binding would be ambiguous.
+#[proc_macro]
+pub fn emit_distinct_native_collision(_input: TokenStream) -> TokenStream {
+    rewrite_mixed_bound(
+        "pub fn distinct_native_collision(mut n: u32, bound: u32) { let __mixed_bound = 1u32; while n > 0 invariant bound > 0 decreases n { n -= 1; let _ = __mixed_bound; } let _ = bound; }"
+            .parse()
+            .expect("hygienically distinct collision fixture must tokenize"),
+    )
+}
+
+/// Function-level proposition and monitor maps are text-keyed too. Two
+/// hygienically distinct parameters may therefore not share one displayed
+/// spelling even when a clause token resolves to the call-site parameter.
+#[proc_macro]
+pub fn emit_distinct_native_parameters(_input: TokenStream) -> TokenStream {
+    rewrite_mixed_bound(
+        "pub fn distinct_native_parameters(bound: u32, __mixed_bound: u32) requires bound == bound { let _ = bound; let _ = __mixed_bound; }"
+            .parse()
+            .expect("hygienically distinct parameter fixture must tokenize"),
     )
 }
 

@@ -642,6 +642,30 @@ impl From<Cargo> for BootstrapCommand {
     }
 }
 
+/// Does this cargo binary implement Targo's two-lane policy (`--unverified`)?
+///
+/// Cached for the process: bootstrap constructs a great many cargo commands and
+/// the answer cannot change mid-run.
+///
+/// Detected by asking the binary itself rather than by version-sniffing, so the
+/// check stays correct across seed refreshes. A binary that does not mention the
+/// flag is treated as predating the policy and is invoked exactly as before —
+/// that is what keeps an older bootstrap seed usable.
+fn targo_supports_unverified_lane(cargo: &std::path::Path) -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        std::process::Command::new(cargo)
+            .arg("--help")
+            .output()
+            .map(|out| {
+                let text = String::from_utf8_lossy(&out.stdout).into_owned()
+                    + &String::from_utf8_lossy(&out.stderr);
+                text.contains("--unverified")
+            })
+            .unwrap_or(false)
+    })
+}
+
 impl Builder<'_> {
     /// Like [`Builder::cargo`], but only passes flags that are valid for all commands.
     #[track_caller]
@@ -670,6 +694,19 @@ impl Builder<'_> {
             }
             _ => {
                 let mut cargo = command(&self.initial_cargo);
+                // Targo's two-lane policy: a targo new enough to have it REFUSES a
+                // bare `targo build`, because that would mint an artifact carrying
+                // no proof claim while looking like it might. Bootstrap builds the
+                // compiler and its tooling, which is unverified by definition, so
+                // the honest lane is `--unverified` — and saying so explicitly is
+                // the whole point of the policy.
+                //
+                // Probed once rather than assumed, so a seed targo that predates
+                // the policy keeps working: passing it an unknown global flag
+                // would be a hard error. Costs one `--help` per bootstrap run.
+                if targo_supports_unverified_lane(&self.initial_cargo) {
+                    cargo.arg("--unverified");
+                }
                 cargo.arg(cmd_kind.as_str());
                 cargo
             }

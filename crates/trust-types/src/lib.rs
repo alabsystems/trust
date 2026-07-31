@@ -33,6 +33,270 @@ pub mod fx;
 /// session that produced the IR.
 pub const TRUST_RUSTC_INTRINSIC_PATH_PREFIX: &str = "@trust-rustc-intrinsic::";
 
+/// Prefix stamped onto a direct call path only after rustc's `TyCtxt` confirms
+/// that the callee is one of Trust's modeled total primitive methods.
+///
+/// This namespace is intentionally distinct from
+/// [`TRUST_RUSTC_INTRINSIC_PATH_PREFIX`]: `wrapping_add`/`wrapping_sub`/
+/// `wrapping_mul` are `core` library methods, not rustc intrinsics. As with the
+/// intrinsic marker, `@` makes the prefix impossible to author as a Rust
+/// identifier, while artifact authority still comes from the authenticated
+/// compiler transport/session rather than from a serialized string alone.
+pub const TRUST_RUSTC_TOTAL_PRIMITIVE_METHOD_PATH_PREFIX: &str =
+    "@trust-rustc-total-primitive-method::";
+
+/// Prefix stamped onto an integer wrapping call whose exact `core` method
+/// identity is needed only by the full-mode assertion-refutation model.
+///
+/// This is deliberately separate from
+/// [`TRUST_RUSTC_TOTAL_PRIMITIVE_METHOD_PATH_PREFIX`]. The E6 import lane admits
+/// only unsigned `u8`/`u16`/`u32`/`u64` add/sub/mul, while the refutation-only
+/// model also understands signed and pointer-sized add/sub. A refutation model
+/// must not recover that broader identity from a source-spellable method suffix:
+/// otherwise a user function merely named `wrapping_add` could be modeled as
+/// modular arithmetic and manufacture a false counterexample.
+pub const TRUST_RUSTC_WRAPPING_REFUTATION_METHOD_PATH_PREFIX: &str =
+    "@trust-rustc-wrapping-refutation-method::";
+
+/// The integer carrier authenticated for a refutation-only wrapping method.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RustcWrappingRefutationCarrier {
+    Fixed { width: u32, signed: bool },
+    PointerSized { signed: bool },
+}
+
+impl RustcWrappingRefutationCarrier {
+    /// Whether the extracted operand width/sign agrees with this carrier.
+    ///
+    /// Pointer-sized integers are currently pinned to the 64-bit Trust target.
+    /// Checking that width here is essential: signedness alone would let a
+    /// forged pointer-sized marker authorize modular semantics for (for
+    /// example) an unrelated `u8` call in serialized IR.
+    #[must_use]
+    pub fn matches(self, width: u32, signed: bool) -> bool {
+        match self {
+            Self::Fixed { width: expected, signed: expected_signed } => {
+                width == expected && signed == expected_signed
+            }
+            Self::PointerSized { signed: expected_signed } => {
+                width == 64 && signed == expected_signed
+            }
+        }
+    }
+}
+
+/// The refutation-only wrapping operation authenticated by rustc.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RustcWrappingRefutationOp {
+    Add,
+    Sub,
+}
+
+/// An exact compiler-authenticated `core` integer wrapping add/sub method.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RustcWrappingRefutationMethod {
+    pub op: RustcWrappingRefutationOp,
+    pub carrier: RustcWrappingRefutationCarrier,
+}
+
+impl RustcWrappingRefutationMethod {
+    /// Classify a closed refutation-only method marker.
+    ///
+    /// Fixed signed/unsigned carriers through 128 bits and pointer-sized
+    /// carriers have exact spellings. The downstream arithmetic model retains
+    /// its own width cap and fails closed outside it.
+    #[must_use]
+    pub fn classify(callee: &str) -> Option<Self> {
+        let path = callee.strip_prefix(TRUST_RUSTC_WRAPPING_REFUTATION_METHOD_PATH_PREFIX)?;
+        let mut segments = path.split("::");
+        let (Some(root), Some(module), Some(primitive_impl), Some(method)) =
+            (segments.next(), segments.next(), segments.next(), segments.next())
+        else {
+            return None;
+        };
+        if segments.next().is_some() || root != "core" || module != "num" {
+            return None;
+        }
+        let carrier = match primitive_impl {
+            "<impl u8>" => RustcWrappingRefutationCarrier::Fixed { width: 8, signed: false },
+            "<impl u16>" => RustcWrappingRefutationCarrier::Fixed { width: 16, signed: false },
+            "<impl u32>" => RustcWrappingRefutationCarrier::Fixed { width: 32, signed: false },
+            "<impl u64>" => RustcWrappingRefutationCarrier::Fixed { width: 64, signed: false },
+            "<impl u128>" => RustcWrappingRefutationCarrier::Fixed { width: 128, signed: false },
+            "<impl usize>" => RustcWrappingRefutationCarrier::PointerSized { signed: false },
+            "<impl i8>" => RustcWrappingRefutationCarrier::Fixed { width: 8, signed: true },
+            "<impl i16>" => RustcWrappingRefutationCarrier::Fixed { width: 16, signed: true },
+            "<impl i32>" => RustcWrappingRefutationCarrier::Fixed { width: 32, signed: true },
+            "<impl i64>" => RustcWrappingRefutationCarrier::Fixed { width: 64, signed: true },
+            "<impl i128>" => RustcWrappingRefutationCarrier::Fixed { width: 128, signed: true },
+            "<impl isize>" => RustcWrappingRefutationCarrier::PointerSized { signed: true },
+            _ => return None,
+        };
+        let op = match method {
+            "wrapping_add" => RustcWrappingRefutationOp::Add,
+            "wrapping_sub" => RustcWrappingRefutationOp::Sub,
+            _ => return None,
+        };
+        Some(Self { op, carrier })
+    }
+}
+
+/// A compiler-authenticated, pure-total primitive method admitted without a
+/// same-unit body.
+///
+/// Classification is deliberately strict even though the marker itself can
+/// only be minted by the compiler in an authoritative run. Keeping the grammar
+/// here gives facet inference, E6 body recognition, and TrustIr lowering one
+/// fail-closed source of truth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RustcTotalPrimitiveMethod {
+    WrappingAdd(u32),
+    WrappingSub(u32),
+    WrappingMul(u32),
+}
+
+impl RustcTotalPrimitiveMethod {
+    /// Classify an exact compiler-marked `core` primitive method path.
+    ///
+    /// Only the E6 machine widths are admitted. Signed integers, `u128`,
+    /// `usize`, foreign roots, extra path segments, unmarked paths, and
+    /// same-suffix lookalikes all decline.
+    #[must_use]
+    pub fn classify(callee: &str) -> Option<Self> {
+        let path = callee.strip_prefix(TRUST_RUSTC_TOTAL_PRIMITIVE_METHOD_PATH_PREFIX)?;
+        let mut segments = path.split("::");
+        let (Some(root), Some(module), Some(primitive_impl), Some(method)) =
+            (segments.next(), segments.next(), segments.next(), segments.next())
+        else {
+            return None;
+        };
+        if segments.next().is_some() || root != "core" || module != "num" {
+            return None;
+        }
+        let width = match primitive_impl {
+            "<impl u8>" => 8,
+            "<impl u16>" => 16,
+            "<impl u32>" => 32,
+            "<impl u64>" => 64,
+            _ => return None,
+        };
+        match method {
+            "wrapping_add" => Some(Self::WrappingAdd(width)),
+            "wrapping_sub" => Some(Self::WrappingSub(width)),
+            "wrapping_mul" => Some(Self::WrappingMul(width)),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn width(self) -> u32 {
+        match self {
+            Self::WrappingAdd(width) | Self::WrappingSub(width) | Self::WrappingMul(width) => width,
+        }
+    }
+}
+
+#[cfg(test)]
+mod rustc_total_primitive_method_tests {
+    use super::*;
+
+    #[test]
+    fn wrapping_refutation_method_classifier_is_exact_and_fail_closed() {
+        assert!(
+            RustcWrappingRefutationCarrier::PointerSized { signed: false }.matches(64, false)
+        );
+        assert!(
+            !RustcWrappingRefutationCarrier::PointerSized { signed: false }.matches(8, false),
+            "pointer-sized identity must validate the pinned target width as well as signedness"
+        );
+
+        for (path, op, carrier) in [
+            (
+                "@trust-rustc-wrapping-refutation-method::core::num::<impl u128>::wrapping_add",
+                RustcWrappingRefutationOp::Add,
+                RustcWrappingRefutationCarrier::Fixed { width: 128, signed: false },
+            ),
+            (
+                "@trust-rustc-wrapping-refutation-method::core::num::<impl i32>::wrapping_sub",
+                RustcWrappingRefutationOp::Sub,
+                RustcWrappingRefutationCarrier::Fixed { width: 32, signed: true },
+            ),
+            (
+                "@trust-rustc-wrapping-refutation-method::core::num::<impl usize>::wrapping_add",
+                RustcWrappingRefutationOp::Add,
+                RustcWrappingRefutationCarrier::PointerSized { signed: false },
+            ),
+            (
+                "@trust-rustc-wrapping-refutation-method::core::num::<impl isize>::wrapping_sub",
+                RustcWrappingRefutationOp::Sub,
+                RustcWrappingRefutationCarrier::PointerSized { signed: true },
+            ),
+        ] {
+            assert_eq!(
+                RustcWrappingRefutationMethod::classify(path),
+                Some(RustcWrappingRefutationMethod { op, carrier })
+            );
+        }
+
+        for path in [
+            "core::num::<impl i32>::wrapping_add",
+            "@trust-rustc-wrapping-refutation-method::core::num::<impl f32>::wrapping_add",
+            "@trust-rustc-wrapping-refutation-method::core::num::<impl i32>::wrapping_mul",
+            "@trust-rustc-wrapping-refutation-method::core::num::<impl i32>::wrapping_add::suffix",
+            "@trust-rustc-wrapping-refutation-method::evil::num::<impl i32>::wrapping_add",
+            "@trust-rustc-total-primitive-method::core::num::<impl i32>::wrapping_add",
+        ] {
+            assert_eq!(RustcWrappingRefutationMethod::classify(path), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn total_primitive_method_classifier_is_exact_and_fail_closed() {
+        for (path, expected) in [
+            (
+                "@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add",
+                RustcTotalPrimitiveMethod::WrappingAdd(8),
+            ),
+            (
+                "@trust-rustc-total-primitive-method::core::num::<impl u16>::wrapping_sub",
+                RustcTotalPrimitiveMethod::WrappingSub(16),
+            ),
+            (
+                "@trust-rustc-total-primitive-method::core::num::<impl u32>::wrapping_mul",
+                RustcTotalPrimitiveMethod::WrappingMul(32),
+            ),
+            (
+                "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add",
+                RustcTotalPrimitiveMethod::WrappingAdd(64),
+            ),
+        ] {
+            assert_eq!(RustcTotalPrimitiveMethod::classify(path), Some(expected));
+        }
+
+        for bad in [
+            "core::num::<impl u64>::wrapping_add",
+            "@trust-rustc-intrinsic::core::num::<impl u64>::wrapping_add",
+            "@trust-rustc-total-primitive-method::std::num::<impl u64>::wrapping_add",
+            "@trust-rustc-total-primitive-method::evil::core::num::<impl u64>::wrapping_add",
+            "@trust-rustc-total-primitive-method::core::num::<impl i64>::wrapping_add",
+            "@trust-rustc-total-primitive-method::core::num::<impl u128>::wrapping_add",
+            "@trust-rustc-total-primitive-method::core::num::<impl usize>::wrapping_add",
+            "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add_signed",
+            "@trust-rustc-total-primitive-method::core::num::<impl u64>::saturating_add",
+            "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add::suffix",
+            "@trust-rustc-total-primitive-method::core::num::wrapping_add",
+            "@trust-rustc-total-primitive-method::core::num::<impl u64>",
+            "@trust-rustc-total-primitive-method::",
+        ] {
+            assert_eq!(
+                RustcTotalPrimitiveMethod::classify(bad),
+                None,
+                "malformed or excluded marker must decline: {bad}"
+            );
+        }
+    }
+}
+
 /// Marks a loop contract that could not be paired to a MIR loop header.
 ///
 /// This is a semantic signal carried inside the contract BODY, matched with

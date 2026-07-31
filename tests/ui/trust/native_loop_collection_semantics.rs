@@ -1,16 +1,22 @@
-//@ revisions: slice fixed_array mutation alias
+//@ revisions: slice fixed_array slice_progress mutable_store mutation alias
 //@ needs-trust-verify
 //@ compile-flags: -Ztrust-verify=on -Cstrip=none
 //@[slice] build-pass
 //@[fixed_array] build-pass
+//@[slice_progress] build-pass
+//@[mutable_store] build-pass
 //@[mutation] check-fail
 //@[alias] check-fail
 //@ dont-check-compiler-stderr
-//! End-to-end E4 coverage for the deliberately narrow read-only collection
-//! model. The positive revisions bind source `xs.len()` and `xs[0]` to the
-//! same immutable slice/fixed-array terms used by the MIR transition. The
-//! negative revisions keep the Rust operations feasible while demonstrating
-//! that mutable collection state and retained collection aliases fail closed.
+//! End-to-end E4 coverage for the deliberately narrow collection model. The
+//! immutable positive revisions bind source `xs.len()` and `xs[0]` to the same
+//! slice/fixed-array terms used by the MIR transition. The exact mutable
+//! revision pins a supported fixed-array Store/Select transition; the mutation
+//! negative uses the same admitted shape with a genuinely false invariant. The
+//! progress revision pins the exact `usize` domain shared by a slice length,
+//! an index invariant, and an E5 distance measure. The alias negative keeps
+//! the Rust operation feasible while demonstrating that retained collection
+//! aliases still fail closed.
 
 #[cfg(slice)]
 pub fn read_slice(xs: &[u32], keep: bool) -> u32
@@ -34,6 +40,25 @@ pub fn read_fixed_array(xs: &[u32; 4], keep: bool) -> u32 {
         observed = xs[0];
     }
     observed
+}
+
+#[cfg(slice_progress)]
+pub fn walk_slice(xs: &[u32]) {
+    let mut i = 0usize;
+    while i < xs.len()
+        invariant i <= xs.len()
+        decreases xs.len() - i
+    {
+        i += 1;
+    }
+}
+
+#[cfg(mutable_store)]
+pub fn store_fixed_array(xs: &mut [u32; 4], keep: bool) {
+    xs[0] = 7;
+    while keep invariant xs[0] == 7 {
+        xs[0] = 7;
+    }
 }
 
 #[cfg(mutation)]

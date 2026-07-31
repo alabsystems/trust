@@ -944,6 +944,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
                 opt_match_place: _,
                 pat_span,
                 introductions: _,
+                binding_hir_local_id: _,
             })) => pat_span,
             _ => local_decl.source_info.span,
         };

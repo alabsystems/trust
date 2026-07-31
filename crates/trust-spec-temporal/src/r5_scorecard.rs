@@ -120,7 +120,8 @@ pub enum R5MacroCapability {
     /// Function-valued variables / access / update / comprehension (`Model` ABI
     /// only — not expressible through the macro grammar).
     FunctionValuedModelVars,
-    /// `◇P` liveness under weak fairness (separate lane — not macro-reachable).
+    /// Indexed weak/strong fairness and `◇P` liveness
+    /// (separate lane — not macro-reachable).
     LivenessWeakFairness,
     /// Arbitrary `F ~> G` leads-to discharge (not macro-reachable).
     ArbitraryLeadsTo,
@@ -198,7 +199,7 @@ pub const R5_MACRO_CAPABILITY_SCORECARD: &[R5CapabilityRow] = &[
         migration_blockers: &[],
         replacement: Some(
             "author a temporal Model (or a `clean { … }` island) and certify with \
-             certify_clean_scalar_model_with_ty (closed scalar lane)",
+             certify_bound_clean_scalar_model_with_ty (closed bound scalar lane)",
         ),
     },
     R5CapabilityRow {
@@ -217,7 +218,7 @@ pub const R5_MACRO_CAPABILITY_SCORECARD: &[R5CapabilityRow] = &[
         migration_blockers: &[],
         replacement: Some(
             "author a temporal Model (or a `clean { … }` island) and certify with \
-             certify_clean_scalar_model_with_ty (routes >1 var to the finite keystone)",
+             certify_bound_clean_scalar_model_with_ty (routes >1 var to the finite keystone)",
         ),
     },
     R5CapabilityRow {
@@ -249,20 +250,23 @@ pub const R5_MACRO_CAPABILITY_SCORECARD: &[R5CapabilityRow] = &[
         title: "function-valued variables / access / update / comprehension (Model ABI only)",
         macro_expressible: false,
         surfaces: &[],
-        status: CapabilityReplacementStatus::NotYet,
-        migration_blockers: &[R5TemporalParityBlocker::FunctionValuedModelReplacementMissing],
-        replacement: None,
+        status: CapabilityReplacementStatus::FullyReplaced,
+        migration_blockers: &[],
+        replacement: Some(
+            "author `FiniteModel.Model` with function variables, `fnAccess`, `except`, and \
+             `comprehension`; certify/replay with the bound v2 full-model route",
+        ),
     },
     R5CapabilityRow {
         capability: R5MacroCapability::LivenessWeakFairness,
-        title: "◇P liveness under weak fairness (separate certify_liveness_with_ty lane)",
+        title: "indexed weak/strong fairness semantics + selected automatic liveness classes",
         macro_expressible: false,
         surfaces: &[],
         status: CapabilityReplacementStatus::Partial,
-        migration_blockers: &[],
+        migration_blockers: &[R5TemporalParityBlocker::CertifiedTemporalPropertyClassesIncomplete],
         replacement: Some(
-            "selected recognized classes are certified by certify_liveness_with_ty; \
-             not reachable from the macro grammar",
+            "authored Clean proofs can quantify mixed weak/strong fairness families; selected \
+             recognized classes are also discharged by certify_liveness_with_ty",
         ),
     },
     R5CapabilityRow {
@@ -270,9 +274,12 @@ pub const R5_MACRO_CAPABILITY_SCORECARD: &[R5CapabilityRow] = &[
         title: "arbitrary F ~> G leads-to discharge with general fairness (Model/temporal ABI)",
         macro_expressible: false,
         surfaces: &[],
-        status: CapabilityReplacementStatus::NotYet,
+        status: CapabilityReplacementStatus::Partial,
         migration_blockers: &[R5TemporalParityBlocker::ArbitraryLeadsToDischargeMissing],
-        replacement: None,
+        replacement: Some(
+            "arbitrary authored `F ~> G` constructive proofs kernel-replay; automatic ty \
+             discharge remains limited to recognized classes",
+        ),
     },
 ];
 
@@ -486,12 +493,11 @@ mod tests {
         assert_eq!(row(ScalarSafetyMultiVar).status, FullyReplaced);
         assert_eq!(row(BuggyNonVacuityRatchet).status, FullyReplaced);
         assert_eq!(row(GuardedActionExprGrammar).status, FullyReplaced);
-        // The two Model-ABI-only NotYet rows below stay NotYet but no longer
-        // gate macro retirement (owner override 2026-07-20): they reference the
-        // non-gating R5_MODEL_ABI_AMBITION_BLOCKERS tracker.
-        assert_eq!(row(FunctionValuedModelVars).status, NotYet);
+        // Function-valued models now have the full v2 ABI. General automatic
+        // fairness/leads-to discharge remains honestly Partial and non-gating.
+        assert_eq!(row(FunctionValuedModelVars).status, FullyReplaced);
         assert_eq!(row(LivenessWeakFairness).status, Partial);
-        assert_eq!(row(ArbitraryLeadsTo).status, NotYet);
+        assert_eq!(row(ArbitraryLeadsTo).status, Partial);
     }
 
     #[test]
@@ -579,16 +585,26 @@ mod tests {
                     "{:?} is Partial but names no replacement to migrate toward",
                     row.capability,
                 );
-                // The macro-exercised scalar rows document their exact gap; the
-                // Model-ABI-only liveness row is a recognized-class partial with
-                // no macro-migration blocker to track, so only require a tracked
-                // blocker when the row gates a macro surface.
-                if !row.surfaces.is_empty() {
-                    assert!(
-                        !row.migration_blockers.is_empty(),
-                        "{:?} is a Partial macro capability but tracks no gap blocker",
-                        row.capability,
-                    );
+                assert!(
+                    !row.migration_blockers.is_empty(),
+                    "{:?} is Partial but tracks no gap blocker",
+                    row.capability,
+                );
+                for blocker in row.migration_blockers {
+                    if row.surfaces.is_empty() {
+                        assert!(
+                            R5_MODEL_ABI_AMBITION_BLOCKERS.contains(blocker),
+                            "{:?} is Model-ABI-only and must reference the non-gating \
+                             ambition tracker; found {blocker:?}",
+                            row.capability,
+                        );
+                    } else {
+                        assert!(
+                            R5_TEMPORAL_RETIREMENT_BLOCKERS.contains(blocker),
+                            "{:?} references untracked blocker {blocker:?}",
+                            row.capability,
+                        );
+                    }
                 }
             }
         }
@@ -699,7 +715,7 @@ mod tests {
     fn macro_docs_point_at_the_replacement_and_the_nudge_fires() {
         // Guidance is preserved in prose ...
         assert!(
-            MACRO_IMPLEMENTATION_SOURCE.contains("certify_clean_scalar_model_with_ty"),
+            MACRO_IMPLEMENTATION_SOURCE.contains("certify_bound_clean_scalar_model_with_ty"),
             "macro docs must name the certifier as the forward-authoring path",
         );
         assert!(
@@ -748,7 +764,7 @@ mod tests {
         assert_eq!(value["capabilities"][0]["capability"], "scalar_safety_single_var");
         assert_eq!(value["capabilities"][0]["status"], "fully_replaced");
         assert_eq!(value["capabilities"][4]["capability"], "function_valued_model_vars");
-        assert_eq!(value["capabilities"][4]["status"], "not_yet");
+        assert_eq!(value["capabilities"][4]["status"], "fully_replaced");
     }
 
     #[test]
@@ -777,7 +793,7 @@ mod tests {
 
         // Flipping a capability's status away from the snapshot is rejected.
         let mut forged_status = baseline.clone();
-        forged_status["capabilities"][4]["status"] = serde_json::json!("fully_replaced");
+        forged_status["capabilities"][4]["status"] = serde_json::json!("not_yet");
         assert!(serde_json::from_value::<R5MacroCapabilityScorecard>(forged_status).is_err());
 
         // Re-labelling the FullyReplaced scalar core back to Partial (silently

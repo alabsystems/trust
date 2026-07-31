@@ -842,6 +842,7 @@ fn unsupported_direct_trust_vc_router_evidence(
         obligation_id: obligation.obligation_id.clone(),
         engine: adapter.manifest().clone(),
         status: EvidenceStatus::Unsupported,
+        decline: None,
         proof_strength: None,
         artifacts: Vec::new(),
         counterexample: None,
@@ -1026,6 +1027,7 @@ mod fresh_receipt_binding_tests {
                 trust_verifier_api::EngineKind::Composite,
             ),
             status: EvidenceStatus::Proved,
+            decline: None,
             proof_strength: Some(strength.clone()),
             artifacts: vec![trust_verifier_api::EvidenceArtifact {
                 kind: trust_verifier_api::EvidenceArtifactKind::SolverTranscript,

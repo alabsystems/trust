@@ -110,8 +110,23 @@ const STATUS_KEYWORDS: &[&str] =
 /// Recognized structured header spellings → the compiler's typed transport
 /// `kind`. A `None` return marks an invalid expected-kind name. Tags on the
 /// right come from `format_vc_kind` in trustc.
+///
+/// `HardenedBoundary(<Category>)` names a HARDENED FAMILY, not a bare VC kind:
+/// `VcKind::transport_tag` routes every kind with a `hardened_category()`
+/// through `hardened_<category>` BEFORE the per-kind table, so an unsafe-demand
+/// obligation — vcgen emits it as `Assertion { message: "[unsafe…" }` and the
+/// full-lane reconstruction re-kinds it to `HardenedBoundary { category:
+/// UnsafeOperation }` — transports as `hardened_unsafe_operation`, never
+/// `assert`. A fixture asserting a raw-pointer safety catch must name that
+/// family; `Assertion` would silently match nothing.
 fn recognized_vc_kind(vc_name: &str) -> Option<&'static str> {
     Some(match vc_name {
+        "HardenedBoundary(UnsafeOperation)" => "hardened_unsafe_operation",
+        // `[unsafe:ffi]` rows have their own `hardened_category()` arm
+        // (`HardenedVcCategory::FfiBoundary` in trust-types `vc_kind.rs`), so
+        // they transport as `hardened_ffi_boundary` — a fixture asserting an
+        // FFI-boundary catch must be able to name that family.
+        "HardenedBoundary(FfiBoundary)" => "hardened_ffi_boundary",
         "DivisionByZero" => "divzero",
         "RemainderByZero" => "remzero",
         "IndexOutOfBounds" => "bounds",
@@ -198,9 +213,44 @@ fn transcript_has_compiler_crash(stderr: &str) -> bool {
     if stderr.contains("internal compiler error") {
         return true;
     }
+    // A `debug_assert!` trip inside the verifier prints `thread 'rustc' (<tid>)
+    // panicked at …` plus rustc's ICE banner — and NOT "internal compiler
+    // error" — so this clause is the one that recognizes that class. It always
+    // did: the 2026-07 ICE-mislabeling defect was never a marker gap here but
+    // the CHECK ORDERING in `verify_suite` (see `diagnose_corpus_run`), which
+    // judged the transport before asking whether the compiler had died.
     stderr.lines().any(|line| {
         line.find("thread 'rustc'").is_some_and(|index| line[index..].contains("panicked"))
     })
+}
+
+/// Diagnose one corpus run in CAUSE order, before any expectation is judged.
+///
+/// A compiler that died mid-pass (signal or ICE) emits no terminal
+/// crate/coverage summary, so its transport check would ALSO fail — reporting
+/// "missing transport" for a crash is a true statement that names the symptom
+/// and buries the cause. (It did exactly that for the
+/// `refute_unsafe_demand_findings` positive-witness assertion trip.) So the
+/// death checks run FIRST, and the transport contract is judged only for a
+/// compiler that survived. Neither death check can mislabel a healthy run: a
+/// signal death and an ICE transcript are unambiguous.
+fn diagnose_corpus_run(
+    captured: &Captured,
+    session: &str,
+) -> std::result::Result<Vec<AuthenticatedOutcome>, String> {
+    if captured.terminated_by_signal {
+        return Err("trustc terminated by signal".to_string());
+    }
+    if transcript_has_compiler_crash(&captured.stderr) {
+        return Err("trustc hit an ICE/panic (no example may crash it)".to_string());
+    }
+    let Some(outcomes) = authenticated_outcomes(captured, session) else {
+        return Err("missing/malformed/mixed-session typed verification transport".to_string());
+    };
+    if outcomes.is_empty() {
+        return Err("typed verification transport carried zero obligations".to_string());
+    }
+    Ok(outcomes)
 }
 
 fn verify_suite(root: &Path) -> Result<()> {
@@ -284,18 +334,15 @@ fn verify_suite(root: &Path) -> Result<()> {
             .arg(&out);
         let captured = capture(command)
             .with_context(|| format!("failed to run stage2 trustc on {}", file.display()))?;
-        let transcript = captured.stderr.as_str();
-        let Some(outcomes) = authenticated_outcomes(&captured, &session) else {
-            failures.push(format!(
-                "{basename}: missing/malformed/mixed-session typed verification transport"
-            ));
-            continue;
+        // Cause-ordered diagnosis: compiler death first, transport second (see
+        // `diagnose_corpus_run` — extracted so the ordering is unit-testable).
+        let outcomes = match diagnose_corpus_run(&captured, &session) {
+            Ok(outcomes) => outcomes,
+            Err(diagnosis) => {
+                failures.push(format!("{basename}: {diagnosis}"));
+                continue;
+            }
         };
-        if outcomes.is_empty() {
-            failures
-                .push(format!("{basename}: typed verification transport carried zero obligations"));
-            continue;
-        }
         // A `no_obligations` row is the coverage marker for a function with
         // nothing to prove (e.g. the fixture's `main`) — it carries no
         // obligation id/location BY NATURE and is not a proof claim. Every
@@ -313,15 +360,6 @@ fn verify_suite(root: &Path) -> Result<()> {
 
         // Buggy variants may correctly fail closed with exit 1. Safe variants
         // must compile successfully and materialize a non-empty artifact.
-        if captured.terminated_by_signal {
-            failures.push(format!("{basename}: trustc terminated by signal"));
-            continue;
-        }
-        if transcript_has_compiler_crash(transcript) {
-            failures.push(format!("{basename}: trustc hit an ICE/panic (no example may crash it)"));
-            continue;
-        }
-
         let safe = is_safe_variant(&basename);
         if safe {
             if !captured.exited_with(0) {
@@ -729,8 +767,20 @@ fn dev_test_lib(root: &Path) -> Result<()> {
     // Re-supply the SAME trusted stage2 runtime library dirs trustc_native already uses so
     // dyld resolves libstd; the env is applied AFTER the scrub and inherited by cargo.
     let loader_env = trusted_runtime_library_path_env(&trustc)?;
-    let mut envs: Vec<(&str, &str)> =
-        vec![("CARGO_INCREMENTAL", "1"), ("CARGO_SKIP_CACHE", "1")];
+    // Trust: `-j` above bounds BUILD parallelism, but libtest's harness defaults its own
+    // thread count to ncpu — and the `trust-clean` lib-test binary (the Clean kernel plus
+    // the ~65k-line mirsem suite, 2400+ tests) at 14 threads exhausts host memory and dies
+    // with SIGKILL, which surfaced here as an unexplained `exit status: 101` the first time
+    // the workspace step ever reached it (earlier compile errors in `trust-cg-bridge` had
+    // been masking it). Apply the SAME memory-aware policy to the harness: `RUST_TEST_THREADS`
+    // is libtest's documented env knob and is inherited by every test binary cargo spawns.
+    // Measured on a 48 GB host: 14 threads → SIGKILL; 4 threads → 2420 tests pass in ~9 min.
+    let test_threads = jobs.to_string();
+    let mut envs: Vec<(&str, &str)> = vec![
+        ("CARGO_INCREMENTAL", "1"),
+        ("CARGO_SKIP_CACHE", "1"),
+        ("RUST_TEST_THREADS", test_threads.as_str()),
+    ];
     if let Some((var, ref value)) = loader_env {
         envs.push((var, value.as_str()));
     }
@@ -774,6 +824,45 @@ mod tests {
         assert_eq!(recognized_vc_kind("ArithmeticOverflow(Add)"), Some("overflow:add"));
         assert!(recognized_vc_kind("deref NOT proved (unknown -> CAUGHT)").is_none());
         assert!(recognized_vc_kind("raw deref").is_none());
+    }
+
+    /// An unsafe-demand obligation transports under its HARDENED FAMILY tag, not
+    /// `assert`: `VcKind::transport_tag` short-circuits on `hardened_category()`,
+    /// and `Assertion { message: "[unsafe…" }` has one. The raw-pointer fixtures
+    /// used to spell this `Assertion`, which matched no row at all.
+    #[test]
+    fn hardened_unsafe_operation_family_is_recognized_and_distinct_from_assert() {
+        assert_eq!(
+            recognized_vc_kind("HardenedBoundary(UnsafeOperation)"),
+            Some("hardened_unsafe_operation")
+        );
+        assert_eq!(recognized_vc_kind("Assertion"), Some("assert"));
+        assert_ne!(
+            recognized_vc_kind("HardenedBoundary(UnsafeOperation)"),
+            recognized_vc_kind("Assertion")
+        );
+        // `[unsafe:ffi]` rows transport under their own hardened family, which
+        // must therefore be nameable by a fixture.
+        assert_eq!(
+            recognized_vc_kind("HardenedBoundary(FfiBoundary)"),
+            Some("hardened_ffi_boundary")
+        );
+        // The family name is not a wildcard: a bare spelling and a category no
+        // transport tag exists for stay invalid.
+        assert!(recognized_vc_kind("HardenedBoundary").is_none());
+        assert!(recognized_vc_kind("HardenedBoundary(NotACategory)").is_none());
+    }
+
+    /// The header grammar must round-trip the family spelling: no status keyword
+    /// hides inside `HardenedBoundary(UnsafeOperation)`, so the token splits at
+    /// the trailing status and the name survives intact.
+    #[test]
+    fn hardened_family_header_parses_as_one_structured_token() {
+        let content = "// Expected: HardenedBoundary(UnsafeOperation) FAILED\n// prose\n";
+        assert_eq!(
+            parse_expected_tokens(content),
+            vec![("HardenedBoundary(UnsafeOperation)".into(), "FAILED".into())]
+        );
     }
 
     #[test]
@@ -876,6 +965,84 @@ mod tests {
         assert!(others.contains("target_arch=\"aarch64\""));
         assert!(others.contains("target_pointer_width=\"64\""));
         assert!(!others.iter().any(|line| line.starts_with("target_feature=")));
+    }
+
+    /// The real transcript of the `refute_unsafe_demand_findings`
+    /// positive-witness `debug_assert!` trip: a dead compiler, no `TRUST_JSON:`
+    /// transport rows.
+    const DEBUG_ASSERT_ICE_TRANSCRIPT: &str = "thread 'rustc' (71570751) panicked at \
+         /rustc-dev/3e13ee731/compiler/rustc_mir_transform/src/trust_verify.rs:9150:13:\n\
+         positive-witness invariant breach: `ay-in-process` proved a structurally \
+         refuted obligation\n\
+         error: the compiler unexpectedly panicked. This is a bug\n";
+
+    /// A `debug_assert!` trip prints `thread 'rustc' (<tid>) panicked at …`
+    /// plus rustc's ICE banner, and NOT "internal compiler error". The
+    /// `thread 'rustc' … panicked` clause is what recognizes it — and always
+    /// did: the 2026-07 mislabeled-ICE defect was the check ORDERING in
+    /// `verify_suite` (pinned by
+    /// `crashed_run_is_diagnosed_as_a_crash_not_as_missing_transport`), not a
+    /// marker gap here. Pinned so the clause cannot regress out from under
+    /// that ordering fix.
+    #[test]
+    fn ice_transcript_shapes_are_recognized_as_compiler_crashes() {
+        assert!(transcript_has_compiler_crash(DEBUG_ASSERT_ICE_TRANSCRIPT));
+        assert!(transcript_has_compiler_crash("error: internal compiler error: boom\n"));
+        // An ordinary fail-closed verification transcript is not a crash.
+        assert!(!transcript_has_compiler_crash(
+            "error: Trust strict verification failed for `f`: \
+             1 obligation(s) were not fully verified\n"
+        ));
+        assert!(!transcript_has_compiler_crash(""));
+    }
+
+    /// A crashed compiler emits no transport, so "the transport is missing" and
+    /// "trustc crashed" are BOTH true — and the gate must name the cause, not
+    /// the symptom. The pre-fix `verify_suite` judged the transport first and
+    /// reported the real debug_assert ICE transcript as
+    /// "missing/malformed/mixed-session typed verification transport"; this
+    /// fails if that ordering ever comes back.
+    #[test]
+    fn crashed_run_is_diagnosed_as_a_crash_not_as_missing_transport() {
+        let crash = Captured {
+            exit: 101,
+            terminated_by_signal: false,
+            stdout: String::new(),
+            stderr: DEBUG_ASSERT_ICE_TRANSCRIPT.to_string(),
+        };
+        let diagnosis = diagnose_corpus_run(&crash, "trust-extra-smoke-x")
+            .expect_err("a crashed run must never yield authenticated outcomes");
+        assert!(diagnosis.contains("ICE/panic"), "cause must be named first: {diagnosis}");
+        assert!(
+            !diagnosis.contains("transport"),
+            "the symptom must not mask the cause: {diagnosis}"
+        );
+
+        // A signal death outranks the transport check the same way.
+        let signaled = Captured {
+            exit: -1,
+            terminated_by_signal: true,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        let diagnosis = diagnose_corpus_run(&signaled, "trust-extra-smoke-x")
+            .expect_err("a signal death must never yield authenticated outcomes");
+        assert!(diagnosis.contains("signal"), "unexpected diagnosis: {diagnosis}");
+
+        // A compiler that SURVIVED without emitting transport is still a
+        // transport failure — the ordering only reorders diagnoses, it never
+        // absorbs one.
+        let survived = Captured {
+            exit: 1,
+            terminated_by_signal: false,
+            stdout: String::new(),
+            stderr: "error: Trust strict verification failed for `f`: \
+                 1 obligation(s) were not fully verified\n"
+                .to_string(),
+        };
+        let diagnosis = diagnose_corpus_run(&survived, "trust-extra-smoke-x")
+            .expect_err("a run without transport rows must be a transport failure");
+        assert!(diagnosis.contains("transport"), "unexpected diagnosis: {diagnosis}");
     }
 
     #[test]

@@ -14,6 +14,14 @@
 
 schema_version = "0.2.0"
 
+# Empty, and it must stay declared. The validator
+# (targo-trust/src/trust_added/mod.rs, `exceptions` lookup) requires this key to
+# be present AND an array; deleting the declaration along with the last entry
+# fails the ledger's own schema check, which blocks the gate from running at all
+# rather than reporting zero exceptions. Removing the final entry means emptying
+# this array, not removing it.
+exceptions = []
+
 
 # RETIRED 2026-07-02 (ui-parity campaign, reports/ui-vanilla-rootcause-2026-07-01.md):
 # 22 entries removed — their tests now pass the vanilla ui replay, either via real

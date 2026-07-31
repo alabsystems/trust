@@ -780,7 +780,9 @@ mod tests {
     }
 
     #[test]
-    fn mmap_temporal_model_catches_truncation_proves_under_single_writer() {
+    fn mmap_temporal_model_catches_truncation_and_a_declaration_cannot_prove_it_away() {
+        use trust_types::SingleWriterEvidence;
+
         let prop = "AG !bad";
         let temporal = |md: StateMachineMetadata| VerificationCondition {
             kind: VcKind::Temporal { property: prop.into(), machine: Some(md) },
@@ -792,17 +794,35 @@ mod tests {
         // Truncatable file (no single-writer invariant): the env can shrink the
         // mapping, so an access-while-stale is reachable ⇒ ty CATCHES the hazard.
         // This is the SOUND result — re-validation would NOT change it (TOCTOU).
-        let hazard = TyBackend.verify(&temporal(StateMachineMetadata::mmap_temporal_model(false)));
+        let hazard = TyBackend
+            .verify(&temporal(StateMachineMetadata::mmap_temporal_model(SingleWriterEvidence::None)));
         assert!(
             matches!(hazard, VerificationResult::Failed { .. }),
             "without single-writer, ty must catch the truncate->stale-access hazard, got {hazard:?}"
         );
-        // Single-writer invariant (map_mut's unsafe contract): Truncate disabled,
-        // bad state unreachable ⇒ ty PROVES temporal safety.
-        let safe = TyBackend.verify(&temporal(StateMachineMetadata::mmap_temporal_model(true)));
+        // SOUNDNESS REGRESSION GUARD. `#[trust::single_writer]` is DECLARED, never
+        // verified — the compiler sets it from a bare attribute-presence test. A
+        // declaration must therefore NOT delete the bad state from the model. This
+        // test previously asserted the opposite ("under single-writer, ty must
+        // prove temporal safety"), which let an unverified caller promise be
+        // graded `AssuranceLevel::Sound`. If this flips back to Proved, an
+        // unchecked assertion is once again buying a proof.
+        let declared = TyBackend.verify(&temporal(StateMachineMetadata::mmap_temporal_model(
+            SingleWriterEvidence::Declared,
+        )));
         assert!(
-            matches!(safe, VerificationResult::Proved { .. }),
-            "under single-writer, ty must prove temporal safety, got {safe:?}"
+            matches!(declared, VerificationResult::Failed { .. }),
+            "a DECLARED single-writer invariant must not prove the hazard away, got {declared:?}"
+        );
+        // Only a CHECKED single-writer proof discharges `Truncate`. Nothing
+        // constructs `Verified` in production yet; this pins the seam so the
+        // reduction stays available to a real proof.
+        let verified = TyBackend.verify(&temporal(StateMachineMetadata::mmap_temporal_model(
+            SingleWriterEvidence::Verified,
+        )));
+        assert!(
+            matches!(verified, VerificationResult::Proved { .. }),
+            "a VERIFIED single-writer invariant may prove temporal safety, got {verified:?}"
         );
     }
 

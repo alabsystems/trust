@@ -457,6 +457,7 @@ fn transform_member(
                                     name: fx.res_name.clone(),
                                     variant: 0,
                                     active_field: None,
+                                    args: None,
                                 },
                                 vec![
                                     Operand::Move(Place::local(rz)),

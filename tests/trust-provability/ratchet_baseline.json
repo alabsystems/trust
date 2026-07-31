@@ -1,6 +1,6 @@
 {
  "_host": "aarch64-apple-darwin",
- "_trustc": "rustc 1.99.0-dev (35d8a1dc4 2026-07-26) (trustc)",
+ "_trustc": "rustc 1.99.0-dev (346dba94e 2026-07-26) (trustc)",
  "corpora": {
   "provability-corpus": {
    "certified": 14,

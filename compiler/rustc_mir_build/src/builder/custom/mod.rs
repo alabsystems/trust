@@ -71,7 +71,10 @@ pub(super) fn build_custom_mir<'tcx>(
         parent_scope: None,
         inlined: None,
         inlined_parent_scope: None,
-        local_data: ClearCrossCrate::Set(SourceScopeLocalData { lint_root: hir_id }),
+        local_data: ClearCrossCrate::Set(SourceScopeLocalData {
+            lint_root: hir_id,
+            trust_loop_hir_local_id: None,
+        }),
     });
     body.injection_phase = Some(parse_attribute(dialect, phase));
 

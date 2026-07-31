@@ -1,7 +1,8 @@
 // Trust test: raw-pointer deref out of bounds -- unsafe variant
-// VcKind: Assertion
-// Expected: Assertion FAILED
-// The assertion finding is the fail-closed catch for the out-of-bounds deref.
+// VcKind: Assertion { message: "[unsafe...]" } -- transports as the hardened
+//   unsafe-operation family (`hardened_unsafe_operation`), not `assert`.
+// Expected: HardenedBoundary(UnsafeOperation) FAILED
+// The unsafe-demand finding is the fail-closed catch for the out-of-bounds deref.
 // Counterexample: `p.add(5)` is 5 elements past a single-`i32` allocation.
 //
 // Soundness guard: the stack-good lane discharges in-bounds ONLY at offset 0,

@@ -111,6 +111,7 @@ use trust_ir::{
     CastOp,
     Constant,
     FCmpOp,
+    ScopeData,
     FuncId,
     FuncTy,
     FuncTyId,
@@ -135,6 +136,7 @@ pub mod crate_module;
 pub mod differential;
 pub mod flip;
 pub mod flip_registry;
+pub mod lineage;
 pub mod mir_differential;
 pub mod to_mir;
 
@@ -197,8 +199,16 @@ pub struct Lowered {
     pub module: Module,
     /// Trust: fn body vs const/static initializer body (see [`BodyKind`]).
     pub body_kind: BodyKind,
-    /// Trust (totality Batch C): true iff the body reads at least one SYMBOLIC assoc
-    /// const (a value-less extern-immutable global — see `LowerCx::symbolic_consts`).
+    /// Trust (#173): true iff a LIVE value's type took a deliberate, tag-free OPAQUE COLLAPSE
+    /// (wave-EL data-enum lane, or a `struct_ty_rmw_opaque` non-pure sibling lane). Such a body
+    /// can be tag-free — "lowered clean" — while carrying a placeholder for a real value, so the
+    /// scorecard must not count it as MODELLED. MEASUREMENT ONLY: unlike `symbolic` it gates
+    /// nothing, because the differential and the splice each decline these on their own terms.
+    pub opaque_collapse: bool,
+    /// Trust (totality Batch C): true iff the body carries at least one OPAQUE carrier —
+    /// a value-less extern-immutable global for a symbolic assoc const or const-generic
+    /// param (`LowerCx::symbolic_consts`), or the opaque `Ty::Unit` spelling of a bare
+    /// generic param type (`LowerCx::param_opaque`, wave-PO).
     /// Consumers MUST check this at their seams: the interpretation differential skips
     /// the body as a precise NotRun class (a value-less `Load` interpreted would
     /// manufacture a false TypeError verdict), and the crate-module assembler excludes
@@ -320,6 +330,86 @@ pub struct CalleeRef {
     /// (the body stays clean-only, never a wrong flip — a non-matching rebuild is caught by the
     /// comparator's `raw_call_channel` FnDef equality, the liveness-not-safety anchor).
     pub site_args: Option<Vec<SiteArg>>,
+    /// Trust (#178): the RESULT type this crate's call sites actually bind from this callee, when
+    /// every observed site agrees and the type is TABLE-FREE. `None` means "unknown" — no site
+    /// bound a result, the type was unmappable, two sites disagreed, or the type is table-indexed.
+    ///
+    /// WHY THIS EXISTS. A callee that does not resolve to a local body becomes a bodyless
+    /// DECLARATION at crate assembly, and every declaration used to share ONE signature:
+    /// `FuncTy { params: [], returns: [], is_vararg: true }`. `is_vararg` is the params-side
+    /// "unknown" encoding — which is exactly why arg-count mismatches were rare — but
+    /// `returns: []` has no such escape hatch: it is a POSITIVE CLAIM of "returns nothing". So
+    /// every call binding a result was ill-typed, and `validate_module` reported
+    /// `InstrResultArityMismatch { op: "call", expected: 0, actual: 1 }` — 1542 occurrences,
+    /// 66% of ALL validation errors in the corpus, from that one default.
+    ///
+    /// FAIL-CLOSED BY CONSTRUCTION. Recording the type OBSERVED at the call site (rather than
+    /// re-deriving the callee's signature) keeps the declaration consistent with the instruction
+    /// that uses it, which is precisely what the validator compares. TABLE-FREE is required
+    /// because a declaration's signature is interned into the ASSEMBLED module while a
+    /// table-indexed `Ty` (`Struct`/`Enum`/`Array`) is numbered in the BODY's tables — carrying
+    /// one across without the `prepare_body_tables` remap would name a different type. Unknown
+    /// stays unknown: the old empty-`returns` spelling, which is honest for a callee no site
+    /// takes a value from.
+    pub ret_ty: Option<Ty>,
+    /// Trust (#178): sticky POISON for [`CalleeRef::ret_ty`]. `ret_ty: None` alone is ambiguous
+    /// between "no site has bound a result yet" and "two sites disagreed", and conflating them
+    /// would let a THIRD site resurrect a type two earlier sites had already contradicted. Once
+    /// set, `ret_ty` is never written again and crate assembly treats the callee as unknown.
+    pub ret_ty_conflict: bool,
+}
+
+/// Trust (#178): the trust-ir `Ty` for a BARE SCALAR rustc type, computed WITHOUT touching the
+/// lowerer. Used only to record what a call site binds ([`CalleeRef::ret_ty`]).
+///
+/// WHY NOT `map_ty`/`map_ty_checked`. Neither is a query — both MUTATE. `map_ty` pushes the
+/// `unsupported` entry itself, and `map_ty_checked` merely *detects* that it did ("the inner entry
+/// stays, keeping the precise reason"), so probing a type through it ADDS A TAG to a body whose own
+/// lowering succeeded. The first cut of #178 did exactly that and cost 41 clean bodies in the
+/// corpus — a spurious fail-closed, which is still a wrong answer. `map_ty` can also intern into
+/// the per-body pending `types`/`func_types`/`closure_types` tables (and the enum/struct
+/// registries), any of which would change the emitted module as a side effect of a lookup.
+///
+/// So this handles ONLY the bare scalars, directly off the rustc kind: they are exactly the
+/// table-free fragment a declaration's `returns` may carry, and mapping them cannot tag, cannot
+/// pend, and cannot register. Everything else is `None` = unknown = the old empty-`returns`
+/// spelling. Narrow and side-effect-free beats broad and mutating.
+fn scalar_ret_ty(rty: RustcTy<'_>) -> Option<Ty> {
+    Some(match rty.kind() {
+        ty::Int(ty::IntTy::I8) => Ty::I8,
+        ty::Int(ty::IntTy::I16) => Ty::I16,
+        ty::Int(ty::IntTy::I32) => Ty::I32,
+        ty::Int(ty::IntTy::I64) => Ty::I64,
+        ty::Int(ty::IntTy::I128) => Ty::I128,
+        ty::Int(ty::IntTy::Isize) => Ty::Isize,
+        ty::Uint(ty::UintTy::U8) => Ty::U8,
+        ty::Uint(ty::UintTy::U16) => Ty::U16,
+        ty::Uint(ty::UintTy::U32) => Ty::U32,
+        ty::Uint(ty::UintTy::U64) => Ty::U64,
+        ty::Uint(ty::UintTy::U128) => Ty::U128,
+        ty::Uint(ty::UintTy::Usize) => Ty::Usize,
+        ty::Float(ty::FloatTy::F16) => Ty::F16,
+        ty::Float(ty::FloatTy::F32) => Ty::F32,
+        ty::Float(ty::FloatTy::F64) => Ty::F64,
+        ty::Bool => Ty::Bool,
+        ty::Char => Ty::Char,
+        // A reference or raw pointer whose POINTEE is itself a bare scalar. Such a pointee is
+        // sized by inspection, so the pointer is unconditionally THIN and maps to `Ty::Ptr` —
+        // decided syntactically, with no sizedness/layout query and no risk of the fat/thin hole
+        // T5 (`6ac3ab3a1b`) just closed for DST-tailed pointees. Deliberately NOT recursive past
+        // one level and NOT extended to `ty::Adt` pointees: `&ArcInner<str>` is exactly the shape
+        // that was mis-signed as 8 bytes, and deciding it needs the layout query this function
+        // exists to avoid.
+        ty::Ref(_, pointee, _) | ty::RawPtr(pointee, _)
+            if matches!(
+                pointee.kind(),
+                ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::Bool | ty::Char
+            ) =>
+        {
+            Ty::Ptr
+        }
+        _ => return None,
+    })
 }
 
 /// Trust (wave-C): a lifetime-free encoding of one `GenericArg` at a concrete-monomorphic call
@@ -493,6 +583,53 @@ pub fn lower_module_collect_all_from_thir<'tcx>(
     lower_module_inner(tcx, def, thir, root, true).unsupported
 }
 
+thread_local! {
+    /// Trust (wave-EP root fix): the `DefId`s of the bodies THIS THREAD's producer is currently
+    /// lowering, outermost first.
+    ///
+    /// The producer runs inside `mir_built`. Any query it issues that ends up demanding
+    /// `mir_built` for a body already on this stack is a QUERY CYCLE (E0391) — a hard compile
+    /// error, i.e. a `-Ztrust-ir-lower` flag turning a passing crate into a failing one, which
+    /// is the single worst failure mode this producer has.
+    ///
+    /// `LowerCx::body_def` alone cannot see it. The self-referential case
+    /// (`static FOO: Foo = Foo { foo: Some(&FOO) }`) is caught by comparing against the current
+    /// body, but a MUTUAL cycle (`static A = &B; static B = &A;`) is not: while lowering A we
+    /// evaluate B, whose own `mir_built` re-enters this hook as a nested frame whose
+    /// `body_def` is B — and that frame then evaluates A, closing the cycle. A stack sees the
+    /// whole chain; a single field never can.
+    ///
+    /// Thread-local, not global: rustc builds MIR on parallel worker threads and each owns its
+    /// own query stack, so cross-thread entries would be both wrong and a false decline.
+    static LOWERING_BODIES: std::cell::RefCell<Vec<rustc_span::def_id::DefId>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// RAII: keeps [`LOWERING_BODIES`] balanced even if the lowering below returns early (the huge-body
+/// cap does) or unwinds.
+struct LoweringBodyGuard;
+
+impl LoweringBodyGuard {
+    fn enter(def: rustc_span::def_id::DefId) -> Self {
+        LOWERING_BODIES.with(|s| s.borrow_mut().push(def));
+        LoweringBodyGuard
+    }
+}
+
+impl Drop for LoweringBodyGuard {
+    fn drop(&mut self) {
+        LOWERING_BODIES.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+/// True iff evaluating `def_id`'s body would re-enter a `mir_built` already on this thread's
+/// producer stack. Callers MUST decline rather than issue the query.
+fn would_reenter_lowering(def_id: rustc_span::def_id::DefId) -> bool {
+    LOWERING_BODIES.with(|s| s.borrow().contains(&def_id))
+}
+
 fn lower_module_inner<'tcx>(
     tcx: TyCtxt<'tcx>,
     def: LocalDefId,
@@ -500,6 +637,7 @@ fn lower_module_inner<'tcx>(
     root: ExprId,
     collect_all: bool,
 ) -> Lowered {
+    let _reentry_guard = LoweringBodyGuard::enter(def.to_def_id());
     let mut module = Module::new(tcx.crate_name(def.to_def_id().krate).to_string());
 
     // Trust (huge-body cap): a body whose THIR expression count is enormous is
@@ -535,6 +673,8 @@ fn lower_module_inner<'tcx>(
             callees: Vec::new(),
             pending_consts: Vec::new(),
             symbolic: false,
+            // The cap fires BEFORE any type is mapped, so no value went opaque.
+            opaque_collapse: false,
         };
     }
     let mut cx = LowerCx {
@@ -550,6 +690,8 @@ fn lower_module_inner<'tcx>(
         cur_span: None,
         files: Vec::new(),
         value_names: Vec::new(),
+        scopes: vec![ScopeData { parent: None, span: None }],
+        cur_scope: 0,
         cur_params: Vec::new(),
         sealed: false,
         locals: Vec::new(),
@@ -568,6 +710,8 @@ fn lower_module_inner<'tcx>(
         // Trust (totality Batch C): symbolic assoc-const ledger.
         symbolic_consts: Vec::new(),
         static_globals: Vec::new(),
+        param_opaque: false,
+        opaque_collapse: false,
         unsupported: Vec::new(),
         collect_all,
         struct_ids: Vec::new(),
@@ -636,7 +780,10 @@ fn lower_module_inner<'tcx>(
         callees: cx.callees,
         pending_consts: cx.pending_consts,
         // Trust (totality Batch C): non-empty symbolic-const ledger ⇒ symbolic body.
-        symbolic: !cx.symbolic_consts.is_empty(),
+        // wave-PO: an opaque-param body joins the symbolic class for the same reason a
+        // value-less symbolic const does — it lowers, but its values are not modelled.
+        symbolic: !cx.symbolic_consts.is_empty() || cx.param_opaque,
+        opaque_collapse: cx.opaque_collapse,
     }
 }
 
@@ -648,25 +795,32 @@ fn lower_module_inner<'tcx>(
 /// in lockstep with them (the same coupling `map_ty` has with the MIR-side oracle): if `map_ty`'s
 /// ref/rawptr/aggregate fatness rules change, update this too or the gate silently drifts. Anything
 /// `map_ty` cannot lower faithfully collapses to `Opaque` (the conservative catch-all).
-#[derive(PartialEq, Eq)]
+// Trust (T5): `Debug` so the lockstep invariant can be asserted with `assert_eq!` and REPORT
+// which shape disagreed — an `assert!(a == b)` that only says "false" is exactly the
+// lost-error-message anti-pattern the testing rules forbid.
+#[derive(Debug, PartialEq, Eq)]
 enum FatShape {
     /// A scalar (`bool`/`char`/int/uint/float) → `map_ty` gives a scalar `Ty`. A clean-identity
     /// scalar position is CONCRETE (a bare `ty::Param` is `Opaque`, never clean by value), so the
     /// identity and concrete scalar at one position are identical by construction — no need to
     /// distinguish widths.
     Scalar,
-    /// A THIN pointer: `&T`/`&mut T` whose (normalized) pointee is not slice/str (incl. `&Self`,
-    /// `&Param`, `&dyn`, `&mut [T]`), or a thin raw pointer → `map_ty` `Ty::Ptr`.
+    /// A THIN pointer: `&T`/`&mut T` whose (normalized) pointee is not slice/str and whose
+    /// struct TAIL carries no metadata (incl. `&Self`, `&Param`, `&mut [T]`, an `extern type`
+    /// pointee), or a thin raw pointer → `map_ty` `Ty::Ptr`.
     Thin,
     /// A FAT shared slice/str reference `&[T]`/`&str` (`Mutability::Not`) → `map_ty` `Tuple([Ptr,I64])`.
     /// The pointee element is irrelevant to fatness (`&[U]` and `&[i32]` share the tuple shape).
+    /// Trust (T5): also any `&T`/`&mut T`/`*const T` whose pointee CONTAINS a `str`/`[U]` tail
+    /// (`*const ArcInner<str>`) — map_ty signs the same 16-byte pair for those.
     Fat,
     /// A tuple / concrete-length array / struct / enum, recursively — `map_ty` recurses into each
     /// element/field/variant, so the gate must too (a fat ref NESTED here flips fatness invisibly to
     /// a top-level-only check — the exact wave-19 adversarial finding).
     Agg(Vec<FatShape>),
-    /// `map_ty` FAILS CLOSED (or would): a bare `ty::Param`/unresolved alias by value, a fat/array
-    /// raw pointer, a const-generic-length array, a recursive/unsupported adt or enum, `dyn`, foreign,
+    /// `map_ty` FAILS CLOSED (or would): a bare `ty::Param`/unresolved alias by value, a
+    /// VTABLE-metadata pointer (`*const dyn`, `&StructWithDynTail` — T5), an unevaluated-length
+    /// array raw pointer, a const-generic-length array, a recursive/unsupported adt or enum, `dyn`, foreign,
     /// fn-ptr, closure, never, etc. An `Opaque` in the IDENTITY signature means the callee body itself
     /// failed closed at that position → it is DIRTY → a bodyless HAVOC declaration at assembly, so any
     /// instantiation links soundly and the position is SKIPPED (not a coherence constraint).
@@ -688,6 +842,77 @@ fn agg_or_opaque(children: Vec<FatShape>) -> FatShape {
         FatShape::Opaque
     } else {
         FatShape::Agg(children)
+    }
+}
+
+/// Trust (T5, 2026-07-29): what METADATA does a pointer to this pointee carry? — i.e. is
+/// `&pointee` / `*const pointee` an 8-byte address or a 16-byte `(data, metadata)` pair?
+///
+/// This is the classification `map_ty`'s two POINTER CATCH-ALLS were missing. Both used to
+/// spell every remaining pointee thin, which is right for a sized pointee and a LIE for a
+/// pointee that merely CONTAINS a DST in tail position — the `*const ArcInner<str>` inside
+/// `Arc<str>`, reachable from clean-kernel's `Name`, hence from `Level::Param(Name)`.
+///
+/// Determined by rustc's rule, restated: a pointer is fat iff the pointee's STRUCT TAIL (the
+/// deeply last field of nested structures — `TyCtxt::struct_tail_raw`, rustc_middle
+/// ty/util.rs:254) is `str`/`[T]` (usize metadata) or `dyn Trait` (vtable metadata). An
+/// `extern type` tail is `!Sized` but its pointers are THIN (`ptr_metadata_ty_or_tail` gives
+/// `()` for `ty::Foreign`, sty.rs:1796) — which is why plain `is_sized` is the WRONG predicate
+/// here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointeeMeta {
+    /// No metadata — the pointee is sized, or its tail is an `extern type`.
+    Thin,
+    /// `usize` metadata — the tail is `str` or `[T]`.
+    Len,
+    /// Vtable metadata — the tail is `dyn Trait`.
+    Vtable,
+    /// NOT determinable here: the tail is a bare `ty::Param` / unresolved alias (or the walk
+    /// ran out of fuel). The metadata is whatever the instantiation supplies. Callers keep the
+    /// PRE-EXISTING thin spelling, whose soundness is the wave-19 argument recorded on
+    /// `sig_shapes_coherent`: a generic body forwarding its own `?Sized` param signs `Thin` on
+    /// both sides, and every unsized CONCRETE instantiation is rejected at the outer call site
+    /// where the shapes are compared.
+    Unknown,
+}
+
+/// Trust (T5): `map_ty`'s spelling for a pointer whose pointee CONTAINS a DST in tail position
+/// (as opposed to *being* one — `&[T]`/`&str`/`&dyn` and `*const [T]`/`*const str` have their own
+/// first-class arms). `None` means FAIL CLOSED; the caller records the tag.
+///
+/// The `Len` spelling is deliberately the SAME anonymous `(data, len)` pair `map_ty` already
+/// signs for `*const str` / `*const [T]` (`slice_fat_pointer_ty()` on the oracle side): 8+8 = the
+/// 16 bytes rustc lays out, table-free, and no claim that the data pointer addresses string or
+/// slice CONTENT — which a `FatPtrKind::Str`/`Slice` spelling WOULD make, wrongly (the data
+/// pointer of a `*const ArcInner<str>` addresses the `ArcInner` header, not the `str` bytes).
+/// `FatPtrKind` has no variant for a custom-DST pointee; adding one is the trust-ir-side
+/// follow-up, not something to fake with a near-miss kind.
+///
+/// `Vtable` fails closed because this producer carries no vtable component — the same reason the
+/// direct `*const dyn` arm has always failed closed rather than respell it thin.
+fn container_pointee_ty(meta: PointeeMeta) -> Option<Ty> {
+    match meta {
+        PointeeMeta::Len => Some(Ty::Tuple(vec![Ty::Ptr, Ty::I64])),
+        PointeeMeta::Vtable => None,
+        // Thin: genuinely an address. Unknown: keep the PRE-EXISTING spelling — a change of
+        // spelling must rest on a determination, never on the absence of one.
+        PointeeMeta::Thin | PointeeMeta::Unknown => Some(Ty::Ptr),
+    }
+}
+
+/// Trust (T5): the [`FatShape`] of a pointer whose pointee CONTAINS a DST in tail position.
+///
+/// DERIVED from [`container_pointee_ty`] rather than restated, so `fat_shape` and `map_ty`
+/// CANNOT drift on this class. Drift is not hypothetical: B2-3 records that flipping map_ty's
+/// `&dyn` spelling without flipping `fat_shape` "reopens the wave-19 DST-coherence hole", where
+/// a link certifies `Thin == Thin` while the callee record signs fat.
+fn fat_shape_of_container_pointee(meta: PointeeMeta) -> FatShape {
+    match container_pointee_ty(meta) {
+        // map_ty fails closed here → the body is dirty → a havoc position.
+        None => FatShape::Opaque,
+        Some(Ty::Ptr) => FatShape::Thin,
+        // The only other spelling this function produces is the 16-byte `(data, len)` pair.
+        Some(_) => FatShape::Fat,
     }
 }
 
@@ -807,6 +1032,15 @@ struct LowerCx<'a, 'tcx> {
     /// `finish_body` (binary v32 `value_names`). Params only for now — ValueId(i) IS entry
     /// param i by construction, so the ledger cannot desync from the signature.
     value_names: Vec<(ValueId, String)>,
+    /// Trust (C2-scopes): the lexical scope tree under construction. Index 0 is the
+    /// outermost (whole-body) scope, pushed at cx creation so `cur_scope` is always
+    /// valid; its span stays `None` because the CONSUMER already holds the body span
+    /// from `tcx` and uses it verbatim — two sources for one location could disagree.
+    scopes: Vec<ScopeData>,
+    /// Trust (C2-scopes): the scope instructions are currently emitted into. Deepens
+    /// after each `let` in a block (built MIR's per-`let` VISIBILITY scope) and is
+    /// restored on block exit.
+    cur_scope: u32,
     /// Params of the currently-open block (entry params seeded in `lower_fn`; join blocks get a
     /// single result param via `start_block`).
     cur_params: Vec<(ValueId, Ty)>,
@@ -891,6 +1125,27 @@ struct LowerCx<'a, 'tcx> {
     /// Trust (wave-SR2): one emitted global per `static` DefId read by this body, so every read
     /// of the same static resolves to the SAME `GlobalId` (read-read equality is structural).
     static_globals: Vec<(rustc_span::def_id::DefId, GlobalId)>,
+    /// Trust (wave-PO): set when a bare `ty::Param` was spelled as the opaque `Ty::Unit`
+    /// placeholder. Such a body lowers for COVERAGE but must never reach the interpretation
+    /// differential or the executable splice — `Unit` is a placeholder, not a model of `T`.
+    param_opaque: bool,
+    /// Trust (#173): set when a LIVE value's type took a deliberate, TAG-FREE opaque collapse —
+    /// the wave-EL data-enum lane (`register_enum` declined ⇒ `Ty::Unit`/`Ty::Bool`) or a
+    /// `struct_ty_rmw_opaque` non-pure sibling lane.
+    ///
+    /// This is NOT a fail-closed tag and must not become one: the collapse is sound, because
+    /// every OPERATION arm re-gates on the mapped type and keeps its own precise tag, so the
+    /// payload can never be observed. But the body is then "clean" while carrying a placeholder
+    /// for a real value — the differential refuses to sample it ("opaque sampling refused"), so
+    /// it can no more become `Agreed` than a symbolic body can.
+    ///
+    /// It is tracked SEPARATELY from `symbolic` rather than folded into it. Folding would change
+    /// behaviour: `symbolic` gates the differential and the splice, and these bodies are
+    /// deliberately still offered to both (the differential declines on its own terms, per-body,
+    /// and some opaque-lane bodies DO splice). This flag is measurement only — it exists so the
+    /// scorecard stops counting these as MODELLED, which overstated the modelled rate by an
+    /// amount nobody could quantify.
+    opaque_collapse: bool,
     unsupported: Vec<(String, &'static str)>,
     /// Trust (v2 Phase 0b): COLLECT-ALL measurement mode — failure seams that normally
     /// short-circuit sibling subtrees (first bad call arg, …) record their tag and keep walking,
@@ -1125,8 +1380,17 @@ struct LoopCtx {
     exit: BlockId,
     /// The loop-carried locals (a local assigned somewhere in the body), in stable order, with the
     /// header block-param `ValueId` each is bound to on header entry. Back-edge/`continue` `Br`s pass
-    /// these locals' CURRENT values as args; the `exit` reads them at their header-param versions.
+    /// these locals' CURRENT values as args.
     carried: Vec<(LocalVarId, ValueId, Ty)>,
+    /// Trust (#183): the EXIT block's params, one per carried local, in the same order as `carried`.
+    ///
+    /// The exit used to take no params, and the post-loop code read each carried local at its
+    /// HEADER-param version. That silently DROPPED any write the body made before breaking: a header
+    /// param holds the value at ITERATION ENTRY, not at the break point, so
+    /// `let mut z = 0; while c { z = 1; break; } z` returned 0. Well-formed SSA, wrong value — the
+    /// same defect class as #182 (a join that merges control but not the environment), here on the
+    /// break edge. Every `break` now passes its CURRENT values, exactly as the back-edge already did.
+    exit_params: Vec<(ValueId, Ty)>,
 }
 
 impl<'a, 'tcx> LowerCx<'a, 'tcx> {
@@ -1312,9 +1576,12 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // one `Ty::Enum`) — all scratch-verified, cmtest w5_enum (1)-(8).
             //
             // FAIL-CLOSED admission gates (`register_enum` returns `None`): a variant field
-            // that is not a seedable scalar (nested aggregate/ref/ptr — `enum_layout` sizing must
-            // be PROVABLE, or a clean body's first construction would trap), a recursive enum
-            // (cycle guard), an unresolvable discriminant assignment or one beyond the 64-bit
+            // outside `enum_variant_field_admissible` (seedable scalars, nested first-class
+            // enums, thin `Ty::Ptr`, SIZED registered structs — `enum_layout` sizing must
+            // be PROVABLE, or a clean body's first construction would trap), a by-value ADT
+            // cycle (defensive guard; legal Rust recursion routes through indirection and
+            // terminates at the no-recurse pointer arms — see `register_enum`'s doc), an
+            // unresolvable discriminant assignment or one beyond the 64-bit
             // canonical tag cap, or a `#[repr(i128/u128)]` hint. Unions fall to the catch-all
             // (not `is_struct`, not `is_enum`).
             //
@@ -1337,8 +1604,10 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // Trust (B3-2c T2): register_enum-OR-OPAQUE — the SOLE enum dispatch.
             // The legacy (I64, payload) tuple model is DELETED: every enum
             // register_enum admits (fieldless 2a, scalar-payload 2b, drop-free-ZST
-            // 2c) is first-class Ty::Enum; everything it declines (niche/Ptr
-            // payloads, enum-typed payloads, recursive adts, unresolvable/dup
+            // 2c, nested-enum B3-3, thin-Ptr wave-EP, sized-struct #174 — incl.
+            // the recursive pointer-payload class, T1 above) is first-class
+            // Ty::Enum; everything it declines (inadmissible variant fields,
+            // by-value adt cycles, unresolvable/dup
             // discriminants, repr(i128)) falls to the fail-closed opaque floor.
             ty::Adt(adt, args) if adt.is_enum() => {
                 if let Some(eid) = self.register_enum(*adt, *args) {
@@ -1349,6 +1618,10 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // Reaching here means register_enum declined = `is_opaque_lane_enum`
                 // by construction. Every OTHER declined enum keeps the wave-EL
                 // `Ty::Unit` collapse; flag off is byte-identical.
+                // Trust (#173): mark the collapse for MEASUREMENT (see `opaque_collapse`).
+                // Both branches are opaque: `Ty::Bool` keeps only the discriminant, `Ty::Unit`
+                // keeps nothing. Neither models the payload.
+                self.opaque_collapse = true;
                 if option_flag_lanes_enabled()
                     && self.tcx.get_diagnostic_item(rustc_span::sym::Option) == Some(adt.did())
                 {
@@ -1461,7 +1734,46 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // single `Alloca` slot for its whole lifetime; see the `promoted` field + the
             // `ExprKind::Borrow{Mut}` / `*r = v` arms). Raw pointers / fn pointers are deliberately
             // NOT mapped here (still fail-closed). The `&[T]` slice ref is handled by the arm ABOVE.
-            ty::Ref(_, _, rustc_hir::Mutability::Not | rustc_hir::Mutability::Mut) => Ty::Ptr,
+            //
+            // Trust (T5, 2026-07-29): this catch-all used to spell EVERY remaining pointee thin.
+            // That is right for a sized pointee and a LIE for a pointee that merely CONTAINS a
+            // DST in tail position (`&ArcInner<str>`): rustc lays those out as a 16-byte
+            // `(data, metadata)` pair. `pointee_meta` (the `struct_tail_raw` walk) separates the
+            // two, and a `str`/`[T]` tail now gets the SAME anonymous fat pair the raw-pointer
+            // arm below already signs for `*const str`/`*const [T]` — layout-faithful (8+8=16,
+            // align 8) and table-free. A `dyn` tail fails CLOSED with a named tag, extending this
+            // producer's existing `*const dyn` posture ("does not yet carry the vtable
+            // component; never silently respell them thin").
+            //
+            // DELIBERATELY EXCLUDED — a pointee that IS the DST (`&mut [T]`, `&mut str`,
+            // `&mut dyn`; the SHARED forms are first-class `FatPtr` on the arms above). Those
+            // three are NAMED thin postures with an oracle-side twin: trust-ir-bridge
+            // `lower.rs`'s `Ty::Ref{..} | Ty::RawPtr{..} => TrustIrTy::Ptr` catch-all spells
+            // them thin too, and the B2-3 comment records `&mut dyn` as "producer-thin on both
+            // sides this slice". Flipping one side alone manufactures a signature divergence on
+            // every such body; retiring them is the B2 `&mut` fat-ref lane, which moves BOTH
+            // sides at once. They remain unfaithful and are reported as a residual, not silently
+            // fixed here. The exclusion is tested on the NORMALIZED pointee so a concrete
+            // projection (`&<i32 as Tr>::Assoc` = `&str`) keeps its existing spelling rather
+            // than acquiring a second one.
+            ty::Ref(_, pointee, rustc_hir::Mutability::Not | rustc_hir::Mutability::Mut) => {
+                let te = ty::TypingEnv::fully_monomorphized();
+                let pointee_is_the_dst = matches!(
+                    cycle_safe_normalize(self.tcx, te, *pointee).kind(),
+                    ty::Slice(_) | ty::Str | ty::Dynamic(..)
+                );
+                if pointee_is_the_dst {
+                    Ty::Ptr
+                } else {
+                    match container_pointee_ty(self.pointee_meta(*pointee)) {
+                        Some(mapped) => mapped,
+                        None => {
+                            self.unsupported.push((format!("{ty:?}"), "Ty(fat pointee)"));
+                            Ty::Unit
+                        }
+                    }
+                }
+            }
             // Trust: a THIN raw pointer `*const T` / `*mut T` → `Ty::Ptr`, as an OPAQUE value.
             // This is exactly the MIR-side oracle's convention (`trust_mir_extract` converts
             // `TyKind::RawPtr → TrustTy::RawPtr` and the bridge's `map_type` sends any
@@ -1508,7 +1820,30 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     self.unsupported.push((format!("{ty:?}"), "Ty(raw-ptr fat/array pointee)"));
                     Ty::Unit
                 }
-                _ => Ty::Ptr,
+                // Trust (T5, 2026-07-29): the catch-all is the OTHER half of the same defect the
+                // `ty::Ref` arm above documents, and it is the one that actually bites the
+                // crystal: `*const ArcInner<str>` — inside `Arc<str>`, inside
+                // `NameInner::Str(Arc<Name>, Arc<str>)`, inside `Name`, inside
+                // `Level::Param(Name)` — is a 16-byte fat pointer that this arm spelled as an
+                // 8-byte `Ty::Ptr`. MEASURED on the 2026-07-13 seed trustc, dumping
+                // `struct Holder { tag: u64, s: Arc<str> }`: the module carries
+                // `struct @NonNull { ptr } id=0` — ONE thin field — while `register_struct`
+                // records rustc's true `size = 16`. The def was SELF-INCONSISTENT: declared 16
+                // bytes, field types summing to 8, with the length lane simply absent, so a
+                // whole-value `Load`/`Store` of that struct drops the metadata.
+                //
+                // A `str`/`[T]` tail therefore gets the same `(data, len)` pair the `ty::Slice |
+                // ty::Str` arm above signs; a `dyn` tail joins the fail-closed `ty::Dynamic` arm
+                // (same tag — the bucket means the same thing, and #181's lesson is not to
+                // explode tag cardinality); an `extern type` tail is genuinely thin; an
+                // undeterminable tail keeps the pre-existing thin spelling (see `PointeeMeta`).
+                _ => match container_pointee_ty(self.pointee_meta(*pointee)) {
+                    Some(mapped) => mapped,
+                    None => {
+                        self.unsupported.push((format!("{ty:?}"), "Ty(raw-ptr fat/array pointee)"));
+                        Ty::Unit
+                    }
+                },
             },
             // Trust: a FIXED-SIZE array `[T; N]` → a `Ty::Tuple([T; N])` of N identical (recursively
             // mapped) element types. We do NOT use `Ty::Array(TyId, N)`: that needs an interned `TyId`
@@ -1662,6 +1997,25 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 } else {
                     Ty::Tuple(upvar_tys.iter().map(|t| self.map_ty(t)).collect())
                 }
+            }
+            // Trust (wave-PO): a bare generic PARAMETER type. The ORACLE already lowers these —
+            // the extractor emits `Unsupported{kind:"TyKind::Param"}` and the bridge maps that to
+            // `TrustIrTy::Unit` (trust-ir-bridge lower.rs:325,:2387) — so the producer refusing
+            // was a ONE-SIDED gap, not a shared limitation. Match the oracle's spelling exactly
+            // (`Ty::Unit`, which this catch-all already returned) and drop the tag.
+            //
+            // SOUNDNESS: `Unit` is NOT a faithful model of `T` — it is an opaque placeholder with
+            // no layout. That is safe for a body that merely PASSES a `T` through (the whole
+            // realizable class), because every operation needing `T`'s bytes — arithmetic, field
+            // projection, memory transit — still fails closed on the `Unit` spelling downstream.
+            // What it must NOT do is manufacture agreement: two sides that both spell `T` as
+            // `Unit` would "agree" about a function neither modelled. So the body is marked
+            // SYMBOLIC, and the existing seams exclude it from the interpretation differential
+            // and from the crate-module splice — the same discipline wave-CP used for const
+            // params. COVERAGE, never Agreed.
+            ty::Param(_) => {
+                self.param_opaque = true;
+                Ty::Unit
             }
             _ => {
                 self.unsupported.push((format!("{ty:?}"), "Ty"));
@@ -1900,6 +2254,10 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 force_havoc,
                 site_def_id,
                 site_args,
+                // Trust (#178): filled in by `emit_call` once the call's result type is known —
+                // `admit_callee` runs BEFORE the `Inst::Call` is emitted, so it cannot know it here.
+                ret_ty: None,
+                ret_ty_conflict: false,
             });
         }
         func_id
@@ -2020,6 +2378,66 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         })
     }
 
+    /// Trust (T5, 2026-07-29): classify a POINTEE by the metadata a pointer to it carries — see
+    /// [`PointeeMeta`] for the rule and why plain `is_sized` is the wrong predicate.
+    ///
+    /// A HAND-ROLLED `struct_tail_raw` (rustc_middle ty/util.rs:254, the same walk: "the deeply
+    /// last field of nested structures", `tail_opt` for structs, last element for tuples,
+    /// through `ty::Pat`). Hand-rolled on purpose: `struct_tail_for_codegen` runs
+    /// `assert_fully_normalized` plus a normalizing query, and this producer runs INSIDE
+    /// `mir_built`, where that can ICE or open the E0391 query cycle the `cycle_safe_*` helpers
+    /// exist to avoid. Normalization here goes through `cycle_safe_normalize` (identity on
+    /// param/infer/opaque/bound-bearing types) exactly as `fat_shape` does, so a CONCRETE
+    /// projection resolves and an identity alias stays `Unknown`.
+    ///
+    /// Fuel-bounded by `ADT_VISIT_FUEL` like every other type walk here: an unguarded fixpoint
+    /// is a stack-overflow SIGBUS, not an error. Exhausting fuel yields `Unknown`, i.e. the
+    /// pre-existing spelling — never a claim.
+    ///
+    /// Side-effect free (`&self`, no `map_ty`, no interning), so `fat_shape` can call it.
+    fn pointee_meta(&self, pointee: RustcTy<'tcx>) -> PointeeMeta {
+        let tcx = self.tcx;
+        let te = ty::TypingEnv::fully_monomorphized();
+        let mut ty = cycle_safe_normalize(tcx, te, pointee);
+        for _ in 0..ADT_VISIT_FUEL {
+            match ty.kind() {
+                ty::Str | ty::Slice(_) => return PointeeMeta::Len,
+                ty::Dynamic(..) => return PointeeMeta::Vtable,
+                // An `extern type` is `!Sized`, but pointers to it carry NO metadata and are
+                // thin (rustc_middle ty/sty.rs:1796 — "Extern types have metadata = ()").
+                ty::Foreign(..) => return PointeeMeta::Thin,
+                // Not determinable: the tail's metadata comes from the instantiation.
+                ty::Param(_)
+                | ty::Alias(..)
+                | ty::Bound(..)
+                | ty::Placeholder(_)
+                | ty::Infer(_) => {
+                    return PointeeMeta::Unknown;
+                }
+                // Only a STRUCT has a tail (rustc breaks out of the walk on enums/unions —
+                // both are sized, and neither can carry an unsized field).
+                ty::Adt(def, args) if def.is_struct() => match def.non_enum_variant().tail_opt() {
+                    // Trust: `skip_normalization()` then `cycle_safe_normalize` — rust 1.99's
+                    // `FieldDef::ty` returns `Unnormalized<Ty>`; the same two-step
+                    // `struct_field_tys`/`fat_shape` use.
+                    Some(f) => {
+                        ty = cycle_safe_normalize(tcx, te, f.ty(tcx, *args).skip_normalization());
+                    }
+                    None => return PointeeMeta::Thin,
+                },
+                ty::Tuple(elems) => match elems.iter().last() {
+                    Some(last) => ty = cycle_safe_normalize(tcx, te, last),
+                    None => return PointeeMeta::Thin,
+                },
+                ty::Pat(inner, _) => ty = cycle_safe_normalize(tcx, te, *inner),
+                // Everything else is a sized leaf (scalars, arrays, refs, raw pointers,
+                // fn-ptrs, closures, coroutines, enums, unions, `!`, …).
+                _ => return PointeeMeta::Thin,
+            }
+        }
+        PointeeMeta::Unknown
+    }
+
     /// Trust (wave-19): PURE recursive `map_ty` fatness classifier — see [`FatShape`]. Normalizes each
     /// type (and each ref pointee) under `fully_monomorphized` so a concrete projection
     /// (`&<i32 as Tr>::Assoc`) resolves to its fat form (`&str`) before classification, while an
@@ -2056,11 +2474,25 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 if matches!(norm(*pointee).kind(), ty::Slice(_) | ty::Str | ty::Dynamic(..)) {
                     FatShape::Fat
                 } else {
-                    FatShape::Thin
+                    // Trust (T5): LOCKSTEP with map_ty's ref catch-all — a pointee that CONTAINS
+                    // a DST in tail position is now the fat `Tuple([Ptr,I64])` (→ `Fat`) for a
+                    // `str`/`[T]` tail and fail-closed (→ `Opaque`) for a `dyn` tail. Same
+                    // reason B2-3 had to move both at once: leaving this `Thin` would certify
+                    // `Thin==Thin` on a link whose callee record now signs fat.
+                    fat_shape_of_container_pointee(self.pointee_meta(*pointee))
                 }
             }
-            // Any `&mut _` → THIN `Ty::Ptr` (map_ty:732, incl. `&mut [T]`/`&mut str`).
-            ty::Ref(_, _, rustc_hir::Mutability::Mut) => FatShape::Thin,
+            // `&mut _` → THIN `Ty::Ptr` for a pointee that IS the DST (`&mut [T]`/`&mut str`/
+            // `&mut dyn` — map_ty's named, oracle-matched thin postures). Trust (T5): a pointee
+            // that merely CONTAINS a DST follows map_ty's catch-all, exactly as the shared arm
+            // above does.
+            ty::Ref(_, pointee, rustc_hir::Mutability::Mut) => {
+                if matches!(norm(*pointee).kind(), ty::Slice(_) | ty::Str | ty::Dynamic(..)) {
+                    FatShape::Thin
+                } else {
+                    fat_shape_of_container_pointee(self.pointee_meta(*pointee))
+                }
+            }
             // Raw pointer — LOCKSTEP with map_ty's Batch-A arm: slice/str pointee is the
             // FAT `Tuple([Ptr, I64])` pair; array pointee is the same three-way split
             // (concrete length → THIN `Ty::Ptr`, const-generic Param → FAT, anything
@@ -2073,7 +2505,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     (None, _) => FatShape::Opaque,
                 },
                 ty::Dynamic(..) => FatShape::Opaque,
-                _ => FatShape::Thin,
+                // Trust (T5): LOCKSTEP with map_ty's raw-pointer catch-all — a container
+                // pointee (`*const ArcInner<str>`) is fat, a `dyn`-tailed one fails closed.
+                _ => fat_shape_of_container_pointee(self.pointee_meta(*pointee)),
             },
             // Fixed-size array: map_ty needs a CONCRETE length (`try_to_target_usize`), else fails
             // closed (a const-generic `[T; N]`). The element shape carries any nested fatness.
@@ -3965,12 +4399,53 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     fn emit_call(&mut self, inst: Inst, result_rty: RustcTy<'tcx>) -> Option<ValueId> {
         self.contains_call = true;
         let node = InstrNode::new(inst);
+        // Trust (C2 repair): through `push_node`, like every other emission. These two sites
+        // pushed to `self.cur` directly, so EVERY `Inst::Call` left the producer with
+        // `span: None` AND `scope: None` — the C2 work claimed `push_node` was the only
+        // chokepoint and it was not. The consumer then inherited the previous node's location
+        // for each call, collapsing a run of distinct call rows onto one DWARF line.
         if result_rty.is_unit() {
-            self.cur.push(node);
+            self.push_node(node);
             None
         } else {
+            // Trust (#178): record the result type this site binds, against the callee's ledger
+            // entry, so crate assembly can give the callee's DECLARATION a signature that returns
+            // something. Observed-at-the-site (not re-derived from the callee's rustc signature)
+            // is deliberate: the declaration must agree with the instruction the validator checks
+            // it against. See `CalleeRef::ret_ty` for why `returns: []` was a positive lie.
+            //
+            // Three fail-closed conditions, each landing on `None` = "unknown" = the old empty
+            // spelling: unmappable type, table-indexed type (its id belongs to the BODY's tables,
+            // not the assembled module's), and DISAGREEMENT between two sites on one callee —
+            // which is reachable pre-monomorphization, where one `def_path` can be called at two
+            // instantiations. Never guess; a wrong signature is worse than an absent one.
+            if let Inst::Call { callee, .. } = &node.inst {
+                let callee = *callee;
+                let observed = scalar_ret_ty(result_rty);
+                for c in self.callees.iter_mut().filter(|c| c.func_id == callee) {
+                    if c.ret_ty_conflict {
+                        continue; // poisoned: never written again
+                    }
+                    match (&c.ret_ty, &observed) {
+                        // First site to bind a usable result type for this callee.
+                        (None, Some(t)) => c.ret_ty = Some(t.clone()),
+                        // A second site disagreed — poison, permanently.
+                        (Some(prev), Some(t)) if prev != t => {
+                            c.ret_ty = None;
+                            c.ret_ty_conflict = true;
+                        }
+                        // A site whose own type is unknown must not silently endorse an earlier
+                        // site's type either: it is evidence of a shape this lane cannot spell.
+                        (Some(_), None) => {
+                            c.ret_ty = None;
+                            c.ret_ty_conflict = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
             let result = self.fresh();
-            self.cur.push(node.with_result(result));
+            self.push_node(node.with_result(result));
             Some(result)
         }
     }
@@ -5310,9 +5785,19 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             };
             // Trust (C2-spans): the epilogue seals OUTSIDE any expr scope (the `lower_expr`
             // wrapper restored `cur_span` on exit), which left the implicit tail `Return` as
-            // the one structurally unstamped terminator. Attribute it to the body's tail
-            // expression — the value being returned is the location a reader wants.
-            self.cur_span = self.to_source_span(self.thir.exprs[body].span);
+            // the one structurally unstamped terminator.
+            //
+            // It takes the FN-END position — `shrink_to_hi()`, just past the closing brace —
+            // because that is what built MIR uses: `construct_fn` computes
+            // `fn_end = span_with_body.shrink_to_hi()` and gives the return terminator
+            // `source_info(fn_end)` (rustc_mir_build/src/builder/mod.rs:762-770). The
+            // earlier choice here was the body span's LO (the `{`), on the reasoning that a
+            // reader wants the returned value's location; `llvm-dwarfdump --debug-line`
+            // then put derived's epilogue rows at the opening brace against built's closing
+            // one, which is the entire debuginfo-gate disagreement. Parity with built is
+            // not a preference to be traded against readability here — a debugger stepping
+            // out of a derived body must land where it lands for a built one.
+            self.cur_span = self.to_source_span(self.thir.exprs[body].span.shrink_to_hi());
             self.seal_with(Inst::Return { values });
         }
 
@@ -5410,6 +5895,20 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // Some(empty) — absence must stay distinguishable from "named, zero names".
         if !self.value_names.is_empty() {
             func.value_names = Some(std::mem::take(&mut self.value_names));
+        }
+        // Trust (C2-scopes, binary v33): the lexical scope tree. A body whose tree is JUST
+        // the root carries no information the consumer could not supply itself, so it emits
+        // NOTHING — and then the `Some(0)` stamps `push_node` left on every node would point
+        // into an absent table, so they are stripped in the same breath. Table and stamps
+        // ship together or not at all; there is no third state.
+        if self.scopes.len() > 1 {
+            func.scopes = Some(std::mem::take(&mut self.scopes));
+        } else {
+            for block in &mut func.blocks {
+                for node in &mut block.body {
+                    node.scope = None;
+                }
+            }
         }
         module.add_function(func);
     }
@@ -5570,6 +6069,14 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 field_tys.push(mapped);
             } else {
                 self.unsupported.truncate(before);
+                // Trust (#173): this else-branch IS the sibling opaque lane — every path out of
+                // it (the `Ty::Bool` discriminant below, the recursion, the `Ty::Unit` floor)
+                // replaces a live field's type with a placeholder. Marked here, once, ABOVE the
+                // branch split so no path can be added later that silently skips it. Note the
+                // `truncate` immediately above rolls back the failed map's TAGS — which is
+                // exactly why this needs its own flag: after the rollback the body looks clean
+                // and nothing else records that a value went opaque.
+                self.opaque_collapse = true;
                 // Trust (wave-OPTFLAG): under `TRUST_OPTION_FLAG_LANES=1`, a provably-opaque
                 // `Option<T>` sibling — EXACTLY the shape that collapses to `Ty::Unit` below
                 // (the Option lang enum whose payload is non-pure-value; a pure
@@ -5693,6 +6200,89 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     /// order — the same order `ExprKind::Adt` writes and `Field` reads). `None` (fail-closed)
     /// for an unregistered id — impossible for a `Ty::Struct` freshly produced by `map_ty`,
     /// but checked, never assumed.
+    /// Trust (wave-EP): may `fty` appear as a VARIANT FIELD of a first-class registered `EnumDef`?
+    ///
+    /// This wall used to be spelled `seed_constant(&fty).is_some() || matches!(fty, Ty::Enum(_))` —
+    /// "every variant field of every variant must be a seedable scalar". That single predicate was
+    /// standing in for THREE independent requirements, and seedability is strictly stronger than any
+    /// of them, so it rejected types that satisfy all three. Split out and checked separately:
+    ///
+    ///  1. LAYOUT SIZABILITY, for EVERY variant. The pinned interpreter sizes ALL variants at the
+    ///     enum's first construction/store (`enum_layout_shape_inner`, trust-ir shape.rs), so one
+    ///     unsizable field in a never-constructed variant would trap every construction — a
+    ///     manufactured differential divergence. This is the requirement the old wall really
+    ///     needed, and it is the reason the check is per-variant rather than per-use.
+    ///  2. SEEDABILITY, for VARIANT 0 ONLY. Only variant 0's fields are ever materialized as a
+    ///     placeholder (`seed_constant_ty`'s wave-ES arm builds `[Int(disc0), field_seeds…]` when a
+    ///     registered enum appears as an aggregate FIELD). Not checked here: if variant 0 turns out
+    ///     unseedable, `seed_constant_ty` returns `None` and the aggregate caller records its own
+    ///     `…non-scalar field seed` tag. That is fail-closed at the exact site that needs it, and it
+    ///     does not have to cost the whole enum its first-class spelling.
+    ///  3. TABLE-FREEDOM, for the splice. Registered enums intern BEFORE structs, so a def whose
+    ///     field names a table id could not be spliced (`crate_module::splice_ok` re-checks
+    ///     `ty_table_free`). This is what still keeps `Ty::Struct(sid)` out — the recorded
+    ///     enum-struct-payload NO-GO — and it is a property of the SPELLING, not of the value.
+    ///
+    /// `Ty::Ptr` satisfies all three: the interpreter sizes it at `pointer_bits` with pointer
+    /// alignment (`TyShape::ThinPointer`), it carries no table id, and variant 0 of the common cases
+    /// (`Option<&T>`, `Option<*const T>`) is the fieldless `None`. Admitting it is what lets
+    /// `match o { Some(r) => …, None => … }` on a reference-payload enum lower first-class instead
+    /// of collapsing to the opaque lane with `EnumMatch(non-enum mapped ty)`.
+    ///
+    /// Deliberately NOT admitted: `Ty::FatPtr` (its `Slice(TyId)` form carries a table id, failing 3),
+    /// and every aggregate spelling. Fail-closed by default — a `Ty` this function has not been
+    /// taught about declines the whole enum, exactly as before.
+    fn enum_variant_field_admissible(&self, fty: &Ty) -> bool {
+        // Scalars: ints/bool/floats/char — sizable, seedable, table-free.
+        if seed_constant(fty).is_some() {
+            return true;
+        }
+        match fty {
+            // A NESTED first-class enum (Trust B3-3): `map_ty` registered the inner def FIRST, so a
+            // `Ty::Enum` here is registered by construction with a strictly smaller id, and
+            // `seed_constant_ty` recurses into its own variant 0.
+            Ty::Enum(_) => true,
+            // Trust (wave-EP): a THIN pointer. See requirements 1-3 above.
+            Ty::Ptr => true,
+            // Trust (#174): a STRUCT payload — the class this wall was really costing us
+            // (`Option<String>`, `Option<Vec<T>>`, `Result<T, StructE>`, `Option<NonZeroU64>`).
+            // Requirement (3), table-freedom, used to refuse it because the splice interned enums
+            // before structs; pass 1 now interns the enum+struct DAG TOPOLOGICALLY, so a struct id
+            // inside an enum def resolves. Neither the trust-ir format nor its validator ever
+            // required the ordering (both resolve struct ids by lookup) — it was an assembler
+            // convention.
+            //
+            // Requirement (1), LAYOUT SIZABILITY, is the one that still needs a check here, and it
+            // is checked rather than assumed: the interpreter's `ty_layout_shape_inner` sizes a
+            // `Ty::Struct` from the DEF's recorded `size`, which `register_struct` fills from
+            // rustc's layout query and leaves as `None` when that query declines. An unsized def
+            // inside an enum variant would make `enum_layout_shape` fail at the enum's first
+            // construction — a manufactured divergence for every body touching the enum, including
+            // variants that never mention the struct. So a struct payload is admitted ONLY against
+            // a registered def that carries a size.
+            Ty::Struct(sid) => self.registered_struct_size(*sid).is_some(),
+            // `Ty::Unit` is deliberately NOT admitted here, even though a unit field is sizable,
+            // seedable and table-free. `map_ty` returns `Ty::Unit` for TWO different things: a
+            // genuine unit/ZST, and the FAIL-CLOSED PLACEHOLDER for a type it could not model (it
+            // pushes a `Ty` tag and returns `Ty::Unit`). Admitting the mapped spelling therefore
+            // admits DEGRADED fields — the enum registers carrying a field that is really an
+            // unmodelled type, and the tag rides along into the body. Measured: an earlier cut of
+            // this wave did admit it and lost 16 clean bodies to exactly that (12 of them tagged
+            // plain `Ty`), against 8 gained. The genuine ZST field never reaches here anyway: the
+            // B3-2c E1 respell above tests the GROUND-TRUTH rustc type with `is_drop_free_zst` and
+            // `continue`s before the `map_ty` call, which is the same "never key on the mapped ty"
+            // rule that arm already documents.
+            _ => false,
+        }
+    }
+
+    /// Trust (#174): the recorded byte size of a registered struct def, or `None` if the def is
+    /// unknown or its layout query declined. The enum-payload admission gate keys on this — see
+    /// `enum_variant_field_admissible`'s `Ty::Struct` arm for why an unsized def must refuse.
+    fn registered_struct_size(&self, sid: trust_ir::StructId) -> Option<u64> {
+        self.pending_structs.iter().find(|sd| sd.id == sid).and_then(|sd| sd.size)
+    }
+
     fn registered_struct_field_tys(&self, sid: trust_ir::StructId) -> Option<Vec<Ty>> {
         self.pending_structs
             .iter()
@@ -5805,17 +6395,43 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     /// signedness — the value a `Switch` case and the constant seed's leading `Int` both carry,
     /// single source of truth), and the `#[repr(iN)]` tag hint. ADMISSION GATE (all checked,
     /// never assumed):
-    ///   * every variant field of EVERY variant must be a seedable scalar
-    ///     (`seed_constant`: ints/bool/floats). This is what makes the pinned interpreter's
-    ///     `enum_layout` PROVABLY computable — the layout sizes ALL variants at the first
-    ///     construction/store of the enum, so one unsizable field in a never-constructed
-    ///     variant would trap every construction (a manufactured differential divergence).
-    ///     It also keeps registered defs table-free, the splice's enums-first intern
-    ///     precondition (`crate_module::splice_ok` re-checks).
+    ///   * every variant field of EVERY variant must satisfy
+    ///     `enum_variant_field_admissible` — seedable scalars, nested first-class
+    ///     `Ty::Enum` (B3-3), thin `Ty::Ptr` (wave-EP), or a SIZED registered
+    ///     `Ty::Struct` (#174); drop-free ZSTs respell to `Ty::Unit` first (B3-2c E1).
+    ///     Sizability is the property that keeps the pinned interpreter's
+    ///     `enum_layout` PROVABLY computable — the layout sizes ALL variants at the
+    ///     first construction/store of the enum, so one unsizable field in a
+    ///     never-constructed variant would trap every construction (a manufactured
+    ///     differential divergence). Struct-payload defs are no longer table-free;
+    ///     the splice interns the enum+struct DAG topologically (#174,
+    ///     `crate_module::splice_ok` re-checks resolvability).
     ///   * `canonical_tag_repr()` must resolve on the BUILT def (uninhabited enums,
     ///     discriminants beyond the 64-bit tag cap, or a too-narrow repr hint all decline) —
     ///     the same call the interpreter makes, so tag-lane agreement is by construction.
     ///   * recursion declines via `adt_visit_stack` (mirrors `struct_field_tys`).
+    ///     Trust (plan 2026-07-29 T1, scoped): for LEGAL Rust this guard is purely
+    ///     defensive — a by-value ADT cycle is unsized/impossible, so every
+    ///     recursive enum routes through indirection, and the field walk TERMINATES
+    ///     there: `&T`/`*const T` map to `Ty::Ptr` without recursing into the
+    ///     pointee, so `Box<Self>`/`Arc<Self>` edges bottom out at `NonNull`'s raw
+    ///     pointer and the RECURSIVE POINTER-PAYLOAD shape class (clean-kernel's
+    ///     `Level`/`ExprKind`/`TypeError` — the census's 64,067 `Ty(enum-def)`
+    ///     block, measured on the pre-#174 2026-07-13 seed) ADMITS under the
+    ///     gates above. Shape pinned by
+    ///     tests/ui/trust/trust_ir_lower_recursive_pointer_payload_enum.rs
+    ///     (termination) + differential.rs `level_shape_*` (def-DAG machinery);
+    ///     the census step-change is measured at the next trustc stage rebuild.
+    ///     The SPELLING CAVEAT this class used to carry is CLOSED (T5,
+    ///     2026-07-29): a raw pointer to an UNSIZED-TAIL ADT
+    ///     (`NonNull<ArcInner<str>>` inside `Arc<str>`, reachable from
+    ///     clean-kernel `Name`) was spelled thin `Ty::Ptr` while its rustc layout
+    ///     is a 16-byte fat pointer, making the recorded def SELF-INCONSISTENT
+    ///     (rustc-true `size = 16`, field types summing to 8). The catch-alls now
+    ///     classify by struct TAIL (`pointee_meta`) and sign the same
+    ///     `Tuple([Ptr, I64])` pair `*const str`/`*const [T]` already used, so the
+    ///     class keeps admitting — the narrowing did NOT have to be a decline, and
+    ///     no body that lowered before this change stops lowering because of it.
     fn register_enum(
         &mut self,
         adt: ty::AdtDef<'tcx>,
@@ -5887,15 +6503,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     continue;
                 }
                 let fty = self.map_ty(rust_fty);
-                // Seedable wall: scalar fields (ints/bool/floats) pass via
-                // seed_constant; a NESTED first-class enum field passes too
-                // (Trust B3-3 — `map_ty` registers the nested def FIRST, so a
-                // `Ty::Enum` here is registered by construction with an id
-                // strictly smaller than the outer's, and `seed_constant_ty`'s
-                // wave-ES arm seeds it recursively as its variant-0 value).
-                // Anything else — non-enum aggregates, refs/ptrs — still
-                // declines the WHOLE enum (see the gate doc).
-                if seed_constant(&fty).is_none() && !matches!(fty, Ty::Enum(_)) {
+                if !self.enum_variant_field_admissible(&fty) {
                     fields_ok = false;
                     break 'variants;
                 }
@@ -5998,6 +6606,41 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     /// inside `mir_built`, such a query can cycle through opaque `type_of`/borrowck instead of
     /// returning an error. Only for a CONCRETE ZST is `needs_drop` consulted (a ZST with a `Drop`
     /// impl has an observable drop effect → `false`).
+    /// Trust (#175): does the PLACE expression `e` project through a `repr(packed)` ADT?
+    ///
+    /// Only reachable from `&raw const`/`&raw mut`, because `&packed.field` is rejected by rustc
+    /// itself (E0793). Such a place yields a legitimately UNDER-ALIGNED pointer, and the
+    /// interpreter's `eval_load`/`eval_store` check alignment — so a load through it at the
+    /// pointee's natural alignment would report UB on a program real Rust runs fine, i.e. a
+    /// manufactured differential divergence.
+    ///
+    /// Conservative on both axes: peels the transparent wrappers, and answers TRUE (decline) for
+    /// any field projection whose base ADT is packed at ALL, without trying to prove the
+    /// specific field is actually mis-aligned. A false decline costs coverage; a false admit
+    /// would cost a divergence.
+    fn place_projects_through_packed(&self, e: ExprId) -> bool {
+        let mut e = e;
+        loop {
+            match &self.thir.exprs[e].kind {
+                ExprKind::Scope { value, .. } => e = *value,
+                ExprKind::Use { source } => e = *source,
+                ExprKind::Field { lhs, .. } => {
+                    let base_ty = self.thir.exprs[*lhs].ty;
+                    if let ty::Adt(adt, _) = base_ty.kind() {
+                        if adt.repr().packed() {
+                            return true;
+                        }
+                    }
+                    e = *lhs;
+                }
+                // Index/Deref keep walking: a packed ADT can sit anywhere up the chain.
+                ExprKind::Index { lhs, .. } => e = *lhs,
+                ExprKind::Deref { arg } => e = *arg,
+                _ => return false,
+            }
+        }
+    }
+
     fn is_drop_free_zst(&self, ty: ty::Ty<'tcx>) -> bool {
         if !layout_query_is_reentrant_safe(ty) {
             return false;
@@ -6103,6 +6746,34 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // `Closure`, so it is unaffected and lowers normally via `ClosureCall`.
                 if self.closure_literal(e) {
                     return;
+                }
+                // Trust (wave-TW): a bare-statement DROP-FREE ZST literal (`Unit;`, `PhantomData;`,
+                // a fieldless-variant path as a statement) is constructed and immediately
+                // discarded. It occupies no bytes, has exactly one inhabitant, and is drop-free,
+                // so evaluating it performs nothing observable — skip it, the same
+                // no-op-modulo-Drop argument as the discarded-closure case above.
+                //
+                // SCOPED TO THE DISCARD POSITION ON PURPOSE. The first cut of this wave made the
+                // ZST value-less in `lower_expr_walk`, i.e. in EVERY position, and the corpus
+                // differential immediately caught it: a `fn ctor() -> Self { Self }` then emitted
+                // a body returning no value under a signature declaring one return
+                // ("Call returns arity mismatch: expected 1, got 0" —
+                // rfc-2302-self-struct-ctor and impls-nested-within-anon-consts-semantic). The
+                // producer's value-less model and its SIGNATURE arity have to agree, and today
+                // the signature keys value-ness on the real unit type, not on ZST-ness. Making
+                // those agree everywhere is the separate `map_ty`-spells-drop-free-ZST-as-Unit
+                // unification; until then the safe subset is the position where nothing consumes
+                // the value at all.
+                if matches!(self.thir.exprs[e].kind, ExprKind::ZstLiteral { .. }) {
+                    let zst_ty = self.thir.exprs[e].ty;
+                    // Ground-truth rustc type, never `map_ty(..) == Ty::Unit` (also the
+                    // fail-closed placeholder for degraded types). A drop-BEARING ZST keeps
+                    // lowering — its drop is an observable effect the producer does not model —
+                    // and a `FnDef` ZST is excluded because its identity, not its size, is the
+                    // point.
+                    if self.is_drop_free_zst(zst_ty) && !zst_ty.is_fn() {
+                        return;
+                    }
                 }
                 let _ = self.lower_expr(e);
             }
@@ -6509,15 +7180,121 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     /// Trust (C2-spans): rustc `Span` -> trust-ir `SourceSpan` ({file,line,col}, LO edge).
     /// Macro spans degrade to the call site (`source_callsite`, the span_map.rs precedent);
     /// dummy spans yield `None` rather than a fabricated location.
+    ///
+    /// # This is DEBUG INFO, not obligation identity — the two must not be unified
+    ///
+    /// Two span-conversion POLICIES coexist in this tree, and they normalize DIFFERENTLY
+    /// on purpose:
+    ///
+    /// * THE DEBUG-INFO CONVERSION — this fn, plus `trust-ir/frontend/src/span_map.rs::
+    ///   to_ir`. Macro spans: `source_callsite()`, i.e. the user's INVOCATION.
+    ///   Extent: LO edge only (a POINT). Dummy: `None`, emit span-less.
+    ///   File: the SourceMap's own rendering, verbatim.
+    /// * THE OBLIGATION-IDENTITY CONVERSION — `trust_verify.rs::
+    ///   source_span_from_rustc_span`, plus its byte-identical copies
+    ///   `trust-mir-extract/src/convert.rs::convert_span` and
+    ///   `trust_r1_oracle.rs::source_span`, producing `trust_types::SourceSpan`.
+    ///   Macro spans: RAW, i.e. the macro DEFINITION. Extent: LO+HI (a RANGE).
+    ///   Dummy: `SourceSpan::default()`. File: the same rendering passed through
+    ///   `trust_types::stable_obligation_file` (toolchain build token elided).
+    ///
+    /// The policy is a property of the CONVERTER, not of the type it writes into. This fn
+    /// produces `trust_ir::value::SourceSpan`, but so does `trust-ir-bridge/src/
+    /// native_request.rs::obligation_sources_for_module`, which fills
+    /// `NativeObligationSource.span` by projecting `ProofObligationSourceRange` — raw
+    /// IDENTITY-lane coordinates, fed from `trust_types::SourceSpan` by
+    /// `trust-ir-bridge::lower::ObligationSourceMetadata::to_proof_source_identity` — into
+    /// the same type (equality-compared in `crates/trust-wp/src/verifier_api.rs`,
+    /// serialized by `trust_verify.rs::native_source_span_json`). So a
+    /// `trust_ir::SourceSpan` may carry EITHER quantity; judge a value by its producer,
+    /// never by its type name.
+    ///
+    /// The natural reading — "two conversions disagree, pick one" — is wrong. They carry
+    /// two DIFFERENT quantities:
+    ///
+    /// * **This one is a debug-info stamp.** It lands on `InstrNode.span`, is printed by
+    ///   `trust-ir/src/display.rs` as the `; #loc:` clause, and is converted BACK to a
+    ///   rustc `Span` by [`crate::to_mir`]`::span_from_source_span` to drive built-MIR
+    ///   `SourceInfo` and the DWARF line table. A debugger stepping through `assert!(..)`
+    ///   must stop at the user's line, so `source_callsite()` is REQUIRED here — and a
+    ///   DWARF row is a point, so LO-only is the right extent. It also keeps the round
+    ///   trip working at all — though not for the reason one might guess. A
+    ///   macro-definition span from `core` resolves to a decoded foreign `SourceFile`
+    ///   whose name is the remapped virtual `/rustc/<sha>/library/...` (`bootstrap.toml`
+    ///   sets `remap-debuginfo = true`; `RealFileName::to_string_lossy`'s `Local` arm
+    ///   falls back to `maybe_remapped` because a decoded foreign file has no `local`
+    ///   path). That file IS in the same `sm.files()` table
+    ///   (`SourceMap::new_imported_source_file` -> `register_source_file`), under the
+    ///   same rendering, so `span_from_source_span`'s name `find` WOULD match it. What
+    ///   fails is one step later: an imported file is created with `src: None` and
+    ///   `ExternalSourceKind::AbsentOk`, so `SourceFile::get_line` has no line text to
+    ///   return, `file.get_line(line_idx)?` yields `None`, and the span is dropped.
+    ///   Rebasing to the callsite keeps the position inside a file whose source is
+    ///   actually present.
+    /// * **The other one is an obligation identity key.** Its exact consumers: R1's
+    ///   `trust_verify.rs::exact_callsite_span_multiset_matches` (oracle call sites vs
+    ///   producer VC locations, by exact span multiset, callers fail closed on mismatch);
+    ///   `trust_verify.rs::collect_synthesized_box_deref_spans`' DROP set for the
+    ///   missing-SAFETY doc lint; and
+    ///   `trust-router::strengthen_whole_program::SealedVcIdentity`, which keys a
+    ///   sealed VC on `(function, kind, file, line_start, col_start, formula)`.
+    ///   `source_callsite()` is not a projection, it is a MERGE: it collapses every span
+    ///   from one expansion onto a single point. Applying it there would make two distinct
+    ///   calls inside one macro invocation indistinguishable, weakening a check whose whole
+    ///   purpose is exactness, and would widen the lint drop set over user-written derefs
+    ///   at the same call site.
+    ///
+    /// So neither normalization is "the wrong one" for its own job, and the identity
+    /// lane's raw range must never be swapped for a callsite-rebased one. What WAS wrong
+    /// with the identity lane, and is now fixed at its producers, is that the rendered
+    /// `/rustc/<sha>/…` file name embedded the COMPILER's commit, so a macro-generated
+    /// obligation's `SealedVcIdentity.file` moved when the compiler was rebuilt —
+    /// `trust_types::stable_obligation_file` now elides that build token. What REMAINS
+    /// wrong there is actionability: the raw location of a macro-generated obligation
+    /// still names the macro definition inside `core`, which the user cannot edit. That
+    /// fix is ADDITIVE — carry a callsite anchor BESIDE the raw range — never a swap,
+    /// which would destroy exactness. Do not "unify" these two conversions.
+    ///
+    /// Note the LO/HI axis is NOT what blocks cross-lane comparison: the trust-types lane
+    /// already projects to LO-only wherever it needs an identity (`SealedVcIdentity`,
+    /// `trust_r1_oracle.rs::span_line_col`), and trust-ir carries a genuine RANGE for
+    /// obligations in `ProofObligationSourceRange` (fed from the trust-types lane by
+    /// `trust-ir-bridge::lower::ObligationSourceMetadata::to_proof_source_identity`),
+    /// separately from this point-valued `value::SourceSpan`. `source_callsite()` is the
+    /// only irreconcilable axis.
+    ///
+    /// # Column convention (0-based `CharPos`) — and a known violation
+    ///
+    /// `col` is `CharPos.0` VERBATIM: 0-based, counted in CHARS, not display width. That
+    /// is the format's written contract (the `; #loc:` comment in `trust-ir/src/display.rs`:
+    /// the column is "0-BASED — the producer stores `CharPos.0` verbatim") and what the
+    /// consumer expects ([`crate::to_mir`]`::span_from_source_span` walks `char_indices()`
+    /// by `col`, and treats `col == chars_in_line` as the legitimate end-of-line position
+    /// — the case the `shrink_to_hi()` fn-end return stamp in `finish_body` produces).
+    ///
+    /// `trust-ir/frontend/src/span_map.rs::to_ir` breaks BOTH halves of that: it emits
+    /// `loc.col_display + 1`. `col_display` is a terminal rendering width
+    /// (`SourceFile::lookup_file_pos_with_col_display` sums `char_width`), which rustc's own
+    /// comment there warns is "only used to properly show underlines in the terminal" and
+    /// incorrect for tools; and the `+ 1` makes it 1-based. Feeding such a span to
+    /// `span_from_source_span` lands one char right on an ASCII line, arbitrarily far off
+    /// on a line with a tab or a wide char, and — for the common end-of-line stamp —
+    /// overruns to `chars_in_line + 1`, which fails closed to `None` and drops the span
+    /// entirely. That converter lives in the `first-party/trust-ir` submodule, so it is
+    /// reported rather than patched here; pinned — with its repair fingerprint
+    /// pre-accepted, so landing the submodule fix cannot red this repo's suite — by
+    /// `crates/trust-types/tests/span_normalization_parity.rs`.
     fn to_source_span(&mut self, sp: rustc_span::Span) -> Option<SourceSpan> {
         let sp = sp.source_callsite();
         if sp.is_dummy() {
             return None;
         }
         let loc = self.tcx.sess.source_map().lookup_char_pos(sp.lo());
-        // `prefer_local_unconditionally` is this tree's canonical filename rendering — the same
-        // call `trust_verify` uses for obligation locations and trust-ir's own `span_map.rs`
-        // uses for its file table, so the three lanes agree on file identity.
+        // `prefer_local_unconditionally` VERBATIM — the SourceMap's own name, which is what
+        // `to_mir.rs::span_from_source_span` matches against `sm.files()` on the way back, and
+        // the same rendering trust-ir's `span_map.rs` interns. (The identity lane wraps this
+        // rendering in `trust_types::stable_obligation_file`; this debug-info lane must NOT —
+        // an elided name would no longer match the file table on the round trip.)
         let file = loc.file.name.prefer_local_unconditionally().to_string();
         let file = self.intern_file(&file);
         Some(SourceSpan {
@@ -6531,7 +7308,25 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     /// former `self.push_node(InstrNode::new(..))` site (170 at conversion) goes through here.
     fn push_node(&mut self, mut node: InstrNode) {
         node.span = self.cur_span;
+        // Trust (C2-scopes): stamped UNCONDITIONALLY, even at the root. `None` means
+        // "inherit the running scope", and scopes do not only deepen — a block exit
+        // pops back out, so an unstamped root-scope node emitted after a nested one
+        // would inherit the nested scope and report the wrong variable list. If the
+        // finished tree turns out to be just the root, `finish_body` strips these
+        // stamps wholesale rather than leaving indices pointing at an absent table.
+        node.scope = Some(self.cur_scope);
         self.cur.push(node);
+    }
+
+    /// Trust (C2-scopes): open a scope nested in the current one and return its index.
+    /// Mirrors `Builder::new_source_scope` — the parent is whatever is current and the
+    /// index is allocated in creation order, which is what makes `parent < index` hold
+    /// for every entry, the invariant the consumer range-checks instead of traversing.
+    fn open_scope(&mut self, at: rustc_span::Span) -> u32 {
+        let span = self.to_source_span(at);
+        let idx = u32::try_from(self.scopes.len()).expect("scope table exceeds u32");
+        self.scopes.push(ScopeData { parent: Some(self.cur_scope), span });
+        idx
     }
 
     /// Trust (C2-spans): span-scoping wrapper — the walk itself is `lower_expr_walk`. A wrapper
@@ -6576,19 +7371,161 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // catch-all and the break never lowers, so the else-arm falls through to the loop body's
             // join instead of the exit — an infinite loop.
             ExprKind::NeverToAny { source } => self.lower_expr(*source),
+            // Trust (#171 Part B): `Self` used as a unit-struct CONSTRUCTOR — `impl S { fn ctor()
+            // -> Self { Self } }`. rustc spells that `ExprKind::ZstLiteral` (a `Res::SelfCtor`
+            // resolution), whereas the very same value written by NAME (`fn f() -> S { S }`) is an
+            // `ExprKind::Adt` and has always lowered clean and Agreed. So this arm is not new
+            // behaviour — it is the missing spelling of a lowering the producer already performs,
+            // and it emits the byte-identical instruction the `Adt` path emits:
+            //     %0 = const struct.N {  }
+            //
+            // DIRECTION MATTERS HERE, and an earlier attempt got it backwards. Wave-TW first tried
+            // making a drop-free ZST VALUE-LESS in every position; the corpus differential caught
+            // it as "Call returns arity mismatch: expected 1, got 0" (rfc-2302-self-struct-ctor,
+            // impls-nested-within-anon-consts-semantic), because the producer's SIGNATURE keys
+            // return value-ness on `fn_sig.output().is_unit()` — the real `ty::Tuple([])` and
+            // nothing else — so a unit-struct return declares one return no matter how the body is
+            // spelled. The MIR-side oracle agrees with the signature, not with the elision: it
+            // models a ZST struct as value-BEARING and emits `Return{values:[_0]}`. The repair is
+            // therefore to make the BODY produce the value its own signature already declares,
+            // never to delete the return on both sides. The seven `is_unit()` value-ness sites are
+            // deliberately untouched.
+            //
+            // GATED ON THE GROUND-TRUTH rustc type, never on `map_ty`'s output: `map_ty` also
+            // returns `Ty::Unit` as the fail-closed placeholder for an unsupported type, and
+            // keying on it here would mint a value for a type the producer could not model.
+            // Fail-closed for a `FnDef` ZST (zero-size, but its identity is the point — it feeds
+            // Reify/call resolution), a drop-BEARING ZST (its drop is an observable this producer
+            // does not model), and any non-struct ZST; each keeps its existing tag.
+            ExprKind::ZstLiteral { .. }
+                if !expr_ty.is_fn()
+                    && matches!(expr_ty.kind(), ty::Adt(adt, _) if adt.is_struct())
+                    && self.is_drop_free_zst(expr_ty) =>
+            {
+                let ty = self.map_ty(expr_ty);
+                // The seed IS the value for a zero-field aggregate: `seed_constant_ty` yields
+                // `Constant::Aggregate(vec![])` for a registered zero-field `Ty::Struct`, which is
+                // exactly what the `Adt` arm emits for the same type. Decline (keeping the
+                // existing catch-all tag) if the struct did not register or a field fails to
+                // seed — never invent a constant.
+                match self.seed_constant_ty(&ty, 0) {
+                    Some(value) => {
+                        let res = self.fresh();
+                        self.push_node(InstrNode::new(Inst::Const { ty, value }).with_result(res));
+                        Some(res)
+                    }
+                    None => {
+                        self.unsupported
+                            .push((format!("{expr_span:?}"), "ZstLiteral(unseedable struct)"));
+                        None
+                    }
+                }
+            }
+            // Trust (wave-TW): a TYPE ASCRIPTION (`expr: T`, and the place-position form rustc
+            // synthesizes for `let PAT: T = ..`) is VALUE-TRANSPARENT. rustc builds the source
+            // and then emits `StatementKind::AscribeUserType`, which is a borrowck-only
+            // obligation with `NonMutatingUse` semantics — it computes nothing and is erased
+            // before codegen (`MirPhase::Runtime` drops it). So the lowered value IS the
+            // source's value, exactly like `Use`/`Scope` above.
+            //
+            // Discarding the ascribed type is not a loss of checking: the ascription's whole
+            // effect is a region/type constraint that rustc has ALREADY discharged by the time
+            // THIR exists. The producer models values, not lifetimes.
+            ExprKind::ValueTypeAscription { source, .. }
+            | ExprKind::PlaceTypeAscription { source, .. } => self.lower_expr(*source),
+            // Trust (wave-TW): a NON-HIR literal — a `ScalarInt` rustc synthesizes with no source
+            // literal behind it (desugared `offset_of` operands, range-pattern endpoints,
+            // `#[rustc_*]` shims). It is the same value as a `Literal` int, minus the `neg` flag
+            // (a `ScalarInt` already carries the final bit pattern), so it reuses the SAME
+            // constant construction — `int_scalar_bits` for the width/signedness of the mapped
+            // type, then `integer_constant_from_bits`, which is the single place the producer
+            // decides `Int` vs the canonical `U128` upper-half spelling.
+            //
+            // FAIL-CLOSED on a non-integer mapped type and on a `ScalarInt` whose stored width
+            // disagrees with the mapped type's width (`try_to_bits` returns `Err`) — reading a
+            // scalar at the wrong size is exactly the class of silent value corruption the
+            // producer must never commit. Bool and char are handled explicitly rather than
+            // through the integer path: their carriers are distinct `Constant` spellings, and
+            // `Ty::Char` is validator-range-checked, so a stray bit pattern must not be minted
+            // as a char.
+            ExprKind::NonHirLiteral { lit, .. } => {
+                let lit = *lit;
+                let ty = self.map_ty(expr_ty);
+                let value = match ty {
+                    Ty::Bool => match lit.try_to_bits(rustc_abi::Size::from_bits(8)) {
+                        Ok(0) => Constant::Bool(false),
+                        Ok(1) => Constant::Bool(true),
+                        _ => {
+                            self.unsupported
+                                .push((format!("{expr_span:?}"), "NonHirLiteral(bad bool bits)"));
+                            return None;
+                        }
+                    },
+                    Ty::Char => match lit.try_to_bits(rustc_abi::Size::from_bits(32)) {
+                        Ok(b) if u32::try_from(b).ok().and_then(char::from_u32).is_some() => {
+                            Constant::Int(b as i128)
+                        }
+                        _ => {
+                            self.unsupported
+                                .push((format!("{expr_span:?}"), "NonHirLiteral(bad char bits)"));
+                            return None;
+                        }
+                    },
+                    _ => {
+                        let Some((bits, signed)) = int_scalar_bits(&ty) else {
+                            self.unsupported
+                                .push((format!("{expr_span:?}"), "NonHirLiteral(non-scalar Ty)"));
+                            return None;
+                        };
+                        match lit.try_to_bits(rustc_abi::Size::from_bits(bits)) {
+                            Ok(raw) => integer_constant_from_bits(raw, signed, bits),
+                            Err(_) => {
+                                self.unsupported.push((
+                                    format!("{expr_span:?}"),
+                                    "NonHirLiteral(width disagreement)",
+                                ));
+                                return None;
+                            }
+                        }
+                    }
+                };
+                let res = self.fresh();
+                self.push_node(InstrNode::new(Inst::Const { ty, value }).with_result(res));
+                Some(res)
+            }
             ExprKind::Block { block } => {
                 // Copy out stmt ids + tail (Copy) so no `self.thir` borrow is held while lowering.
                 let blk = &self.thir.blocks[*block];
                 let stmts: Vec<StmtId> = blk.stmts.iter().copied().collect();
                 let tail = blk.expr;
+                // Trust (C2-scopes): a lexical block is where built MIR's scope chain is
+                // built, so it is where ours is. `ast_block_stmts` opens ONE visibility
+                // scope per `let` and enters it AFTER the statement is lowered, which is
+                // what makes a binding invisible to a debugger stopped in its own
+                // initializer; the outer scope is restored at block exit (block.rs:352).
+                // Both are reproduced here, including on the diverged path — a `return;`
+                // mid-block must not leave the deeper scope current for whatever the
+                // caller emits next.
+                let outer_scope = self.cur_scope;
                 for s in stmts {
+                    // Read the `let` span BEFORE lowering: `lower_stmt` takes `&mut self`.
+                    let let_span = match &self.thir.stmts[s].kind {
+                        StmtKind::Let { span, .. } => Some(*span),
+                        StmtKind::Expr { .. } => None,
+                    };
                     self.lower_stmt(s);
                     // A statement may have diverged (`return;`). Once sealed, the rest is dead.
                     if self.sealed {
+                        self.cur_scope = outer_scope;
                         return None;
                     }
+                    if let Some(span) = let_span {
+                        self.cur_scope = self.open_scope(span);
+                    }
                 }
-                tail.and_then(|t| self.lower_expr(t))
+                let r = tail.and_then(|t| self.lower_expr(t));
+                self.cur_scope = outer_scope;
+                r
             }
             // Trust (wave-CE): a captured-variable READ inside a capturing Fn/FnMut closure body.
             // The env param (`_0` / `ValueId(0)`, a `&{closure}` thin ptr) points at the closure
@@ -8607,8 +9544,46 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // raw-ptr deref) fails closed (would need a real address-of, not the snapshot store /
             // slot model). `Shared`/`Fake` are both immutable/aliasable, so both take the
             // snapshot-store path.
-            ExprKind::Borrow { borrow_kind, arg } => {
-                let arg = *arg;
+            // Trust (#175): `&raw const place` / `&raw mut place` shares this arm. The ADDRESS
+            // computation is identical to a reference borrow's — only the guarantees attached to
+            // the result differ, and trust-ir has no Ref-vs-RawPtr distinction at the value
+            // level, so the same lowering is faithful for the value.
+            //
+            // Two facts make the reuse safe rather than merely convenient:
+            //   * the interpreter does NOT assume a `Ty::Ptr` is dereferenceable —
+            //     `eval_load` goes through `memory.read(..)?`, so an invalid pointer is a
+            //     trapping UB error, never silent nonsense (checked in trust-ir interpret.rs);
+            //   * the FLIP is self-refusing — a flipped body would re-derive MIR spelling
+            //     `Rvalue::Ref` where built MIR spells `RawPtr`, a structural difference the
+            //     comparator declines. So this buys clean-rate, and cannot buy a wrong flip.
+            //
+            // The ONE case that needs a new gate is alignment, because this arm has never seen
+            // it: `&packed.field` is a compile ERROR in Rust (E0793), while
+            // `&raw const packed.field` is legal and legitimately yields an UNDER-ALIGNED
+            // pointer. `eval_load` checks alignment, so lowering that place and later loading
+            // through it at natural alignment would report UB where real Rust is fine — a
+            // manufactured divergence. `place_projects_through_packed` declines it.
+            ExprKind::Borrow { .. } | ExprKind::RawBorrow { .. } => {
+                let (borrow_kind, arg) = match &expr.kind {
+                    ExprKind::Borrow { borrow_kind, arg } => (*borrow_kind, *arg),
+                    ExprKind::RawBorrow { mutability, arg } => {
+                        if self.place_projects_through_packed(*arg) {
+                            self.unsupported
+                                .push((format!("{expr_span:?}"), "RawBorrow(packed place)"));
+                            return None;
+                        }
+                        let kind = match mutability {
+                            rustc_hir::Mutability::Not => rustc_middle::mir::BorrowKind::Shared,
+                            rustc_hir::Mutability::Mut => rustc_middle::mir::BorrowKind::Mut {
+                                kind: rustc_middle::mir::MutBorrowKind::Default,
+                            },
+                        };
+                        (kind, *arg)
+                    }
+                    // The match arms above are the only two patterns this arm accepts.
+                    _ => return None,
+                };
+                let borrow_kind = &borrow_kind;
                 // Trust: FAITHFUL `&a[..]` full-range slice. rustc lowers `&a[..]` (a `RangeFull` index
                 // on an array) NOT as a clean unsize coercion but as a SHARED borrow of
                 // `*<[T] as Index<RangeFull>>::index(&a, ..)` — i.e. `Borrow{Shared, Deref{Call{
@@ -9466,13 +10441,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     (src_int, dst_int)
                 {
                     // Integer-shaped → integer-shaped; `Ty::Char` retains its type identity.
-                    if dst_bits < src_bits {
-                        CastOp::Trunc
-                    } else if dst_bits > src_bits {
-                        if src_signed { CastOp::SExt } else { CastOp::ZExt }
-                    } else {
-                        CastOp::Trunc
-                    }
+                    // Trust (#164): equal width is `Bitcast`, not `Trunc` — see
+                    // `int_to_int_cast_op`.
+                    int_to_int_cast_op(src_bits, dst_bits, src_signed)
                 } else if src_bool && dst_int.is_some() {
                     // bool → int: zero-extend the 1-bit value (MIR `IntToInt`).
                     CastOp::ZExt
@@ -9888,9 +10859,11 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 }
             };
             let (amount_u, u_ty) = if rhs_signed {
-                // Equal-width `Trunc` is the bit-pattern reinterpretation (see the
-                // `ExprKind::Cast` arm): a negative amount becomes at least 128 unsigned, an
-                // overflowing shift for every width — exactly MIR's cast rationale.
+                // Trust (#164): `unsigned_twin` is SAME WIDTH by definition, so this is a
+                // pure bit-pattern reinterpretation and must be spelled `Bitcast` — an
+                // equal-width `Trunc` is rejected by the validator. A negative amount becomes
+                // at least 128 unsigned, an overflowing shift for every width — exactly MIR's
+                // cast rationale.
                 let u_ty = match unsigned_twin(&rhs_ty) {
                     Some(t) => t,
                     None => {
@@ -9900,7 +10873,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 };
                 let cast = self.fresh();
                 self.push_node(InstrNode::new(Inst::Cast {
-                        op: CastOp::Trunc,
+                        op: CastOp::Bitcast,
                         src_ty: rhs_ty.clone(),
                         dst_ty: u_ty.clone(),
                         operand: r,
@@ -10004,13 +10977,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     fn emit_shift_amount_cast(&mut self, dst_ty: Ty, src_ty: Ty, v: ValueId) -> Option<ValueId> {
         let (src_bits, src_signed) = int_scalar_bits(&src_ty)?;
         let (dst_bits, _) = int_scalar_bits(&dst_ty)?;
-        let op = if dst_bits <= src_bits {
-            CastOp::Trunc
-        } else if src_signed {
-            CastOp::SExt
-        } else {
-            CastOp::ZExt
-        };
+        // Trust (#164): equal width is `Bitcast`, not `Trunc` (the old `<=` folded the
+        // same-width case into `Trunc`, which the validator rejects).
+        let op = int_to_int_cast_op(src_bits, dst_bits, src_signed);
         let res = self.fresh();
         self.cur
             .push(InstrNode::new(Inst::Cast { op, src_ty, dst_ty, operand: v }).with_result(res));
@@ -10539,9 +11508,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             }
         };
         let ptr = self.fresh();
-        self.cur.push(InstrNode::new(Inst::GlobalAddr { global }).with_result(ptr));
+        self.push_node(InstrNode::new(Inst::GlobalAddr { global }).with_result(ptr));
         let res = self.fresh();
-        self.cur.push(
+        self.push_node(
             InstrNode::new(Inst::Load { ty, ptr, volatile: false, align: None }).with_result(res),
         );
         Some(res)
@@ -10581,10 +11550,29 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             self.unsupported.push((format!("{span:?}"), "StaticRef(thread-local)"));
             return None;
         }
-        // LOCAL statics are admitted here (unlike local CONSTS): `lower_named_const`'s E0391
-        // hazard is specific to inline/anon consts, which are CHILDREN of the body being built.
-        // A `static` is a module-level ITEM whose initializer body cannot reference the function
-        // being lowered. The read below uses `eval_static_initializer`, which is the query
+        // Trust (wave-EP root fix): REENTRANCY. The read below demands `mir_built` for this
+        // static's initializer, so a static whose initializer body is already being lowered on
+        // this thread must decline — issuing the query would close a rustc query cycle (E0391),
+        // turning a passing crate into a hard compile error under `-Ztrust-ir-lower`.
+        //
+        // The comment that used to stand here asserted the opposite — "a `static` is a
+        // module-level ITEM whose initializer body cannot reference the function being lowered"
+        // — and that is simply false for a SELF-referential static:
+        //     static FOO: Foo = Foo { foo: Some(&FOO) };   (tests/ui/consts/static-cycle-error.rs)
+        // where the body being lowered IS FOO's initializer and the `&FOO` inside it lands here.
+        // Wave-SR2 shipped with this hole; nothing hit it only because `Option<&'static Foo>`
+        // declined registration, so the enum collapsed to the opaque lane and the `&FOO` was
+        // never reached. Wave-EP admitted thin-pointer enum payloads and the corpus turned it up
+        // immediately as a flag_induced_fail. Fixed at the ROOT (the reentrancy stack), not by
+        // re-declining the enum: any future wave that reaches a self-referential static would
+        // have rediscovered the same cycle.
+        if would_reenter_lowering(def_id) {
+            self.unsupported.push((format!("{span:?}"), "StaticRef(self-referential static)"));
+            return None;
+        }
+        // LOCAL statics are otherwise admitted here (unlike local CONSTS): `lower_named_const`'s
+        // E0391 hazard is specific to inline/anon consts, which are CHILDREN of the body being
+        // built. The read below uses `eval_static_initializer`, which is the query
         // designed for statics — NOT `const_eval_poly`, which asserts against statics outright
         // ("statics are conceptually places, not values -- so what we do here could break
         // pointer identity", rustc_const_eval eval_queries.rs). An eval error declines below.
@@ -10607,7 +11595,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         if let Some((_, g)) = self.static_globals.iter().find(|(d, _)| *d == def_id) {
             let g = *g;
             let ptr = self.fresh();
-            self.cur.push(InstrNode::new(Inst::GlobalAddr { global: g }).with_result(ptr));
+            self.push_node(InstrNode::new(Inst::GlobalAddr { global: g }).with_result(ptr));
             self.borrow_ptrs.push(ptr);
             self.global_ptrs.push(ptr);
             return Some(ptr);
@@ -10638,7 +11626,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         let global = GlobalId::new(idx as u32);
         self.static_globals.push((def_id, global));
         let ptr = self.fresh();
-        self.cur.push(InstrNode::new(Inst::GlobalAddr { global }).with_result(ptr));
+        self.push_node(InstrNode::new(Inst::GlobalAddr { global }).with_result(ptr));
         // Same registration as the wave-16 promoted lane: the address is `'static`, so the
         // return-escape guards ADMIT returning it while every other borrow-ptr escape guard
         // still fails closed on it.
@@ -12153,11 +13141,12 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             .with_result(len_u64),
         );
         // Reinterpret the U64 len to the `usize`-mapped result type — a same-width
-        // reinterpret (`CastOp::Trunc` is the equal-width identity in the interpreter,
-        // matching the numeric-`Cast` arm).
+        // reinterpret. Trust (#164): spelled `Bitcast`, matching the numeric-`Cast` arm. It
+        // was `Trunc` on the grounds that the interpreter treats an equal-width `Trunc` as the
+        // identity, but the VALIDATOR rejects it, so those modules were ill-formed.
         let res = self.fresh();
         self.push_node(InstrNode::new(Inst::Cast {
-                op: CastOp::Trunc,
+                op: CastOp::Bitcast,
                 src_ty: Ty::U64,
                 dst_ty: result_ty,
                 operand: len_u64,
@@ -12833,10 +13822,18 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     ///
     /// We do NOT route through `lower_if` because one arm is a *constant* (`true`/`false`), not a THIR
     /// `ExprId`; instead we replicate `lower_if`'s block plumbing directly. The result is always
-    /// `bool` (so always value-producing — there is no unit/diverging case to special-case), and the
-    /// arms merge through a single `Bool` join block-param — trust-ir's idiomatic SSA-with-block-param
-    /// merge, exactly what the interpreter's `bind_block_params` consumes (no phi nodes). Matching
-    /// MIR's structure here is what lets the differential oracle reach `mode = Agreed`.
+    /// `bool` (so always value-producing — there is no unit/diverging case to special-case). The arms
+    /// merge through a `Bool` join block-param FOLLOWED BY one param per merged local — trust-ir's
+    /// idiomatic SSA-with-block-param merge, exactly what the interpreter's `bind_block_params`
+    /// consumes (no phi nodes). Matching MIR's structure here is what lets the differential oracle
+    /// reach `mode = Agreed`.
+    ///
+    /// "Replicate `lower_if`'s block plumbing directly" is exactly the hazard that produced #182: the
+    /// replication copied the result merge and omitted the ENVIRONMENT merge, so this was the only
+    /// join in the producer that let an arm's rebinding escape its dominance region. It now calls the
+    /// same `merged_locals` / `seal_arm_into_join` helpers rather than hand-rolling `Br` args. If a
+    /// future join is added here, use those helpers too — a hand-rolled `Br` to a join is the shape
+    /// this bug takes.
     fn lower_logical_op(
         &mut self,
         span: rustc_span::Span,
@@ -12876,39 +13873,70 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             else_args: vec![],
         });
 
-        // The Bool result merged at the join.
+        // The Bool result merged at the join. (Allocated HERE, before the arms are lowered, purely so
+        // value numbering is byte-identical to the pre-#182 producer in the overwhelmingly common
+        // case where no local is merged — this fix should not churn every `&&`/`||` dump.)
         let join_param = self.fresh();
 
-        // 3. RHS-continuation arm: evaluate `rhs`, branch its value to the join.
+        // Trust (#182): SSA-merge the binding environment across the short-circuit, exactly as
+        // `lower_if` does (its step 4). This join used to merge its RESULT but not its ENVIRONMENT —
+        // the one join in the producer that did. A local the RHS arm rebinds kept the RHS arm's
+        // `ValueId` in `self.locals` past the join, so a later read referenced a value defined in a
+        // block that does NOT DOMINATE the reader: ill-formed SSA, emitted silently and spliced into
+        // the crate module.
+        //
+        // WHY NO DIFFERENTIAL EVER CAUGHT IT: the interpreter resolves values through a global map,
+        // so it happily computes the RIGHT answer from the ill-formed module and reports `verdict =
+        // agreed`. Dominance is a static property; an interpreter that does not model scoping cannot
+        // observe its violation. `validate_module` is the only instrument that can, which is the
+        // whole argument for the well-formedness ratchet. Found as `UseBeforeDefInBlock` on
+        // `tests/ui/rfcs/rfc-2497-if-let-chains/chains-without-let.rs`.
+        let pre_locals = self.locals.clone();
+
+        // 3. RHS-continuation arm: evaluate `rhs`, then CAPTURE it — the `Br` cannot be sealed yet
+        //    because its args are not known until the merged-local set is.
         self.start_block(rhs_id, vec![]);
         let rhs_val = self.lower_expr(rhs);
-        let mut rhs_reaches_join = !self.sealed;
-        if rhs_reaches_join {
-            match rhs_val {
-                Some(v) => self.seal_with(Inst::Br { target: join_id, args: vec![v] }),
-                None => {
-                    // RHS yielded no value (some unsupported shape inside it). Routing a 0-arg `Br`
-                    // to the 1-param join would be a block-param arity mismatch (malformed IR), so
-                    // seal `Unreachable`; `unsupported` already keeps the gate red.
-                    self.unsupported.push((format!("{span:?}"), "LogicalOp(rhs no value)"));
-                    self.seal_with(Inst::Unreachable);
-                    rhs_reaches_join = false;
-                }
-            }
-        }
+        let rhs_arm = self.capture_arm(span, true, rhs_val, "LogicalOp(rhs no value)");
 
-        // 4. Short-circuit arm: emit the constant `true`/`false`, branch it to the join.
+        // Lower the short-circuit arm against the SAME bindings the RHS arm started from, so the RHS
+        // arm's rebinds cannot leak into it.
+        self.locals = pre_locals.clone();
+
+        // 4. Short-circuit arm: emit the constant `true`/`false`. It always reaches the join.
         self.start_block(short_id, vec![]);
         let const_val = self.fresh();
         self.push_node(InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(constant) })
                 .with_result(const_val),
         );
-        self.seal_with(Inst::Br { target: join_id, args: vec![const_val] });
+        let short_arm = self.capture_arm(span, true, Some(const_val), "LogicalOp(short no value)");
 
-        // 5. Join. The short-circuit arm always reaches it; if the RHS arm also failed to, the join is
-        //    still reachable (via the constant arm), so always open it with the Bool param.
-        let _ = rhs_reaches_join;
-        self.start_block(join_id, vec![(join_param, Ty::Bool)]);
+        // 5. Merge and open the join. The short-circuit arm always reaches, so the join is always
+        //    reachable even when the RHS arm sealed `Unreachable` on an unsupported shape.
+        let merged: Vec<(LocalVarId, Ty)> =
+            self.merged_locals(&pre_locals, &[&rhs_arm, &short_arm]);
+        let merged_params: Vec<(ValueId, Ty)> =
+            merged.iter().map(|(_, ty)| (self.fresh(), ty.clone())).collect();
+        self.seal_arm_into_join(rhs_arm, join_id, true, &pre_locals, &merged);
+        self.seal_arm_into_join(short_arm, join_id, true, &pre_locals, &merged);
+
+        let mut join_params: Vec<(ValueId, Ty)> = vec![(join_param, Ty::Bool)];
+        join_params.extend(merged_params.iter().cloned());
+        // Restore the pre-split environment, then layer the merged rebinds on top.
+        //
+        // A local bound ONLY inside the RHS arm — `let z; c && { z = 3; true } && z == 3`, the
+        // deferred-init shape that surfaced this — is absent from `pre_locals`, so `merged_locals`
+        // has no pre-split version to compare against and cannot type a join param for it. It stays
+        // UNBOUND here, and a later read fails closed as `VarRef(unbound)` rather than silently
+        // referencing the RHS arm's value. That is the correct conservative outcome: merging that
+        // shape honestly needs a maybe-initialized lattice (a poison/undef value on the edge where
+        // the binding did not happen), which is B4 memory-model work, not a join fix. The identical
+        // `if`-shaped spelling (`let z; if c { z = 1 } else { z = 2 }`) already declines this way.
+        self.locals = pre_locals;
+        self.start_block(join_id, join_params);
+        for ((var, ty), (param, _)) in merged.iter().zip(merged_params.iter()) {
+            self.set_local(*var, *param, ty.clone());
+        }
         Some(join_param)
     }
 
@@ -12945,10 +13973,15 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     /// FAIL-CLOSED (the boundary — reported, never mis-lowered):
     ///   * the operand is not a concrete `Result`/`Option` enum, or its `(tag,payload)` repr is declined
     ///     (non-scalar / heterogeneous payload) by `register_enum`;
-    ///   * the fn return type is not the SAME enum (a different `Result`/`Option`, or a non-enum) —
-    ///     i.e. a `From`-CONVERTING `?` (`E -> E2`) which genuinely needs the `from_residual` trait call;
-    ///   * the operand/return payload (Ok/Some) or error (Err) types are non-scalar, or the operand
-    ///     itself does not lower (its own `unsupported` is recorded).
+    ///   * the fn return type is not the SAME enum DEFINITION with the IDENTICAL residual (Err/None)
+    ///     carrier — i.e. a `From`-CONVERTING `?` (`E -> E2`, or a different enum family entirely)
+    ///     which genuinely needs the `from_residual` trait call. Distinct MONOMORPHIZATIONS of the
+    ///     same def that agree on the residual (`Result<(),E>?` inside a fn returning
+    ///     `Result<u64,E>`) ARE admitted: the success payload never crosses the two types — only the
+    ///     residual is reconstructed, and it is carrier-identical;
+    ///   * the operand's success (Ok/Some) payload is neither a scalar nor the canonical drop-free-ZST
+    ///     `Ty::Unit`, the error (Err) type is non-scalar, or the operand itself does not lower (its
+    ///     own `unsupported` is recorded).
     fn lower_try_question(
         &mut self,
         result_rty: RustcTy<'tcx>,
@@ -12995,11 +14028,12 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             }
         };
         // Same enum DEFINITION. For `Result` the error type must also match (identity `From`); for
-        // `Option` the residual is niladic so only the def needs to match. We require the operand and
-        // return to be the SAME monomorphized enum type for `Result` (so `Err(e)` reconstructs with the
-        // right error type), and the SAME def for `Option`. The simplest sound check that covers both:
-        // identical `AdtDef` AND identical error/None carrier. We compare the discriminant-bearing repr
-        // and the error payload type below; first require the same def.
+        // `Option` the residual is niladic so only the def needs to match. The sound check that covers
+        // both: identical `AdtDef` AND identical residual (Err/None) carrier — the SUCCESS payload may
+        // differ (`Result<(),E>?` inside a fn returning `Result<u64,E>` is admitted; the `?` value
+        // never crosses the two types, only the residual is reconstructed, and it is
+        // carrier-identical). The residual guard + per-def facts run in `lower_try_question_general`;
+        // first require the same def.
         if op_adt.did() != ret_adt.did() {
             self.unsupported.push((format!("{span:?}"), "Try(operand/return enum differ)"));
             return None;
@@ -13037,9 +14071,19 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     ///     the ACTIVE variant, so a shared pre-Switch extract would trap on
     ///     heterogeneous Result<T,E>;
     ///   * the residual reconstructs via the general ctor convention
-    ///     (Const{Enum, Aggregate([Int(disc), seeds…])} + InsertField at slot 1).
-    /// Identity guards (same def, residual arity +
-    /// field-type equality — a From-converting `?` fails closed) run here.
+    ///     (Const{Enum, Aggregate([Int(disc), seeds…])} + InsertField at slot 1);
+    ///   * `op_eid` and `ret_eid` may be DISTINCT registrations (distinct
+    ///     monomorphizations of the same `AdtDef` — the `tick_heartbeat()?`
+    ///     shape); everything read FROM the operand (tag repr, Ok discriminant,
+    ///     payload slot types) is typed by the OPERAND's def, everything the
+    ///     residual is reconstructed AS (Err discriminant + seed) by the
+    ///     RETURN's def — see `try_question_facts`;
+    ///   * a `Ty::Unit` success payload (`Result<(),E>?`) joins VALUE-LESS
+    ///     (`None` without a tag — the producer's unit model): no payload
+    ///     extract, no join param.
+    /// Residual-identity guards (same def, residual arity + field-type equality
+    /// at both the rustc and registered-def level — a `From`-converting `?`,
+    /// same-def-different-`E`, fails closed) run here.
     #[allow(clippy::too_many_arguments)]
     fn lower_try_question_general(
         &mut self,
@@ -13053,13 +14097,14 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         op_eid: trust_ir::EnumId,
         ret_eid: trust_ir::EnumId,
     ) -> Option<ValueId> {
-        // Same monomorphized enum on both sides — the identity-`?` case. Distinct
-        // EnumIds mean distinct (DefId, args) registrations; reconstructing the
-        // residual across them is the From-converting case → fail closed.
-        if op_eid != ret_eid {
-            self.unsupported.push((format!("{span:?}"), "Try(operand/return enum ids differ)"));
-            return None;
-        }
+        // Trust (T3): distinct EnumIds — distinct (DefId, args) registrations of the SAME
+        // AdtDef (the caller already required `op_adt.did() == ret_adt.did()`) — are
+        // admitted, PROVIDED the residual (Err/None) carrier is IDENTICAL across the two
+        // monomorphizations: the residual guards below (rustc-typed here, registered-def-
+        // typed in `try_question_facts`) enforce it. A `From`-CONVERTING `?` (different
+        // `E`) stays FAIL-CLOSED at those guards — its `from_residual` genuinely applies
+        // `From::from`, which this bypass does not lower; only same-`E` is identity
+        // (coherence pins `From<E> for E` to std's reflexive impl).
         let (ok_variant, err_variant) = match self.classify_try_variants(op_adt) {
             Some(v) => v,
             None => {
@@ -13084,67 +14129,45 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 return None;
             }
         }
-        // Registered-def facts, cloned out before any &mut self op.
-        let (tag_ty, ok_disc, err_disc, ok_field_ty, err_field_ty, err_seed) = {
-            let Some(def) = self.registered_enum(op_eid) else {
+        // Success-payload spelling, computed BEFORE borrowing the registered defs
+        // (`map_ty` is `&mut self` — it may register new types), plus the GROUND-TRUTH
+        // rustc ZST test the `Ty::Unit` admission keys on (`map_ty` also spells opaque
+        // collapses as `Ty::Unit`; the mapped ty alone must never admit a live payload —
+        // the same "never key on the mapped ty" rule as the E1 admission site).
+        let result_ty = self.map_ty(result_rty);
+        let result_is_drop_free_zst = self.is_drop_free_zst(result_rty);
+        // Registered-def facts, cloned out before any &mut self op. Sourcing (T3): the
+        // OPERAND def types everything read FROM the operand value; the RETURN def types
+        // everything the residual is reconstructed AS — reconstruction targets
+        // `Ty::Enum(ret_eid)` below. See `try_question_facts` for the full matrix.
+        let facts = {
+            let (Some(op_def), Some(ret_def)) =
+                (self.registered_enum(op_eid), self.registered_enum(ret_eid))
+            else {
                 self.unsupported.push((format!("{span:?}"), "Try(enum not registered)"));
                 return None;
             };
-            let Some(tag_ty) = def.canonical_tag_repr().map(|r| r.ty()) else {
-                self.unsupported.push((format!("{span:?}"), "Try(no canonical tag)"));
-                return None;
-            };
-            let Some(discs) = def.effective_discriminants() else {
-                self.unsupported.push((format!("{span:?}"), "Try(discriminants unresolvable)"));
-                return None;
-            };
-            let (Some(&ok_disc), Some(&err_disc)) =
-                (discs.get(ok_variant.as_usize()), discs.get(err_variant.as_usize()))
-            else {
-                self.unsupported.push((format!("{span:?}"), "Try(variant/disc desync)"));
-                return None;
-            };
-            let ok_field_ty = match def.variants.get(ok_variant.as_usize()).map(|v| &v.fields[..]) {
-                Some([f]) => f.clone(),
-                _ => {
-                    self.unsupported.push((format!("{span:?}"), "Try(ok variant not 1-field)"));
+            match try_question_facts(
+                op_def,
+                ret_def,
+                ok_variant.as_usize(),
+                err_variant.as_usize(),
+                &result_ty,
+                result_is_drop_free_zst,
+            ) {
+                Ok(f) => f,
+                Err(tag) => {
+                    self.unsupported.push((format!("{span:?}"), tag));
                     return None;
                 }
-            };
-            let err_fields = match def.variants.get(err_variant.as_usize()) {
-                Some(v) => v.fields.clone(),
-                None => {
-                    self.unsupported.push((format!("{span:?}"), "Try(variant/disc desync)"));
-                    return None;
-                }
-            };
-            let (err_field_ty, err_seed) = match &err_fields[..] {
-                [] => (None, None),
-                [f] => match seed_constant(f) {
-                    Some(seed) => (Some(f.clone()), Some(seed)),
-                    None => {
-                        self.unsupported.push((format!("{span:?}"), "Try(err field not seedable)"));
-                        return None;
-                    }
-                },
-                _ => {
-                    self.unsupported.push((format!("{span:?}"), "Try(err variant multi-field)"));
-                    return None;
-                }
-            };
-            (tag_ty, ok_disc, err_disc, ok_field_ty, err_field_ty, err_seed)
+            }
         };
-        // The `?`-result must be the Ok variant's own field type (defensive — the
-        // classify step already keys on it) and scalar (the 2b payload scope).
-        let result_ty = self.map_ty(result_rty);
-        if !is_scalar_ty(&result_ty) {
-            self.unsupported.push((format!("{span:?}"), "Try(non-scalar success payload)"));
-            return None;
-        }
-        if ok_field_ty != result_ty {
-            self.unsupported.push((format!("{span:?}"), "Try(payload slot != success type)"));
-            return None;
-        }
+        let TryQuestionFacts { tag_ty, ok_disc, err_disc, ok_field_ty, err_field_ty, err_seed } =
+            facts;
+        // Unit success payload (`Result<(),E>?`): the `?` value is `()`, which the
+        // producer models as VALUE-LESS — no payload extract, no join param, and the
+        // expression lowers to `None` WITHOUT a tag (the unit value, not a failure).
+        let unit_success = ok_field_ty == Ty::Unit;
 
         let op_val = match self.lower_expr(operand) {
             Some(v) => v,
@@ -13172,20 +14195,28 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             cases: vec![SwitchCase { value: Constant::Int(ok_disc), target: ok_id, args: vec![] }],
             exhaustive_enum_unreachable: false,
         });
-        let join_param = self.fresh();
+        // Minted BEFORE the ok arm so the non-unit path's ValueId numbering is
+        // byte-identical to the pre-T3 lowering (dump/differential stability).
+        let join_param = if unit_success { None } else { Some(self.fresh()) };
 
         // Ok/Some arm: extract the payload AT THE OK VARIANT'S TYPE inside the arm
-        // (slot 1 is typed by the active variant) and branch it to the join.
+        // (slot 1 is typed by the active variant) and branch it to the join. A UNIT
+        // success payload has nothing to extract (the interpreter cannot materialize
+        // a `Ty::Unit` value): the arm branches value-less.
         self.start_block(ok_id, vec![]);
-        let ok_payload = self.fresh();
-        self.push_node(InstrNode::new(Inst::ExtractField {
-                ty: ok_field_ty.clone(),
-                aggregate: op_val,
-                field: 1,
-            })
-            .with_result(ok_payload),
-        );
-        self.seal_with(Inst::Br { target: join_id, args: vec![ok_payload] });
+        if unit_success {
+            self.seal_with(Inst::Br { target: join_id, args: vec![] });
+        } else {
+            let ok_payload = self.fresh();
+            self.push_node(InstrNode::new(Inst::ExtractField {
+                    ty: ok_field_ty.clone(),
+                    aggregate: op_val,
+                    field: 1,
+                })
+                .with_result(ok_payload),
+            );
+            self.seal_with(Inst::Br { target: join_id, args: vec![ok_payload] });
+        }
 
         // Err/None arm: reconstruct the return enum's residual variant via the
         // general ctor convention and Return it.
@@ -13221,8 +14252,19 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         };
         self.seal_with(Inst::Return { values: vec![err_enum] });
 
-        self.start_block(join_id, vec![(join_param, result_ty)]);
-        Some(join_param)
+        match join_param {
+            Some(jp) => {
+                self.start_block(join_id, vec![(jp, result_ty)]);
+                Some(jp)
+            }
+            None => {
+                // Unit success (`Result<(),E>?`): the join carries no value. `None`
+                // WITHOUT an `unsupported` tag is the producer's unit model (the
+                // VarRef value-less convention) — the unit value, NOT a failure.
+                self.start_block(join_id, vec![]);
+                None
+            }
+        }
     }
 
     /// Trust: peel `Scope`/`Use` wrappers off the `?`-desugar scrutinee and, if it is the expected
@@ -15781,6 +16823,10 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         let exit_id = self.fresh_block_id();
         let header_params: Vec<(ValueId, Ty)> =
             carried_init.iter().map(|(_, _, ty)| (self.fresh(), ty.clone())).collect();
+        // Trust (#183): the exit takes the SAME shape as the header — one param per carried local,
+        // same order — so each `break` can hand over the values as of the break point.
+        let exit_params: Vec<(ValueId, Ty)> =
+            carried_init.iter().map(|(_, _, ty)| (self.fresh(), ty.clone())).collect();
 
         // 3. Seal the pre-loop block with the entry `Br` to the header, passing each carried local's
         //    INITIAL (pre-loop) value as the matching header-param arg.
@@ -15809,6 +16855,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             header: header_id,
             exit: exit_id,
             carried: carried.clone(),
+            exit_params: exit_params.clone(),
         });
 
         // 6. Lower the body in the header block. Its result is discarded (loop body is unit-typed).
@@ -15827,8 +16874,11 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // 8. Pop the loop context and open the exit. Carried locals stay bound to their header params
         //    (the post-loop dataflow — see the method doc). The loop expression is unit (`None`).
         self.loop_stack.pop();
-        self.start_block(exit_id, vec![]);
-        for (var, param, ty) in &carried {
+        // Trust (#183): open the exit with its params and rebind each carried local to ITS EXIT
+        // PARAM, not to the header param. The header param is the value at iteration entry; the exit
+        // param is the value the breaking edge actually carried.
+        self.start_block(exit_id, exit_params.clone());
+        for ((var, _, ty), (param, _)) in carried.iter().zip(exit_params.iter()) {
             self.set_local(*var, *param, ty.clone());
         }
         None
@@ -15847,8 +16897,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             self.unsupported.push((format!("{span:?}"), "Break(with value)"));
             return None;
         }
-        let exit = match self.loop_stack.last() {
-            Some(ctx) if ctx.scope == label => ctx.exit,
+        let (exit, carried) = match self.loop_stack.last() {
+            Some(ctx) if ctx.scope == label => (ctx.exit, ctx.carried.clone()),
             Some(_) => {
                 // Labeled break aimed at an outer loop (multi-level breakout) — not modeled.
                 self.unsupported.push((format!("{span:?}"), "Break(non-innermost label)"));
@@ -15859,7 +16909,13 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 return None;
             }
         };
-        self.seal_with(Inst::Br { target: exit, args: vec![] });
+        // Trust (#183): hand the exit each carried local's value AS OF THIS BREAK. Same convention
+        // as the back-edge — fall back to the header param for a local this path never rebound.
+        let args: Vec<ValueId> = carried
+            .iter()
+            .map(|(var, param, _)| self.local_value(*var).unwrap_or(*param))
+            .collect();
+        self.seal_with(Inst::Br { target: exit, args });
         None
     }
 
@@ -16143,6 +17199,106 @@ fn seed_constant(ty: &Ty) -> Option<Constant> {
     }
 }
 
+/// Trust (T3): the registered-def facts `lower_try_question_general` joins on, with
+/// their SOURCING made explicit now that `op_def` and `ret_def` may be distinct
+/// registrations (distinct monomorphizations of the same `AdtDef`):
+///   * everything read FROM the operand value is typed by the OPERAND's def —
+///     `tag_ty` (the tag `ExtractField`), `ok_disc` (the `Switch` case),
+///     `ok_field_ty` / `err_field_ty` (the payload `ExtractField`s);
+///   * everything the residual is reconstructed AS is typed by the RETURN's def —
+///     `err_disc` (the reconstruction's discriminant seed) and `err_seed` (the
+///     placeholder for the Err slot); the `Const`/`InsertField` themselves target
+///     `Ty::Enum(ret_eid)` at the call site.
+#[derive(Debug, PartialEq)]
+struct TryQuestionFacts {
+    tag_ty: Ty,
+    ok_disc: i128,
+    err_disc: i128,
+    ok_field_ty: Ty,
+    err_field_ty: Option<Ty>,
+    err_seed: Option<Constant>,
+}
+
+/// Trust (T3): extract + guard the [`TryQuestionFacts`] for an identity-`?` join.
+/// Pure over the two REGISTERED defs so the guards are unit-testable without a
+/// rustc session; `Err` is the exact fail-closed `unsupported` tag.
+///
+/// Guards enforced here (the registered-def level; the rustc-typed residual guard
+/// runs earlier in `lower_try_question_general`):
+///   * both defs must have a canonical tag + resolvable discriminants covering the
+///     Ok/Err variant indices;
+///   * the RESIDUAL (Err/None) variant's field list must be IDENTICAL across the
+///     two defs — a `From`-CONVERTING `?` (same def, different `E`) stays
+///     FAIL-CLOSED here: its `from_residual` genuinely applies `From::from`, which
+///     the identity bypass does not lower; only same-`E` is identity (coherence
+///     pins `From<E> for E` to std's reflexive impl);
+///   * the success payload is either a SCALAR equal to the operand's Ok slot type
+///     (the pre-T3 scope), or the canonical drop-free-ZST `Ty::Unit`
+///     (`Result<(),E>?`) — admitted only when the GROUND-TRUTH rustc type is a
+///     drop-free ZST (`result_is_drop_free_zst`; the mapped ty alone must never
+///     admit a payload — it is also the fail-closed spelling for degraded types);
+///   * the Err variant is niladic or 1-field with a seedable field type (the
+///     reconstruction convention).
+fn try_question_facts(
+    op_def: &trust_ir::EnumDef,
+    ret_def: &trust_ir::EnumDef,
+    ok_idx: usize,
+    err_idx: usize,
+    result_ty: &Ty,
+    result_is_drop_free_zst: bool,
+) -> Result<TryQuestionFacts, &'static str> {
+    let Some(tag_ty) = op_def.canonical_tag_repr().map(|r| r.ty()) else {
+        return Err("Try(no canonical tag)");
+    };
+    let (Some(op_discs), Some(ret_discs)) =
+        (op_def.effective_discriminants(), ret_def.effective_discriminants())
+    else {
+        return Err("Try(discriminants unresolvable)");
+    };
+    let (Some(&ok_disc), Some(&err_disc)) = (op_discs.get(ok_idx), ret_discs.get(err_idx)) else {
+        return Err("Try(variant/disc desync)");
+    };
+    let ok_field_ty = match op_def.variants.get(ok_idx).map(|v| &v.fields[..]) {
+        Some([f]) => f.clone(),
+        _ => return Err("Try(ok variant not 1-field)"),
+    };
+    // Registered-def residual identity — the def-level half of the From-converting
+    // fail-close (the rustc-typed half already ran at the call site).
+    let (Some(op_err), Some(ret_err)) =
+        (op_def.variants.get(err_idx), ret_def.variants.get(err_idx))
+    else {
+        return Err("Try(variant/disc desync)");
+    };
+    if op_err.fields != ret_err.fields {
+        return Err("Try(residual defs differ)");
+    }
+    let (err_field_ty, err_seed) = match &ret_err.fields[..] {
+        [] => (None, None),
+        [f] => match seed_constant(f) {
+            Some(seed) => (Some(f.clone()), Some(seed)),
+            None => return Err("Try(err field not seedable)"),
+        },
+        _ => return Err("Try(err variant multi-field)"),
+    };
+    if ok_field_ty == Ty::Unit {
+        // E1 invariant: a registered Unit field means the rustc field was a drop-free
+        // ZST — require the ground truth to agree (defensive; never key on mapped ty).
+        if !result_is_drop_free_zst {
+            return Err("Try(unit slot but non-ZST success)");
+        }
+    } else {
+        // The `?`-result must be scalar (the 2b payload scope) and the Ok variant's
+        // own field type (defensive — the classify step already keys on it).
+        if !is_scalar_ty(result_ty) {
+            return Err("Try(non-scalar success payload)");
+        }
+        if ok_field_ty != *result_ty {
+            return Err("Try(payload slot != success type)");
+        }
+    }
+    Ok(TryQuestionFacts { tag_ty, ok_disc, err_disc, ok_field_ty, err_field_ty, err_seed })
+}
+
 /// Trust: the `#[repr(iN/uN/isize/usize)]` tag hint of an enum `AdtDef`, as the
 /// `trust_ir::EnumTagRepr` the general-path `EnumDef` pins its tag lane with. Outer `None`
 /// (fail-closed) ONLY for a hint the canonical tag cannot express (`repr(i128/u128)` — trust-ir
@@ -16174,6 +17330,33 @@ fn enum_repr_hint(adt: ty::AdtDef<'_>) -> Option<Option<trust_ir::EnumTagRepr>> 
 /// `SExt`) in the `ExprKind::Cast` arm. Bool is excluded HERE (it is not a fixed-width int), but
 /// `bool as uN/iN` is still lowered by that arm as a dedicated `ZExt` case — see `float_scalar_bits`
 /// and the arm doc for the full int/bool/float cast classification.
+/// Trust (#164): the CastOp for an integer-shaped -> integer-shaped conversion.
+///
+/// EQUAL WIDTH IS `Bitcast`, NOT `Trunc`. The producer used to spell every non-widening int
+/// cast `Trunc`, including the same-width case (`i32 as u32`, `usize as isize`, a shift
+/// amount's `unsigned_twin`, a `U64` len reinterpreted to the `usize`-mapped type). The
+/// trust-ir validator REJECTS that outright —
+///     CastWidthDirectionInvalid { op: "trunc", src: "i32", dst: "u32",
+///                                 reason: "trunc requires src width (32) > dst width (32)" }
+/// — so every module carrying one was ill-formed, even though the interpreter happened to
+/// treat an equal-width `Trunc` as the identity. "The interpreter tolerates it" is not the
+/// same as "the format admits it".
+///
+/// This also ALIGNS THE TWO PRODUCERS rather than diverging them: the MIR-side oracle already
+/// spells the same-width case `Bitcast` (`trust-ir-bridge/src/lower.rs`, the
+/// `(Some(sw), Some(dw)) if sw == dw => CastOp::Bitcast` arm). The producer was the one out of
+/// step, so this moves it TOWARD the oracle.
+pub(crate) fn int_to_int_cast_op(src_bits: u32, dst_bits: u32, src_signed: bool) -> CastOp {
+    if dst_bits < src_bits {
+        CastOp::Trunc
+    } else if dst_bits > src_bits {
+        if src_signed { CastOp::SExt } else { CastOp::ZExt }
+    } else {
+        // Same width: a pure bit-pattern reinterpretation.
+        CastOp::Bitcast
+    }
+}
+
 pub(crate) fn int_scalar_bits(ty: &Ty) -> Option<(u32, bool)> {
     Some(match ty {
         // Trust (v25 B1): faithful scalars at the pinned 64-bit target;
@@ -16932,7 +18115,50 @@ fn variant_name(kind: &ExprKind<'_>) -> &'static str {
         // by-value) that closure construction does not emit yet. Split from the catch-all
         // "Other" so the ratchet measures the capturing-closure-body gap precisely.
         ExprKind::UpvarRef { .. } => "UpvarRef(capturing env)",
-        _ => "Other",
+        // Trust (measurement honesty): EXHAUSTIVE. The old `_ => "Other"` catch-all named the
+        // second-largest sole-blocker bucket in the corpus and told us nothing about it — the
+        // event carries only a SPAN, so 63 sole-`Other` bodies were 63 unidentified shapes and
+        // no wave could be planned against them. Coverage notes must NAME the offender. Listing
+        // every variant also makes the next upstream `ExprKind` addition a compile error here
+        // rather than a silent merge into the anonymous bucket.
+        ExprKind::Scope { .. } => "Scope",
+        ExprKind::If { .. } => "If",
+        ExprKind::Call { .. } => "Call",
+        ExprKind::ByUse { .. } => "ByUse",
+        ExprKind::Binary { .. } => "Binary",
+        ExprKind::LogicalOp { .. } => "LogicalOp",
+        ExprKind::Use { .. } => "Use",
+        ExprKind::NeverToAny { .. } => "NeverToAny",
+        ExprKind::PointerCoercion { .. } => "PointerCoercion",
+        ExprKind::LoopMatch { .. } => "LoopMatch",
+        ExprKind::Let { .. } => "Let",
+        ExprKind::Block { .. } => "Block",
+        ExprKind::AssignOp { .. } => "AssignOp",
+        ExprKind::VarRef { .. } => "VarRef",
+        ExprKind::RawBorrow { .. } => "RawBorrow",
+        ExprKind::Break { .. } => "Break",
+        ExprKind::Continue { .. } => "Continue",
+        ExprKind::ConstContinue { .. } => "ConstContinue",
+        ExprKind::Return { .. } => "Return",
+        ExprKind::Become { .. } => "Become",
+        ExprKind::ConstBlock { .. } => "ConstBlock",
+        ExprKind::Repeat { .. } => "Repeat",
+        ExprKind::Array { .. } => "Array",
+        ExprKind::PlaceTypeAscription { .. } => "PlaceTypeAscription",
+        ExprKind::ValueTypeAscription { .. } => "ValueTypeAscription",
+        ExprKind::PlaceUnwrapUnsafeBinder { .. } => "PlaceUnwrapUnsafeBinder",
+        ExprKind::ValueUnwrapUnsafeBinder { .. } => "ValueUnwrapUnsafeBinder",
+        ExprKind::WrapUnsafeBinder { .. } => "WrapUnsafeBinder",
+        ExprKind::Literal { .. } => "Literal",
+        ExprKind::NonHirLiteral { .. } => "NonHirLiteral",
+        ExprKind::ZstLiteral { .. } => "ZstLiteral",
+        ExprKind::NamedConst { .. } => "NamedConst",
+        ExprKind::ConstParam { .. } => "ConstParam",
+        ExprKind::StaticRef { .. } => "StaticRef",
+        ExprKind::InlineAsm { .. } => "InlineAsm",
+        ExprKind::ThreadLocalRef(..) => "ThreadLocalRef",
+        ExprKind::Yield { .. } => "Yield",
+        ExprKind::Reborrow { .. } => "Reborrow",
     }
 }
 
@@ -16958,6 +18184,222 @@ mod u128_v24_constant_tests {
         assert_eq!(
             integer_literal_constant(1u128 << 127, true, true, 128),
             Constant::Int(i128::MIN),
+        );
+    }
+}
+
+#[cfg(test)]
+mod try_question_facts_tests {
+    use super::*;
+
+    /// A registered `Result<ok, err>` def as `register_enum` would mint it:
+    /// variant 0 = `Ok(ok)`, variant 1 = `Err(err)`, implicit discriminants
+    /// (0, 1), no repr hint (canonical tag = U8 via `smallest_for`).
+    fn result_def(id: u32, ok: Ty, err: Ty) -> trust_ir::EnumDef {
+        trust_ir::EnumDef::new(
+            trust_ir::EnumId::new(id),
+            "Result",
+            vec![
+                trust_ir::EnumVariant { name: "Ok".into(), fields: vec![ok], field_names: vec![] },
+                trust_ir::EnumVariant {
+                    name: "Err".into(),
+                    fields: vec![err],
+                    field_names: vec![],
+                },
+            ],
+        )
+    }
+
+    /// Identity `Result<(),E>?` in a fn returning `Result<(),E>` — the SAME
+    /// registration on both sides, unit success payload admitted.
+    #[test]
+    fn identity_unit_result_admits_with_unit_ok_slot() {
+        let def = result_def(0, Ty::Unit, Ty::U32);
+        let facts = try_question_facts(&def, &def, 0, 1, &Ty::Unit, true)
+            .expect("identity Result<(),E>? should extract facts");
+        assert_eq!(facts.tag_ty, Ty::U8);
+        assert_eq!(facts.ok_disc, 0);
+        assert_eq!(facts.err_disc, 1);
+        assert_eq!(facts.ok_field_ty, Ty::Unit);
+        assert_eq!(facts.err_field_ty, Some(Ty::U32));
+        assert_eq!(facts.err_seed, Some(Constant::Int(0)));
+    }
+
+    /// `Result<(),E>?` inside a fn returning `Result<u64,E>` — the
+    /// `tick_heartbeat()?` shape: DISTINCT registrations of the same `AdtDef`,
+    /// identical residual carrier, unit success payload.
+    #[test]
+    fn tick_heartbeat_shape_distinct_monos_same_residual_admit() {
+        let op = result_def(0, Ty::Unit, Ty::U32);
+        let ret = result_def(1, Ty::U64, Ty::U32);
+        let facts = try_question_facts(&op, &ret, 0, 1, &Ty::Unit, true)
+            .expect("Result<(),E>? inside Result<u64,E> should extract facts");
+        assert_eq!(facts.ok_field_ty, Ty::Unit);
+        assert_eq!(facts.err_field_ty, Some(Ty::U32));
+    }
+
+    /// The same cross-mono shape with a SCALAR success stand-in
+    /// (`Result<u32,E>?` inside `Result<u64,E>`) — the success payload never
+    /// crosses the two types, so it is typed by the OPERAND's Ok slot.
+    #[test]
+    fn distinct_monos_scalar_success_admits_at_operand_slot_type() {
+        let op = result_def(0, Ty::U32, Ty::U8);
+        let ret = result_def(1, Ty::U64, Ty::U8);
+        let facts = try_question_facts(&op, &ret, 0, 1, &Ty::U32, false)
+            .expect("Result<u32,E>? inside Result<u64,E> should extract facts");
+        assert_eq!(facts.ok_field_ty, Ty::U32);
+        assert_eq!(facts.err_field_ty, Some(Ty::U8));
+    }
+
+    /// A `From`-converting `?` (different residual carrier) stays FAIL-CLOSED
+    /// at the registered-def residual guard.
+    #[test]
+    fn converting_question_different_err_carrier_fails_closed() {
+        let op = result_def(0, Ty::U32, Ty::U8);
+        let ret = result_def(1, Ty::U32, Ty::U64);
+        assert_eq!(
+            try_question_facts(&op, &ret, 0, 1, &Ty::U32, false),
+            Err("Try(residual defs differ)"),
+        );
+    }
+
+    /// Residual ARITY mismatch (1-field Err vs niladic) is the same def-level
+    /// fail-close.
+    #[test]
+    fn converting_question_residual_arity_mismatch_fails_closed() {
+        let op = result_def(0, Ty::U32, Ty::U8);
+        let mut ret = result_def(1, Ty::U32, Ty::U8);
+        ret.variants[1].fields.clear();
+        assert_eq!(
+            try_question_facts(&op, &ret, 0, 1, &Ty::U32, false),
+            Err("Try(residual defs differ)"),
+        );
+    }
+
+    /// A Unit Ok slot whose GROUND-TRUTH rustc success type is not a drop-free
+    /// ZST must fail closed (the mapped ty alone never admits a payload).
+    #[test]
+    fn unit_ok_slot_without_ground_truth_zst_fails_closed() {
+        let def = result_def(0, Ty::Unit, Ty::U32);
+        assert_eq!(
+            try_question_facts(&def, &def, 0, 1, &Ty::Unit, false),
+            Err("Try(unit slot but non-ZST success)"),
+        );
+    }
+
+    /// The pre-T3 scalar scope is unchanged: a non-scalar (non-unit) success
+    /// payload still fails closed.
+    #[test]
+    fn non_scalar_success_payload_still_fails_closed() {
+        let def = result_def(0, Ty::F32, Ty::U32);
+        assert_eq!(
+            try_question_facts(&def, &def, 0, 1, &Ty::F32, false),
+            Err("Try(non-scalar success payload)"),
+        );
+    }
+}
+
+#[cfg(test)]
+mod container_pointee_spelling_tests {
+    use super::*;
+
+    /// The target's thin-pointer width the pinned interpreter and every downstream gate
+    /// execute at (`Ty::bit_width_with`'s `pointer_bits`).
+    const POINTER_BITS: u32 = 64;
+
+    /// A `str`/`[T]` tail means `usize` metadata, so the pointer is the 16-byte `(data, len)`
+    /// pair — the SAME spelling `map_ty` already signs for `*const str` / `*const [T]`.
+    /// Asserted structurally (two pointer-width lanes), not as a magic number.
+    #[test]
+    fn len_metadata_pointee_is_a_two_lane_pointer_pair() {
+        let spelled = container_pointee_ty(PointeeMeta::Len).expect("Len must not fail closed");
+        let Ty::Tuple(lanes) = &spelled else {
+            panic!("a Len-metadata pointee must be spelled as a pair, got {:?}", spelled);
+        };
+        assert_eq!(lanes.len(), 2, "a fat pointer has exactly two lanes: data and metadata");
+        let lane_bits: Vec<Option<u32>> =
+            lanes.iter().map(|l| l.bit_width_with(POINTER_BITS)).collect();
+        assert_eq!(
+            lane_bits,
+            vec![Some(POINTER_BITS), Some(POINTER_BITS)],
+            "both lanes must be pointer-width ({} bits each) = the 16 bytes rustc lays out for \
+             a pointer to a str/slice-tailed pointee",
+            POINTER_BITS,
+        );
+    }
+
+    /// The thin spelling is one lane. This is the CONTROL for the test above: it is what the
+    /// catch-alls used to emit for a `Len`-metadata pointee (`*const ArcInner<str>`), and the
+    /// half-width is exactly the lie — a 16-byte value described by an 8-byte type.
+    #[test]
+    fn thin_pointee_is_one_pointer_lane_and_is_half_the_fat_width() {
+        assert_eq!(container_pointee_ty(PointeeMeta::Thin), Some(Ty::Ptr));
+        assert_eq!(Ty::Ptr.bit_width_with(POINTER_BITS), Some(POINTER_BITS));
+        let fat = container_pointee_ty(PointeeMeta::Len).expect("Len must not fail closed");
+        let Ty::Tuple(lanes) = &fat else { panic!("expected the pair spelling") };
+        let fat_bits: u32 = lanes.iter().filter_map(|l| l.bit_width_with(POINTER_BITS)).sum();
+        assert_eq!(
+            fat_bits,
+            2 * POINTER_BITS,
+            "the fat spelling must be twice the thin one — the width the old catch-all dropped",
+        );
+    }
+
+    /// An UNDETERMINABLE tail (a bare `ty::Param` / unresolved alias) keeps the PRE-EXISTING
+    /// thin spelling. A change of spelling must rest on a determination, never on the absence
+    /// of one; the soundness of this lane is the wave-19 `sig_shapes_coherent` argument, not a
+    /// claim about the metadata.
+    #[test]
+    fn unknown_tail_keeps_the_pre_existing_thin_spelling() {
+        assert_eq!(container_pointee_ty(PointeeMeta::Unknown), Some(Ty::Ptr));
+    }
+
+    /// A VTABLE-metadata tail fails CLOSED — this producer carries no vtable component, and the
+    /// direct `*const dyn` arm has always refused rather than respell it thin.
+    #[test]
+    fn vtable_metadata_pointee_fails_closed() {
+        assert_eq!(container_pointee_ty(PointeeMeta::Vtable), None);
+    }
+
+    /// THE LOCKSTEP INVARIANT. `fat_shape` must agree with `map_ty` on every `PointeeMeta`:
+    /// fail-closed ⟺ `Opaque`, thin spelling ⟺ `Thin`, anything wider ⟺ `Fat`. B2-3 records
+    /// what a violation costs — flipping one side alone "reopens the wave-19 DST-coherence
+    /// hole", where a call link certifies `Thin == Thin` while the callee record signs fat.
+    #[test]
+    fn fat_shape_agrees_with_the_map_ty_spelling_on_every_metadata_class() {
+        for meta in [PointeeMeta::Thin, PointeeMeta::Len, PointeeMeta::Vtable, PointeeMeta::Unknown]
+        {
+            let expected = match container_pointee_ty(meta) {
+                None => FatShape::Opaque,
+                Some(Ty::Ptr) => FatShape::Thin,
+                Some(_) => FatShape::Fat,
+            };
+            assert_eq!(
+                fat_shape_of_container_pointee(meta),
+                expected,
+                "fat_shape and map_ty disagree for {:?}",
+                meta,
+            );
+        }
+    }
+
+    /// Every metadata class is covered — a new `PointeeMeta` variant must be given a spelling
+    /// deliberately, not inherit one from a catch-all. Stated as an exhaustive match so adding
+    /// a variant is a COMPILE error here, which no runtime assertion can achieve.
+    #[test]
+    fn every_metadata_class_has_a_deliberate_spelling() {
+        fn classified(meta: PointeeMeta) -> bool {
+            match meta {
+                PointeeMeta::Thin
+                | PointeeMeta::Len
+                | PointeeMeta::Vtable
+                | PointeeMeta::Unknown => true,
+            }
+        }
+        assert!(
+            [PointeeMeta::Thin, PointeeMeta::Len, PointeeMeta::Vtable, PointeeMeta::Unknown]
+                .into_iter()
+                .all(classified)
         );
     }
 }

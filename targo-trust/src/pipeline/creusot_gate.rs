@@ -1,17 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright 2026 Andrew Yates
-//! Build-time Creusot-manifest evidence boundary (fail-closed).
+//! Build-time Creusot-manifest disclosure boundary.
 //!
 //! A package that declares a dependency on the Creusot contract family
 //! (`creusot-contracts`, `creusot-std`, and their satellite crates) is opting
 //! into a Creusot spec surface (`#[requires]` / `#[ensures]` / `#[logic]`).
-//! Outside the Creusot toolchain those attributes expand to no-ops, and Trust
-//! does not import that legacy attribute surface: trustc's contract lane never
-//! sees the specs. Letting such a package flow through `targo trust build`
-//! would therefore be a false green: every declared Creusot spec would be
-//! silently unverified while the build reports success. Selected packages that
-//! opt into Creusot fail with an explicit unverified-spec setup error;
-//! non-Creusot packages remain a no-op pass-through.
+//! Outside the Creusot toolchain those attributes expand to no-ops, and trustc's
+//! contract lane never sees the specs.
+//!
+//! **Amended 2026-07-26 (two-language design v5, §3.2 MIGRATE)**, in lockstep
+//! with the Kani gate — v5 reclassifies the Creusot attribute surface as a
+//! *zero-authority ingestion lane* on the same terms, and this gate is
+//! explicitly the same boundary shape, so the two must not desynchronize.
+//!
+//! The specs really are unverified: no reader has been built yet. But the
+//! false-green risk was never the *dependency*, it was the word "silently".
+//! Rejecting the build for declaring the dependency also blocks the migration
+//! the amendment authorizes — you cannot port specs you are not allowed to
+//! compile alongside. So detection is kept and the rejection is replaced with an
+//! unmissable disclosure: the build proceeds, and the operator is told plainly
+//! that the Creusot specs carried no authority and were not examined.
+//!
+//! Not fail-open: the attributes expand to no-ops outside the Creusot
+//! toolchain, so there is no verdict here to soften and no authority to withhold
+//! that is not already structurally absent. See `kani_gate` for the equivalent
+//! three-point argument on the Kani side.
+//!
+//! Fail-closed is preserved where it still means something: a manifest that
+//! cannot be inspected is a setup error, not a pass.
 //!
 //! This is the same boundary shape as the Kani gate (`kani_gate::gate_build`),
 //! applied to the Creusot dependency family.

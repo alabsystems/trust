@@ -579,8 +579,11 @@ pub(super) fn arm_value_rvalue_for(
         // into bb1, whose `OverflowNeg` Assert FIRES exactly when `self == iN::MIN`. So
         // abs's panic path is REACHABLE: `abs(iN::MIN)` genuinely panics (debug) / wraps
         // (release). Lemma 6 CERTIFIES the emitted `NegationOverflow` VC's ADEQUACY
-        // (the core `Eq(self, MIN)` grounds def-eq to `neg_overflows_iW`, found via
-        // `find_violation_leaf_through_eq`), but `function_safety_vcs_all_discharged`
+        // (the core `Eq(self, MIN)` grounds def-eq to `neg_overflows_iW`, resolved
+        // through the block definition that BINDS the assert's own condition local —
+        // `vc_faithful::assert_condition_binding`, which replaced the whole-formula
+        // `find_violation_leaf_through_eq` scan on 2026-07-29), but
+        // `function_safety_vcs_all_discharged`
         // correctly FAILS: the obligation `self != iN::MIN` is NOT implied by the guard
         // `self < 0` (`MIN < 0`), so the negation-overflow VC is genuinely
         // undischargeable WITHOUT a precondition `self != iN::MIN`. The assert-guarded

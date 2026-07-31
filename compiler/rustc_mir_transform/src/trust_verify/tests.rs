@@ -14,6 +14,16 @@ use trust_router::full_verification::{
 
 use super::*;
 
+/// Trust: the value a DEFAULT session would hand
+/// `verify_full_bundle_with_body_bound_receipts` — `-Ztrust-verify-timeout-ms`'s
+/// default (compiler/rustc_session/src/options.rs:3378), which production reaches
+/// through `vc_timeout_ms(tcx.sess)`. The tests below assert DISPATCH and RECEIPT
+/// behaviour, not timeout behaviour, so they take the default rather than inventing
+/// a number: a test-only timeout that drifts from the shipped default would quietly
+/// stop exercising the configuration users actually run.
+const SESSION_DEFAULT_VC_TIMEOUT_MS: u64 = 5_000;
+
+
 /// These carrier fixtures have no compiler `Session`, and therefore no
 /// session-owned panic-freedom grounding inventory. Keep that absence explicit
 /// while exercising the same validation core as production.
@@ -545,6 +555,187 @@ fn test_vc(line_start: u32) -> VerificationCondition {
         },
         formula: trust_types::Formula::Bool(true),
         contract_metadata: None,
+    }
+}
+
+/// Trust (regression — positive-witness ICE / nullified sep discharges):
+/// `refute_unsafe_demand_findings` selects the `[unsafe` FAMILY by marker, but
+/// the refutation criterion is "unprovable by construction". A ground
+/// `Bool(true)` demand finding is still forced `Failed` from any non-`Failed`
+/// verdict; a genuinely solvable separation-logic obligation that a solver
+/// PROVED — `[unsafe:sep:deref] null check` (`ptr == 0`, discharged by
+/// `SepEngine::discharge_stack_good`) and the `[unsafe:sep:backing]` ESTABLISH
+/// obligation (`alloc_size < len`, the `#[trust::backing]` certificate's whole
+/// point) — keeps its proof. Overriding those both destroyed real proofs and
+/// drove a genuine `Proved` into `structural_refutation_solver_label`, whose
+/// positive-witness `debug_assert!` then ICEd trustc on
+/// `let x = 7; let p = &x as *const i32; unsafe { *p }`.
+#[test]
+fn unsafe_demand_refutation_spares_genuinely_discharged_separation_obligations() {
+    let unsafe_vc = |message: &str, formula: Formula| {
+        let mut vc = test_vc(11);
+        vc.kind = VcKind::Assertion { message: message.to_string() };
+        vc.formula = formula;
+        vc
+    };
+    let proved = || VerificationResult::Proved {
+        solver: "ay-in-process".into(),
+        time_ms: 0,
+        strength: ProofStrength::smt_unsat(),
+        proof_certificate: None,
+        solver_warnings: None,
+        native_proof_envelope: None,
+    };
+    let ptr = Formula::Var("ptr_raw_2".to_string(), Sort::Int);
+    let mut results = vec![
+        // Unprovable by construction: a ground `Bool(true)` violation. Still
+        // refuted from a non-`Failed` verdict — the original surviving-mutant fix.
+        (
+            unsafe_vc("[unsafe] missing SAFETY comment on unsafe block", Formula::Bool(true)),
+            VerificationResult::Unknown {
+                solver: "trust-full-verifier".into(),
+                time_ms: 0,
+                reason: "no model".to_string(),
+            },
+        ),
+        // Same family, a different non-`Failed` verdict: still refuted. (A
+        // `Proved` on a ground `Bool(true)` violation is deliberately NOT
+        // exercised here — that case IS the positive-witness breach and
+        // `structural_refutation_solver_label` debug-asserts on it by design. A
+        // `Proved` on the `Bool(false)` placeholder is NOT a breach — see
+        // `unsafe_demand_refutation_refutes_placeholder_proofs_for_vacuity`.)
+        (
+            unsafe_vc(
+                "[unsafe:unmodeled-call] call to `c` (unsafe fn) is not covered",
+                Formula::Bool(true),
+            ),
+            VerificationResult::Timeout { solver: "trust-mc".into(), timeout_ms: 7 },
+        ),
+        // A REAL obligation a real solver discharged: `ptr == 0` refuted by the
+        // stack-good non-null fact. Must keep its proof.
+        (
+            unsafe_vc(
+                "[unsafe:sep:deref] null check for *raw_2",
+                Formula::And(vec![
+                    Formula::Gt(Box::new(ptr.clone()), Box::new(Formula::Int(0))),
+                    Formula::Eq(Box::new(ptr), Box::new(Formula::Int(0))),
+                ]),
+            ),
+            proved(),
+        ),
+        // The `#[trust::backing]` ESTABLISH obligation `alloc_size < len`.
+        (
+            unsafe_vc(
+                "[unsafe:sep:backing] field #0 must be valid for field #1 \
+                 bytes at construction in map",
+                Formula::Lt(
+                    Box::new(Formula::Var("len".to_string(), Sort::Int)),
+                    Box::new(Formula::Var("len".to_string(), Sort::Int)),
+                ),
+            ),
+            proved(),
+        ),
+        // A solvable sep obligation nothing discharged still fails closed.
+        (
+            unsafe_vc(
+                "[unsafe:sep:deref] alignment check for *raw_2",
+                Formula::Var("misaligned".to_string(), Sort::Bool),
+            ),
+            VerificationResult::Unknown {
+                solver: "trust-full-verifier".into(),
+                time_ms: 0,
+                reason: "nonlinear".to_string(),
+            },
+        ),
+    ];
+
+    refute_unsafe_demand_findings(&mut results);
+
+    let solver_of = |index: usize| match &results[index].1 {
+        VerificationResult::Failed { solver, .. } => format!("failed:{solver}"),
+        VerificationResult::Proved { solver, .. } => format!("proved:{solver}"),
+        other => format!("other:{other:?}"),
+    };
+    assert_eq!(
+        solver_of(0),
+        "failed:structural-unsafe-demand-finding",
+        "a ground unprovable demand finding must still be refuted"
+    );
+    assert_eq!(
+        solver_of(1),
+        "failed:structural-unsafe-demand-finding",
+        "every non-`Failed` verdict on a ground finding is still refuted"
+    );
+    assert!(
+        matches!(&results[1].1, VerificationResult::Failed { time_ms: 7, .. }),
+        "the overridden verdict's elapsed time is carried onto the refutation"
+    );
+    assert_eq!(
+        solver_of(2),
+        "proved:ay-in-process",
+        "a discharged null check carries a real formula and must keep its proof"
+    );
+    assert_eq!(
+        solver_of(3),
+        "proved:ay-in-process",
+        "the backing ESTABLISH obligation is designed to be discharged"
+    );
+    assert_eq!(
+        solver_of(4),
+        "failed:structural-unsafe-demand-finding",
+        "an undischarged solvable unsafe obligation still fails closed"
+    );
+}
+
+/// Trust (vacuous-placeholder-proof arm): `Bool(false)` — the full-lane
+/// reconstruction placeholder (`legacy_vc_from_api_obligation` falls back to it
+/// when the obligation's payload formula cannot be reconstructed) — is UNSAT,
+/// so a sound solver legitimately returns `Proved` for it. That proof is
+/// vacuous about the original obligation, and the vacuity gate
+/// (`apply_vacuity_gate_with_authority`) runs only downstream of
+/// `refute_unsafe_demand_findings`, so the pass must refuse it itself: forced
+/// `Failed` under the dedicated placeholder label, WITHOUT routing through
+/// `structural_refutation_solver_label` — whose positive-witness
+/// `debug_assert!` is an invariant of the `Bool(true)`
+/// unprovable-by-construction class only. On the unrepaired code this row
+/// trips that assertion (ICE in a debug build) and, in a release build, is
+/// mislabeled `…-over-unwitnessed-proof:…`.
+#[test]
+fn unsafe_demand_refutation_refutes_placeholder_proofs_for_vacuity() {
+    let mut vc = test_vc(13);
+    // The reconstructed native-transport shape: re-kinded to the hardened
+    // unsafe-operation family, payload lost to the `Bool(false)` placeholder.
+    vc.kind = VcKind::HardenedBoundary {
+        category: trust_types::HardenedVcCategory::UnsafeOperation,
+        callee: "map".to_string(),
+        detail: "[unsafe:sep:heap] out-of-bounds heap read".to_string(),
+    };
+    vc.formula = Formula::Bool(false);
+    let mut results = vec![(
+        vc,
+        VerificationResult::Proved {
+            solver: "ay-in-process".into(),
+            time_ms: 3,
+            strength: ProofStrength::smt_unsat(),
+            proof_certificate: None,
+            solver_warnings: None,
+            native_proof_envelope: None,
+        },
+    )];
+
+    refute_unsafe_demand_findings(&mut results);
+
+    match &results[0].1 {
+        VerificationResult::Failed { solver, time_ms, counterexample } => {
+            assert_eq!(
+                format!("{solver}"),
+                "structural-unsafe-demand-finding-over-vacuous-placeholder-proof:ay-in-process",
+                "a placeholder proof is refuted for vacuity, not as a witness breach"
+            );
+            assert_eq!(*time_ms, 3, "the vacuous proof's elapsed time is carried");
+            assert!(counterexample.is_none(), "no counterexample can be minted for a placeholder");
+        }
+        other => panic!("a `Proved` placeholder row must be forced Failed, got {other:?}"),
     }
 }
 
@@ -2494,6 +2685,7 @@ impl trust_verifier_api::VerificationEngine for NativeTrustIrUnitEngine {
                 obligation_id: obligation.obligation_id.clone(),
                 engine: self.manifest.clone(),
                 status: trust_verifier_api::EvidenceStatus::Proved,
+                decline: None,
                 proof_strength: Some(self.proof_strength.clone()),
                 artifacts: materialize_native_unit_test_artifacts(
                     &self.manifest.name,
@@ -2689,6 +2881,7 @@ fn test_api_evidence(
             trust_verifier_api::EngineKind::Composite,
         ),
         status: trust_verifier_api::EvidenceStatus::Proved,
+        decline: None,
         proof_strength: Some(proof_strength),
         artifacts,
         counterexample: None,
@@ -2922,6 +3115,7 @@ fn trust_mc_compiler_transport_rows_share_canonical_native_identity() {
             trust_verifier_api::EngineKind::Reachability,
         ),
         status: trust_verifier_api::EvidenceStatus::Proved,
+        decline: None,
         proof_strength: Some(trust_verifier_api::ProofStrength {
             reasoning: trust_verifier_api::ReasoningKind::Pdr,
             assurance: trust_verifier_api::AssuranceLevel::SmtBacked,
@@ -6793,10 +6987,7 @@ fn full_verification_compiler_input_defers_direct_trust_vc_proof_unit() {
             proved: transport_results.iter().filter(|row| row.outcome == Outcome::Proved).count(),
             failed: transport_results.iter().filter(|row| row.outcome == Outcome::Failed).count(),
             unknown: transport_results.iter().filter(|row| row.outcome == Outcome::Unknown).count(),
-            timed_out: transport_results
-                .iter()
-                .filter(|row| row.outcome.is_timeout())
-                .count(),
+            timed_out: transport_results.iter().filter(|row| row.outcome.is_timeout()).count(),
             skipped: transport_results.iter().filter(|row| row.outcome == Outcome::Skipped).count(),
             runtime_checked: transport_results
                 .iter()
@@ -7105,6 +7296,7 @@ fn direct_trust_vc_live_fixture(run_id: &str) -> DirectTrustVcCompilerFixture {
         Some(&native_bundle),
         &[],
         &context,
+        SESSION_DEFAULT_VC_TIMEOUT_MS,
     );
     assert!(live.body_bound_receipts.is_empty());
     let snapshot = exact_fresh_vc_rekey_snapshot(
@@ -7611,6 +7803,7 @@ fn direct_trust_vc_receipt_survives_exact_unrelated_bridge_publication() {
         Some(&native_bundle),
         &[],
         &context,
+        SESSION_DEFAULT_VC_TIMEOUT_MS,
     );
     let mut live_receipts = live.live_receipts.expect("live receipt package");
     assert!(!live_receipts.direct_trust_vc_receipts().is_empty(), "direct sibling receipt");
@@ -7733,6 +7926,7 @@ fn fresh_exact_direct_fixture_for(
             Some(&native_bundle),
             &[],
             &context,
+            SESSION_DEFAULT_VC_TIMEOUT_MS,
         );
     assert!(body_bound_receipts.is_empty());
     let live_receipts = live_receipts.expect("live receipt package");
@@ -8036,7 +8230,8 @@ fn fresh_exact_direct_receipt_mints_s3_and_s4_rejects_public_only_or_mutated_tok
                 &authorities,
             );
             assert_ne!(
-                candidate_transport[target_row].outcome, Outcome::Proved,
+                candidate_transport[target_row].outcome,
+                Outcome::Proved,
                 "{label} must not transport as proved",
             );
             assert!(
@@ -8359,7 +8554,8 @@ fn same_span_fresh_exact_direct_authority_and_transport_are_row_bijective() {
     );
     assert_eq!(transport[row_b].obligation_id.as_deref(), Some(obligation_id_b.as_str()));
     assert_eq!(
-        transport[row_b].outcome, Outcome::Unknown,
+        transport[row_b].outcome,
+        Outcome::Unknown,
         "an E4 loop-contract row has no runtime monitor and must fail closed without authority",
     );
     assert!(transport[row_b].proof_evidence.is_none());
@@ -8910,6 +9106,7 @@ fn unsupported_trust_vc_native_import_surfaces_structured_transport_row() {
         obligation_id: obligation.obligation_id.clone(),
         engine: trust_vc_manifest,
         status: trust_verifier_api::EvidenceStatus::Unsupported,
+        decline: None,
         proof_strength: None,
         artifacts: Vec::new(),
         counterexample: None,
@@ -9019,6 +9216,7 @@ fn rejected_trust_vc_native_import_surfaces_structured_transport_row() {
         obligation_id: obligation.obligation_id.clone(),
         engine: trust_vc_manifest,
         status: trust_verifier_api::EvidenceStatus::Unsupported,
+        decline: None,
         proof_strength: None,
         artifacts: Vec::new(),
         counterexample: None,
@@ -10194,6 +10392,7 @@ fn body_bound_monitor_stamped_ge_and_gt_preserve_exact_compiler_carriers() {
         Some(&ge_native),
         &ge_carriers,
         &trust_router::VerifierExecutionContext::new("body-bound-monitor-ge"),
+        SESSION_DEFAULT_VC_TIMEOUT_MS,
     );
     assert_eq!(ge_live.body_bound_receipts.len(), 1);
 
@@ -10222,6 +10421,7 @@ fn body_bound_monitor_stamped_ge_and_gt_preserve_exact_compiler_carriers() {
         Some(&gt_native),
         &gt_carriers,
         &trust_router::VerifierExecutionContext::new("body-bound-monitor-gt"),
+        SESSION_DEFAULT_VC_TIMEOUT_MS,
     );
     assert!(gt_live.body_bound_receipts.is_empty(), "refutations never mint proof receipts");
     assert!(gt_live.result.evidence.iter().any(|evidence| {
@@ -10343,6 +10543,7 @@ fn body_bound_live_trust_wp_receipt_is_exact_private_authority() {
         Some(&native_bundle),
         &carriers,
         &context,
+        SESSION_DEFAULT_VC_TIMEOUT_MS,
     );
     assert_eq!(
         live.body_bound_receipts.len(),
@@ -10665,6 +10866,7 @@ fn body_bound_forged_claim_is_rejected_by_the_kernel() {
         Some(&native_bundle),
         &carriers,
         &context,
+        SESSION_DEFAULT_VC_TIMEOUT_MS,
     );
     let finalized = finalize_body_bound_native_replay_receipts(
         &bundle,
@@ -11966,24 +12168,44 @@ fn full_verification_flags_failed_unknown_runtime_and_unaccounted_artifacts() {
 }
 
 #[test]
-fn strict_scope_treats_every_non_proved_bucket_as_fatal() {
-    for failure in [
-        FullVerificationFailure { failed: 1, unknown: 0, runtime_checked: 0, skipped: 0 },
-        FullVerificationFailure { failed: 0, unknown: 1, runtime_checked: 0, skipped: 0 },
-        FullVerificationFailure { failed: 0, unknown: 0, runtime_checked: 1, skipped: 0 },
-        FullVerificationFailure { failed: 0, unknown: 0, runtime_checked: 0, skipped: 1 },
-    ] {
+fn strict_scope_bucket_fatality_follows_the_discharge_policy() {
+    // Trust (program-3 C.7): `strict_failure_is_fatal` gained
+    // `require_full_discharge`, and the two policies differ on EXACTLY ONE
+    // bucket. This test pins both sides, because pinning only one leaves the
+    // other free to regress — and the whole point of the parameter is that the
+    // two answers differ.
+    let failed = FullVerificationFailure { failed: 1, unknown: 0, runtime_checked: 0, skipped: 0 };
+    let unknown = FullVerificationFailure { failed: 0, unknown: 1, runtime_checked: 0, skipped: 0 };
+    let checked = FullVerificationFailure { failed: 0, unknown: 0, runtime_checked: 1, skipped: 0 };
+    let skipped = FullVerificationFailure { failed: 0, unknown: 0, runtime_checked: 0, skipped: 1 };
+    let clean = FullVerificationFailure { failed: 0, unknown: 0, runtime_checked: 0, skipped: 0 };
+
+    // Full discharge: every unproved bucket is fatal, `runtime_checked` included.
+    for failure in [failed, unknown, checked, skipped] {
         assert!(
-            strict_failure_is_fatal(failure),
-            "strict scope must reject every unproved outcome bucket: {failure:?}"
+            strict_failure_is_fatal(failure, true),
+            "full discharge must reject every unproved outcome bucket: {failure:?}"
         );
     }
-    assert!(!strict_failure_is_fatal(FullVerificationFailure {
-        failed: 0,
-        unknown: 0,
-        runtime_checked: 0,
-        skipped: 0,
-    }));
+
+    // Policy B: `runtime_checked` is the ONE tolerated bucket — rustc still emits
+    // the check, so such a row is bit-for-bit vanilla Rust semantics and failing
+    // the build on it buys no safety while costing drop-in. Every other bucket
+    // stays fatal.
+    for failure in [failed, unknown, skipped] {
+        assert!(
+            strict_failure_is_fatal(failure, false),
+            "policy B must still reject this bucket: {failure:?}"
+        );
+    }
+    assert!(
+        !strict_failure_is_fatal(checked, false),
+        "policy B tolerates a runtime-checked row; this is the whole difference"
+    );
+
+    // Nothing unproved is fatal under either policy.
+    assert!(!strict_failure_is_fatal(clean, true));
+    assert!(!strict_failure_is_fatal(clean, false));
 }
 
 #[test]
@@ -12070,6 +12292,7 @@ fn native_run_result(
             obligation_id: format!("obligation-{idx}"),
             engine: engine.clone(),
             status: trust_verifier_api::EvidenceStatus::Proved,
+            decline: None,
             proof_strength: Some(trust_verifier_api::ProofStrength::smt_unsat()),
             artifacts: vec![trust_verifier_api::EvidenceArtifact {
                 kind: trust_verifier_api::EvidenceArtifactKind::SolverTranscript,
@@ -12485,6 +12708,7 @@ fn authority_test_strict_native_run(
             trust_verifier_api::EngineKind::Reachability,
         ),
         status: trust_verifier_api::EvidenceStatus::Proved,
+        decline: None,
         proof_strength: Some(trust_verifier_api::ProofStrength::smt_unsat()),
         artifacts,
         counterexample: None,
@@ -12600,6 +12824,7 @@ fn authority_test_direct_trust_vc_run(
         obligation_id: obligation.obligation_id.clone(),
         engine: engine.clone(),
         status: trust_verifier_api::EvidenceStatus::Proved,
+        decline: None,
         proof_strength: Some(trust_verifier_api::ProofStrength::certified(
             trust_verifier_api::ReasoningKind::OwnershipAnalysis,
         )),
@@ -14083,7 +14308,7 @@ fn certified_monitor_transport_uses_original_bundle_metadata_and_exact_row_bindi
 }
 
 #[test]
-fn loop_contracts_are_explicitly_unmonitored_without_inserting_iteration_monitors() {
+fn unmatched_loop_contract_rows_are_explicitly_unmonitored() {
     let function = proof_feedback_loop_function();
     let compiler_contracts = trust_types::CompilerContractBundle::new(function.contracts.clone());
     let (solver_vcs, discharged) = trust_vcgen::generate_vcs_with_discharge(&function);
@@ -14193,6 +14418,17 @@ fn loop_contracts_are_explicitly_unmonitored_without_inserting_iteration_monitor
             obligation.obligation_id,
         );
     }
+}
+
+#[test]
+fn loop_monitor_predecessor_inventory_is_per_block_not_per_duplicate_switch_edge() {
+    let first = BasicBlock::from_usize(7);
+    let second = BasicBlock::from_usize(3);
+    assert_eq!(
+        canonical_monitor_predecessors([first, second, first, second, first]),
+        vec![second, first],
+        "duplicate SwitchInt targets must produce one instrumentation chain per predecessor block",
+    );
 }
 
 #[test]
@@ -14604,6 +14840,77 @@ fn grounded_panic_freedom_identity_cannot_cross_authorize_same_index_in_another_
 }
 
 #[test]
+fn native_proved_authority_accepts_only_the_exact_recorded_grounding() {
+    let mut obligation =
+        authority_test_native_obligation("vc:test::grounded-s4:assertion:panic-freedom:0", 54, 54);
+    obligation.kind = trust_verifier_api::ObligationKind::Assertion;
+    obligation.description = "panic freedom: test::grounded_s4".to_string();
+    let run = authority_test_strict_native_run(obligation.clone());
+
+    let mut vc = test_vc(54);
+    vc.function = trust_types::Symbol::intern("test::grounded_s4");
+    vc.kind = VcKind::Assertion { message: "panic freedom: test::grounded_s4".to_string() };
+    vc.formula = Formula::Eq(Box::new(Formula::Int(0)), Box::new(Formula::Int(1)));
+    let results = vec![(vc, authority_test_proved())];
+    let bindings = vec![None];
+    let cleancic = certify_all(&results, None);
+    let authorities = build_result_proof_authorities(&results, &bindings, None, &cleancic);
+    assert!(matches!(authorities[0].as_ref(), Some(ResultProofAuthority::KernelCertified { .. })));
+
+    let exact = exact_result_row_identity(0, &results[0].0).expect("exact grounded row");
+    let validate = |candidate_results: &[(VerificationCondition, VerificationResult)],
+                    recorded: Option<ExactResultRowIdentity>| {
+        native_proved_authority_validation_failures_with_grounding_lookup(
+            Some(&run),
+            candidate_results,
+            &bindings,
+            &authorities,
+            |id| (id == obligation.obligation_id).then(|| recorded.clone()).flatten(),
+        )
+    };
+
+    assert!(
+        validate(&results, Some(exact.clone())).is_empty(),
+        "the exact compiler-recorded grounded row retains its kernel authority"
+    );
+    assert!(
+        validate(&results, None)
+            .iter()
+            .any(|failure| failure.contains("has no exact current compiler result binding")),
+        "a missing grounding record must not excuse the retired public binding"
+    );
+
+    let mut unrelated_vc = results[0].0.clone();
+    unrelated_vc.function = trust_types::Symbol::intern("test::unrelated");
+    let unrelated =
+        exact_result_row_identity(0, &unrelated_vc).expect("unrelated exact row identity");
+    assert!(
+        validate(&results, Some(unrelated))
+            .iter()
+            .any(|failure| failure.contains("exact grounded row is absent, changed")),
+        "an unrelated function at the same row index must not donate grounding authority"
+    );
+
+    let mut cross_row = exact.clone();
+    cross_row.index = 1;
+    assert!(
+        validate(&results, Some(cross_row))
+            .iter()
+            .any(|failure| failure.contains("exact grounded row is absent, changed")),
+        "a grounding record moved to another row index must fail closed"
+    );
+
+    let mut mutated_results = results.clone();
+    mutated_results[0].0.formula = Formula::Bool(true);
+    assert!(
+        validate(&mutated_results, Some(exact))
+            .iter()
+            .any(|failure| failure.contains("exact grounded row is absent, changed")),
+        "a post-grounding formula mutation must revoke the recorded row and its authority"
+    );
+}
+
+#[test]
 fn duplicate_public_obligation_ids_are_ambiguous_and_fail_closed() {
     let obligation = authority_test_native_obligation("authority:duplicate", 41, 41);
     let mut run = authority_test_strict_native_run(obligation.clone());
@@ -14682,6 +14989,7 @@ fn same_obligation_proved_failed_conflict_cannot_mint_compiler_authority() {
         obligation_id: obligation.obligation_id.clone(),
         engine: proved.engine.clone(),
         status: trust_verifier_api::EvidenceStatus::Failed,
+        decline: None,
         proof_strength: None,
         artifacts: Vec::new(),
         counterexample: None,
@@ -15869,6 +16177,7 @@ fn strict_l0_verification_rejects_public_l0_api_obligations_not_compiler_proved(
             trust_verifier_api::EngineKind::Deductive,
         ),
         status: trust_verifier_api::EvidenceStatus::Proved,
+        decline: None,
         proof_strength: None,
         artifacts: Vec::new(),
         counterexample: None,
@@ -17364,10 +17673,16 @@ fn extern_call_others_all_proved_gate() {
     ];
     assert!(extern_call_demotion_others_all_proved(&ok));
     // Add a genuine non-mandate unknown → gate closed (fail-closed).
-    let blocked = vec![extern_call_transport_row(Outcome::Unknown), plain_transport_row(Outcome::Unknown, false)];
+    let blocked = vec![
+        extern_call_transport_row(Outcome::Unknown),
+        plain_transport_row(Outcome::Unknown, false),
+    ];
     assert!(!extern_call_demotion_others_all_proved(&blocked));
     // A failed non-mandate row also blocks.
-    let failed = vec![extern_call_transport_row(Outcome::Unknown), plain_transport_row(Outcome::Failed, false)];
+    let failed = vec![
+        extern_call_transport_row(Outcome::Unknown),
+        plain_transport_row(Outcome::Failed, false),
+    ];
     assert!(!extern_call_demotion_others_all_proved(&failed));
 }
 
@@ -17443,19 +17758,24 @@ fn fmt_format_gate_requires_all_three_pins() {
 #[test]
 fn fmt_format_extern_call_scopes_to_format_not_stdout() {
     // The `alloc::fmt::format` (format! backend) leg IS the safe subset.
-    assert!(transport_row_is_unproved_fmt_format_extern_call(&extern_call_transport_row(Outcome::Unknown
+    assert!(transport_row_is_unproved_fmt_format_extern_call(&extern_call_transport_row(
+        Outcome::Unknown
     )));
     // A proved fmt::format row is never demoted.
-    assert!(!transport_row_is_unproved_fmt_format_extern_call(&extern_call_transport_row(Outcome::Proved
+    assert!(!transport_row_is_unproved_fmt_format_extern_call(&extern_call_transport_row(
+        Outcome::Proved
     )));
     // The stdout `_print` leg is an extern-call row but NOT in the safe subset.
-    assert!(transport_row_is_unproved_extern_call(&stdout_print_extern_call_transport_row(Outcome::Unknown
+    assert!(transport_row_is_unproved_extern_call(&stdout_print_extern_call_transport_row(
+        Outcome::Unknown
     )));
     assert!(!transport_row_is_unproved_fmt_format_extern_call(
         &stdout_print_extern_call_transport_row(Outcome::Unknown)
     ));
     // A non-extern-call row is not a fmt::format row.
-    assert!(!transport_row_is_unproved_fmt_format_extern_call(&plain_transport_row(Outcome::Unknown, false
+    assert!(!transport_row_is_unproved_fmt_format_extern_call(&plain_transport_row(
+        Outcome::Unknown,
+        false
     )));
     // The callee extractor reads the backtick-delimited callee.
     assert_eq!(
@@ -17652,23 +17972,35 @@ fn expected_absent_identity_preserves_generic_and_crate_disambiguation_bytes() {
 #[test]
 fn absent_expected_absent_and_drop_glue_unproved_rows_are_fatal() {
     // The unproved absent-callee row is detected as a fatal panic gap.
-    assert!(transport_row_is_unproved_assumption_panic(&absent_callee_transport_row(Outcome::Unknown)));
-    assert!(transport_row_is_unproved_assumption_panic(&absent_callee_transport_row(Outcome::RuntimeChecked
+    assert!(transport_row_is_unproved_assumption_panic(&absent_callee_transport_row(
+        Outcome::Unknown
     )));
-    assert!(transport_row_is_unproved_assumption_panic(&expected_absent_callee_transport_row(Outcome::Unknown
+    assert!(transport_row_is_unproved_assumption_panic(&absent_callee_transport_row(
+        Outcome::RuntimeChecked
+    )));
+    assert!(transport_row_is_unproved_assumption_panic(&expected_absent_callee_transport_row(
+        Outcome::Unknown
     )));
     // The unproved drop-glue row too.
     assert!(transport_row_is_unproved_assumption_panic(&drop_glue_transport_row(Outcome::Unknown)));
     // A proved row (never actually emitted for this class, but keyed on for safety)
     // is not a gap.
-    assert!(!transport_row_is_unproved_assumption_panic(&absent_callee_transport_row(Outcome::Proved)));
-    assert!(!transport_row_is_unproved_assumption_panic(&expected_absent_callee_transport_row(Outcome::Proved
+    assert!(!transport_row_is_unproved_assumption_panic(&absent_callee_transport_row(
+        Outcome::Proved
+    )));
+    assert!(!transport_row_is_unproved_assumption_panic(&expected_absent_callee_transport_row(
+        Outcome::Proved
     )));
     assert!(!transport_row_is_unproved_assumption_panic(&drop_glue_transport_row(Outcome::Proved)));
     // A plain obligation and an extern-call row are a DIFFERENT class — not this
     // fail-closed panic gap (extern-call has its own W3.5/W3.6 demotion gate).
-    assert!(!transport_row_is_unproved_assumption_panic(&plain_transport_row(Outcome::Unknown, false)));
-    assert!(!transport_row_is_unproved_assumption_panic(&extern_call_transport_row(Outcome::Unknown)));
+    assert!(!transport_row_is_unproved_assumption_panic(&plain_transport_row(
+        Outcome::Unknown,
+        false
+    )));
+    assert!(!transport_row_is_unproved_assumption_panic(&extern_call_transport_row(
+        Outcome::Unknown
+    )));
 
     // The batch predicate fires when ANY row is an unproved assumption panic.
     assert!(transport_rows_have_unproved_assumption_panic(&[
@@ -18015,7 +18347,10 @@ fn native_lowering_collapse_preserves_proofs_and_refutations() {
     assert!(native_lowering_collapse_keeps_row(&plain_transport_row(Outcome::Failed, false)));
     // Poisoned coverage-gap outcomes fold into the single native-lowering row.
     assert!(!native_lowering_collapse_keeps_row(&plain_transport_row(Outcome::Unknown, false)));
-    assert!(!native_lowering_collapse_keeps_row(&plain_transport_row(Outcome::RuntimeChecked, false)));
+    assert!(!native_lowering_collapse_keeps_row(&plain_transport_row(
+        Outcome::RuntimeChecked,
+        false
+    )));
     assert!(!native_lowering_collapse_keeps_row(&plain_transport_row(Outcome::Skipped, false)));
 }
 
@@ -18133,6 +18468,7 @@ fn unsupported_evidence_for(
             trust_verifier_api::EngineKind::Composite,
         ),
         status: trust_verifier_api::EvidenceStatus::Unsupported,
+        decline: None,
         proof_strength: None,
         artifacts: Vec::new(),
         counterexample: None,
@@ -18459,7 +18795,8 @@ fn def_site_requires_marker_keeps_public_and_private_carriers_in_parity() {
     let marker_row = &transport_rows[marker_index];
     assert_eq!(marker_row.kind, "assumption:requires");
     assert_eq!(
-        marker_row.outcome, Outcome::Skipped,
+        marker_row.outcome,
+        Outcome::Skipped,
         "the transport boundary must expose the def-site requires marker as an assumption: {marker_row:#?}"
     );
     assert_eq!(marker_row.solver, TRUST_ENTRY_ASSUMPTION_SOLVER);
@@ -18827,6 +19164,316 @@ fn extern_abi_non_unwinding_whitelist_is_airtight() {
 }
 
 #[test]
+fn dataflow_encoder_fires_on_invoke_function() {
+    // Regression guard for the scoping fix: real functions contain calls
+    // (lowered to `Invoke` terminators, whose landing pad ends in `Unreachable`)
+    // and matches (`Switch`). The enriched data-flow encoder MUST stay in scope
+    // (`Ok(Some)`) for such a function — an earlier {Br,CondBr,Return,Unreachable}
+    // -only gate fell back to the structural encoder on every real function.
+    use trust_ir::{Block, BlockId, FuncId, FuncTyId, Function, Inst, InstrNode, Ty, ValueId};
+
+    let off = ValueId::new(0);
+    let call_ret = ValueId::new(10);
+    let bb1_param = ValueId::new(1);
+
+    // bb0(off: i64): %10 = invoke @1() normal=bb1(off) unwind=bb2
+    let mut bb0 = Block::new(BlockId::new(0)).with_param(off, Ty::I64);
+    bb0.body.push(
+        InstrNode::new(Inst::Invoke {
+            callee: FuncId::new(1),
+            args: vec![],
+            normal_dest: BlockId::new(1),
+            normal_args: vec![off],
+            unwind_dest: BlockId::new(2),
+        })
+        .with_result(call_ret),
+    );
+    // bb1(v1: i64): return
+    let mut bb1 = Block::new(BlockId::new(1)).with_param(bb1_param, Ty::I64);
+    bb1.body.push(InstrNode::new(Inst::Return { values: vec![] }));
+    // bb2(): unreachable  (the landing-pad panic sink)
+    let mut bb2 = Block::new(BlockId::new(2));
+    bb2.body.push(InstrNode::new(Inst::Unreachable));
+
+    let mut function =
+        Function::new(FuncId::new(0), "demo::with_invoke", FuncTyId::new(0), BlockId::new(0));
+    function.blocks = vec![bb0, bb1, bb2];
+
+    let (relations, rules, vars) =
+        super::trust_mc_dataflow_chc_for_function(&function, super::ChcErrorMode::Structural)
+            .expect("encoder must not error on a well-formed function")
+            .expect("encoder MUST fire (Ok(Some)) for a function whose terminator is an Invoke");
+
+    // Enriched block relations carry `arg_sorts` (structural relations are nullary):
+    // bb0 threads its i64 param, so its relation declares one Int argument.
+    let bb0_relation = relations
+        .as_array()
+        .and_then(|relations| relations.iter().find(|relation| relation["name"] == "bb0"))
+        .expect("bb0 relation present");
+    assert_eq!(
+        bb0_relation["arg_sorts"],
+        serde_json::json!([{ "kind": "int" }]),
+        "bb0 relation must carry its i64 param as an Int arg_sort (data-flow enrichment)"
+    );
+
+    // The Invoke unwind edge reaches the `Unreachable` panic sink → a REACHABLE
+    // `error` edge on bb2 (structural behavior, now with canonical args).
+    let bb2_error = rules
+        .as_array()
+        .and_then(|rules| {
+            rules.iter().find(|rule| {
+                rule["head"]["name"] == "error" && rule["body"]["relation"]["name"] == "bb2"
+            })
+        })
+        .expect("bb2 (unreachable) must route to error");
+    assert_eq!(bb2_error["body"]["constraints"][0]["value"], true);
+
+    // The threaded SSA value is declared once in the top-level `vars`.
+    assert!(
+        vars.iter().any(|var| var["name"] == "v0"),
+        "off (v0) must be declared in vars: {vars:?}"
+    );
+}
+
+#[test]
+fn dataflow_arithmetic_safety_only_models_unsigned_overflow_with_range_facts() {
+    // SOUNDNESS regression: an unsigned `u64` overflow MUST be modeled in
+    // ArithmeticSafetyOnly mode with (a) the `> 2^64-1` violation error edge
+    // (never dropped — this is what refutes the UNSAFE program), (b) the free
+    // entry param's `0 <= a <= u64::MAX` type invariant, and (c) NO structural
+    // `Unreachable`->error edge.
+    use trust_ir::{
+        Block, BlockId, FuncId, FuncTyId, Function, Inst, InstrNode, OverflowOp, Ty, ValueId,
+    };
+    let a = ValueId::new(0);
+    let val = ValueId::new(2);
+    let ovf = ValueId::new(3);
+
+    // bb0(a: u64): %2,%3 = add.overflow u64 a, a ; br bb1
+    let mut bb0 = Block::new(BlockId::new(0)).with_param(a, Ty::U64);
+    bb0.body.push(
+        InstrNode::new(Inst::Overflow { op: OverflowOp::AddOverflow, ty: Ty::U64, lhs: a, rhs: a })
+            .with_results([val, ovf]),
+    );
+    bb0.body.push(InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![] }));
+    // bb1(): unreachable  (panic sink — a PURE sink in AS mode, no error edge)
+    let mut bb1 = Block::new(BlockId::new(1));
+    bb1.body.push(InstrNode::new(Inst::Unreachable));
+
+    let mut function =
+        Function::new(FuncId::new(0), "demo::u64_add", FuncTyId::new(0), BlockId::new(0));
+    function.blocks = vec![bb0, bb1];
+
+    let (_relations, rules, _vars) = super::trust_mc_dataflow_chc_for_function(
+        &function,
+        super::ChcErrorMode::ArithmeticSafetyOnly,
+    )
+    .expect("no error on a well-formed function")
+    .expect("unsigned u64 overflow IS modeled -> Ok(Some)");
+    let rules = rules.as_array().expect("rules array");
+    let u64_max = u64::MAX.to_string(); // 18446744073709551615
+
+    // (b) Entry fact carries the unsigned type invariant `0 <= a <= u64::MAX`.
+    let entry = rules
+        .iter()
+        .find(|rule| rule["head"]["name"] == "bb0" && rule["body"].get("relation").is_none())
+        .expect("entry fact for bb0");
+    let entry_constraints = entry["body"]["constraints"].as_array().expect("entry constraints");
+    assert!(
+        entry_constraints
+            .iter()
+            .any(|constraint| constraint["op"] == "ge" && constraint["rhs"]["value"] == "0"),
+        "entry fact must assert a >= 0: {entry_constraints:?}"
+    );
+    assert!(
+        entry_constraints
+            .iter()
+            .any(|constraint| constraint["op"] == "le"
+                && constraint["rhs"]["value"] == u64_max.as_str()),
+        "entry fact must assert a <= u64::MAX: {entry_constraints:?}"
+    );
+
+    // (a) The unsigned overflow VIOLATION error edge (`> 2^64-1`) is present.
+    assert!(
+        rules.iter().any(|rule| {
+            rule["head"]["name"] == "error"
+                && rule["body"]["relation"]["name"] == "bb0"
+                && serde_json::to_string(rule).unwrap().contains(u64_max.as_str())
+        }),
+        "unsigned overflow error edge (> u64::MAX) must be present"
+    );
+
+    // (c) No structural Unreachable->error edge on the panic sink in AS mode.
+    assert!(
+        !rules.iter().any(
+            |rule| rule["head"]["name"] == "error" && rule["body"]["relation"]["name"] == "bb1"
+        ),
+        "ArithmeticSafetyOnly must NOT emit an Unreachable->error edge for bb1"
+    );
+}
+
+#[test]
+fn dataflow_arithmetic_safety_only_gates_out_unmodeled_arithmetic() {
+    // Coverage gate: an arithmetic-safety op the CHC does NOT model — 128-bit
+    // overflow (wrap point exceeds i128), POINTER-WIDTH overflow (`usize`/`isize`
+    // wrap is target-dependent, so a fixed 64-bit bound could miss a real 32-bit
+    // overflow), or integer div/rem (div-by-zero) — must fall back to Ok(None), so
+    // a redirected obligation can never be discharged from a CHC that lacks its
+    // violation edge (false-proof guard).
+    use trust_ir::{
+        BinOp, Block, BlockId, FuncId, FuncTyId, Function, Inst, InstrNode, OverflowOp, Ty, ValueId,
+    };
+    let x = ValueId::new(0);
+    let build = |inst: Inst, results: Vec<ValueId>| -> Function {
+        let mut bb0 = Block::new(BlockId::new(0)).with_param(x, Ty::U64);
+        bb0.body.push(InstrNode::new(inst).with_results(results));
+        bb0.body.push(InstrNode::new(Inst::Unreachable));
+        let mut function =
+            Function::new(FuncId::new(0), "demo::g", FuncTyId::new(0), BlockId::new(0));
+        function.blocks = vec![bb0];
+        function
+    };
+
+    for (label, unmodeled) in [
+        (
+            "128-bit overflow",
+            build(
+                Inst::Overflow { op: OverflowOp::AddOverflow, ty: Ty::U128, lhs: x, rhs: x },
+                vec![ValueId::new(2), ValueId::new(3)],
+            ),
+        ),
+        (
+            "pointer-width unsigned overflow",
+            build(
+                Inst::Overflow { op: OverflowOp::AddOverflow, ty: Ty::Usize, lhs: x, rhs: x },
+                vec![ValueId::new(2), ValueId::new(3)],
+            ),
+        ),
+        (
+            "pointer-width signed overflow",
+            build(
+                Inst::Overflow { op: OverflowOp::SubOverflow, ty: Ty::Isize, lhs: x, rhs: x },
+                vec![ValueId::new(2), ValueId::new(3)],
+            ),
+        ),
+        (
+            "integer div",
+            build(
+                Inst::BinOp { op: BinOp::UDiv, ty: Ty::U64, lhs: x, rhs: x },
+                vec![ValueId::new(2)],
+            ),
+        ),
+        (
+            "integer rem",
+            build(
+                Inst::BinOp { op: BinOp::SRem, ty: Ty::I64, lhs: x, rhs: x },
+                vec![ValueId::new(2)],
+            ),
+        ),
+    ] {
+        assert!(
+            super::trust_mc_dataflow_chc_for_function(
+                &unmodeled,
+                super::ChcErrorMode::ArithmeticSafetyOnly
+            )
+            .expect("no error")
+            .is_none(),
+            "{label} must gate out to Ok(None)"
+        );
+    }
+}
+
+#[test]
+fn dataflow_chc_is_env_gated_and_structural_mode_keeps_the_structural_error_edges() {
+    // (1) THE key safety property: the enriched encoder is reached ONLY through
+    // `TRUST_MC_DATAFLOW_CHC`. With the variable absent — the shipped default —
+    // `trust_mc_typed_chc_contract_for_native_trust_ir_obligation` never calls it,
+    // so the emitted CHC is byte-identical to today's structural encoding.
+    assert_eq!(
+        super::trust_mc_dataflow_chc_enabled(),
+        std::env::var_os("TRUST_MC_DATAFLOW_CHC").is_some(),
+        "the data-flow encoder must be gated on TRUST_MC_DATAFLOW_CHC and nothing else"
+    );
+
+    // (2) When it IS opted into, `Structural` mode must reproduce every structural
+    // `error` edge byte-for-byte (same `reachable` flag, same `reason` text as
+    // `trust_mc_default_error_rule`), differing only by the canonical block args
+    // the enriched relations require.
+    use trust_ir::{
+        Block, BlockId, CallingConv, FuncId, FuncTyId, Function, Inst, InstrNode, ValueId,
+    };
+    // bb0(): call_indirect %9() ; br bb1   → fail-closed-admission error edge
+    let mut bb0 = Block::new(BlockId::new(0));
+    bb0.body.push(InstrNode::new(Inst::CallIndirect {
+        callee: ValueId::new(9),
+        sig: FuncTyId::new(0),
+        args: vec![],
+        calling_conv: CallingConv::C,
+    }));
+    bb0.body.push(InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![] }));
+    // bb1(): unreachable                   → reachable `error` edge
+    let mut bb1 = Block::new(BlockId::new(1));
+    bb1.body.push(InstrNode::new(Inst::Unreachable));
+    // bb2(): return                        → `reachable:false` placeholder
+    let mut bb2 = Block::new(BlockId::new(2));
+    bb2.body.push(InstrNode::new(Inst::Return { values: vec![] }));
+
+    let mut function =
+        Function::new(FuncId::new(0), "demo::structural", FuncTyId::new(0), BlockId::new(0));
+    function.blocks = vec![bb0, bb1, bb2];
+
+    let (_relations, rules, _vars) =
+        super::trust_mc_dataflow_chc_for_function(&function, super::ChcErrorMode::Structural)
+            .expect("no error on a well-formed function")
+            .expect("structural mode fires for a fully-modeled function");
+    let rules = rules.as_array().expect("rules array");
+    let error_edge = |source: &str| {
+        rules
+            .iter()
+            .find(|rule| {
+                rule["head"]["name"] == "error" && rule["body"]["relation"]["name"] == source
+            })
+            .unwrap_or_else(|| panic!("{source} must have an error edge"))
+            .clone()
+    };
+
+    let bb0_error = error_edge("bb0");
+    assert_eq!(bb0_error["body"]["constraints"][0]["value"], true);
+    assert!(
+        bb0_error["body"]["constraints"][0]["reason"].as_str().expect("reason string").starts_with(
+            "typed TrustIr block 0 contains unsupported native trust-mc admission instruction"
+        ),
+        "fail-closed-admission reason text must match the structural encoder: {bb0_error}"
+    );
+
+    let bb1_error = error_edge("bb1");
+    assert_eq!(bb1_error["body"]["constraints"][0]["value"], true);
+    assert_eq!(
+        bb1_error["body"]["constraints"][0]["reason"],
+        serde_json::json!("typed TrustIr block 1 reaches an unreachable terminator")
+    );
+
+    let bb2_error = error_edge("bb2");
+    assert_eq!(bb2_error["body"]["constraints"][0]["value"], false);
+    assert_eq!(
+        bb2_error["body"]["constraints"][0]["reason"],
+        serde_json::json!("typed TrustIr block 2 has no reachable native trust-mc admission error")
+    );
+
+    // A block that already routes to `error` never also gets the placeholder.
+    assert_eq!(
+        rules
+            .iter()
+            .filter(
+                |rule| rule["head"]["name"] == "error" && rule["body"]["relation"]["name"] == "bb0"
+            )
+            .count(),
+        1,
+        "exactly one error edge per fail-closed block, as in the structural encoder"
+    );
+}
+
+#[test]
 fn bodyless_nonunwind_foreign_call_requires_an_exact_registered_proof() {
     let mut function = native_trust_ir_panic_function(false);
     let callee = "ffi::bodyless_nonunwind";
@@ -18899,7 +19546,7 @@ fn certified_monitor_uses_canonical_compiler_predicate_body() {
         };
         assert_eq!(canonical_monitor_predicate_text(&lowered).as_deref(), Ok("(x) == (result)"));
         assert_eq!(
-            canonical_monitor_static_proposition(&lowered),
+            canonical_monitor_static_proposition(TrustContractKind::Ensures, &lowered),
             Ok(StaticMonitorProposition {
                 formula: Formula::Eq(
                     Box::new(Formula::Var("x".to_string(), Sort::Int)),
@@ -18936,7 +19583,10 @@ fn certified_monitor_uses_canonical_compiler_predicate_body() {
                 }),
             ),
         };
-        assert!(canonical_monitor_static_proposition(&missing_prefix).is_err());
+        assert!(
+            canonical_monitor_static_proposition(TrustContractKind::Ensures, &missing_prefix)
+                .is_err()
+        );
 
         let mir_local = TrustContractPredicateKind::MirLocal { local: Local::arg(0) };
         assert!(canonical_monitor_predicate_text(&mir_local).is_err());
@@ -18946,23 +19596,44 @@ fn certified_monitor_uses_canonical_compiler_predicate_body() {
 }
 
 #[test]
-fn resolved_scalar_carriers_preserve_broad_elaboration_and_narrow_runtime_policy() {
-    for (carrier, name, runtime) in [
-        (TrustResolvedScalarType::U8, "u8", true),
-        (TrustResolvedScalarType::U16, "u16", true),
-        (TrustResolvedScalarType::U32, "u32", true),
-        (TrustResolvedScalarType::U64, "u64", true),
-        (TrustResolvedScalarType::Usize, "usize", false),
-        (TrustResolvedScalarType::I8, "i8", false),
-        (TrustResolvedScalarType::I16, "i16", false),
-        (TrustResolvedScalarType::I32, "i32", false),
-        (TrustResolvedScalarType::I64, "i64", false),
-        (TrustResolvedScalarType::Isize, "isize", false),
-        (TrustResolvedScalarType::Bool, "bool", true),
+fn resolved_scalar_carriers_preserve_exact_elaboration_names() {
+    for (carrier, name) in [
+        (TrustResolvedScalarType::U8, "u8"),
+        (TrustResolvedScalarType::U16, "u16"),
+        (TrustResolvedScalarType::U32, "u32"),
+        (TrustResolvedScalarType::U64, "u64"),
+        (TrustResolvedScalarType::U128, "u128"),
+        (TrustResolvedScalarType::Usize, "usize"),
+        (TrustResolvedScalarType::I8, "i8"),
+        (TrustResolvedScalarType::I16, "i16"),
+        (TrustResolvedScalarType::I32, "i32"),
+        (TrustResolvedScalarType::I64, "i64"),
+        (TrustResolvedScalarType::I128, "i128"),
+        (TrustResolvedScalarType::Isize, "isize"),
+        (TrustResolvedScalarType::Bool, "bool"),
     ] {
         assert_eq!(carrier.elaborator_name(), name);
-        assert_eq!(carrier.supports_runtime_monitor(), runtime);
     }
+}
+
+#[test]
+fn signed_monitor_literals_separate_source_range_from_runtime_bit_patterns() {
+    use trust_spec_elab::{RuntimeMonitorDomain as Domain, RuntimeMonitorExpr as Runtime};
+
+    // A positive source literal must fit the signed source type.
+    assert_eq!(static_monitor_literal(i8::MAX as u128, Domain::I8), Ok(Runtime::Lit(127)));
+    assert!(static_monitor_literal((i8::MAX as u128) + 1, Domain::I8).is_err());
+
+    // A certified negative literal is transported to MIR as its exact
+    // two's-complement bit pattern. Runtime validation must admit the full
+    // width even though the corresponding positive source literal would be
+    // out of range.
+    assert_eq!(static_monitor_negative_literal(1, Domain::I8), Ok(Runtime::Lit(u8::MAX.into())));
+    assert!(runtime_monitor_literal_fits(u8::MAX.into(), Domain::I8));
+    assert!(!runtime_monitor_literal_fits((u8::MAX as u128) + 1, Domain::I8));
+
+    assert_eq!(static_monitor_negative_literal(1, Domain::I128), Ok(Runtime::Lit(u128::MAX)));
+    assert!(runtime_monitor_literal_fits(u128::MAX, Domain::I128));
 }
 
 #[test]
@@ -19025,9 +19696,121 @@ fn zero_eq_bound_monitor() -> BoundCertifiedMonitor {
     .expect("closed certified monitor binds to its exact static tree")
 }
 
+fn zero_bound_measure() -> BoundCertifiedMeasure {
+    let session = trust_certify::clean_island::CleanIslandSession::new();
+    let certified = trust_spec_elab::certify_measure_typed(
+        session.environment().expect("fresh Clean session"),
+        "0",
+        &[],
+    )
+    .expect("closed zero measure certifies");
+    bind_certified_measure_to_static_formula(
+        certified,
+        StaticMonitorProposition { formula: Formula::Int(0), variable_domains: Vec::new() },
+    )
+    .expect("closed certified measure binds to its exact static tree")
+}
+
 fn zero_eq_typed_proposition_digest() -> String {
     let bound = zero_eq_bound_monitor();
     trust_types::typed_contract_proposition_digest(&bound.static_formula, &bound.variable_domains)
+}
+
+#[test]
+fn loop_provenance_failure_rejects_only_its_exact_source_group() {
+    use rustc_middle::mir::trust_contract::{TrustContractKind, TrustContractSubject, TrustLoopId};
+
+    let subject = |index, hir_local_id| TrustContractSubject::HirLoop {
+        id: TrustLoopId { index, hir_local_id },
+        loop_span: DUMMY_SP,
+        header_span: DUMMY_SP,
+    };
+    let records = vec![
+        ClauseMonitorRecord {
+            source_index: 0,
+            kind: TrustContractKind::LoopInvariant,
+            subject: subject(0, 10),
+            span: DUMMY_SP,
+            predicate_digest: format!("sha256:{}", "a".repeat(64)),
+            typed_proposition_digest: Some(zero_eq_typed_proposition_digest()),
+            evidence: ClauseMonitorEvidence::MonitorCertified(zero_eq_bound_monitor()),
+        },
+        ClauseMonitorRecord {
+            source_index: 1,
+            kind: TrustContractKind::Decreases,
+            subject: subject(0, 10),
+            span: DUMMY_SP,
+            predicate_digest: format!("sha256:{}", "b".repeat(64)),
+            typed_proposition_digest: None,
+            evidence: ClauseMonitorEvidence::MeasureCertified(zero_bound_measure()),
+        },
+        ClauseMonitorRecord {
+            source_index: 2,
+            kind: TrustContractKind::LoopInvariant,
+            subject: subject(1, 20),
+            span: DUMMY_SP,
+            predicate_digest: format!("sha256:{}", "c".repeat(64)),
+            typed_proposition_digest: Some(zero_eq_typed_proposition_digest()),
+            evidence: ClauseMonitorEvidence::MonitorCertified(zero_eq_bound_monitor()),
+        },
+    ];
+
+    let rejected = certified_loop_provenance_rejections(
+        &records,
+        &[(
+            1,
+            "e45.loop-source.no-mir-header: HIR loop 20 matched 0 dominator-proved MIR header(s)"
+                .to_string(),
+        )],
+    );
+
+    assert_eq!(rejected.keys().copied().collect::<Vec<_>>(), [2]);
+    assert!(rejected[&2].contains("source loop 1: e45.loop-source.no-mir-header"));
+    assert!(matches!(records[0].evidence, ClauseMonitorEvidence::MonitorCertified(_)));
+    assert!(matches!(records[1].evidence, ClauseMonitorEvidence::MeasureCertified(_)));
+}
+
+#[test]
+fn provisional_monitor_and_measure_evaluators_never_stamp_positive_executability() {
+    let mut monitor_metadata = Vec::new();
+    let monitor = ClauseMonitorRecord {
+        source_index: 0,
+        kind: rustc_middle::mir::trust_contract::TrustContractKind::Requires,
+        subject: rustc_middle::mir::trust_contract::TrustContractSubject::Function,
+        span: DUMMY_SP,
+        predicate_digest: format!("sha256:{}", "a".repeat(64)),
+        typed_proposition_digest: Some(zero_eq_typed_proposition_digest()),
+        evidence: ClauseMonitorEvidence::MonitorCertified(zero_eq_bound_monitor()),
+    };
+    stamp_clause_monitor_metadata(&mut monitor_metadata, &monitor);
+    assert_eq!(
+        exactly_one_metadata_value(&monitor_metadata, TRUST_MONITOR_STATUS_METADATA_KEY),
+        Some("unmonitored"),
+    );
+    assert!(
+        exactly_one_metadata_value(&monitor_metadata, TRUST_MONITOR_REASON_METADATA_KEY)
+            .is_some_and(|reason| reason.contains("placement were not authenticated")),
+    );
+
+    let mut measure_metadata = Vec::new();
+    let measure = ClauseMonitorRecord {
+        source_index: 1,
+        kind: rustc_middle::mir::trust_contract::TrustContractKind::Decreases,
+        subject: rustc_middle::mir::trust_contract::TrustContractSubject::Function,
+        span: DUMMY_SP,
+        predicate_digest: format!("sha256:{}", "b".repeat(64)),
+        typed_proposition_digest: None,
+        evidence: ClauseMonitorEvidence::MeasureCertified(zero_bound_measure()),
+    };
+    stamp_clause_monitor_metadata(&mut measure_metadata, &measure);
+    assert_eq!(
+        exactly_one_metadata_value(&measure_metadata, TRUST_MONITOR_STATUS_METADATA_KEY),
+        Some("unmonitored"),
+    );
+    assert!(
+        exactly_one_metadata_value(&measure_metadata, TRUST_MONITOR_REASON_METADATA_KEY)
+            .is_some_and(|reason| reason.contains("transition placement was not authenticated")),
+    );
 }
 
 fn u8_wrapping_bound_monitor() -> BoundCertifiedMonitor {
@@ -19179,7 +19962,10 @@ fn static_monitor_projector_admits_exact_literals_and_safe_arithmetic_only() {
 
     for formula in [
         Formula::Eq(Box::new(Formula::Int(-1)), Box::new(Formula::Int(0))),
-        Formula::Eq(Box::new(Formula::UInt(u128::from(u64::MAX) + 1)), Box::new(Formula::Int(0))),
+        Formula::Eq(
+            Box::new(x()),
+            Box::new(Formula::UInt(u128::from(u64::MAX) + 1)),
+        ),
         Formula::Eq(
             Box::new(Formula::Div(Box::new(x()), Box::new(Formula::Int(0)))),
             Box::new(Formula::Int(0)),
@@ -19284,8 +20070,11 @@ fn certified_monitor_transport_metadata_parser_is_strict_and_fail_closed() {
         ]
     };
     let monitored_digest = format!("sha256:{}", "a".repeat(64));
+    let measured_digest = format!("sha256:{}", "c".repeat(64));
     let unmonitored_digest = format!("sha256:{}", "b".repeat(64));
     let monitored = metadata("monitored", "Clean kernel accepted equivalence", &monitored_digest);
+    let measured =
+        metadata("measured", "Clean kernel accepted the exact scalar binding", &measured_digest);
     let unmonitored = metadata(
         "unmonitored",
         "quantified proposition has no finite monitor",
@@ -19297,6 +20086,14 @@ fn certified_monitor_transport_metadata_parser_is_strict_and_fail_closed() {
             status: trust_types::TransportMonitorStatus::Monitored,
             reason: "Clean kernel accepted equivalence".to_string(),
             predicate_digest: monitored_digest,
+        })
+    );
+    assert_eq!(
+        transport_monitor_evidence_from_metadata(&measured),
+        Some(trust_types::TransportMonitorEvidence {
+            status: trust_types::TransportMonitorStatus::Measured,
+            reason: "Clean kernel accepted the exact scalar binding".to_string(),
+            predicate_digest: measured_digest,
         })
     );
     assert_eq!(
@@ -19528,6 +20325,7 @@ fn certified_monitor_metadata_is_dense_indexed_complete_and_utf8_bounded() {
         ClauseMonitorRecord {
             source_index: 0,
             kind: rustc_middle::mir::trust_contract::TrustContractKind::Requires,
+            subject: rustc_middle::mir::trust_contract::TrustContractSubject::Function,
             span: DUMMY_SP,
             predicate_digest: format!("sha256:{}", "a".repeat(64)),
             typed_proposition_digest: Some(zero_eq_typed_proposition_digest()),
@@ -19536,6 +20334,7 @@ fn certified_monitor_metadata_is_dense_indexed_complete_and_utf8_bounded() {
         ClauseMonitorRecord {
             source_index: 1,
             kind: rustc_middle::mir::trust_contract::TrustContractKind::Ensures,
+            subject: rustc_middle::mir::trust_contract::TrustContractSubject::Function,
             span: DUMMY_SP,
             predicate_digest: format!("sha256:{}", "b".repeat(64)),
             typed_proposition_digest: None,
@@ -19546,6 +20345,7 @@ fn certified_monitor_metadata_is_dense_indexed_complete_and_utf8_bounded() {
         ClauseMonitorRecord {
             source_index: 2,
             kind: rustc_middle::mir::trust_contract::TrustContractKind::Ensures,
+            subject: rustc_middle::mir::trust_contract::TrustContractSubject::Function,
             span: DUMMY_SP,
             predicate_digest: format!("sha256:{}", "z".repeat(64)),
             typed_proposition_digest: Some(zero_eq_typed_proposition_digest()),
@@ -19720,6 +20520,7 @@ fn supported_static_monitor_fixture() -> (
     let record = ClauseMonitorRecord {
         source_index: 0,
         kind: rustc_middle::mir::trust_contract::TrustContractKind::Requires,
+        subject: rustc_middle::mir::trust_contract::TrustContractSubject::Function,
         span: DUMMY_SP,
         predicate_digest: format!("sha256:{}", "b".repeat(64)),
         typed_proposition_digest: Some(typed_digest),
@@ -20177,6 +20978,7 @@ fn unsupported_static_monitor_fixture() -> (
     let record = ClauseMonitorRecord {
         source_index: 0,
         kind: rustc_middle::mir::trust_contract::TrustContractKind::Requires,
+        subject: rustc_middle::mir::trust_contract::TrustContractSubject::Function,
         span: DUMMY_SP,
         predicate_digest: format!("sha256:{}", "b".repeat(64)),
         typed_proposition_digest: Some(typed_proposition_digest),
@@ -20365,6 +21167,7 @@ fn certified_monitor_contract_identity_uses_shared_canonical_path_encoding() {
     let record = ClauseMonitorRecord {
         source_index: 7,
         kind: rustc_middle::mir::trust_contract::TrustContractKind::Requires,
+        subject: rustc_middle::mir::trust_contract::TrustContractSubject::Function,
         span: DUMMY_SP,
         predicate_digest: format!("sha256:{}", "a".repeat(64)),
         typed_proposition_digest: None,
@@ -20793,7 +21596,10 @@ fn derived_total_fallback_summary_shape_stays_fatal_under_strict() {
         failure,
         FullVerificationFailure { failed: 0, unknown: 0, runtime_checked: 0, skipped: 1 },
     );
-    assert!(strict_failure_is_fatal(failure));
+    // `false` — the DEFAULT policy — is the load-bearing case: this asserts the
+    // zero-inventory certificate fallback stays fatal even under the tolerant
+    // policy, which is the one a real build runs.
+    assert!(strict_failure_is_fatal(failure, false));
 }
 
 // ---------------------------------------------------------------------------
@@ -20967,13 +21773,31 @@ fn r1_recursive_callsite_inventory_is_exact_and_multiplicity_preserving() {
     );
 }
 
+/// UX contract of the crate-level R1 scan-gap warning: it is a raw `dcx`
+/// warning (deliberately not a lint, so `-Dwarnings` cannot fail a sound
+/// build), which also means `-Awarnings`/`#[allow]` cannot silence it — so it
+/// must NEVER fire on a compile in which no verdict was withheld. A crate that
+/// merely contains a `global_asm!` item (scan poisoned) but proves every
+/// Level-0 obligation compiles without it; the poison's cause is stated exactly
+/// when its effect (a kept non-proved verdict) was felt. The positive half is
+/// pinned end-to-end by tests/ui/trust/r1/reject_global_asm_names_reason.rs.
+#[test]
+fn r1_scan_gap_warning_requires_a_withheld_verdict() {
+    // Poisoned scan, fully-proved crate: SILENT — this is the ordinary-source
+    // UX regression case (trust-verify defaults to On).
+    assert!(!r1_scan_gap_warning_applies(true, false));
+    // Un-poisoned scan never warns, withheld verdict or not.
+    assert!(!r1_scan_gap_warning_applies(false, false));
+    assert!(!r1_scan_gap_warning_applies(false, true));
+    // Poisoned scan AND a withheld verdict: the cause must be stated.
+    assert!(r1_scan_gap_warning_applies(true, true));
+}
+
 /// Budget and worker-limit arithmetic decides when the pass stops asking
 /// solvers questions. A saturating or silently-defaulting bound would turn a
 /// configured budget into the built-in one and change which obligations get
 /// answered at all, so the clamping edges are pinned here.
 mod runtime_config_tests {
-    use super::*;
-
     use super::*;
 
     #[test]

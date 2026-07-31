@@ -614,7 +614,9 @@ pub fn admit_function_into(
             // the result share one domain).
             let param_domains = param_domains_of(func)?;
             let domain = param_domains.first().cloned()?;
-            if !param_domains.iter().all(|d| *d == domain) {
+            if !param_domains.iter().all(|d| *d == domain)
+                || ty_to_domain(&func.body.return_ty).as_ref() != Some(&domain)
+            {
                 return None;
             }
             // Build a spec-syntax body over POSITIONAL parameter names
@@ -641,7 +643,9 @@ pub fn admit_function_into(
         trust_types::admissible_body::AdmissibleBody::Composed { expr } => {
             let param_domains = param_domains_of(func)?;
             let domain = param_domains.first().cloned()?;
-            if !param_domains.iter().all(|d| *d == domain) {
+            if !param_domains.iter().all(|d| *d == domain)
+                || ty_to_domain(&func.body.return_ty).as_ref() != Some(&domain)
+            {
                 return None;
             }
             // Render the composed tree FULLY PARENTHESIZED so the spec parser
@@ -1379,6 +1383,69 @@ mod tests {
         assert_eq!(minted[0].1.arity, 2);
     }
 
+    /// THE LOAD-BEARING SOUNDNESS ARTIFACT for the `ite` select encoding.
+    ///
+    /// The mint emits Clean's own `ite` term, so the discharge is a TAUTOLOGY
+    /// ABOUT `instLT{T}`: both sides are the same term, `Eq.refl` checks, and
+    /// nothing is verified about what `<` MEANS. The previous
+    /// `Nat.ble`-over-`toNat` encoding stated unsignedness out loud; this one
+    /// delegates it. These theorems are what keep that honest.
+    ///
+    /// Each is proved by `fun h => h`, because the two sides are δβ-identical
+    /// through `T.lt` → `instLTBitVec` → `Nat.lt` over `BitVec.toNat`. That is
+    /// precisely what FAILS for a signed carrier, whose `.lt` would not unfold
+    /// to a Nat order on `toNat` — so the theorem cannot be vacuously true.
+    /// Swap in a signed instance and this test stops passing.
+    ///
+    /// The witness it rules out: `a = 2^63`, `b = 0`. Unsigned, `a < b` is
+    /// false and Rust returns `b`. Signed, it is true and the island would
+    /// denote `a`. Without this agreement, that divergence reports `Proved`
+    /// with kernel-defeq strength — a false accept.
+    #[test]
+    fn machine_comparison_agrees_with_unsigned_nat_order_at_every_width() {
+        for (ty, to_nat) in [
+            ("UInt8", "UInt8.toNat"),
+            ("UInt16", "UInt16.toNat"),
+            ("UInt32", "UInt32.toNat"),
+            ("UInt64", "UInt64.toNat"),
+        ] {
+            let mut env = Environment::with_prelude();
+            let src = format!(
+                "theorem lt_agrees : forall (a : {ty}) (b : {ty}), \
+                     Iff (LT.lt a b) (Nat.lt ({to_nat} a) ({to_nat} b)) := \
+                     fun a b => Iff.intro (fun h => h) (fun h => h)\n\n\
+                 theorem le_agrees : forall (a : {ty}) (b : {ty}), \
+                     Iff (LE.le a b) (Nat.le ({to_nat} a) ({to_nat} b)) := \
+                     fun a b => Iff.intro (fun h => h) (fun h => h)"
+            );
+            let outcome = check_clean_island_into(&src, &mut env);
+            assert!(
+                !outcome.is_rejected(),
+                "{ty}: machine comparison must agree with unsigned Nat order on \
+                 the toNat images; kernel said {:?}",
+                outcome.errors
+            );
+
+            // TEETH. The agreement above is proved by `fun h => h`, so it is
+            // worth nothing unless the kernel would REFUSE a false agreement.
+            // Reverse the operands: `a < b` iff `toNat b < toNat a` is exactly
+            // what a wrong (or signed, or byte-swapped) instance would satisfy,
+            // and it must not typecheck.
+            let mut env_neg = Environment::with_prelude();
+            let bogus = format!(
+                "theorem lt_disagrees : forall (a : {ty}) (b : {ty}), \
+                     Iff (LT.lt a b) (Nat.lt ({to_nat} b) ({to_nat} a)) := \
+                     fun a b => Iff.intro (fun h => h) (fun h => h)"
+            );
+            let neg = check_clean_island_into(&bogus, &mut env_neg);
+            assert!(
+                neg.is_rejected(),
+                "{ty}: a REVERSED agreement must be refused, or the positive \
+                 direction proves nothing"
+            );
+        }
+    }
+
     /// `fn min2(a: u64, b: u64) -> u64 { if a < b { a } else { b } }` as the
     /// MIR-shaped input the Select recognizer expects.
     fn min2_verifiable_function() -> trust_types::VerifiableFunction {
@@ -1447,6 +1514,137 @@ mod tests {
             postconditions: Vec::new(),
             spec: Default::default(),
         }
+    }
+
+    /// PHASE D, PILLAR 2 — MEASURED. What does a citation actually bind to?
+    ///
+    /// §4.1.1 ratifies that a citation binds `ItemKey` (crate-instance ×
+    /// declaration-path-hash × sort) plus revision digests, and that is ABSENT:
+    /// `kernel_discharge_ensures_citation` takes the theorem as a bare NAME and
+    /// looks it up in the environment. The scoping note calls this a
+    /// soundness-relevant gap in a lane that already ships.
+    ///
+    /// This test measures how much a same-named substitute can actually get
+    /// away with, because "resolves by name" overstates the exposure. Two
+    /// CONTENT-based checks sit downstream of the lookup, and both are load
+    /// bearing:
+    ///
+    ///   1. the theorem's statement must match the elaborated goal;
+    ///   2. its proof term must grade `Certified` — an axiom or `sorry` in the
+    ///      transitive closure downgrades it to `Trusted`, which does not
+    ///      discharge.
+    ///
+    /// So substituting a DIFFERENT theorem under the same name only succeeds
+    /// when that theorem genuinely proves the same goal with a clean closure —
+    /// which is a different valid proof, not a hijack. The real `ItemKey` risk
+    /// is cross-crate version skew, where "the same" name changes meaning
+    /// between compilations; that is not reachable from a single environment
+    /// and is what the pillar still has to address.
+    #[test]
+    fn a_citation_is_bound_by_statement_and_provenance_even_though_it_resolves_by_name() {
+        let params: &[(&str, &str)] = &[("x", "u64")];
+
+        // (1) An honest theorem under the name discharges.
+        let mut env = Environment::with_prelude();
+        let ok = check_clean_island_into(
+            "def self_id (x : UInt64) : UInt64 := x\n\n\
+             theorem t : forall (x : UInt64), Nat.le (UInt64.toNat x) (UInt64.toNat x) := \
+                 fun x => Nat.le.refl (UInt64.toNat x)",
+            &mut env,
+        );
+        assert!(!ok.is_rejected(), "setup island: {:?}", ok.errors);
+        let mut facets = trust_spec_elab::FacetTable::new();
+        admit_certified_island_definition(&env, "self_id", &mut facets)
+            .expect("self_id must admit");
+        let verdict = kernel_discharge_ensures_citation(
+            &env, "t", "result >= x", params, "self_id", &facets,
+        );
+        assert!(
+            matches!(verdict, CitationVerdict::KernelStatementMatchCertified),
+            "an honest theorem must discharge; got {verdict:?}"
+        );
+
+        // (2) SAME NAME, DIFFERENT STATEMENT — refused by the statement match,
+        // not by any identity check.
+        let mut env2 = Environment::with_prelude();
+        let ok2 = check_clean_island_into(
+            "def self_id (x : UInt64) : UInt64 := x\n\n\
+             theorem t : forall (n : Nat), Nat.le n n := fun n => Nat.le.refl n",
+            &mut env2,
+        );
+        assert!(!ok2.is_rejected(), "setup island 2: {:?}", ok2.errors);
+        let mut facets2 = trust_spec_elab::FacetTable::new();
+        admit_certified_island_definition(&env2, "self_id", &mut facets2)
+            .expect("self_id must admit");
+        let swapped = kernel_discharge_ensures_citation(
+            &env2, "t", "result >= x", params, "self_id", &facets2,
+        );
+        assert!(
+            !matches!(swapped, CitationVerdict::KernelStatementMatchCertified),
+            "a same-named theorem with a different statement must NOT discharge; got {swapped:?}"
+        );
+
+        // (3) A NAME THAT IS NOT THERE fails closed rather than resolving to
+        // anything nearby.
+        let absent = kernel_discharge_ensures_citation(
+            &env, "t_absent", "result >= x", params, "self_id", &facets,
+        );
+        assert!(
+            !matches!(absent, CitationVerdict::KernelStatementMatchCertified),
+            "an absent citation must fail closed; got {absent:?}"
+        );
+    }
+
+    /// ITEM 10 HYPOTHESIS TEST — can an island theorem be stated over the Rust
+    /// function ITSELF, via its E6 kernel import, rather than restating the
+    /// body as an island definition and hoping it matches?
+    ///
+    /// This is the experiment the adversarial review asked for before anyone
+    /// spends build time on two-phase island checking. It deliberately does in
+    /// ONE test what the compiler does in two ordered phases, but in the
+    /// OPPOSITE order: mint the program admission FIRST, then check an island
+    /// that names `trust_import_crate__min2`.
+    ///
+    /// If this certifies, the feature is real and item 10 is purely an ORDERING
+    /// problem — today `trust_check_clean_islands` runs before
+    /// `trust_mint_program_admissions`, so the constant does not exist yet when
+    /// the island is elaborated and any such theorem fails with an unknown
+    /// constant. If it does NOT certify, item 10 is dead and no one need build
+    /// the two-phase scheme.
+    ///
+    /// Note what the clause says: `result <= a` — pure Rust vocabulary, with
+    /// NOTHING restated about the body. That is the whole point of the feature.
+    #[test]
+    fn an_island_theorem_can_be_stated_over_the_kernel_import() {
+        let facet_seed = trust_spec_elab::FacetTable::from_structural_facets([(
+            "crate::min2",
+            true,
+            true,
+            true,
+            true,
+        )]);
+        let mut session = CleanIslandSession::new();
+        let minted = session.admit_program_functions(&[min2_verifiable_function()], &facet_seed);
+        assert_eq!(minted.len(), 1, "min2 must mint first: {minted:?}");
+        assert_eq!(minted[0].1.kernel_const, "trust_import_crate__min2");
+
+        // The island names the COMPILED FUNCTION, not a restatement of it.
+        let outcome = session.check(
+            "theorem min2_thm : forall (a : UInt64) (b : UInt64), \
+                 Nat.le (UInt64.toNat (trust_import_crate__min2 a b)) (UInt64.toNat a) := \
+                 fun a b => Decidable.casesOn \
+                     (motive := fun (d : Decidable (LT.lt a b)) => \
+                         Nat.le (UInt64.toNat (Decidable.casesOn (motive := fun _ => UInt64) \
+                             d (fun _ => b) (fun _ => a))) (UInt64.toNat a)) \
+                     (instDecidableUInt64Lt a b) \
+                     (fun h => Iff.mp (Nat.not_lt (UInt64.toNat a) (UInt64.toNat b)) h) \
+                     (fun h => Nat.le.refl (UInt64.toNat a))",
+        );
+        assert!(
+            !outcome.is_rejected(),
+            "an island theorem over the kernel import must check; got {:?}",
+            outcome.errors
+        );
     }
 
     /// THE GOAL (docs/design/2026-07-25-select-encoding-ergonomics.md, RULED):
@@ -1523,7 +1721,7 @@ mod tests {
                         id: BlockId(0),
                         stmts: Vec::new(),
                         terminator: Terminator::Call {
-                            func: "core::num::<impl u64>::wrapping_add".into(),
+                            func: "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add".into(),
                             args: vec![
                                 Operand::Copy(Place::local(1)),
                                 Operand::Constant(ConstValue::Uint(1, 64)),
@@ -1942,7 +2140,7 @@ mod tests {
                         id: BlockId(0),
                         stmts: Vec::new(),
                         terminator: prim(
-                            "core::num::<impl u64>::wrapping_add",
+                            "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add",
                             vec![
                                 Operand::Copy(Place::local(1)),
                                 Operand::Constant(ConstValue::Uint(1, 64)),
@@ -1955,7 +2153,7 @@ mod tests {
                         id: BlockId(1),
                         stmts: Vec::new(),
                         terminator: prim(
-                            "core::num::<impl u64>::wrapping_mul",
+                            "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_mul",
                             vec![
                                 Operand::Copy(Place::local(2)),
                                 Operand::Constant(ConstValue::Uint(2, 64)),

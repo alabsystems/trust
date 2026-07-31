@@ -80,9 +80,17 @@
 //! * `<crate>.trust-ir.txt` — the canonical text form (`trust_ir::format::canonical`, the
 //!   diff-stable rendering).
 //! * `<crate>.coverage.json` — per-body `{def_path, def_index, kind, lowered, spliced,
-//!   instr_count, unsupported: [[reason, count], …], calls: {resolved, extern_decls,
-//!   unresolved}, differentials: {interpreter, derived_mir, deferred_to_seam, seam}}` + crate
-//!   totals. Differential verdicts are typed `agreed` / `mismatch` / `unsupported` / `not-run`;
+//!   lineage, func_id, instr_count, unsupported: [[reason, count], …], calls: {resolved,
+//!   extern_decls, unresolved}, differentials: {interpreter, derived_mir, deferred_to_seam,
+//!   seam}}` + crate
+//!   totals. `lineage`/`func_id` are the L1 artifact-lineage pair (both schema-additive):
+//!   `lineage` is the digest of the pre-assembly (mini-module, callee ledger) this row was
+//!   built from — the SAME value the flip event logs for the body it selected — and `func_id`
+//!   is the row's index into the assembled `module.functions`. Together they let an external
+//!   consumer state "the body the flip compiled is THIS function of the published artifact";
+//!   they do not by themselves PROVE the assembled function still means what the pre-assembly
+//!   module meant (that is the canonical-remapping certificate, `crate::lineage` §future work).
+//!   Differential verdicts are typed `agreed` / `mismatch` / `unsupported` / `not-run`;
 //!   deferred bodies receive an exact resolved seam outcome before JSON is rendered, while
 //!   non-deferred rows say `not-applicable`. The ambiguous internal `equal` boolean is never
 //!   serialized. (`kind` is `"fn"` / `"const-init"` / `"static-init"`;
@@ -330,6 +338,15 @@ struct BodyRecord {
     /// this is never a duplicate extraction. `VerifiableFunction` is fully owned `Clone` data
     /// (no `Rc`), so the `'static` registry invariant holds.
     mir_snapshot: Option<trust_types::VerifiableFunction>,
+    /// Trust (L1, artifact-lineage attestation): the per-body lineage digest
+    /// ([`crate::lineage::body_lineage_digest`]), computed over the INTACT hook-time
+    /// (mini-module, callee ledger) BEFORE `record` strips `functions[0]` for assembly —
+    /// so it equals, value-for-value, the digest `flip_registry::record_green` stores and
+    /// the flip event logs. Rides into the coverage row so an external consumer can match
+    /// "the body the flip selected" to "the row in the published artifact" by digest
+    /// equality. `None` only for records whose mini-module carried no single function
+    /// (never green-recorded, so nothing to match).
+    lineage: Option<trust_ir::ProofDigest>,
 }
 
 /// Crate-wide records belong to one compiler Session. rustc_driver can create
@@ -609,6 +626,13 @@ pub fn record(
     let def_path =
         rustc_middle::ty::print::with_no_trimmed_paths!(tcx.def_path_str(def.to_def_id()));
 
+    // Trust (L1, artifact-lineage attestation): digest the INTACT (mini-module, callee ledger)
+    // BEFORE the destructure below removes `functions[0]` — this must be the same value
+    // `flip_registry::record_green` minted for this body (same pure function, same input), or
+    // the flip event and the artifact row cannot be matched. A refusal (no single function)
+    // records `None`: such a body was never green-recorded, so there is no flip to match.
+    let lineage = crate::lineage::body_lineage_digest(&lowered.module, &lowered.callees).ok();
+
     let Lowered {
         mut module,
         body_kind,
@@ -618,6 +642,12 @@ pub fn record(
         place_path_carrier,
         callees,
         pending_consts,
+        // Trust (#173): MEASUREMENT ONLY — consumed by the `body class` debug event at the
+        // mir_built hook, not by the crate assembler. Deliberately does NOT gate the splice the
+        // way `symbolic` does: an opaque-collapse body is still offered to the splice and to the
+        // differential, each of which declines on its own terms. Bound explicitly rather than
+        // via `..` so a future field cannot slip past this destructure unnoticed.
+        opaque_collapse: _opaque_collapse,
     } = lowered;
     let deferred = lowered_unsupported.is_empty() && pending_consts.is_empty() && contains_call;
     let function =
@@ -779,6 +809,7 @@ pub fn record(
         derived_mir,
         differential_errors,
         mir_snapshot,
+        lineage,
     };
 
     tcx.sess.with_trust_compiler_state::<CrateModuleRegistry, _>(|registry| {
@@ -1433,6 +1464,40 @@ pub fn finalize_and_dump(tcx: TyCtxt<'_>) -> FinalizeSummary {
     resolve_pending_consts(tcx, &mut records);
 
     let mut assembled = assemble(&crate_name, &records);
+    stamp_target_info_if_vacuous(tcx, &mut assembled.module);
+    // Trust (#181): THE PRODUCER NOW VALIDATES ITS OWN OUTPUT. Log-only.
+    //
+    // Nothing in this pipeline ever asked "is the module I just emitted WELL-FORMED?". The
+    // coverage ratchet asks only "did this body lower without a fail-closed tag", and those are
+    // different questions: a corpus sweep with the trust-ir validator found ~31% of emitted
+    // modules REJECTED, across four classes, none of which any gate could see. Two were real
+    // defects with a silent blast radius — an equal-width `trunc` the format forbids (#164, now
+    // fixed), and an `InstrResultArityMismatch` whose mismatched SSA result gets no `val_ty`
+    // entry at all, so every downstream type check on that value is vacuously skipped.
+    //
+    // This is deliberately a TRIPWIRE, not a gate. It emits one debug event per error CLASS so
+    // the scorecard can ratchet the counts; it does not fail the build, does not touch `errors`,
+    // and does not change a single verdict. Turning it into a gate is a separate, ratified step
+    // that has to wait until the known classes are down — a gate that fires on a third of all
+    // modules would be turned off within a day, which is how a load-bearing check dies.
+    //
+    // Costs nothing on a normal compile: `tracing::enabled!` short-circuits before the walk, so
+    // only a run that is already collecting debug output (the scorecard) pays for it.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let verrors = trust_ir_build::validate_module(&assembled.module);
+        let mut by_class: BTreeMap<String, u64> = BTreeMap::new();
+        for e in &verrors {
+            let class = validation_error_class(e);
+            *by_class.entry(class).or_default() += 1;
+        }
+        for (class, n) in by_class {
+            tracing::debug!(class = %class, n, "trust-ir-lower: module validation error");
+        }
+        tracing::debug!(
+            total = verrors.len(),
+            "trust-ir-lower: module validation summary"
+        );
+    }
     errors.extend(direct_authority_inventory_errors(&assembled.module));
     if !errors.is_empty() {
         // Never feed an authority-bearing direct module into the structural
@@ -2663,7 +2728,13 @@ enum CalleeResolution {
     /// Fail-closed bodyless declaration. `key` dedups declarations (class-prefixed so a local
     /// path can never merge with an extern one); `name` is the declaration's display identity;
     /// `is_extern` picks the coverage counter.
-    Decl { key: String, name: String, is_extern: bool },
+    /// Trust (#178): `ret` is the RESULT type the crate's call sites bind from this callee, when
+    /// they agree and it is table-free (`CalleeRef::ret_ty`). It types the declaration's
+    /// signature; `None` keeps the old empty-`returns` spelling. It also joins `key`, so two
+    /// sites that disagree mint DISTINCT declarations rather than one whose signature contradicts
+    /// half its callers — pre-monomorphization, one `def_path` at two instantiations genuinely is
+    /// two functions, and names are display identity only (resolution is by `FuncId`).
+    Decl { key: String, name: String, is_extern: bool, ret: Option<Ty> },
 }
 
 struct Assembled {
@@ -2721,6 +2792,17 @@ struct CoverageRow {
     /// Present exactly when `deferred_to_seam` is true, and installed only after assembly and
     /// linked comparison. Coverage rendering rejects either a missing or unexpected value.
     seam: Option<InterpreterEvidence>,
+    /// Trust (L1): the per-body lineage digest (see `BodyRecord::lineage`) — rendered into
+    /// the coverage row so the artifact-side row is digest-matchable against the flip event.
+    lineage: Option<trust_ir::ProofDigest>,
+    /// Trust (L1): the `FuncId` this body received in the ASSEMBLED module, i.e. its index
+    /// into `module.functions` (the assembler maintains `functions[i].id == i` end to end).
+    /// `Some` exactly when `spliced`. Without it, pointing at the assembled row means
+    /// re-deriving the assembler's own name mangling (`{const-init}` / `{static-init}`
+    /// suffixes) from `def_path`; with it, the (row → assembled function) leg of the
+    /// lineage chain is an index, not a string match. This is the ADDRESS of the object the
+    /// canonical-remapping certificate will have to talk about — it is not that certificate.
+    func_id: Option<u32>,
 }
 
 fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
@@ -2751,7 +2833,8 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
 
     // ---- Pass 2: splice functions, rewriting intra-crate callee FuncIds. ----
     // Fail-closed declarations: (dedup key, id, display name), first-encounter order.
-    let mut decls: Vec<(String, FuncId, String)> = Vec::new();
+    // Trust (#178): `(dedup key, id, display name, agreed table-free return type)`.
+    let mut decls: Vec<(String, FuncId, String, Option<Ty>)> = Vec::new();
     let mut rows: Vec<CoverageRow> = Vec::new();
 
     for r in records {
@@ -2775,6 +2858,8 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
             derived_mir: r.derived_mir.clone(),
             deferred_to_seam: r.deferred,
             seam: None,
+            lineage: r.lineage,
+            func_id: None,
         };
         let Some(new_id) = lookup(r.def_index) else {
             rows.push(row);
@@ -2813,8 +2898,8 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
                             *callee = id;
                             row.calls_resolved += 1;
                         }
-                        CalleeResolution::Decl { key, name, is_extern } => {
-                            *callee = decl_id(&mut decls, assigned.len(), key, name);
+                        CalleeResolution::Decl { key, name, is_extern, ret } => {
+                            *callee = decl_id(&mut decls, assigned.len(), key, name, ret);
                             if is_extern {
                                 row.calls_extern += 1;
                             } else {
@@ -2848,8 +2933,8 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
                                     *fid = id;
                                     row.calls_resolved += 1;
                                 }
-                                CalleeResolution::Decl { key, name, is_extern } => {
-                                    *fid = decl_id(&mut decls, assigned.len(), key, name);
+                                CalleeResolution::Decl { key, name, is_extern, ret } => {
+                                    *fid = decl_id(&mut decls, assigned.len(), key, name, ret);
                                     if is_extern {
                                         row.calls_extern += 1;
                                     } else {
@@ -2865,6 +2950,10 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
         }
 
         row.spliced = true;
+        // Trust (L1): record WHERE this body landed in the assembled module. Declarations are
+        // appended after this loop, so `new_id.index()` is a stable index into
+        // `module.functions` for the whole artifact.
+        row.func_id = Some(new_id.index());
         module.add_function(f);
         rows.push(row);
     }
@@ -2873,12 +2962,29 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
     // signature (`is_vararg: true`, no params/returns) is the explicit fail-closed marker, along
     // with bodylessness itself (`Function::is_declaration` — callers stay havoced).
     if !decls.is_empty() {
-        let unknown_sig = intern_func_ty(
-            &mut module,
-            FuncTy { params: Vec::new(), returns: Vec::new(), is_vararg: true },
-        );
-        for (_key, id, name) in &decls {
-            let mut d = Function::new(*id, name.clone(), unknown_sig, BlockId::new(0))
+        // Trust (#178): a declaration's signature is now per-declaration, not one shared
+        // `unknown_sig` for the whole module.
+        //
+        // `is_vararg: true` with empty `params` is the params-side "unknown" encoding, and it is
+        // why arg-count mismatches were already rare. `returns` had no such escape hatch:
+        // `returns: []` is a POSITIVE CLAIM of "returns nothing", so EVERY call binding a result
+        // from a declared callee was ill-typed. That single default was
+        // `InstrResultArityMismatch { op: "call", expected: 0, actual: 1 }` — 1542 occurrences,
+        // 66% of all validation errors in the corpus.
+        //
+        // Where the call sites agreed on a table-free result type, spell it. Where they did not,
+        // keep the empty `returns` — honest for a callee no site takes a value from, and still
+        // the old behavior for everything this lane cannot type.
+        for (_key, id, name, ret) in &decls {
+            let sig = intern_func_ty(
+                &mut module,
+                FuncTy {
+                    params: Vec::new(),
+                    returns: ret.clone().into_iter().collect(),
+                    is_vararg: true,
+                },
+            );
+            let mut d = Function::new(*id, name.clone(), sig, BlockId::new(0))
                 .with_producer(trust_ir::Producer::TRust);
             d.linkage = Linkage::External;
             module.add_function(d);
@@ -2907,36 +3013,144 @@ fn resolve_callee(
         // generic site. The distinct `havoc:` key prefix keeps it from coalescing with any real
         // `local:`/`extern:` edge to the same symbol; it counts in the honest can't-resolve bucket.
         [c] if c.force_havoc => CalleeResolution::Decl {
-            key: format!("havoc:{}", c.def_path),
+            key: format!("havoc:{}{}", c.def_path, ret_key(c)),
             name: c.def_path.clone(),
             is_extern: false,
+            ret: decl_ret(c),
         },
         [c] if c.is_local => match lookup(c.def_index) {
             Some(id) => CalleeResolution::Local(id),
             // A real local fn, but its own body did not lower cleanly — declare, don't link.
             None => CalleeResolution::Decl {
-                key: format!("local-unlowered:{}", c.def_path),
+                key: format!("local-unlowered:{}{}", c.def_path, ret_key(c)),
                 name: c.def_path.clone(),
                 is_extern: false,
+                ret: decl_ret(c),
             },
         },
         [c] => CalleeResolution::Decl {
-            key: format!("extern:{}", c.def_path),
+            key: format!("extern:{}{}", c.def_path, ret_key(c)),
             name: c.def_path.clone(),
             is_extern: true,
+            ret: decl_ret(c),
         },
+        // No ledger entry at all — there is no site evidence to type a return with.
         [] => CalleeResolution::Decl {
             key: format!("unknown:{}", callee.index()),
             name: format!("!unknown_callee_{}", callee.index()),
             is_extern: false,
+            ret: None,
         },
         // Two identities behind one DefIndex-derived FuncId (local/extern index collision):
         // linking either would be a guess. Declare.
+        // Two identities behind one FuncId: their return types are not jointly attributable.
         _ => CalleeResolution::Decl {
             key: format!("ambiguous:{}", callee.index()),
             name: format!("!ambiguous_callee_{}", callee.index()),
             is_extern: false,
+            ret: None,
         },
+    }
+}
+
+/// Trust (#180): pin the module's target — but ONLY when doing so asserts nothing that is not
+/// already a fact about the compilation target.
+///
+/// `validate_module` demands a pinned target from any module carrying an FFI boundary (a bodyless
+/// external declaration): byte-level ABI agreement is part of such a module's meaning, and that
+/// agreement is only well-defined against a target. 615 occurrences of `TargetInfoRequired` —
+/// after #178, the LARGEST remaining class.
+///
+/// WHY THIS WAS BLOCKED, AND WHY THIS SLICE IS NOT. `TargetInfo::struct_passing` is a real ABI
+/// CLAIM with exactly two values, and NEITHER is honest for what this producer emits:
+///   * `NativeC` — "a producer marks the memory-classed parameters/returns `byval`/`sret`
+///     ([`ParamAttrs`]) per those rules". This producer emits no `ParamAttrs` at all.
+///   * `AlwaysMemory` — every by-value aggregate crosses through memory, `byval`/`sret`. Same
+///     missing marks.
+/// It is also digest-bearing (it flows into `Module::stable_digest`), so a wrong pick silently
+/// changes module identity too. Picking one is an owner ruling and this function does not make it.
+///
+/// BUT the claim quantifies over BY-VALUE AGGREGATES CROSSING CALL EDGES. In a module where no
+/// such crossing exists, both policy values describe exactly the same empty set: the field has no
+/// observable content, so stamping cannot be a false claim. `triple`, `pointer_size` and
+/// `endianness` were never in question — they are facts about the target being compiled for.
+///
+/// THE SCAN IS DELIBERATELY A SUPERSET AND FAILS CLOSED. Every call edge's types live in some
+/// `FuncTy` in `module.func_types` (a `Function` names one via `ty`, a `CallIndirect` via `sig`),
+/// so scanning the WHOLE table over-approximates the set of crossings — it can only refuse to
+/// stamp a module that would have been fine, never stamp one that is not. The per-type test
+/// allow-lists the non-aggregates and treats everything else — including any variant added to
+/// `Ty` later — as an aggregate. An over-permissive scan here would stamp exactly the false ABI
+/// claim the ruling exists to prevent, so unknown must mean "aggregate".
+fn stamp_target_info_if_vacuous(tcx: TyCtxt<'_>, module: &mut Module) {
+    if module.target_info.is_some() {
+        return;
+    }
+    fn crosses_by_value_aggregate(ty: &Ty) -> bool {
+        !matches!(
+            ty,
+            Ty::I8
+                | Ty::I16
+                | Ty::I32
+                | Ty::I64
+                | Ty::I128
+                | Ty::U8
+                | Ty::U16
+                | Ty::U32
+                | Ty::U64
+                | Ty::U128
+                | Ty::Isize
+                | Ty::Usize
+                | Ty::Char
+                | Ty::F16
+                | Ty::F32
+                | Ty::F64
+                | Ty::Bool
+                | Ty::Ptr
+                | Ty::Unit
+                | Ty::Never
+        )
+    }
+    let aggregate_at_a_boundary = module.func_types.iter().any(|ft| {
+        ft.params.iter().chain(ft.returns.iter()).any(crosses_by_value_aggregate)
+    });
+    if aggregate_at_a_boundary {
+        return;
+    }
+    let target = &tcx.sess.target;
+    module.target_info = Some(trust_ir::TargetInfo {
+        triple: target.llvm_target.to_string(),
+        pointer_size: u32::from(target.pointer_width / 8),
+        endianness: match target.endian {
+            rustc_abi::Endian::Little => trust_ir::Endianness::Little,
+            rustc_abi::Endian::Big => trust_ir::Endianness::Big,
+        },
+        // `None` = "derived from the triple" (the documented legacy state), NOT a claim of a
+        // specific calling-convention ruleset. The producer has no independent ABI identity to
+        // assert here.
+        abi: None,
+        // Vacuous by the scan above: no by-value aggregate crosses any call edge in this module,
+        // so this field ranges over nothing. It is the serde default and carries no content here.
+        struct_passing: trust_ir::StructPassingPolicy::default(),
+    });
+}
+
+/// Trust (#178): the return type to give this callee's DECLARATION — the type its call sites
+/// agreed on, or `None` if the ledger entry was poisoned by disagreement. Reading the poison flag
+/// here (rather than only `ret_ty.is_some()`) is what keeps a contradicted type from being
+/// resurrected: `ret_ty` is cleared on conflict, and `ret_ty_conflict` records WHY it is empty.
+fn decl_ret(c: &crate::CalleeRef) -> Option<Ty> {
+    if c.ret_ty_conflict { None } else { c.ret_ty.clone() }
+}
+
+/// Trust (#178): the declaration dedup-key suffix for a callee's agreed return type. Two call
+/// sites that bind different types from one `def_path` must NOT collapse into one declaration —
+/// its signature would contradict half of them. Empty for the unknown case, so a callee with no
+/// agreed type keeps byte-identical keys to the pre-#178 producer.
+fn ret_key(c: &crate::CalleeRef) -> String {
+    match decl_ret(c) {
+        Some(t) => format!("|ret:{t:?}"),
+        None => String::new(),
     }
 }
 
@@ -2944,16 +3158,20 @@ fn resolve_callee(
 /// defined functions; declarations take the ids after them, first-encounter order). Shared by
 /// the `Inst::Call` callee rewrite and the `Constant::FnDef` rewrite.
 fn decl_id(
-    decls: &mut Vec<(String, FuncId, String)>,
+    decls: &mut Vec<(String, FuncId, String, Option<Ty>)>,
     defined: usize,
     key: String,
     name: String,
+    ret: Option<Ty>,
 ) -> FuncId {
-    match decls.iter().find(|(k, _, _)| *k == key) {
-        Some((_, id, _)) => *id,
+    match decls.iter().find(|(k, _, _, _)| *k == key) {
+        Some((_, id, _, _)) => *id,
         None => {
             let id = FuncId::new((defined + decls.len()) as u32);
-            decls.push((key, id, name));
+            // Trust (#178): `ret` rides the entry so the declaration can be given a signature that
+            // actually returns something. It is part of `key`, so a reused entry's stored `ret`
+            // always equals this one — no last-writer-wins ambiguity.
+            decls.push((key, id, name, ret));
             id
         }
     }
@@ -3003,10 +3221,11 @@ fn splice_ok(r: &BodyRecord) -> bool {
     let (Some(f), Some(ft)) = (&r.function, &r.func_ty) else {
         return false;
     };
-    // Enum table: positional ids + NESTED-FIRST defs (every variant field table-free OR a
-    // nested first-class enum with a strictly smaller id — the producer's registration wall,
-    // re-checked here). Enums intern FIRST in pass 1, which is what entitles struct fields /
-    // types entries (and later enum defs) to reference them.
+    // Enum table: positional ids, and every variant field RESOLVABLE (`enum_def_field_ok`).
+    // Trust (#174): this used to demand table-free-or-strictly-earlier-enum, because pass 1
+    // interned enums before structs so an enum could not name a struct id. Pass 1 is now a
+    // TOPOLOGICAL intern of the enum+struct DAG, so ordering is the intern's job (and a cycle
+    // fails the body closed there); splice_ok's job here is resolvability alone.
     for (i, ed) in r.enums.iter().enumerate() {
         if ed.id.as_usize() != i {
             return false;
@@ -3015,12 +3234,7 @@ fn splice_ok(r: &BodyRecord) -> bool {
         // a strictly smaller id (registration is inner-before-outer) — the
         // struct-table nested-first discipline, mirrored. Everything else
         // must be table-free.
-        if !ed.variants.iter().all(|v| {
-            v.fields.iter().all(|f| match f {
-                Ty::Enum(j) => j.as_usize() < i,
-                other => ty_table_free(other),
-            })
-        }) {
+        if !ed.variants.iter().all(|v| v.fields.iter().all(|f| enum_def_field_ok(r, f))) {
             return false;
         }
     }
@@ -3167,6 +3381,33 @@ fn ty_spliceable(r: &BodyRecord, ty: &Ty) -> bool {
 /// structs, and their defs are checked self-contained, so no cycle is possible); anything
 /// else table-indexed (incl. `Ty::Array`, whose types-table entry may itself reference
 /// structs — a cross-table cycle) fails closed.
+/// Trust (#174): may `ty` appear as a VARIANT FIELD of enum def `i` in a spliceable body?
+///
+/// The sibling of [`def_field_ok`] for the enum table, and deliberately NOT the same rule.
+/// `def_field_ok` keeps a nested-first bound on struct-to-struct references (`sid < i`) because
+/// that is the producer's own registration discipline for the struct table; enum variant fields
+/// have no such bound to inherit now that pass 1 interns topologically. Both a struct and an
+/// enum reference need only RESOLVE against the body's tables — the topological intern places
+/// them in dependency order, and a cycle refuses the body there rather than here.
+///
+/// Everything else must still be table-free: a `Ty::Array`/`Ty::Closure`/`Ty::FatPtr(Slice)`
+/// names the TYPES or closure table, which intern strictly after both def tables, so a def
+/// field naming one could not be remapped.
+fn enum_def_field_ok(r: &BodyRecord, ty: &Ty) -> bool {
+    match ty {
+        Ty::Vector(elem, _) => enum_def_field_ok(r, elem),
+        Ty::Tuple(elems) => elems.iter().all(|e| enum_def_field_ok(r, e)),
+        Ty::Ref(inner)
+        | Ty::RefMut(inner)
+        | Ty::PtrConst(inner)
+        | Ty::PtrMut(inner)
+        | Ty::Rc(inner) => enum_def_field_ok(r, inner),
+        Ty::Struct(sid) => r.structs.get(sid.as_usize()).is_some_and(|sd| sd.id == *sid),
+        Ty::Enum(eid) => r.enums.get(eid.as_usize()).is_some_and(|ed| ed.id == *eid),
+        _ => ty_table_free(ty),
+    }
+}
+
 fn def_field_ok(r: &BodyRecord, ty: &Ty, i: usize) -> bool {
     match ty {
         Ty::Vector(elem, _) => def_field_ok(r, elem, i),
@@ -3315,37 +3556,215 @@ fn remap_node_span(node: &mut InstrNode, files: &[String], module: &mut Module) 
         .map(|path| SourceSpan { file: module.intern_file(path.as_str()), ..sp });
 }
 
+/// Trust (C2-scopes): the scope table's spans carry file ids from the SAME per-body table
+/// as instruction spans, so they need the same re-interning — a scope left pointing at the
+/// mini-module's index would name a different file (or none) once assembled. The topology
+/// (`parent`) is index-into-this-function and needs no remap. Dangling ids drop the span
+/// and KEEP the scope: losing a location costs a debugger one line number, losing the entry
+/// would renumber every later scope and invalidate every node index pointing past it.
+fn remap_func_scopes(func: &mut Function, files: &[String], module: &mut Module) {
+    let Some(scopes) = func.scopes.as_mut() else { return };
+    for sc in scopes.iter_mut() {
+        let Some(sp) = sc.span else { continue };
+        sc.span = files
+            .get(sp.file as usize)
+            .map(|path| SourceSpan { file: module.intern_file(path.as_str()), ..sp });
+    }
+}
+
+/// Trust (#174): a node in a body's enum+struct definition DAG, for the topological intern in
+/// [`prepare_body_tables`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DefNode {
+    Enum(usize),
+    Struct(usize),
+}
+
+/// Collect the enum/struct definitions that `ty` names, appending to `out`.
+///
+/// FAIL-CLOSED BY OMISSION, deliberately: if a `Ty` variant that carries an `EnumId`/`StructId`
+/// is missing from this walk, the topological order may intern its def too early, and
+/// `remap_ty` then finds a `None` and DECLINES the body. A miss costs coverage, never
+/// correctness — which is why this mirrors `remap_ty`'s recursive structure rather than trying
+/// to be clever. `Ty::Array`/`Ty::Closure`/`Ty::FatPtr(Slice)` name the TYPES / closure tables,
+/// which intern strictly after both def tables, so they are not DAG nodes here; a def field
+/// naming one already declines in `remap_ty` against the empty maps, exactly as before.
+fn collect_def_refs(ty: &Ty, out: &mut Vec<DefNode>) {
+    match ty {
+        Ty::Enum(e) => out.push(DefNode::Enum(e.as_usize())),
+        Ty::Struct(sid) => out.push(DefNode::Struct(sid.as_usize())),
+        Ty::Vector(inner, _)
+        | Ty::Ref(inner)
+        | Ty::RefMut(inner)
+        | Ty::PtrConst(inner)
+        | Ty::PtrMut(inner)
+        | Ty::Rc(inner) => collect_def_refs(inner, out),
+        Ty::Tuple(elems) => {
+            for e in elems {
+                collect_def_refs(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The DAG edges out of one definition node: every enum/struct its field types name.
+/// `None` = the node index is out of range (refuse the body).
+fn def_node_refs(r: &BodyRecord, n: DefNode, out: &mut Vec<DefNode>) -> Option<()> {
+    out.clear();
+    match n {
+        DefNode::Enum(i) => {
+            for variant in &r.enums.get(i)?.variants {
+                for fty in &variant.fields {
+                    collect_def_refs(fty, out);
+                }
+            }
+        }
+        DefNode::Struct(j) => {
+            for field in &r.structs.get(j)?.fields {
+                collect_def_refs(&field.ty, out);
+            }
+        }
+    }
+    Some(())
+}
+
+/// Trust (#181): the STABLE CLASS NAME of a validation error, for the ratchet.
+///
+/// The variant name ONLY, never the payload: payloads carry block ids, struct ids and type
+/// spellings that differ per body, so a histogram keyed on those would produce a different set
+/// of buckets every run — unrankable, which is exactly the failure the anonymous `Other`
+/// coverage tag caused before it was made exhaustive.
+///
+/// EVERY variant reports its OWN name. An earlier cut of this mapped anything outside a
+/// hand-written allowlist to `"Other"`, and the first full-corpus run promptly produced an
+/// `Other` bucket of 49 — an unplannable blob, the very thing this function exists to prevent,
+/// reintroduced by the function itself. The allowlist is gone: the name is derived from `Debug`,
+/// which renders `VariantName { .. }` / `VariantName(..)`, so a new upstream variant names
+/// itself the day it first fires and needs no maintenance here.
+fn validation_error_class(e: &trust_ir_build::ValidationError) -> String {
+    let rendered = format!("{e:?}");
+    let name: String = rendered
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    // A `Debug` impl that does not start with an identifier would yield an empty string; report
+    // that as a named bucket rather than a blank field, so it is visible instead of silent.
+    if name.is_empty() { "UnnamedVariant".to_string() } else { name }
+}
+
 fn prepare_body_tables(r: &BodyRecord, module: &mut Module) -> Option<(Function, FuncTy)> {
     let (Some(func), Some(func_ty)) = (&r.function, &r.func_ty) else {
         return None;
     };
-    // Enum table FIRST (struct fields / types entries may reference enums; an enum def may
-    // reference only EARLIER enum defs — nested-first, checked in `splice_ok` — so the map
-    // built so far is always sufficient to intern the next def).
-    let mut enum_map: Vec<EnumId> = Vec::with_capacity(r.enums.len());
-    for ed in &r.enums {
-        let mut remapped = ed.clone();
-        for variant in &mut remapped.variants {
-            for fty in &mut variant.fields {
-                // Trust (B3-3): a nested first-class enum field references an
-                // EARLIER entry (nested-first ids, checked in `splice_ok`), so
-                // the enum map built SO FAR resolves it; every other field
-                // stays table-free and passes through untouched.
-                *fty = remap_ty(fty, &enum_map, &[], &[], &[])?;
+    // Trust (#174): TOPOLOGICAL intern of the enum+struct DAG, replacing the old fixed
+    // "enums FIRST, then structs" order.
+    //
+    // That fixed order was the ONLY thing forcing enum variant fields to be table-free — an
+    // enum def could not name a struct id because structs had not been interned yet. It was an
+    // assembler convention, never a format rule: verified in first-party/trust-ir that
+    // `ty_layout_shape_inner`'s `Ty::Struct(id)` arm resolves by LOOKUP in `self.structs`, and
+    // that the validator's enum-variant-field check is a dangling-reference check through
+    // `module.struct_def(id)` — also a lookup. Both require RESOLVABILITY, neither requires an
+    // ordering. So the constraint moves here, where it belongs: intern each def only after
+    // everything it references, whichever kind that is.
+    //
+    // The graph is acyclic in practice (`register_enum`/`register_struct` decline recursive
+    // ADTs via `adt_visit_stack`), but that is NOT assumed — a back edge fails the body closed
+    // rather than looping. Likewise an out-of-range reference. Every failure mode here is a
+    // `None` = "body not spliced, recorded in coverage", never a mis-linked id.
+    //
+    // The maps become sparse (`Vec<Option<_>>`) because they are filled out of body order;
+    // `remap_ty` resolves through the Option, so a reference to a not-yet-interned def is a
+    // decline instead of a wrong id. They are densified back before the types/closure/global
+    // phases below, which still run strictly after both def tables.
+    let n_enums = r.enums.len();
+    let n_structs = r.structs.len();
+    let total_defs = n_enums.checked_add(n_structs)?;
+    // Node numbering: enums [0, n_enums), structs [n_enums, total_defs).
+    let node_of = |n: DefNode| match n {
+        DefNode::Enum(i) => i,
+        DefNode::Struct(j) => n_enums + j,
+    };
+    const UNVISITED: u8 = 0;
+    const ON_PATH: u8 = 1;
+    const DONE: u8 = 2;
+    let mut state = vec![UNVISITED; total_defs];
+    let mut order: Vec<DefNode> = Vec::with_capacity(total_defs);
+    let mut stack: Vec<(DefNode, bool)> = Vec::new();
+    let mut refs: Vec<DefNode> = Vec::new();
+    let starts = (0..n_enums).map(DefNode::Enum).chain((0..n_structs).map(DefNode::Struct));
+    for start in starts {
+        if state[node_of(start)] == DONE {
+            continue;
+        }
+        stack.push((start, false));
+        while let Some((n, expanded)) = stack.pop() {
+            let k = node_of(n);
+            if expanded {
+                // Post-order: every dependency of `n` is already in `order`.
+                state[k] = DONE;
+                order.push(n);
+                continue;
+            }
+            if state[k] == DONE {
+                // Reached twice through different parents; the first visit already placed it.
+                continue;
+            }
+            if state[k] == ON_PATH {
+                return None; // defensive: a back edge is a cycle — fail closed.
+            }
+            state[k] = ON_PATH;
+            stack.push((n, true));
+            def_node_refs(r, n, &mut refs)?;
+            for m in refs.drain(..) {
+                let mk = match m {
+                    DefNode::Enum(i) if i < n_enums => node_of(m),
+                    DefNode::Struct(j) if j < n_structs => node_of(m),
+                    // Out-of-range id: refuse the body rather than intern against a table
+                    // that cannot resolve it.
+                    _ => return None,
+                };
+                match state[mk] {
+                    UNVISITED => stack.push((m, false)),
+                    ON_PATH => return None, // cycle
+                    _ => {}
+                }
             }
         }
-        enum_map.push(module.add_enum_def(remapped));
     }
-    // Struct table next (types entries may reference structs, never vice versa — checked in
-    // `splice_ok::def_field_ok`).
-    let mut struct_map: Vec<StructId> = Vec::with_capacity(r.structs.len());
-    for sd in &r.structs {
-        let mut remapped = sd.clone();
-        for field in &mut remapped.fields {
-            field.ty = remap_ty(&field.ty, &enum_map, &struct_map, &[], &[])?;
+    let mut enum_map: Vec<Option<EnumId>> = vec![None; n_enums];
+    let mut struct_map: Vec<Option<StructId>> = vec![None; n_structs];
+    for n in &order {
+        match *n {
+            DefNode::Enum(i) => {
+                let mut remapped = r.enums.get(i)?.clone();
+                for variant in &mut remapped.variants {
+                    for fty in &mut variant.fields {
+                        // Trust (B3-3 + #174): a nested first-class enum field, and now a
+                        // struct-payload field, both resolve through the maps — which the
+                        // topological order guarantees are already filled for everything this
+                        // def names.
+                        *fty = remap_ty(fty, &enum_map, &struct_map, &[], &[])?;
+                    }
+                }
+                enum_map[i] = Some(module.add_enum_def(remapped));
+            }
+            DefNode::Struct(j) => {
+                let mut remapped = r.structs.get(j)?.clone();
+                for field in &mut remapped.fields {
+                    field.ty = remap_ty(&field.ty, &enum_map, &struct_map, &[], &[])?;
+                }
+                struct_map[j] = Some(module.add_struct_def(remapped));
+            }
         }
-        struct_map.push(module.add_struct_def(remapped));
     }
+    // Densify: the traversal covers every node, so a `None` here would mean the walk missed
+    // one — refuse rather than let a later phase index a hole.
+    let enum_map: Vec<EnumId> = enum_map.into_iter().collect::<Option<Vec<_>>>()?;
+    let struct_map: Vec<StructId> = struct_map.into_iter().collect::<Option<Vec<_>>>()?;
+    let enum_map: Vec<Option<EnumId>> = enum_map.into_iter().map(Some).collect();
+    let struct_map: Vec<Option<StructId>> = struct_map.into_iter().map(Some).collect();
     let mut ty_map: Vec<TyId> = Vec::with_capacity(r.types.len());
     for t in &r.types {
         // (A types entry cannot reference a closure type — `type_entry_ok` refuses it —
@@ -3405,6 +3824,7 @@ fn prepare_body_tables(r: &BodyRecord, module: &mut Module) -> Option<(Function,
                 remap_node_span(node, &r.files, module);
             }
         }
+        remap_func_scopes(&mut f, &r.files, module);
         return Some((f, func_ty.clone()));
     }
     let mut ft = func_ty.clone();
@@ -3428,6 +3848,7 @@ fn prepare_body_tables(r: &BodyRecord, module: &mut Module) -> Option<(Function,
             }
         }
     }
+    remap_func_scopes(&mut f, &r.files, module);
     Some((f, ft))
 }
 
@@ -3435,10 +3856,15 @@ fn prepare_body_tables(r: &BodyRecord, module: &mut Module) -> Option<(Function,
 /// (`enum_map[k]` / `struct_map[i]` / `ty_map[j]` = the assembled module's id for the body's
 /// positional entry `k`/`i`/`j`). `None` for an out-of-range id or a variant the remap does
 /// not model — the caller refuses the body (fail-closed), never emits a guess.
+/// Trust (#174): `enum_map`/`struct_map` are SPARSE — the topological intern in
+/// `prepare_body_tables` fills them out of body order, so an entry is `None` until its def has
+/// been interned. Both lookups therefore double-`?`: an id that is out of range OR not yet
+/// interned declines the body. That is the whole safety property of the reordering — a
+/// reference the order has not yet satisfied can never resolve to a wrong id, only to no id.
 fn remap_ty(
     ty: &Ty,
-    enum_map: &[EnumId],
-    struct_map: &[StructId],
+    enum_map: &[Option<EnumId>],
+    struct_map: &[Option<StructId>],
     ty_map: &[TyId],
     closure_map: &[trust_ir::ClosureTyId],
 ) -> Option<Ty> {
@@ -3467,8 +3893,8 @@ fn remap_ty(
         Ty::Rc(inner) => {
             Ty::Rc(Box::new(remap_ty(inner, enum_map, struct_map, ty_map, closure_map)?))
         }
-        Ty::Struct(sid) => Ty::Struct(*struct_map.get(sid.as_usize())?),
-        Ty::Enum(eid) => Ty::Enum(*enum_map.get(eid.as_usize())?),
+        Ty::Struct(sid) => Ty::Struct((*struct_map.get(sid.as_usize())?)?),
+        Ty::Enum(eid) => Ty::Enum((*enum_map.get(eid.as_usize())?)?),
         Ty::Array(tid, n) => Ty::Array(*ty_map.get(tid.as_usize())?, *n),
         // Trust (B6): first-class closure types remap through the pass-1 closure map
         // (per-body positional id -> assembled-module id, exactly like structs/enums).
@@ -3565,6 +3991,7 @@ fn ty_table_free(ty: &Ty) -> bool {
         _ => false,
     }
 }
+
 
 /// Trust (wave-16): is `g` a spliceable global? Two strict allow-listed shapes (any other fails
 /// closed, so the assembled module can only carry the exact globals the producer mints):
@@ -3878,11 +4305,26 @@ fn coverage_json(
             }
         };
         let comma = if i + 1 == rows.len() { "" } else { "," };
+        // Trust (L1): the lineage digest (schema-additive). `null` = no single-function
+        // mini-module existed for this record, so no green recording / flip was possible.
+        // The digest string is `Display`-formatted (`sha256:<hex>`), matching the flip
+        // event's `lineage` field byte-for-byte.
+        let lineage = match &r.lineage {
+            Some(digest) => format!("\"{digest}\""),
+            None => "null".to_string(),
+        };
+        // Trust (L1): the assembled-module address (schema-additive). `null` = the body was
+        // not spliced, so it has no function in the artifact to point at.
+        let func_id = match r.func_id {
+            Some(id) => id.to_string(),
+            None => "null".to_string(),
+        };
         let _ = writeln!(
             out,
             "    {{ \"def_path\": \"{}\", \"def_index\": {}, \"kind\": \"{}\", \"lowered\": {}, \
              \"symbolic\": {}, \
-             \"spliced\": {}, \"instr_count\": {}, \"unsupported\": [{}], \
+             \"spliced\": {}, \"lineage\": {}, \"func_id\": {}, \"instr_count\": {}, \
+             \"unsupported\": [{}], \
              \"unsupported_details\": {{{}}}, \
              \"collect_primary\": [{}], \"collect_cascade\": [{}], \"calls\": {{ \
              \"resolved\": {}, \"extern_decls\": {}, \"unresolved\": {} }}, \
@@ -3896,6 +4338,8 @@ fn coverage_json(
             r.lowered,
             r.symbolic,
             r.spliced,
+            lineage,
+            func_id,
             r.instr_count,
             unsupported,
             unsupported_details,
@@ -3954,6 +4398,8 @@ mod authority_tests {
             },
             deferred_to_seam,
             seam: None,
+            lineage: None,
+            func_id: None,
         }
     }
 
@@ -4053,6 +4499,152 @@ mod authority_tests {
         assert!(vacuous[0].seam.is_none());
     }
 
+    /// Trust (L1): the artifact row renders the lineage digest exactly as the flip event
+    /// logs it (`Display`: `sha256:<hex>`), and `null` for digest-less records — so the
+    /// two carriers are matchable byte-for-byte.
+    #[test]
+    fn test_coverage_rows_render_lineage_digest_and_null() {
+        let mut module = Module::new("lineage_row_probe");
+        let ty = module.add_func_type(FuncTy {
+            params: Vec::new(),
+            returns: Vec::new(),
+            is_vararg: false,
+        });
+        module.add_function(Function::new(FuncId::new(0), "probe", ty, BlockId::new(0)));
+        let digest = crate::lineage::body_lineage_digest(&module, &[])
+            .expect("single-function probe module must digest");
+
+        let mut with_digest = coverage_row(3, false);
+        with_digest.lineage = Some(digest);
+        with_digest.func_id = Some(4);
+        let rows = vec![with_digest, coverage_row(7, false)];
+        let coverage = coverage_json("probe", &rows, 2, 0).expect("resolved coverage");
+        assert!(
+            coverage.contains(&format!("\"lineage\": \"{digest}\"")),
+            "a digest-bearing row must render the Display form the flip event logs"
+        );
+        assert!(
+            coverage.contains("\"lineage\": \"sha256:"),
+            "the rendered digest must be algorithm-prefixed"
+        );
+        assert!(
+            coverage.contains("\"lineage\": null"),
+            "a digest-less record must render an explicit null, never a fabricated value"
+        );
+        assert!(
+            coverage.contains("\"func_id\": 4"),
+            "a spliced row must publish its index into the assembled function table"
+        );
+        assert!(
+            coverage.contains("\"func_id\": null"),
+            "an un-spliced row has no assembled function to address, and must say so"
+        );
+    }
+
+    /// A per-body record whose mini-module is the minimal spliceable shape: one
+    /// zero-argument, block-free function, no tables, no callees. `lineage` is minted by
+    /// the production function over that same mini-module, exactly as `record` does.
+    fn lineage_body_record(def_index: u32, fn_name: &str) -> BodyRecord {
+        let mut module = Module::new("lineage_assembly_probe");
+        let func_ty = FuncTy { params: Vec::new(), returns: Vec::new(), is_vararg: false };
+        let ty = module.add_func_type(func_ty.clone());
+        module.add_function(Function::new(FuncId::new(0), fn_name, ty, BlockId::new(0)));
+        let lineage = crate::lineage::body_lineage_digest(&module, &[])
+            .expect("the minimal per-body mini-module must digest");
+        let function = module.functions.remove(0);
+        BodyRecord {
+            def_index,
+            kind: BodyKind::Fn,
+            symbolic: false,
+            def_path: fn_name.to_string(),
+            place_path_carrier: false,
+            function: Some(function),
+            func_ty: Some(func_ty),
+            files: Vec::new(),
+            closure_types: Vec::new(),
+            structs: Vec::new(),
+            enums: Vec::new(),
+            types: Vec::new(),
+            globals: Vec::new(),
+            unsupported: Vec::new(),
+            unsupported_details: Vec::new(),
+            collect_primary: Vec::new(),
+            collect_cascade: Vec::new(),
+            instr_count: 0,
+            callees: Vec::new(),
+            func_types: Vec::new(),
+            pending_consts: Vec::new(),
+            deferred: false,
+            interpreter: evidence(ArtifactVerdict::NotRun),
+            derived_mir: DerivedMirEvidence {
+                verdict: ArtifactVerdict::Agreed,
+                detail: "agreed".to_string(),
+                markers_exact: true,
+                markers_detail: "identical".to_string(),
+            },
+            differential_errors: Vec::new(),
+            mir_snapshot: None,
+            lineage: Some(lineage),
+        }
+    }
+
+    /// Trust (L1), the assembly leg of the lineage chain: assembly SORTS bodies, assigns
+    /// fresh dense `FuncId`s, re-interns types and rewrites callees — and the row must come
+    /// out the other side carrying (a) the digest minted BEFORE any of that, unchanged, and
+    /// (b) the address of the function it became. Those two facts are what let an external
+    /// consumer say "the body the flip selected is THIS function of the artifact".
+    ///
+    /// What this test does NOT establish — deliberately, and stated so no reader mistakes
+    /// the plumbing for the theorem: that the assembled function still MEANS what the
+    /// pre-assembly mini-module meant. That is the canonical-remapping certificate, which
+    /// does not exist (see `crate::lineage`, "Future work").
+    #[test]
+    fn test_assembly_preserves_lineage_digest_and_addresses_the_assembled_function() {
+        // Deliberately out of DefIndex order: assembly sorts, and the row must follow its
+        // own body rather than its input position.
+        let mut sorted =
+            vec![lineage_body_record(9, "probe::second"), lineage_body_record(2, "probe::first")];
+        sorted.sort_by_key(|r| r.def_index);
+
+        let assembled = assemble("lineage_assembly_probe", &sorted);
+        assert_eq!(assembled.spliced, 2, "both minimal bodies must splice");
+
+        for record in &sorted {
+            let row = assembled
+                .coverage_rows
+                .iter()
+                .find(|row| row.def_index == record.def_index)
+                .expect("every record must produce a coverage row");
+            assert_eq!(
+                row.lineage, record.lineage,
+                "assembly must carry the pre-assembly digest through unchanged"
+            );
+            let func_id = row.func_id.expect("a spliced row must address its assembled function");
+            let function = assembled
+                .module
+                .functions
+                .get(func_id as usize)
+                .expect("func_id must index the assembled function table");
+            assert_eq!(
+                function.id.index(),
+                func_id,
+                "the assembler's `functions[i].id == i` invariant is what makes func_id an address"
+            );
+            assert_eq!(
+                function.name, record.def_path,
+                "func_id must address the function this row is about, not merely some function"
+            );
+        }
+
+        let first = assembled.coverage_rows.iter().find(|r| r.def_index == 2).expect("row");
+        let second = assembled.coverage_rows.iter().find(|r| r.def_index == 9).expect("row");
+        assert_ne!(
+            first.lineage, second.lineage,
+            "distinct bodies must be distinguishable by digest, or matching is meaningless"
+        );
+        assert_ne!(first.func_id, second.func_id, "distinct bodies must get distinct addresses");
+    }
+
     #[test]
     fn direct_thir_artifacts_are_explicitly_non_authoritative() {
         let assembled = assemble("direct_authority_tripwire", &[]);
@@ -4100,6 +4692,51 @@ mod authority_tests {
         assert!(errors[0].contains("function claims 1"));
         assert!(errors[0].contains("function summaries 1"));
         assert!(errors[0].contains("linked spec modules 1"));
+    }
+
+    /// The tripwire bounds PROOF CONTENT, not module population. Measured
+    /// 2026-07-29 because a design doc had recorded the opposite, and sent the
+    /// next reader chasing a capability flip they do not need.
+    ///
+    /// Two-language design item 11 (§1 converse) lowers a Clean `def` into this
+    /// same module as an ordinary executable function. Such a function carries no
+    /// obligations, no claims and no summary, so it must add ZERO to every one of
+    /// the seven counters — and therefore must NOT require flipping
+    /// `DIRECT_OBLIGATION_CAPABILITY`, which is documented as "a deliberate
+    /// soundness event". Adding proof content to that same function still trips
+    /// the wire, which is what keeps the distinction meaningful rather than a
+    /// loophole: the pin below asserts BOTH directions on one function.
+    #[test]
+    fn a_proof_free_function_does_not_trip_the_direct_authority_tripwire() {
+        let mut module = Module::new("proof_free_population");
+        let ty = module.add_func_type(FuncTy {
+            params: Vec::new(),
+            returns: Vec::new(),
+            is_vararg: false,
+        });
+        // The shape a lowered Clean `def` would have: real executable content,
+        // empty `proofs`, no `summary`.
+        let plain = Function::new(FuncId::new(0), "clean_def_gcd", ty, BlockId::new(0));
+        assert!(plain.proofs.is_empty(), "the lowered-def shape carries no claims");
+        assert!(plain.summary.is_none(), "the lowered-def shape carries no summary");
+        module.add_function(plain);
+
+        assert!(
+            direct_authority_inventory_errors(&module).is_empty(),
+            "populating `functions` is not proof authority; the tripwire bounds \
+             obligations/certificates/diagnostics/claims/summaries/spec-proofs/linked-specs"
+        );
+        assert_eq!(
+            DIRECT_OBLIGATION_CAPABILITY,
+            DirectObligationCapability::StructuralParityOnly,
+            "and it stays StructuralParityOnly while doing so"
+        );
+
+        // The other direction, on the SAME function: one claim is enough to trip.
+        module.functions[0].proofs.push(trust_ir::proof::ProofAnnotation::NoOverflow);
+        let errors = direct_authority_inventory_errors(&module);
+        assert_eq!(errors.len(), 1, "a claim-bearing function must still fail closed");
+        assert!(errors[0].contains("function claims 1"));
     }
 
     #[test]

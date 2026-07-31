@@ -21,8 +21,13 @@
 //     are scanned too — so a `FnDef` in `static T:[fn();1]=[f]` or a promoted `&[f]`
 //     temp is caught as address-taken. A body we MUST account for but cannot
 //     (fn-like `Steal` already stolen, or an unrecognized body-owner kind) POISONS
-//     the whole scan (`incomplete = true`) ⇒ `compute_coverage_signals` rejects EVERY
-//     function. We NEVER skip a missing body (that could hide an address-take).
+//     the whole scan (an `R1ScanGap` is recorded) ⇒ `compute_coverage_signals` rejects
+//     EVERY function. We NEVER skip a missing body (that could hide an address-take).
+//     The gap list is the REASON CHANNEL: the poison used to be a bare `bool` whose
+//     cause was erased at detection and stated NOWHERE — the pure core's gap
+//     classification is dropped unread by its only compiler consumer — so a poisoned
+//     crate silently lost R1 with only an unexplained per-function failure to show for
+//     it. Reasons now travel with the poison, out to one crate-level warning.
 //   * RECURSION: a full iterative Tarjan SCC over the direct-call `edges` now marks
 //     every member of a call cycle `recursive` (mutual recursion), not just self-loops.
 
@@ -74,6 +79,117 @@ pub(crate) struct DirectCallSite {
     pub call_site: trust_types::SourceSpan,
 }
 
+/// Why the crate-wide caller scan could not account for the whole crate.
+///
+/// Each variant is a DISTINCT cause that states a DIFFERENT true thing about the
+/// program. They used to collapse into a bare `incomplete: bool` folded into
+/// `is_public`, and from that point the cause was stated NOWHERE: the only
+/// compiler consumer of the pure core's coverage classification collapses the
+/// gap list to a Total/not-Total test (`try_harvest_flip`), so the poison
+/// silently disabled R1 crate-wide and the user saw only an unexplained
+/// per-function failure. (Had the gaps ever been rendered, the fold would also
+/// have mis-stated the cause as `CoverageGap::ExternallyReachable` — an
+/// unscannable body is not evidence that F is reachable from another crate —
+/// but the shipped defect was the silence, not a rendered false reason.)
+/// A non-empty list poisons the scan exactly as the bool did, so R1 stays
+/// fail-closed crate-wide; the difference is that the cause now reaches the one
+/// consumer that actually reports it: the crate-level warning in
+/// `trust_ensure_whole_crate_verification`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum R1ScanGap {
+    /// A fn-like owner's elaborated body (`mir_drops_elaborated_and_const_checked`)
+    /// was ALREADY STOLEN when the scan reached it, and no steal-CONSUMER query
+    /// serves that body. Unreachable by construction today: the one analysis-phase
+    /// steal of a fn-like body is `inner_mir_for_ctfe`'s stealing arm for a
+    /// `#[rustc_comptime]` fn, and the scan routes exactly those bodies to
+    /// `mir_for_ctfe` (the steal consumer) instead of touching the `Steal` — see
+    /// the scan's `(c)` comment. Kept fail-closed so a future earlier steal
+    /// degrades to a named crate-level gap, never a silent skip.
+    ElaboratedBodyStolen { owner: DefId },
+    /// A `mir_keys` body owner whose `DefKind` the scan has no MIR-query route for.
+    /// Unreachable by construction today; kept fail-closed because a new body-owner
+    /// kind must poison rather than be silently skipped.
+    UnrecognizedBodyOwner { owner: DefId, kind: DefKind },
+    /// The crate contains a `global_asm!` item. Assembly can name any function by
+    /// its mangled symbol, so it is an UNCOUNTABLE caller that no `FnDef`-operand
+    /// scan can enumerate — and `mir_keys` strips these fake bodies anyway.
+    GlobalAsmPresent { item: DefId },
+}
+
+/// How many scan gaps are rendered before the tail is summarized as a count.
+/// Bounds both the crate warning and the per-function coverage reason list.
+const SCAN_GAP_REPORT_LIMIT: usize = 4;
+
+impl R1ScanGap {
+    /// The one-line, user-facing reason this gap exists. Names the offending item,
+    /// so a reader can act on it (delete the `global_asm!`, or file the body kind).
+    fn reason(self, tcx: TyCtxt<'_>) -> String {
+        match self {
+            R1ScanGap::ElaboratedBodyStolen { owner } => format!(
+                "the elaborated MIR of `{}` was already stolen when the crate-wide caller \
+                 scan ran, so that body could not be checked for uses that take a \
+                 function's address",
+                trust_mir_extract::safe_def_path_str(tcx, owner)
+            ),
+            R1ScanGap::UnrecognizedBodyOwner { owner, kind } => format!(
+                "`{}` is a body owner of an unhandled kind ({}), which the crate-wide caller \
+                 scan has no MIR query route for",
+                trust_mir_extract::safe_def_path_str(tcx, owner),
+                // `TyCtxt::def_kind_descr`, not `DefKind::descr`: the upstream doc on
+                // `descr` says to prefer the TyCtxt form when one is in hand (better
+                // descriptions for coroutines and associated functions).
+                tcx.def_kind_descr(kind, owner)
+            ),
+            R1ScanGap::GlobalAsmPresent { item } => format!(
+                "`{}` is a `global_asm!` item: assembly can call any function by its mangled \
+                 symbol, a caller no MIR scan can enumerate",
+                trust_mir_extract::safe_def_path_str(tcx, item)
+            ),
+        }
+    }
+
+    /// The offending item's definition span. Anonymous def paths
+    /// (`crate::{global_asm#0}`) are not a source location a reader can act on;
+    /// the crate-level diagnostic attaches this span to each reason so it points
+    /// at the item itself.
+    fn span(self, tcx: TyCtxt<'_>) -> rustc_span::Span {
+        match self {
+            R1ScanGap::ElaboratedBodyStolen { owner }
+            | R1ScanGap::UnrecognizedBodyOwner { owner, .. } => tcx.def_span(owner),
+            R1ScanGap::GlobalAsmPresent { item } => tcx.def_span(item),
+        }
+    }
+}
+
+/// One rendered scan-gap report entry: the reason text plus the offending item's
+/// span (`None` only for the "and N more" summary tail). Produced ONCE per scan
+/// by [`render_scan_gaps`], the single source for BOTH the per-function coverage
+/// reason list and the crate-level warning, so the two can never disagree.
+#[derive(Clone, Debug)]
+pub(crate) struct R1ScanGapNote {
+    pub text: String,
+    pub span: Option<rustc_span::Span>,
+}
+
+/// Render a scan-gap list into at most [`SCAN_GAP_REPORT_LIMIT`] span-carrying
+/// reasons plus an "and N more" tail. Empty in (and only in) the un-poisoned
+/// case, so an ordinary crate pays nothing.
+fn render_scan_gaps(tcx: TyCtxt<'_>, gaps: &[R1ScanGap]) -> Vec<R1ScanGapNote> {
+    let mut notes: Vec<R1ScanGapNote> = gaps
+        .iter()
+        .take(SCAN_GAP_REPORT_LIMIT)
+        .map(|&gap| R1ScanGapNote { text: gap.reason(tcx), span: Some(gap.span(tcx)) })
+        .collect();
+    let omitted = gaps.len().saturating_sub(SCAN_GAP_REPORT_LIMIT);
+    if omitted > 0 {
+        notes.push(R1ScanGapNote {
+            text: format!("… and {omitted} further item(s) the scan could not account for"),
+            span: None,
+        });
+    }
+    notes
+}
+
 /// Whole-crate call facts feeding the coverage oracle.
 pub(crate) struct CrateCallInfo<'tcx> {
     /// Functions whose `FnDef` is taken as a first-class value somewhere (fn pointer,
@@ -91,11 +207,20 @@ pub(crate) struct CrateCallInfo<'tcx> {
     /// the WHOLE SCC to be jointly inductive. Keyed by `DefId`, over the SAME Tarjan run
     /// that fills `recursive`. Absent for a non-recursive function.
     pub recursive_scc: FxHashMap<DefId, UnordSet<DefId>>,
-    /// A body the scan was REQUIRED to account for was unavailable (an already-stolen
-    /// fn-like `Steal`, or an unrecognized body-owner kind). When set, the scan may
-    /// have missed an address-taking use, so `compute_coverage_signals` rejects EVERY
-    /// function (no flip is sound). Fail-closed: we poison rather than skip.
-    pub incomplete: bool,
+    /// Every reason the scan could not account for the whole crate: a body it was
+    /// REQUIRED to scan but could not (an already-stolen fn-like `Steal`, an
+    /// unrecognized body-owner kind), or a `global_asm!` item. NON-EMPTY means the
+    /// scan may have missed an address-taking use, so `compute_coverage_signals`
+    /// rejects EVERY function (no flip is sound) — exactly the poison the old bare
+    /// `bool` carried, now with the cause attached. Fail-closed: we poison rather
+    /// than skip.
+    pub incomplete: Vec<R1ScanGap>,
+    /// [`Self::incomplete`] rendered once, bounded by [`SCAN_GAP_REPORT_LIMIT`]. The
+    /// single source of the reason text for BOTH the per-function coverage gap and
+    /// the crate-level warning, so the two can never disagree; each entry also
+    /// carries the offending item's span for the warning's `span_note`s. Empty iff
+    /// `incomplete` is empty.
+    pub incomplete_notes: Vec<R1ScanGapNote>,
     /// Reverse direct-call graph: callee `DefId` -> deduped caller `DefId`s, over the
     /// SAME edges Tarjan uses. Exhaustive for any `Total`-covered F (a Total F is neither
     /// address-taken nor externally reachable nor hidden-called ⇒ every caller is a
@@ -143,6 +268,16 @@ fn span_line_col(tcx: TyCtxt<'_>, span: rustc_span::Span) -> (u32, u32) {
 /// `trust_mir_extract::convert_span`, so the oracle's call-site identity and
 /// the attributed VC producer can be compared structurally rather than by
 /// diagnostic text or a fixed-width digest.
+///
+/// "Byte-for-byte" is load-bearing, not stylistic: `exact_callsite_span_multiset_matches`
+/// compares the spans this function produces against the VC locations
+/// `trust_mir_extract::convert_span` stamps on the producer side. In particular this must
+/// NOT rebase its input span to `source_callsite()` unless all three copies do (an ADDITIVE
+/// callsite anchor under a new binding is the one permitted evolution, and it too must land
+/// in all three together) — see the note on `trust_verify::source_span_from_rustc_span` for
+/// why the raw range is required for identity exactness, why the file rendering runs
+/// through `trust_types::stable_obligation_file`, and what remains wrong about the raw
+/// location. Pinned by `crates/trust-types/tests/span_normalization_parity.rs`.
 fn source_span(tcx: TyCtxt<'_>, span: rustc_span::Span) -> trust_types::SourceSpan {
     if span.is_dummy() {
         return trust_types::SourceSpan::default();
@@ -151,7 +286,9 @@ fn source_span(tcx: TyCtxt<'_>, span: rustc_span::Span) -> trust_types::SourceSp
     let lo = source_map.lookup_char_pos(span.lo());
     let hi = source_map.lookup_char_pos(span.hi());
     trust_types::SourceSpan {
-        file: lo.file.name.prefer_local_unconditionally().to_string(),
+        file: trust_types::stable_obligation_file(
+            lo.file.name.prefer_local_unconditionally().to_string(),
+        ),
         line_start: lo.line as u32,
         col_start: lo.col.0 as u32,
         line_end: hi.line as u32,
@@ -268,7 +405,7 @@ impl<'tcx> Visitor<'tcx> for CallScan<'_, 'tcx> {
 /// the analysis phase (mirrors `trust_init_backing_certificates`' pre-steal borrow for
 /// fn-like bodies, and uses the steal CONSUMER queries for const/static + promoteds so
 /// early const-eval cannot have stolen them out from under us). Any body we are
-/// REQUIRED to account for but cannot ⇒ `incomplete = true` (poison the whole scan).
+/// REQUIRED to account for but cannot ⇒ push an [`R1ScanGap`] (poison the whole scan).
 #[allow(rustc::untracked_query_information, rustc::potential_query_instability)]
 pub(crate) fn scan_crate_calls<'tcx>(tcx: TyCtxt<'tcx>) -> CrateCallInfo<'tcx> {
     let mut address_taken = FxHashSet::default();
@@ -277,7 +414,7 @@ pub(crate) fn scan_crate_calls<'tcx>(tcx: TyCtxt<'tcx>) -> CrateCallInfo<'tcx> {
     let mut hidden: FxHashSet<DefId> = FxHashSet::default();
     let mut mono_call_sites: FxHashMap<DefId, Vec<MonoCallSite<'tcx>>> = FxHashMap::default();
     let mut mono_unresolved: FxHashSet<DefId> = FxHashSet::default();
-    let mut incomplete = false;
+    let mut incomplete: Vec<R1ScanGap> = Vec::new();
 
     for &local in tcx.mir_keys(()) {
         let did = local.to_def_id();
@@ -303,16 +440,116 @@ pub(crate) fn scan_crate_calls<'tcx>(tcx: TyCtxt<'tcx>) -> CrateCallInfo<'tcx> {
             continue;
         }
 
-        // (c) Scan the owner's own (non-trivial) body via the right query.
-        let body_scanned = match tcx.def_kind(did) {
-            // fn / closure / coroutine / synthetic coroutine body, INCLUDING const fns:
-            // the elaborated body is a `Steal` borrowed pre-codegen-steal. `mir_for_ctfe`
-            // only CLONES a const fn (never steals it), and `optimized_mir`'s steal is a
-            // codegen-phase event, so at the analysis phase this borrow is valid.
+        // (c) Scan the owner's own (non-trivial) body via the right query. `Some(gap)`
+        //     names the exact reason this body escaped the scan; `None` means scanned.
+        let body_gap = match tcx.def_kind(did) {
+            // `#[rustc_comptime]` fn: fn-KINDED but const-CONTEXTED. `hir_body_const_context`
+            // maps `Constness::Const { always: true }` to `ConstContext::Const{..}` — the
+            // predicate on which `inner_mir_for_ctfe` takes its STEALING arm (not the
+            // `ConstFn` clone arm) — and ordinary compilation performs that steal BEFORE this
+            // scan runs (`check_crate` eagerly const-evaluates; see
+            // tests/ui/comptime/trust-scc-graph-excludes-comptime.rs). So route the body to
+            // `mir_for_ctfe`, the CONSUMER of exactly that steal, which serves it stably —
+            // and do so unconditionally, not only when the `Steal` is observed stolen, so the
+            // scan result cannot depend on query-evaluation order. This RECOVERS the body the
+            // old code poisoned the whole crate over (a permanent, avoidable crate-wide R1
+            // loss for one comptime item); pinned by
+            // tests/ui/trust/r1/flip_comptime_stolen_body_recovered.rs.
+            //
+            // `reproducible: false` is load-bearing: the producer never re-runs on a comptime
+            // body (`trust_coverage_eligible_body` excludes const contexts), so a call edge in
+            // it can never become a discharge obligation — every callee it reaches is recorded
+            // `hidden` (never `Total`), and address-takes are recorded normally. Fail-closed
+            // per-callee instead of fail-closed per-crate.
+            //
+            // `SyntheticCoroutineBody` is deliberately NOT in this arm: it has no HIR body, so
+            // `hir_body_const_context` would panic on it — and having no const context it can
+            // only take the ordinary borrow arm below (same exclusion as the backing-
+            // certificate inventory's stolen-body recovery).
+            DefKind::Fn | DefKind::AssocFn | DefKind::Closure
+                if matches!(
+                    tcx.hir_body_const_context(local),
+                    Some(rustc_hir::ConstContext::Const { .. })
+                ) =>
+            {
+                let body = tcx.mir_for_ctfe(did);
+                let mut scan = CallScan {
+                    tcx,
+                    owner: did,
+                    owner_typing_env: TypingEnv::post_analysis(tcx, did),
+                    address_taken: &mut address_taken,
+                    edges: &mut edges,
+                    direct_call_sites: &mut direct_call_sites,
+                    hidden: &mut hidden,
+                    mono_call_sites: &mut mono_call_sites,
+                    mono_unresolved: &mut mono_unresolved,
+                    reproducible: false,
+                };
+                scan.visit_body(body);
+                None
+            }
+            // COROUTINE body (an `async fn`/`gen` block's `{closure#N}`) or the synthetic
+            // by-move body derived from one. Routed by IDENTITY, not by observed steal state,
+            // to the steal CONSUMER — `optimized_mir` — for the same order-independence reason
+            // the comptime arm routes unconditionally through `mir_for_ctfe`.
+            //
+            // Why the elaborated borrow is NOT valid here, discovered the hard way: computing
+            // the coroutine's LAYOUT forces `optimized_mir(coroutine)` during ANALYSIS (the
+            // state-transform must run before the interior's layout exists), and that steals
+            // the coroutine's `mir_drops_elaborated_and_const_checked` long before this scan.
+            // The previous arm's "optimized_mir's steal is a codegen-phase event" claim is
+            // simply false for coroutines: when this poisoned instead of recovering, the
+            // crate-level gap warning fired on TWELVE in-tree ui tests — i.e. R1 had been
+            // silently disabled for every crate containing an `async fn` the whole time the
+            // poison was a bare bool.
+            //
+            // `reproducible: false` is load-bearing, as in the comptime arm: optimized MIR is
+            // post-inlining, so its call edges and spans need not match what the producer
+            // re-derives from a pre-steal body. Every callee reached from a coroutine body is
+            // recorded `hidden` (never `Total`) and address-takes are recorded normally —
+            // fail-closed per-callee instead of fail-closed per-crate.
+            //
+            // The `optimized_mir_query_would_cycle` guard covers the one corner where the
+            // consumer query cannot be read (we are inside this very body's `optimized_mir`,
+            // or it sits in a mutual-recursion SCC whose members snapshot instead): there the
+            // old poison is kept — sound, and strictly no worse than before this arm existed.
+            kind @ (DefKind::Closure | DefKind::SyntheticCoroutineBody)
+                if tcx.is_coroutine(did) || matches!(kind, DefKind::SyntheticCoroutineBody) =>
+            {
+                if crate::trust_verify::optimized_mir_query_would_cycle(tcx, did) {
+                    Some(R1ScanGap::ElaboratedBodyStolen { owner: did })
+                } else {
+                    let body = tcx.optimized_mir(did);
+                    let mut scan = CallScan {
+                        tcx,
+                        owner: did,
+                        owner_typing_env: body.typing_env(tcx),
+                        address_taken: &mut address_taken,
+                        edges: &mut edges,
+                        direct_call_sites: &mut direct_call_sites,
+                        hidden: &mut hidden,
+                        mono_call_sites: &mut mono_call_sites,
+                        mono_unresolved: &mut mono_unresolved,
+                        reproducible: false,
+                    };
+                    scan.visit_body(body);
+                    None
+                }
+            }
+            // Ordinary fn / closure body (including plain `const fn`, which `mir_for_ctfe`
+            // only CLONES). The elaborated body is a `Steal` borrowed pre-codegen-steal:
+            // for a NON-coroutine body, `optimized_mir`'s steal really is a codegen-phase
+            // event (the two analysis-phase fn-like steals that exist — comptime const-eval
+            // and coroutine layout — are both routed to their consumer queries above), so at
+            // the analysis phase this borrow is valid. If the `Steal` is nonetheless already
+            // stolen, NO consumer query serves the body, so the scan cannot account for it:
+            // poison, fail-closed, with the gap naming WHICH body — a named crate-level gap
+            // instead of the hard "read from stolen value" ICE
+            // `trust_mir_direct_local_callees` carried.
             DefKind::Fn | DefKind::AssocFn | DefKind::Closure | DefKind::SyntheticCoroutineBody => {
                 let steal = tcx.mir_drops_elaborated_and_const_checked(local);
                 if steal.is_stolen() {
-                    false
+                    Some(R1ScanGap::ElaboratedBodyStolen { owner: did })
                 } else {
                     let body = steal.borrow();
                     let mut scan = CallScan {
@@ -328,7 +565,7 @@ pub(crate) fn scan_crate_calls<'tcx>(tcx: TyCtxt<'tcx>) -> CrateCallInfo<'tcx> {
                         reproducible: true,
                     };
                     scan.visit_body(&body);
-                    true
+                    None
                 }
             }
             // const / static / anon-const / inline-const ITEM body. `optimized_mir` is
@@ -355,14 +592,14 @@ pub(crate) fn scan_crate_calls<'tcx>(tcx: TyCtxt<'tcx>) -> CrateCallInfo<'tcx> {
                     reproducible: false,
                 };
                 scan.visit_body(body);
-                true
+                None
             }
             // Any other body-owner kind is unexpected here: fail closed (poison), never
             // silently skip — an unscanned body could hide an address-take.
-            _ => false,
+            kind => Some(R1ScanGap::UnrecognizedBodyOwner { owner: did, kind }),
         };
-        if !body_scanned {
-            incomplete = true;
+        if let Some(gap) = body_gap {
+            incomplete.push(gap);
             continue;
         }
 
@@ -394,10 +631,26 @@ pub(crate) fn scan_crate_calls<'tcx>(tcx: TyCtxt<'tcx>) -> CrateCallInfo<'tcx> {
     // enumerate (and a mangled-symbol string names no `FnDef` operand, so scanning the fake
     // body's operands would not even suffice). Fail closed exactly as for any unscannable body:
     // if the crate contains ANY global-asm item, poison the whole scan ⇒ no function is ever
-    // `Total` ⇒ R1 is disabled crate-wide.
-    if tcx.hir_crate_items(()).definitions().any(|d| matches!(tcx.def_kind(d), DefKind::GlobalAsm))
-    {
-        incomplete = true;
+    // `Total` ⇒ R1 is disabled crate-wide. This is the poison cause users actually hit, so the
+    // gap records EVERY such item (the poison decision is unchanged — one is already enough).
+    // `definitions()` walks slice-backed owner ids, so the recorded order is deterministic.
+    for item in tcx.hir_crate_items(()).definitions() {
+        if matches!(tcx.def_kind(item), DefKind::GlobalAsm) {
+            // Trust: `clean{}` islands share `DefKind::GlobalAsm` (the def-kind mapping has no
+            // island variant) but are their own HIR kind, `ItemKind::CleanIsland`. An island is
+            // kernel-bound Lean: it emits NO machine code, so it cannot call, address-take, or
+            // symbol-name a function at runtime — a citation is a proof-side reference, not a
+            // call site. Poisoning on the DefKind alone silently disabled R1 for every crate
+            // containing an island (found when the reason-channel warning fired on eleven
+            // e2/e6/e9 ui tests at once). Only REAL `ItemKind::GlobalAsm` — actual assembly,
+            // which can name any mangled symbol — is the uncountable caller this gap exists for.
+            if let rustc_hir::Node::Item(hir_item) = tcx.hir_node_by_def_id(item)
+                && matches!(hir_item.kind, rustc_hir::ItemKind::CleanIsland { .. })
+            {
+                continue;
+            }
+            incomplete.push(R1ScanGap::GlobalAsmPresent { item: item.to_def_id() });
+        }
     }
 
     let (recursive, recursive_scc) = recursive_defs(&edges);
@@ -411,11 +664,13 @@ pub(crate) fn scan_crate_calls<'tcx>(tcx: TyCtxt<'tcx>) -> CrateCallInfo<'tcx> {
             callers.entry(callee).or_default().push(caller);
         }
     }
+    let incomplete_notes = render_scan_gaps(tcx, &incomplete);
     CrateCallInfo {
         address_taken,
         recursive,
         recursive_scc,
         incomplete,
+        incomplete_notes,
         callers,
         direct_call_sites,
         hidden_call_target: hidden,
@@ -648,7 +903,7 @@ pub(crate) fn generic_mono_coverable(
         && !d.trait_dispatchable
         && !d.recursive
         && !d.lang_item
-        && !info.incomplete
+        && info.incomplete.is_empty()
         && !info.hidden_call_target.contains(&did)
         && !info.address_taken.contains(&did)
         && !info.mono_unresolved.contains(&did)
@@ -683,7 +938,7 @@ pub(crate) fn recursive_inductive_coverable(
         && !d.externally_exposed
         && !d.trait_dispatchable
         && !d.lang_item
-        && !info.incomplete
+        && info.incomplete.is_empty()
         && !info.hidden_call_target.contains(&did)
         && !info.address_taken.contains(&did)
         // The full SCC membership must be recorded (it always is when `d.recursive`),
@@ -728,7 +983,8 @@ fn scc_all_members_coverable(
 
 /// Conservative caller-coverage signals for the local function `f`. Every hazard that
 /// could mean "a caller exists that we cannot enumerate" forces `Incomplete` (via
-/// `is_public` or `address_taken`); the pure core then keeps F's honest verdict.
+/// `is_public`, `address_taken`, or the crate-scan poison in `scan_incomplete`); the
+/// pure core then keeps F's honest verdict.
 pub(crate) fn compute_coverage_signals(
     tcx: TyCtxt<'_>,
     f: LocalDefId,
@@ -813,19 +1069,43 @@ pub(crate) fn compute_coverage_signals(
     // std), so this is a cheap, usually-empty scan for a normal crate.
     let lang_item = tcx.lang_items().iter().any(|(_, ldid)| ldid == did);
 
-    CoverageSignals {
-        // `info.incomplete` poisons EVERY function: the crate-wide scan could not account
-        // for some body, so we cannot rule out an unseen address-taking use of `f`.
-        is_public: info.incomplete
-            || info.hidden_call_target.contains(&did)
-            || bad_kind
-            || externally_exposed
-            || trait_dispatchable
-            || generic
-            || recursive
-            || lang_item,
-        // REAL scan now: address-taken ⇒ an uncountable indirect caller ⇒ reject.
-        address_taken: info.address_taken.contains(&did),
-        unresolved_callees: Vec::new(),
-    }
+    // A NARROWER RELATIVE OF THE SAME MODELLING GAP (deliberately scoped out): the
+    // six per-function causes below also arrive as one bool, so the pure core still
+    // CLASSIFIES a hidden tail-call edge, a closure, a trait method, a generic, a
+    // recursion, or a lang item as `ExternallyReachable`. No consumer renders that
+    // classification today (the compiler's one call site only tests Total/not-Total),
+    // and each of those is a per-FUNCTION fact a reader can see in the source — unlike
+    // the crate-wide scan poison, whose cause was invisible everywhere, which is why
+    // the poison got its own channel first. Splitting these needs one signal field
+    // per cause and touches every gate that reads `is_public`.
+    let is_public = info.hidden_call_target.contains(&did)
+        || bad_kind
+        || externally_exposed
+        || trait_dispatchable
+        || generic
+        || recursive
+        || lang_item;
+    // REAL scan now: address-taken ⇒ an uncountable indirect caller ⇒ reject.
+    let address_taken = info.address_taken.contains(&did);
+    // The crate-wide scan poison rejects EVERY function (we cannot rule out an
+    // unseen address-taking use of `f`) — but it is NOT external reachability, so
+    // it no longer rides in `is_public`. The old fold erased the cause at the
+    // moment of detection: nothing downstream could state why R1 was disabled
+    // (the classification it induced, `ExternallyReachable`, was also false for
+    // `f` — but it was never rendered; the harm was the silence). The reasons
+    // travel in their own channel: `classify_coverage` turns each into a
+    // `CoverageGap::ScanIncomplete` — rejection unchanged, pinned by the ERROR
+    // half of tests/ui/trust/r1/reject_global_asm_names_reason.rs and by
+    // trust-router's `scan_poison_alone_blocks_the_mint_through_classification`
+    // — and the crate-level warning states the same text.
+    //
+    // `CoverageSignals` is `#[non_exhaustive]` with this `new` as the only
+    // out-of-crate constructor, precisely so no consumer can treat the narrowed
+    // `is_public || address_taken` as the old sufficient rejection test.
+    CoverageSignals::new(
+        is_public,
+        address_taken,
+        Vec::new(),
+        info.incomplete_notes.iter().map(|note| note.text.clone()).collect(),
+    )
 }

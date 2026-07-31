@@ -6624,7 +6624,7 @@ mod tests {
         };
         assert_eq!(
             certified_test_execution_terminal_line(&completed),
-            "Certified test execution: schema=trust.certified-test-execution.v1 completion_scope=top-level-cargo-child-exit-only-v1 state=cargo-invocation-exited requested=true compile_only=false phase_a_exit=0 phase_a_success=true authorized_executables=1 phase_b_exit=101"
+            "Certified test execution: schema=trust.certified-test-execution.v2 completion_scope=top-level-cargo-child-exit-only-v1 state=cargo-invocation-exited requested=true compile_only=false phase_a_exit=0 phase_a_success=true authorized_executables=1 phase_b_exit=101"
         );
 
         let blocked = CertifiedTestExecutionReport {
@@ -6644,7 +6644,7 @@ mod tests {
         };
         assert_eq!(
             certified_test_execution_terminal_line(&blocked),
-            "Certified test execution: schema=trust.certified-test-execution.v1 completion_scope=top-level-cargo-child-exit-only-v1 state=blocked requested=true compile_only=false phase_a_exit=2 phase_a_success=false blocker=\"phase A failed\\nbefore execution\""
+            "Certified test execution: schema=trust.certified-test-execution.v2 completion_scope=top-level-cargo-child-exit-only-v1 state=blocked requested=true compile_only=false phase_a_exit=2 phase_a_success=false blocker=\"phase A failed\\nbefore execution\""
         );
     }
 

@@ -19,8 +19,7 @@ fn dense_contract_indices_follow_global_authored_ordinals_with_equal_spans() {
     let ensures = [hir_contract_clause(0), hir_contract_clause(3), hir_contract_clause(4)];
     let decreases = [hir_contract_clause(2)];
 
-    let ordered =
-        restore_hir_contract_authored_order(&requires, &ensures, &decreases).unwrap();
+    let ordered = restore_hir_contract_authored_order(&requires, &ensures, &decreases).unwrap();
     assert_eq!(
         ordered
             .iter()
@@ -106,19 +105,16 @@ fn lowered_text(
             domain: Domain::MachineInt { width: 64, signed: false },
         },
     ];
-    let domains = if origin == ContractClauseOrigin::Native {
-        native_domains.as_slice()
-    } else {
-        &[]
-    };
-    with_test_session_globals(|| match lower_contract_snippet_body_with_domains(
-        body, kind, origin, domains,
-    )? {
-        TrustContractPredicateKind::Typed { text, .. }
-        | TrustContractPredicateKind::Opaque { text } => {
-            Some(text.as_str().strip_prefix(LOWERED_COMPILER_CONTRACT_PREFIX)?.to_string())
+    let domains =
+        if origin == ContractClauseOrigin::Native { native_domains.as_slice() } else { &[] };
+    with_test_session_globals(|| {
+        match lower_contract_snippet_body_with_domains(body, kind, origin, domains)? {
+            TrustContractPredicateKind::Typed { text, .. }
+            | TrustContractPredicateKind::Opaque { text } => {
+                Some(text.as_str().strip_prefix(LOWERED_COMPILER_CONTRACT_PREFIX)?.to_string())
+            }
+            _ => None,
         }
-        _ => None,
     })
 }
 
@@ -146,13 +142,15 @@ fn native_function_clauses_fail_closed_on_unknown_source_names() {
             ),
             None,
         );
-        assert!(lower_contract_snippet_body_with_domains(
-            "result == x",
-            TrustContractKind::Ensures,
-            ContractClauseOrigin::Native,
-            &domains,
-        )
-        .is_some());
+        assert!(
+            lower_contract_snippet_body_with_domains(
+                "result == x",
+                TrustContractKind::Ensures,
+                ContractClauseOrigin::Native,
+                &domains,
+            )
+            .is_some()
+        );
     });
 }
 
@@ -180,10 +178,7 @@ fn canonical_lowering_mints_an_exact_structural_query_proposition() {
         else {
             panic!("supported canonical comparison must be structurally typed")
         };
-        assert_eq!(
-            text.as_str(),
-            "__trust_lowered_compiler_contract__:(x) == (result)"
-        );
+        assert_eq!(text.as_str(), "__trust_lowered_compiler_contract__:(x) == (result)");
         assert_eq!(
             proposition,
             Proposition::Eq(
@@ -202,6 +197,68 @@ fn canonical_lowering_mints_an_exact_structural_query_proposition() {
             lowered_contract_text("forall(i, 0..1, i == i)".to_string()),
             TrustContractPredicateKind::Opaque { .. }
         ));
+    });
+}
+
+#[test]
+fn loop_predicate_source_bindings_are_exact_used_hir_locals_only() {
+    use rustc_middle::mir::trust_contract::TrustContractPropositionDomain as Domain;
+
+    with_test_session_globals(|| {
+        let predicate = lowered_contract_text_with_domains(
+            "inner < limit".to_string(),
+            &[
+                LoweredVariableDomain {
+                    name: "inner".to_string(),
+                    domain: Domain::MachineInt { width: 32, signed: false },
+                },
+                LoweredVariableDomain {
+                    name: "limit".to_string(),
+                    domain: Domain::MachineInt { width: 32, signed: false },
+                },
+            ],
+        );
+        let bindings = exact_predicate_source_bindings(
+            &predicate,
+            &[
+                LoweredSourceBinding { name: "outer".to_string(), hir_local_id: 7 },
+                LoweredSourceBinding { name: "inner".to_string(), hir_local_id: 11 },
+                LoweredSourceBinding { name: "limit".to_string(), hir_local_id: 13 },
+            ],
+        );
+        assert_eq!(
+            bindings
+                .iter()
+                .map(|binding| (binding.name.as_str(), binding.hir_local_id))
+                .collect::<Vec<_>>(),
+            vec![("inner", 11), ("limit", 13)],
+            "unused visible bindings must not enter predicate provenance",
+        );
+
+        let ambiguous = exact_predicate_source_bindings(
+            &predicate,
+            &[
+                LoweredSourceBinding { name: "inner".to_string(), hir_local_id: 11 },
+                LoweredSourceBinding { name: "inner".to_string(), hir_local_id: 17 },
+                LoweredSourceBinding { name: "limit".to_string(), hir_local_id: 13 },
+            ],
+        );
+        assert!(
+            ambiguous.iter().all(|binding| binding.name.as_str() != "inner"),
+            "a conflicting source identity must fail closed instead of choosing one local",
+        );
+
+        let synthesized = lowered_contract_text_with_domains(
+            "xs_len > 0".to_string(),
+            &[LoweredVariableDomain {
+                name: "xs_len".to_string(),
+                domain: Domain::PointerSizedInt { width: 64, signed: false },
+            }],
+        );
+        assert!(
+            exact_predicate_source_bindings(&synthesized, &[]).is_empty(),
+            "a synthesized projection leaf must not acquire whole-local authority",
+        );
     });
 }
 
@@ -405,19 +462,13 @@ fn native_function_decreases_is_early_typed_against_signature_domains() {
     use rustc_middle::mir::trust_contract::TrustContractPropositionDomain as Domain;
 
     let domains = [
-        LoweredVariableDomain {
-            name: "flag".to_string(),
-            domain: Domain::Bool,
-        },
+        LoweredVariableDomain { name: "flag".to_string(), domain: Domain::Bool },
         LoweredVariableDomain {
             name: "n".to_string(),
             domain: Domain::MachineInt { width: 32, signed: false },
         },
     ];
-    assert_eq!(
-        validate_native_function_decreases_body("n - 1", &domains),
-        Ok("n - 1".to_string())
-    );
+    assert_eq!(validate_native_function_decreases_body("n - 1", &domains), Ok("n - 1".to_string()));
 
     let boolean = validate_native_function_decreases_body("flag", &domains).unwrap_err();
     assert!(boolean.contains("must have sort Int"), "unexpected error: {boolean}");
@@ -464,12 +515,8 @@ fn native_function_decreases_accepts_exact_aggregate_measures() {
         Ok("xs[0]".to_string())
     );
     let boolean_element =
-        validate_native_clause_body("flags[0]", TrustContractKind::Decreases, &sorts)
-            .unwrap_err();
-    assert!(
-        boolean_element.contains("must have sort Int"),
-        "unexpected error: {boolean_element}"
-    );
+        validate_native_clause_body("flags[0]", TrustContractKind::Decreases, &sorts).unwrap_err();
+    assert!(boolean_element.contains("must have sort Int"), "unexpected error: {boolean_element}");
 }
 
 #[test]
@@ -486,19 +533,11 @@ fn native_function_requires_accepts_exact_aggregate_accessors() {
     ]);
 
     assert_eq!(
-        validate_native_clause_body(
-            "xs.len() > 0 && n == n",
-            TrustContractKind::Requires,
-            &sorts,
-        ),
+        validate_native_clause_body("xs.len() > 0 && n == n", TrustContractKind::Requires, &sorts,),
         Ok("xs.len() > 0 && n == n".to_string()),
     );
-    let scalar = validate_native_clause_body(
-        "n.len() > 0",
-        TrustContractKind::Requires,
-        &sorts,
-    )
-    .unwrap_err();
+    let scalar = validate_native_clause_body("n.len() > 0", TrustContractKind::Requires, &sorts)
+        .unwrap_err();
     assert!(scalar.contains("requires an Array base"), "unexpected error: {scalar}");
 }
 
@@ -524,34 +563,34 @@ fn native_function_requires_len_mints_typed_query_proposition() {
             name: "_0".to_string(),
             domain: Domain::MachineInt { width: 32, signed: false },
         },
-        LoweredVariableDomain {
-            name: "keep".to_string(),
-            domain: Domain::Bool,
-        },
+        LoweredVariableDomain { name: "keep".to_string(), domain: Domain::Bool },
         LoweredVariableDomain {
             name: "n".to_string(),
             domain: Domain::PointerSizedInt { width: 64, signed: false },
         },
     ];
+    let collection_domains = BTreeMap::from([(
+        "xs".to_string(),
+        LoweredCollectionDomain {
+            element: Domain::MachineInt { width: 8, signed: false },
+            fixed_length: None,
+        },
+    )]);
 
     with_test_session_globals(|| {
         let predicate = typed_native_function_requires(
             "xs.len() > 0 && n == n",
             &sorts,
             &domains,
+            &collection_domains,
             Some(64),
         )
         .expect("the exact native Requires subset must be structurally typed");
         let Predicate::Typed { text, proposition } = predicate else {
             panic!("native Requires must not remain opaque")
         };
-        assert_eq!(
-            text.as_str(),
-            "__trust_lowered_compiler_contract__:xs.len() > 0 && n == n",
-        );
-        let Proposition::And(terms) = proposition else {
-            panic!("expected canonical conjunction")
-        };
+        assert_eq!(text.as_str(), "__trust_lowered_compiler_contract__:xs.len() > 0 && n == n",);
+        let Proposition::And(terms) = proposition else { panic!("expected canonical conjunction") };
         assert!(terms.iter().any(|term| matches!(
             term,
             Proposition::Gt(lhs, _)
@@ -571,6 +610,7 @@ fn native_function_requires_len_mints_typed_query_proposition() {
                 "xs.len() > 0",
                 &sorts,
                 &colliding_domains,
+                &collection_domains,
                 Some(64),
             )
             .is_none(),
@@ -601,12 +641,9 @@ fn native_clause_rejects_visible_synthetic_name_aliases_before_lowering() {
             ("xs".to_string(), array.clone()),
             (reserved.to_string(), trust_types::Sort::Int),
         ]);
-        let error = validate_native_clause_body(
-            "xs.len() == 0",
-            TrustContractKind::LoopInvariant,
-            &sorts,
-        )
-        .unwrap_err();
+        let error =
+            validate_native_clause_body("xs.len() == 0", TrustContractKind::LoopInvariant, &sorts)
+                .unwrap_err();
         assert!(error.contains(reserved), "unexpected error for `{reserved}`: {error}");
         assert!(
             error.contains("synthetic contract-variable namespace"),
@@ -623,10 +660,7 @@ fn native_loop_clauses_are_early_typed_in_their_visible_environment() {
         ("n".to_string(), trust_types::Sort::Int),
         (
             "state".to_string(),
-            trust_types::Sort::Datatype {
-                name: "State".to_string(),
-                constructors: Vec::new(),
-            },
+            trust_types::Sort::Datatype { name: "State".to_string(), constructors: Vec::new() },
         ),
         (
             "xs".to_string(),
@@ -651,16 +685,11 @@ fn native_loop_clauses_are_early_typed_in_their_visible_environment() {
     );
 
     let non_boolean =
-        validate_native_clause_body("n + 1", TrustContractKind::LoopInvariant, &sorts)
-            .unwrap_err();
+        validate_native_clause_body("n + 1", TrustContractKind::LoopInvariant, &sorts).unwrap_err();
     assert!(non_boolean.contains("must have sort Bool"), "unexpected error: {non_boolean}");
 
-    let non_integer = validate_native_clause_body(
-        "flag",
-        TrustContractKind::Decreases,
-        &sorts,
-    )
-    .unwrap_err();
+    let non_integer =
+        validate_native_clause_body("flag", TrustContractKind::Decreases, &sorts).unwrap_err();
     assert!(non_integer.contains("must have sort Int"), "unexpected error: {non_integer}");
 
     let unknown =
@@ -672,10 +701,7 @@ fn native_loop_clauses_are_early_typed_in_their_visible_environment() {
     let scalar_index =
         validate_native_clause_body("flag[0]", TrustContractKind::LoopInvariant, &sorts)
             .unwrap_err();
-    assert!(
-        scalar_index.contains("requires an Array base"),
-        "unexpected error: {scalar_index}"
-    );
+    assert!(scalar_index.contains("requires an Array base"), "unexpected error: {scalar_index}");
 
     let scalar_field =
         validate_native_clause_body("flag.nope == 0", TrustContractKind::LoopInvariant, &sorts)
@@ -692,6 +718,256 @@ fn native_loop_clauses_are_early_typed_in_their_visible_environment() {
         unknown_datatype_field.contains("unsupported without exact field layout"),
         "unexpected error: {unknown_datatype_field}"
     );
+}
+
+#[test]
+fn native_e4_e5_clauses_mint_class_aware_structural_query_carriers() {
+    use rustc_middle::mir::trust_contract::{
+        TrustContractPredicateKind as Predicate, TrustContractProposition as Proposition,
+        TrustContractPropositionDomain as Domain,
+    };
+
+    let sorts = BTreeMap::from([
+        ("limit".to_string(), trust_types::Sort::Int),
+        ("n".to_string(), trust_types::Sort::Int),
+    ]);
+    let domains = [
+        LoweredVariableDomain {
+            name: "limit".to_string(),
+            domain: Domain::MachineInt { width: 32, signed: false },
+        },
+        LoweredVariableDomain {
+            name: "n".to_string(),
+            domain: Domain::MachineInt { width: 32, signed: false },
+        },
+    ];
+
+    with_test_session_globals(|| {
+        let invariant = typed_native_clause(
+            "n <= limit",
+            TrustContractKind::LoopInvariant,
+            &sorts,
+            &domains,
+            Some(64),
+        )
+        .expect("Boolean E4 clause must be typed");
+        assert!(matches!(invariant, Predicate::Typed { proposition: Proposition::Le(_, _), .. }));
+
+        let decreases = typed_native_clause(
+            "limit - n",
+            TrustContractKind::Decreases,
+            &sorts,
+            &domains,
+            Some(64),
+        )
+        .expect("numeric E5 clause must be typed");
+        assert!(matches!(decreases, Predicate::Typed { proposition: Proposition::Sub(_, _), .. }));
+
+        assert!(
+            typed_native_clause(
+                "n <= limit",
+                TrustContractKind::Decreases,
+                &sorts,
+                &domains,
+                Some(64),
+            )
+            .is_none(),
+            "a Boolean proposition cannot masquerade as an E5 measure",
+        );
+        assert!(
+            typed_native_clause(
+                "n",
+                TrustContractKind::Decreases,
+                &sorts,
+                &domains[..1],
+                Some(64),
+            )
+            .is_none(),
+            "a numeric carrier needs the exact domain of every free variable",
+        );
+    });
+}
+
+#[test]
+fn native_collection_loop_clause_mints_exact_literal_projection_domains() {
+    use rustc_middle::mir::trust_contract::{
+        TrustContractPredicateKind as Predicate, TrustContractProposition as Proposition,
+        TrustContractPropositionDomain as Domain,
+    };
+
+    let source_sorts = BTreeMap::from([
+        ("_n".to_string(), trust_types::Sort::Int),
+        ("first".to_string(), trust_types::Sort::Int),
+        (
+            "xs".to_string(),
+            trust_types::Sort::Array(
+                Box::new(trust_types::Sort::Int),
+                Box::new(trust_types::Sort::Int),
+            ),
+        ),
+    ]);
+    let visible_domains = [
+        LoweredVariableDomain {
+            name: "_n".to_string(),
+            domain: Domain::PointerSizedInt { width: 64, signed: false },
+        },
+        LoweredVariableDomain {
+            name: "first".to_string(),
+            domain: Domain::MachineInt { width: 32, signed: false },
+        },
+    ];
+    let collection_domains = BTreeMap::from([(
+        "xs".to_string(),
+        LoweredCollectionDomain {
+            element: Domain::MachineInt { width: 32, signed: false },
+            fixed_length: Some(4),
+        },
+    )]);
+
+    with_test_session_globals(|| {
+        let predicate = typed_native_clause_with_collection_domains(
+            "_n == xs.len() && first == xs[0]",
+            TrustContractKind::LoopInvariant,
+            &source_sorts,
+            &visible_domains,
+            &collection_domains,
+            Some(64),
+        )
+        .expect("a canonical literal collection read must retain its exact element domain");
+        let Predicate::Typed { proposition: Proposition::And(terms), .. } = predicate else {
+            panic!("the collection invariant must cross as one structural conjunction")
+        };
+        let mut variables = BTreeMap::new();
+        fn collect(proposition: &Proposition, variables: &mut BTreeMap<String, Domain>) {
+            match proposition {
+                Proposition::Var { name, domain } => {
+                    variables.insert(name.to_string(), *domain);
+                }
+                Proposition::Not(inner) | Proposition::Neg(inner) => collect(inner, variables),
+                Proposition::And(terms) | Proposition::Or(terms) => {
+                    for term in terms {
+                        collect(term, variables);
+                    }
+                }
+                Proposition::Implies(lhs, rhs)
+                | Proposition::Eq(lhs, rhs)
+                | Proposition::Lt(lhs, rhs)
+                | Proposition::Le(lhs, rhs)
+                | Proposition::Gt(lhs, rhs)
+                | Proposition::Ge(lhs, rhs)
+                | Proposition::Add(lhs, rhs)
+                | Proposition::Sub(lhs, rhs)
+                | Proposition::Mul(lhs, rhs)
+                | Proposition::Div(lhs, rhs)
+                | Proposition::Rem(lhs, rhs) => {
+                    collect(lhs, variables);
+                    collect(rhs, variables);
+                }
+                Proposition::Bool(_) | Proposition::Int(_) | Proposition::UInt(_) => {}
+            }
+        }
+        for term in &terms {
+            collect(term, &mut variables);
+        }
+        assert_eq!(
+            variables,
+            BTreeMap::from([
+                ("_n".to_string(), Domain::PointerSizedInt { width: 64, signed: false }),
+                ("first".to_string(), Domain::MachineInt { width: 32, signed: false }),
+                ("xs[0]".to_string(), Domain::MachineInt { width: 32, signed: false }),
+                ("xs_len".to_string(), Domain::PointerSizedInt { width: 64, signed: false }),
+            ])
+        );
+
+        assert!(
+            typed_native_clause_with_collection_domains(
+                "_n == xs.len() && first == xs[0]",
+                TrustContractKind::LoopInvariant,
+                &source_sorts,
+                &visible_domains,
+                &BTreeMap::new(),
+                Some(64),
+            )
+            .is_none(),
+            "a logical Array sort without its exact element domain is not authority",
+        );
+        assert!(
+            typed_native_clause_with_collection_domains(
+                "first == xs[00]",
+                TrustContractKind::LoopInvariant,
+                &source_sorts,
+                &visible_domains,
+                &collection_domains,
+                Some(64),
+            )
+            .is_none(),
+            "alternate literal spellings must not alias the canonical projected leaf",
+        );
+        assert!(
+            typed_native_clause_with_collection_domains(
+                "first == xs[(0)]",
+                TrustContractKind::LoopInvariant,
+                &source_sorts,
+                &visible_domains,
+                &collection_domains,
+                Some(64),
+            )
+            .is_none(),
+            "literal-index parentheses must not alias the canonical projected leaf",
+        );
+        assert!(
+            typed_native_clause_with_collection_domains(
+                "first == xs[3]",
+                TrustContractKind::LoopInvariant,
+                &source_sorts,
+                &visible_domains,
+                &collection_domains,
+                Some(64),
+            )
+            .is_some(),
+            "the last fixed-array element must retain structural authority",
+        );
+        assert!(
+            typed_native_clause_with_collection_domains(
+                "first == xs[4]",
+                TrustContractKind::LoopInvariant,
+                &source_sorts,
+                &visible_domains,
+                &collection_domains,
+                Some(64),
+            )
+            .is_none(),
+            "an index at the fixed-array length must not mint a projected identity",
+        );
+        assert!(
+            typed_native_clause_with_collection_domains(
+                "_n == xs.len()",
+                TrustContractKind::LoopInvariant,
+                &source_sorts,
+                &visible_domains,
+                &BTreeMap::new(),
+                Some(64),
+            )
+            .is_none(),
+            "an Array source sort alone must not authorize a shadowable length leaf",
+        );
+        let wrong_domain = BTreeMap::from([(
+            "xs".to_string(),
+            LoweredCollectionDomain { element: Domain::Bool, fixed_length: Some(4) },
+        )]);
+        assert!(
+            typed_native_clause_with_collection_domains(
+                "first == xs[0]",
+                TrustContractKind::LoopInvariant,
+                &source_sorts,
+                &visible_domains,
+                &wrong_domain,
+                Some(64),
+            )
+            .is_none(),
+            "an element domain inconsistent with the source Array sort must fail closed",
+        );
+    });
 }
 
 #[test]

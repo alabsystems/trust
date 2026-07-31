@@ -2,6 +2,99 @@ use trust_types::UnwindEdge;
 use super::*;
 
 // ===========================================================================
+// Trust: NO-VACUOUS-CORPUS-TEST (2026-07-29). Read this before adding another
+// fixture-driven test to this file.
+//
+// Every real-fixture loop below used to open its rows with
+//
+//     let bytes = match std::fs::read(&path) {
+//         Ok(b) => b,
+//         Err(_) => continue, // fixture not present in this checkout
+//     };
+//
+// That guard cannot distinguish "this checkout does not ship the corpus" from
+// "the fixture was RENAMED", so it converts a name drift into SILENCE: the loop
+// body never runs, zero assertions execute, and the test still reports `ok`.
+// The 2026-07-29 ladder re-freeze (`reports/2026-07-29-ladder-fixture-refreeze.md`
+// §0) re-dumped the ladder corpora from unmodified sources; the producer now
+// crate-root-qualifies `def_path` (`<u8 as BitField>::get_bit` →
+// `<u8 as lib::BitField>::get_bit`), the fixture filename convention
+// (`def_path.replace("::","__") + ".json"`) followed, and FOUR tests here went
+// vacuous in one commit — including the two that pin the `bit_field` rows the
+// re-freeze regressed. A green suite reported a capability loss as a pass.
+//
+// The helpers below replace that idiom. A named row is MANDATORY:
+//   * `required_corpus_dir` asserts the corpus DIRECTORY once, naming the path;
+//   * `read_required_fixture` fails on a missing row, naming the path AND
+//     listing what the directory actually holds, so the next rename is a
+//     one-look fix instead of a silent pass.
+// Do not reintroduce a fallible open in a corpus loop.
+// ===========================================================================
+
+/// Assert a checked-in fixture directory exists and return it. Fails loudly,
+/// naming the absolute path — a corpus that vanished is a defect, not a skip.
+#[track_caller]
+fn required_corpus_dir(rel: &str) -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+    assert!(
+        dir.is_dir(),
+        "required fixture corpus {} is missing; it is checked in, so this is a defect, \
+         not a checkout that may be skipped",
+        dir.display(),
+    );
+    dir
+}
+
+/// Open one NAMED row of a required corpus, or FAIL — never skip. On a miss the
+/// panic carries the exact path plus the directory's actual contents, which is
+/// what turns a `def_path`-spelling drift into a diagnosis instead of a vacuous
+/// pass (see the NO-VACUOUS-CORPUS-TEST note above).
+#[track_caller]
+fn read_required_fixture(dir: &std::path::Path, name: &str) -> trust_types::VerifiableFunction {
+    let path = dir.join(name);
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+        let mut present: Vec<String> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.ends_with(".json"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        present.sort();
+        panic!(
+            "required fixture {} could not be read: {e}\n\
+             This is a FAILURE, not a skip: a renamed row must never silence a corpus test.\n\
+             {} currently holds {} JSON row(s): {:?}",
+            path.display(),
+            dir.display(),
+            present.len(),
+            present,
+        )
+    });
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|e| panic!("parse required fixture {}: {e}", path.display()))
+}
+
+/// META-GUARD for the anti-vacuous helpers themselves. A named row that cannot
+/// be opened MUST panic. Without this, a future refactor could quietly restore a
+/// tolerant open and every corpus test in this file would go silent again with
+/// nothing to catch it.
+#[test]
+#[should_panic(expected = "could not be read")]
+fn a_missing_named_fixture_fails_the_test_instead_of_skipping() {
+    let dir = required_corpus_dir("fixtures/census-rung2-2026-07-07/bit_field");
+    let _ = read_required_fixture(&dir, "<this row was renamed away>__get_bit.json");
+}
+
+/// META-GUARD: a missing corpus DIRECTORY is a defect, not a skip either.
+#[test]
+#[should_panic(expected = "required fixture corpus")]
+fn a_missing_corpus_directory_fails_the_test_instead_of_skipping() {
+    let _ = required_corpus_dir("fixtures/no-such-corpus-2026-07-29");
+}
+
+// ===========================================================================
 // Trust: HONEST FLOOR inc-2 (2026-07-23) — GATE-ITER-GEN-KEY-DISCIPLINE probe suite.
 // The EXECUTABLE fail-closed detector's forgery probes (F-SAMEGEN / F-CHAIN-INERT /
 // DOUBLE-ADVANCE / MALFORMED-BINDING / RECV-BINDING / F-BRIDGE) + the wired
@@ -313,7 +406,7 @@ mod record_witness_tests {
 
     fn agg(name: &str, ops: Vec<Operand>) -> Rvalue {
         Rvalue::Aggregate(
-            AggregateKind::Adt { name: name.into(), variant: 0, active_field: None },
+            AggregateKind::Adt { name: name.into(), variant: 0, active_field: None, args: None },
             ops,
         )
     }
@@ -5095,31 +5188,42 @@ fn resolve_bitwise_side_declines_a_cyclic_bitwise_temp_chain() {
 /// MirSem fallback lane.
 #[test]
 fn real_bit_field_get_bit_fixtures_are_fully_faithful() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/census-rung2-2026-07-07/bit_field");
+    // Trust (2026-07-29 re-freeze): names re-keyed to the crate-root-qualified
+    // `def_path` the current producer emits (`<u8 as BitField>::get_bit` →
+    // `<u8 as lib::BitField>::get_bit`), and the silent-skip guard removed —
+    // these 12 rows are MANDATORY. See `required_corpus_dir` /
+    // `read_required_fixture` and the NO-VACUOUS-CORPUS-TEST note at the top of
+    // this file. EXPECTATION, stated up front: on the re-frozen fixtures these
+    // rows FAIL until the `Formula::Ge` parameter-domain precondition decline
+    // (`reports/2026-07-29-ladder-fixture-refreeze.md` §5) is repaired. That is
+    // a REAL capability gap the stale fixture was hiding; it must be visible.
+    let dir = required_corpus_dir("fixtures/census-rung2-2026-07-07/bit_field");
     for name in [
-        "<u8 as BitField>__get_bit.json",
-        "<u16 as BitField>__get_bit.json",
-        "<u32 as BitField>__get_bit.json",
-        "<u64 as BitField>__get_bit.json",
-        "<u128 as BitField>__get_bit.json",
-        "<usize as BitField>__get_bit.json",
-        "<i8 as BitField>__get_bit.json",
-        "<i16 as BitField>__get_bit.json",
-        "<i32 as BitField>__get_bit.json",
-        "<i64 as BitField>__get_bit.json",
-        "<i128 as BitField>__get_bit.json",
-        "<isize as BitField>__get_bit.json",
+        "<u8 as lib__BitField>__get_bit.json",
+        "<u16 as lib__BitField>__get_bit.json",
+        "<u32 as lib__BitField>__get_bit.json",
+        "<u64 as lib__BitField>__get_bit.json",
+        "<u128 as lib__BitField>__get_bit.json",
+        "<usize as lib__BitField>__get_bit.json",
+        "<i8 as lib__BitField>__get_bit.json",
+        "<i16 as lib__BitField>__get_bit.json",
+        "<i32 as lib__BitField>__get_bit.json",
+        "<i64 as lib__BitField>__get_bit.json",
+        "<i128 as lib__BitField>__get_bit.json",
+        "<isize as lib__BitField>__get_bit.json",
     ] {
-        let path = dir.join(name);
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => continue, // fixture not present in this checkout
-        };
-        let func: trust_types::VerifiableFunction =
-            serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("parse {name}: {e}"));
+        let func = read_required_fixture(&dir, name);
         let cert = function_fully_faithful_witness(&func).unwrap_or_else(|| {
-            panic!("{name} must be fully faithful via the BIT_FIELD NESTED-RVALUE fix")
+            panic!(
+                "{name} must be fully faithful via the BIT_FIELD NESTED-RVALUE fix.\n\
+                 If this fires on the 2026-07-29 re-frozen corpus the body is NOT the \
+                 problem: the fresh dump carries a synthesized parameter-domain \
+                 precondition `Ge(bit, 0) AND Le(bit, u64::MAX)` that the MirSem \
+                 straight-line witness lane declines on the `Ge` SPELLING alone \
+                 (`Le(0, bit)` — logically identical — certifies). See \
+                 `reports/2026-07-29-ladder-fixture-refreeze.md` §5. FIX THE LANE; \
+                 do NOT re-vacuum this test."
+            )
         });
         assert!(cert.is_modulo_3(), "{name}'s certificate must be modulo 3");
     }
@@ -5135,19 +5239,26 @@ fn real_bit_field_get_bit_fixtures_are_fully_faithful() {
 /// certified shift kind is `ShiftOob(W128, _)` specifically.
 #[test]
 fn bit_field_i128_u128_get_bit_flip_to_fully_faithful_on_the_modeled_128_width() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/census-rung2-2026-07-07/bit_field");
-    for name in ["<i128 as BitField>__get_bit.json", "<u128 as BitField>__get_bit.json"] {
-        let path = dir.join(name);
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => continue, // fixture not present in this checkout
-        };
-        let func: trust_types::VerifiableFunction =
-            serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("parse {name}: {e}"));
+    // Trust (2026-07-29 re-freeze): re-keyed to the crate-root-qualified
+    // `def_path` spelling and the silent-skip guard removed. Same EXPECTATION as
+    // `real_bit_field_get_bit_fixtures_are_fully_faithful`: these two rows FAIL
+    // on the re-frozen corpus until the §5 `Formula::Ge` precondition decline is
+    // repaired. Failing loudly is the point — this test previously reported `ok`
+    // in 0.00s having executed no assertion at all.
+    let dir = required_corpus_dir("fixtures/census-rung2-2026-07-07/bit_field");
+    for name in ["<i128 as lib__BitField>__get_bit.json", "<u128 as lib__BitField>__get_bit.json"] {
+        let func = read_required_fixture(&dir, name);
         // The safety tier certifies the width-128 shift kind specifically.
         let certs = function_safety_vcs_faithful(&func).unwrap_or_else(|| {
-            panic!("{name}: the width-128 shift VC must now certify (the residue is closed)")
+            panic!(
+                "{name}: the width-128 shift VC must now certify (the residue is closed).\n\
+                 On the 2026-07-29 re-frozen corpus this fires for the SAME reason as \
+                 `real_bit_field_get_bit_fixtures_are_fully_faithful`: the fresh dump's \
+                 synthesized `Ge(bit, 0)` parameter-domain precondition is declined on \
+                 spelling by the MirSem straight-line lane \
+                 (`reports/2026-07-29-ladder-fixture-refreeze.md` §5). FIX THE LANE; do \
+                 NOT re-vacuum this test."
+            )
         });
         assert!(certs.all_modulo_3(), "{name}: safety certs must be modulo 3");
         assert!(
@@ -6195,20 +6306,17 @@ fn guarded_local_bitor_shape_certifies_end_to_end() {
 /// and the GUARDED-LOCAL layer together, exactly as the real compiler emits them).
 #[test]
 fn real_ascii_bitor_family_fixtures_are_fully_faithful() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/census-core-m5-2026-07-07/u8-ascii");
+    // Trust (2026-07-29): silent-skip guard removed. This corpus was NOT part of
+    // the ladder re-freeze and its names did not drift, so this test was running
+    // — but it carried the same rename-becomes-silence hazard, so it is hardened
+    // with the rest. See NO-VACUOUS-CORPUS-TEST at the top of this file.
+    let dir = required_corpus_dir("fixtures/census-core-m5-2026-07-07/u8-ascii");
     for name in [
         "num__<impl u8>__is_ascii_alphanumeric.json",
         "num__<impl u8>__is_ascii_hexdigit.json",
         "num__<impl u8>__is_ascii_punctuation.json",
     ] {
-        let path = dir.join(name);
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => continue, // fixture not present in this checkout
-        };
-        let func: trust_types::VerifiableFunction =
-            serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("parse {name}: {e}"));
+        let func = read_required_fixture(&dir, name);
         let cert = function_fully_faithful_witness(&func).unwrap_or_else(|| {
             panic!("{name} must be fully faithful via the GUARDED-LOCAL layer")
         });
@@ -6232,18 +6340,15 @@ fn real_ascii_bitor_family_fixtures_are_fully_faithful() {
 /// widening-cast `i16`/`i32`/`i64` shape are exercised.
 #[test]
 fn real_signum_fixtures_certify_via_three_way_sign() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/stdlib-leaf-num-2026-07-16/dumps");
+    // Trust (2026-07-29): silent-skip guard removed (see NO-VACUOUS-CORPUS-TEST).
+    // The trailing `checked == 4` assertion below was the only thing standing
+    // between this test and a vacuous pass; the loop now fails at the miss
+    // itself, naming the path, which is a diagnosis rather than a count mismatch.
+    let dir = required_corpus_dir("fixtures/stdlib-leaf-num-2026-07-16/dumps");
     let mut checked = 0usize;
     for w in ["i8", "i16", "i32", "i64"] {
         let name = format!("num__<impl {w}>__signum.json");
-        let path = dir.join(&name);
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => continue, // fixture not present in this checkout
-        };
-        let func: trust_types::VerifiableFunction =
-            serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("parse {name}: {e}"));
+        let func = read_required_fixture(&dir, &name);
         let cert = function_fully_faithful_witness(&func).unwrap_or_else(|| {
             panic!("{name} must be fully faithful via the W-CMP-DISCR three-way-sign lane")
         });
@@ -6391,19 +6496,18 @@ fn wrong_or_guard_rhs_fails_closed() {
 /// cond) and certify FULLY FAITHFUL.
 #[test]
 fn real_range_disjunction_fixtures_are_fully_faithful() {
-    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-    for rel in [
-        "census-core-m5-2026-07-07/u8-ascii/num__<impl u8>__is_ascii_control.json",
-        "census-rung2-2026-07-07/ascii_utils/<u8 as Check>__is_space.json",
-        "census-rung2-2026-07-07/ascii_utils/<u8 as Check>__is_control.json",
+    // Trust (2026-07-29 re-freeze): the two `ascii_utils` rows are re-keyed to
+    // the crate-root-qualified `def_path` spelling (`<u8 as Check>::is_space` →
+    // `<u8 as lib::Check>::is_space`) and the silent-skip guard is gone. This
+    // test was PARTIALLY vacuous — the `census-core-m5` row still ran, so it
+    // stayed green while 2 of its 3 rows quietly stopped being checked.
+    for (dir_rel, name) in [
+        ("fixtures/census-core-m5-2026-07-07/u8-ascii", "num__<impl u8>__is_ascii_control.json"),
+        ("fixtures/census-rung2-2026-07-07/ascii_utils", "<u8 as lib__Check>__is_space.json"),
+        ("fixtures/census-rung2-2026-07-07/ascii_utils", "<u8 as lib__Check>__is_control.json"),
     ] {
-        let path = base.join(rel);
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => continue, // fixture not present in this checkout
-        };
-        let func: trust_types::VerifiableFunction =
-            serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("parse {rel}: {e}"));
+        let rel = format!("{dir_rel}/{name}");
+        let func = read_required_fixture(&required_corpus_dir(dir_rel), name);
         // The recognizer recovers an Or cond from the real control-flow `||`.
         let r = sem_cf_return_shape_of(&func).unwrap_or_else(|| {
             panic!("{rel} must be recognized by the decision-DAG recognizer")
@@ -7861,21 +7965,17 @@ fn wrong_cast_identity_claim_fails_closed() {
 /// honest residues).
 #[test]
 fn real_char_check_cast_temp_fixtures_are_fully_faithful() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/census-rung2-2026-07-07/ascii_utils");
+    // Trust (2026-07-29 re-freeze): re-keyed to the crate-root-qualified
+    // `def_path` spelling and the silent-skip guard removed. All four rows had
+    // gone missing at once, so this test was a full vacuous pass.
+    let dir = required_corpus_dir("fixtures/census-rung2-2026-07-07/ascii_utils");
     for name in [
-        "<char as Check>__is_control.json",
-        "<char as Check>__is_extended.json",
-        "<char as Check>__is_printable.json",
-        "<char as Check>__is_us_ascii.json",
+        "<char as lib__Check>__is_control.json",
+        "<char as lib__Check>__is_extended.json",
+        "<char as lib__Check>__is_printable.json",
+        "<char as lib__Check>__is_us_ascii.json",
     ] {
-        let path = dir.join(name);
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => continue, // fixture not present in this checkout
-        };
-        let func: trust_types::VerifiableFunction =
-            serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("parse {name}: {e}"));
+        let func = read_required_fixture(&dir, name);
         let cert = function_fully_faithful_witness(&func).unwrap_or_else(|| {
             panic!("{name} must be fully faithful via the CAST-TEMP GUARD READ fix")
         });
@@ -11388,9 +11488,24 @@ fn cmp_ordering_fixtures_dir() -> std::path::PathBuf {
         .join("fixtures/census-core-m5-2026-07-07/cmp-ordering")
 }
 
-fn load_fixture(name: &str) -> Option<trust_types::VerifiableFunction> {
-    let bytes = std::fs::read(cmp_ordering_fixtures_dir().join(name)).ok()?;
-    crate::prove::decode_verifiable_function_with_authenticated_legacy_metadata(&bytes).ok()
+/// Trust (2026-07-29): was `-> Option<_>` built from `.ok()?`, so BOTH a rename
+/// and a decode failure silently skipped the caller's whole test body. A named
+/// row of a checked-in corpus is MANDATORY — see NO-VACUOUS-CORPUS-TEST at the
+/// top of this file.
+#[track_caller]
+fn load_fixture(name: &str) -> trust_types::VerifiableFunction {
+    let dir = cmp_ordering_fixtures_dir();
+    assert!(
+        dir.is_dir(),
+        "required fixture corpus {} is missing; it is checked in, so this is a defect",
+        dir.display(),
+    );
+    let path = dir.join(name);
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+        panic!("required fixture {} could not be read: {e} (a rename must FAIL, not skip)", path.display())
+    });
+    crate::prove::decode_verifiable_function_with_authenticated_legacy_metadata(&bytes)
+        .unwrap_or_else(|e| panic!("decode required fixture {}: {e}", path.display()))
 }
 
 #[test]
@@ -11399,9 +11514,7 @@ fn real_ordering_as_raw_fixture_is_fully_faithful() {
     // `-Ztrust-dump=mir:<dir>` dump — `cmp::Ordering::as_raw`'s ACTUAL core MIR
     // (`_2 := &_1; _0 := Discriminant((*_2)); return`, `self: Ordering` BY
     // VALUE, a real 3-variant `Ordering`).
-    let Some(func) = load_fixture("cmp__Ordering__as_raw.json") else {
-        return; // fixture not present in this checkout — skip, don't fail.
-    };
+    let func = load_fixture("cmp__Ordering__as_raw.json");
     assert_eq!(func.def_path, "cmp::Ordering::as_raw");
     let cert = function_fully_faithful_witness(&func)
         .expect("the REAL as_raw dump must now be fully faithful (discriminant-as-value)");
@@ -12556,9 +12669,7 @@ fn real_ordering_is_cmp_family_composes_via_certified_as_raw_registry() {
     // `Call(as_raw)` into a temp, then one comparison-vs-`0` of that temp)
     // with ZERO further recognizer changes — exactly the census's claim
     // ("sole blocker is `as_raw` missing from the certified registry").
-    let Some(as_raw) = load_fixture("cmp__Ordering__as_raw.json") else {
-        return; // fixtures not present in this checkout — skip, don't fail.
-    };
+    let as_raw = load_fixture("cmp__Ordering__as_raw.json");
     assert!(
         function_fully_faithful_witness(&as_raw).is_some_and(|c| c.is_modulo_3()),
         "as_raw must itself certify before it can enter the registry"
@@ -12575,7 +12686,7 @@ fn real_ordering_is_cmp_family_composes_via_certified_as_raw_registry() {
         "cmp__Ordering__is_le.json",
         "cmp__Ordering__is_ge.json",
     ] {
-        let Some(func) = load_fixture(name) else { continue };
+        let func = load_fixture(name);
         let cert = function_fully_faithful_witness_with_callees(&func, &registry)
             .unwrap_or_else(|| panic!("{name} must compose via the certified as_raw registry"));
         assert!(cert.is_modulo_3(), "{name}'s certificate must be modulo 3");
@@ -14747,7 +14858,7 @@ fn formula_aware_path_certifies_overflow_family_from_real_emitted_vc() {
                 matches!(vc.kind, K::ArithmeticOverflow { .. } | K::NegationOverflow { .. })
             })
             .expect("an overflow-family fixture raises an arithmetic/negation VC");
-        let (kind, verdict) = safety_vc_is_faithful_formula_aware(vc)
+        let (kind, verdict) = safety_vc_is_faithful_formula_aware(&func, vc)
             .expect("the formula-aware path must certify the real emitted overflow-family VC");
         assert_eq!(kind, expect, "the formula-aware kind+width must match");
         assert_eq!(verdict, AdequacyVerdict::ProvenModulo3);
@@ -20247,6 +20358,7 @@ fn half_promotion_func() -> trust_types::VerifiableFunction {
                                     name: "Error".into(),
                                     variant: 3,
                                     active_field: None,
+                                    args: None,
                                 },
                                 vec![],
                             ),
@@ -20259,6 +20371,7 @@ fn half_promotion_func() -> trust_types::VerifiableFunction {
                                     name: "core::result::Result".into(),
                                     variant: 1,
                                     active_field: None,
+                                    args: None,
                                 },
                                 vec![Operand::Move(Place::local(3))],
                             ),
@@ -20283,6 +20396,7 @@ fn half_promotion_func() -> trust_types::VerifiableFunction {
                                     name: "core::result::Result".into(),
                                     variant: 0,
                                     active_field: None,
+                                    args: None,
                                 },
                                 vec![Operand::Move(Place::local(4))],
                             ),
@@ -20395,6 +20509,7 @@ fn none_arm_block(id: usize) -> trust_types::BasicBlock {
                     name: "std::option::Option".into(),
                     variant: 0,
                     active_field: None,
+                    args: None,
                 },
                 vec![],
             ),
@@ -20482,6 +20597,7 @@ fn slice_first_func() -> trust_types::VerifiableFunction {
                                     name: "std::option::Option".into(),
                                     variant: 1,
                                     active_field: None,
+                                    args: None,
                                 },
                                 vec![Operand::Copy(Place::local(4))],
                             ),
@@ -20577,6 +20693,7 @@ fn slice_get_func() -> trust_types::VerifiableFunction {
                                     name: "std::option::Option".into(),
                                     variant: 1,
                                     active_field: None,
+                                    args: None,
                                 },
                                 vec![Operand::Copy(Place::local(5))],
                             ),
@@ -21069,6 +21186,7 @@ fn sem_adt_return_shape_of_declines_extra_write_to_return_local() {
                     name: "core::result::Result".into(),
                     variant: 0,
                     active_field: None,
+                    args: None,
                 },
                 vec![Operand::Copy(Place::local(1))],
             ),
@@ -21106,6 +21224,7 @@ fn sem_adt_return_shape_of_declines_three_arm_shape() {
                     name: "core::result::Result".into(),
                     variant: 0,
                     active_field: None,
+                    args: None,
                 },
                 vec![Operand::Copy(Place::local(1))],
             ),
@@ -21349,6 +21468,7 @@ fn sem_adt_return_opaque_declines_extra_ret_write() {
                 name: "std::option::Option".into(),
                 variant: 0,
                 active_field: None,
+                args: None,
             },
             vec![],
         ),
@@ -21571,6 +21691,7 @@ fn sem_adt_return_opaque_declines_undefined_payload() {
                     name: "expr::Expr".into(),
                     variant: 0,
                     active_field: None,
+                    args: None,
                 },
                 vec![Operand::Constant(ConstValue::Int(0))],
             ),
@@ -21585,6 +21706,7 @@ fn sem_adt_return_opaque_declines_undefined_payload() {
             name: "std::option::Option".into(),
             variant: 1,
             active_field: None,
+            args: None,
         },
         vec![Operand::Move(Place::local(non_chain))],
     );
@@ -21610,6 +21732,7 @@ fn sem_adt_return_opaque_declines_cross_arm_definition_leak() {
             name: "std::option::Option".into(),
             variant: 0,
             active_field: None,
+            args: None,
         },
         vec![],
     );
@@ -21622,6 +21745,7 @@ fn sem_adt_return_opaque_declines_cross_arm_definition_leak() {
             name: "std::option::Option".into(),
             variant: 1,
             active_field: None,
+            args: None,
         },
         vec![Operand::Move(Place::local(6))],
     );
@@ -21930,6 +22054,7 @@ fn sem_adt_return_opaque_declines_same_variant_arms() {
             name: "std::option::Option".into(),
             variant: 1,
             active_field: None,
+            args: None,
         },
         vec![],
     );
@@ -22080,6 +22205,7 @@ fn sem_adt_return_shape_of_composes_with_discriminant_guard() {
                                 name: "core::result::Result".into(),
                                 variant: 0,
                                 active_field: None,
+                                args: None,
                             },
                             vec![Operand::Copy(Place::local(2))],
                         ),
@@ -22098,6 +22224,7 @@ fn sem_adt_return_shape_of_composes_with_discriminant_guard() {
                                     name: "Error".into(),
                                     variant: 3,
                                     active_field: None,
+                                    args: None,
                                 },
                                 vec![],
                             ),
@@ -22110,6 +22237,7 @@ fn sem_adt_return_shape_of_composes_with_discriminant_guard() {
                                     name: "core::result::Result".into(),
                                     variant: 1,
                                     active_field: None,
+                                    args: None,
                                 },
                                 vec![Operand::Move(Place::local(4))],
                             ),
@@ -22255,6 +22383,7 @@ fn from_signed_func() -> trust_types::VerifiableFunction {
                                 name: "Error".into(),
                                 variant: 3,
                                 active_field: None,
+                                args: None,
                             },
                             vec![],
                         ),
@@ -22302,6 +22431,7 @@ fn from_signed_func() -> trust_types::VerifiableFunction {
                                 name: "Error".into(),
                                 variant: 2,
                                 active_field: None,
+                                args: None,
                             },
                             vec![],
                         ),
@@ -22325,6 +22455,7 @@ fn from_signed_func() -> trust_types::VerifiableFunction {
                                     name: "core::result::Result".into(),
                                     variant: 0,
                                     active_field: None,
+                                    args: None,
                                 },
                                 vec![Operand::Move(Place::local(7))],
                             ),
@@ -22343,6 +22474,7 @@ fn from_signed_func() -> trust_types::VerifiableFunction {
                                 name: "core::result::Result".into(),
                                 variant: 1,
                                 active_field: None,
+                                args: None,
                             },
                             vec![Operand::Move(Place::local(2))],
                         ),
@@ -22461,7 +22593,7 @@ fn sem_adt_return_shape_of_chain_declines_multiply_assigned_within_walk() {
     let extra = Statement::Assign {
         place: trust_types::Place::local(2),
         rvalue: Rvalue::Aggregate(
-            AggregateKind::Adt { name: "Error".into(), variant: 0, active_field: None },
+            AggregateKind::Adt { name: "Error".into(), variant: 0, active_field: None, args: None },
             vec![],
         ),
         span: Default::default(),
@@ -22517,6 +22649,7 @@ fn sem_adt_return_shape_of_chain_declines_extra_write_to_return_local() {
                     name: "core::result::Result".into(),
                     variant: 0,
                     active_field: None,
+                    args: None,
                 },
                 vec![Operand::Copy(Place::local(1))],
             ),
@@ -22710,6 +22843,7 @@ fn reverse_switch3_func() -> trust_types::VerifiableFunction {
                     name: "cmp::Ordering".into(),
                     variant,
                     active_field: None,
+                    args: None,
                 },
                 vec![],
             ),
@@ -22850,7 +22984,7 @@ fn sem_adt_return_shape_of_discriminant_switch3_declines_duplicate_variant_arms(
     func.body.blocks[4].stmts = vec![Statement::Assign {
         place: trust_types::Place::local(0),
         rvalue: Rvalue::Aggregate(
-            AggregateKind::Adt { name: "cmp::Ordering".into(), variant: 1, active_field: None },
+            AggregateKind::Adt { name: "cmp::Ordering".into(), variant: 1, active_field: None, args: None },
             vec![],
         ),
         span: Default::default(),
@@ -22877,6 +23011,7 @@ fn sem_adt_return_shape_of_discriminant_switch3_declines_extra_write_to_return_l
                     name: "cmp::Ordering".into(),
                     variant: 0,
                     active_field: None,
+                    args: None,
                 },
                 vec![],
             ),

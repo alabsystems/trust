@@ -929,7 +929,10 @@ mod tests {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        is_foreign: false,
                         func: "f".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
                         dest: Place::local(2),
@@ -1153,7 +1156,10 @@ mod tests {
 
     #[test]
     fn test_terminator_reads_call() {
-        let term = Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+        let term = Terminator::Call {
+            unwind: UnwindEdge::Unreachable,
+            is_unsafe_sig: false,
+            is_foreign: false,
             func: "foo".to_string(),
             args: vec![Operand::Copy(Place::local(1)), Operand::Move(Place::local(2))],
             dest: Place::local(0),
@@ -1187,7 +1193,10 @@ mod tests {
 
     #[test]
     fn test_terminator_writes_call_dest() {
-        let term = Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+        let term = Terminator::Call {
+            unwind: UnwindEdge::Unreachable,
+            is_unsafe_sig: false,
+            is_foreign: false,
             func: "f".to_string(),
             args: vec![],
             dest: Place::local(5),
@@ -1234,7 +1243,10 @@ mod tests {
 
     #[test]
     fn test_successor_blocks_call_with_target() {
-        let term = Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+        let term = Terminator::Call {
+            unwind: UnwindEdge::Unreachable,
+            is_unsafe_sig: false,
+            is_foreign: false,
             func: "f".to_string(),
             args: vec![],
             dest: Place::local(0),
@@ -1247,7 +1259,10 @@ mod tests {
 
     #[test]
     fn test_successor_blocks_call_no_target() {
-        let term = Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+        let term = Terminator::Call {
+            unwind: UnwindEdge::Unreachable,
+            is_unsafe_sig: false,
+            is_foreign: false,
             func: "f".to_string(),
             args: vec![],
             dest: Place::local(0),

@@ -15,15 +15,15 @@
 //!                     range end that makes the caller's slicing total).
 //!   * `xor_fold`    — from the LOOP INVARIANT.
 //!
-//! The collection vocabulary used here is the narrow read-only model that
-//! `tests/ui/trust/native_loop_collection_semantics.rs:9-13` describes, and it
-//! is genuinely narrow: `.len()` and `.is_empty()` admit only an Array-sorted
-//! base (`crates/trust-types/src/spec_render.rs:404-420`), and a slice
-//! parameter's `xs.len()` reaches the query as the synthetic pointer-sized
-//! `xs_len` leaf (`compiler/rustc_mir_transform/src/trust_contract_query.rs:519-533`).
-//! No `&mut` slice appears here — mutable collection state fails closed in that
-//! model, and the two-state prophecy surface it needs is a successor campaign,
-//! not this lane.
+//! The collection vocabulary used here is the bounded model that
+//! `tests/ui/trust/native_loop_collection_semantics.rs` exercises. Shared
+//! slice/fixed-array reads and exact exclusive Store/Select transitions are
+//! admitted; retained aliases, reseats, collection-bearing calls, and other
+//! mutable shapes fail closed. This fixture uses only shared slices:
+//! `.len()` and `.is_empty()` admit an Array-sorted base
+//! (`crates/trust-types/src/spec_render.rs:404-420`), and a slice parameter's
+//! `xs.len()` reaches the query as the synthetic pointer-sized `xs_len` leaf
+//! (`compiler/rustc_mir_transform/src/trust_contract_query.rs:519-533`).
 
 /// Read one element with the bound PROVED rather than checked.
 ///

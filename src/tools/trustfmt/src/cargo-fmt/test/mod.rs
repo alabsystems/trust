@@ -70,6 +70,22 @@ fn signaled_formatter_is_a_failure() {
     assert_eq!(child_exit_code(&signaled), FAILURE);
 }
 
+#[cfg(unix)]
+#[test]
+fn formatter_that_aborts_during_process_launch_fails_closed() {
+    // A missing rustc-driver dylib makes dyld abort `trustfmt` before its Rust
+    // main runs. Exercise the real spawn/wait path, not only a fabricated
+    // ExitStatus: cargo-fmt historically treated this no-code status as
+    // success and let `targo fmt --check` pass without formatting anything.
+    let mut formatter = Command::new("/bin/sh");
+    formatter.args(["-c", "kill -ABRT $$"]);
+
+    assert_eq!(
+        wait_for_formatter(&mut formatter).expect("run aborting formatter fixture"),
+        FAILURE
+    );
+}
+
 #[test]
 fn default_options() {
     let empty: Vec<String> = vec![];

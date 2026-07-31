@@ -70,7 +70,7 @@ fn deserialize_schema_registry<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    let mut schemas = BTreeMap::<String, String>::deserialize(deserializer)?;
+    let schemas = BTreeMap::<String, String>::deserialize(deserializer)?;
     match schemas.get("version").map(String::as_str) {
         Some(VERSION_SCHEMA) => {}
         Some(schema) => {

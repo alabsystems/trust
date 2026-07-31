@@ -54,16 +54,16 @@ fn local_leaf(x: u8) -> u8 {
     x
 }
 
-// A local function containing a program call is not a closed scalar leaf.
-// The diagnostic must stay negative; it must never reuse `local_leaf`'s
-// positive findings or claim that a kernel admission exists.
+// Whole-crate E6 composition closes the diagnostic facets over certified
+// callees, so this local caller has all four positive findings. They remain
+// diagnostic-only and must not be confused with a kernel admission.
 fn calls_local_leaf(x: u8) -> u8 {
     local_leaf(x)
 }
 
 fn cite_internal_callee() -> u8
     ensures calls_local_leaf(1) == 1 by placeholder
-    //~^ ERROR at least one E6 structural facet of `calls_local_leaf` is not established
+    //~^ ERROR all four public E6 structural facet findings of `calls_local_leaf` are positive
 {
     1
 }

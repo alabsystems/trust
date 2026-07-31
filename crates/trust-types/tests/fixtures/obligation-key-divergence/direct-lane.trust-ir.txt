@@ -1,0 +1,53 @@
+; TrustIr text format v1
+module "fixture"
+file 0 "fixture.rs"
+
+functy.0 = (fatptr<slice ty.0>, usize, u64) -> (u64)
+
+functy.1 = (u64, u64, u64) -> (u64)
+
+functy.2 = (u64, u64) -> (u64)
+
+type ty.0 = u64
+
+fn @contract_div_index(functy.0) {
+    ; #producer: trust
+    ; #names: %0="xs", %1="i", %2="d"
+bb0(%0: fatptr<slice ty.0>, %1: usize, %2: u64):
+    %3 = ptr_data fatptr<slice ty.0> %0  ; #loc: 0 7 4
+    %4 = gep u64, ptr %3, %1  ; #loc: 0 7 4
+    %5 = load u64, ptr %4  ; #loc: 0 7 4
+    %6 = const u64 0  ; #loc: 0 7 4
+    %7 = icmp ne u64 %2, %6  ; #loc: 0 7 4
+    assert %7  ; #proof: div_nonzero  ; #loc: 0 7 4
+    %8 = udiv u64 %5, %2  ; #loc: 0 7 4
+    ret %8  ; #loc: 0 8 1
+}
+
+fn @add3(functy.1) {
+    ; #producer: trust
+    ; #names: %0="a", %1="b", %2="c"
+bb0(%0: u64, %1: u64, %2: u64):
+    %3, %4 = add.overflow u64 %0, %1  ; #loc: 0 15 4
+    %5 = const bool false  ; #loc: 0 15 4
+    %6 = const bool true  ; #loc: 0 15 4
+    %7 = select bool %4, %5, %6  ; #loc: 0 15 4
+    assert %7  ; #proof: no_overflow  ; #loc: 0 15 4
+    %8, %9 = add.overflow u64 %3, %2  ; #loc: 0 15 4
+    %10 = const bool false  ; #loc: 0 15 4
+    %11 = const bool true  ; #loc: 0 15 4
+    %12 = select bool %9, %10, %11  ; #loc: 0 15 4
+    assert %12  ; #proof: no_overflow  ; #loc: 0 15 4
+    ret %8  ; #loc: 0 16 1
+}
+
+fn @macro_div(functy.2) {
+    ; #producer: trust
+    ; #names: %0="a", %1="d"
+bb0(%0: u64, %1: u64):
+    %2 = const u64 0  ; #loc: 0 26 4
+    %3 = icmp ne u64 %1, %2  ; #loc: 0 26 4
+    assert %3  ; #proof: div_nonzero  ; #loc: 0 26 4
+    %4 = udiv u64 %0, %1  ; #loc: 0 26 4
+    ret %4  ; #loc: 0 27 1
+}

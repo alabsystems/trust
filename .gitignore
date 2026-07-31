@@ -59,6 +59,11 @@ no_llvm_build
 /src/bootstrap/target
 /src/tools/x/target
 /targo-trust/target/
+# `targo trust` writes its own bootstrap + dry-run scratch here. `/build` above is
+# root-anchored so it never covered this one, and the directory is 500M+ of
+# regenerable output that dirties the checkout — which blocks every gate that
+# requires a clean tree (the falsification gate refuses to start on one).
+/targo-trust/build/
 crates/*/target/
 tests/ui/trust/target/
 examples/target/

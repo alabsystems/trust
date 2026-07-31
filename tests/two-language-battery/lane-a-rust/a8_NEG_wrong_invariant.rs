@@ -1,36 +1,18 @@
 //@ battery-lane: A-rust
-//@ battery-expect: frontier
+//@ battery-expect: reject
 //@ battery-flags: -Ztrust-verify=on --crate-type=lib
-//! LANE A — FALSE LOOP INVARIANTS. Written as a negative control; MEASURED as
-//! a frontier. The reclassification is the finding.
+//! LANE A NEGATIVE CONTROL — FALSE LOOP INVARIANTS, one per failure mode.
 //!
-//! ## Measured outcome (2026-07-25, toolchain c6be27eb88)
+//! ## Measured outcome (2026-07-26)
 //!
-//! Neither false invariant is REFUTED. Both land as unsupported rows:
-//!
-//!     [unknown] UNKNOWN ... unsupported MIR `UserLoopContractUnsupported`:
-//!     loop invariant `i < xs.len()` is outside the exact single-path
-//!     loop-transition fragment at bb1
-//!
-//! The report reads `2 proved, 0 failed, 2 unknown` — and to be exact about
-//! what that means: the two PROVED obligations are bounds checks, not the
-//! invariants. The invariants were never evaluated at all. **This is not a
-//! false accept**: the build still fails, because strict policy treats an
-//! unsupported row as an error. But it is not a refutation either, and the
-//! difference matters — the battery has NO working negative control for the
-//! E4 invariant surface until the single-path fragment grows to cover a
-//! two-statement body. See `a12_FRONTIER_multipath_loop.rs` for the same
-//! fragment limit hit from the positive side.
-//!
-//! Everything below this line is the original design intent, retained because
-//! it states precisely what these programs SHOULD exercise once the fragment
-//! covers them — at which point this file's verdict becomes `frontier-refuted`
-//! and it should be restored to `battery-expect: reject`.
-//!
-//! ORIGINAL INTENT — FALSE LOOP INVARIANTS, one per failure mode.
+//! The bounded multi-path and collection lanes now model both bodies. The
+//! compiler genuinely refutes the bad consecution in `backoff_delay` and the
+//! bad initiation in `parity_fold`; neither rejection depends on an
+//! unsupported row. This file is therefore restored to an ordinary
+//! `battery-expect: reject` canary.
 //!
 //! `a3` and `a5` cover a false `ensures` and a missing descent. Nothing in
-//! this battery yet covers the E4 surface's own refutation: an authored loop
+//! those controls covers the E4 surface's own refutation: an authored loop
 //! invariant that is simply not true. Authored loop facts must never be
 //! accepted as documentation, or merely because they were written
 //! (`tests/ui/trust/native_loop_clause_semantics.rs:9-13`).

@@ -383,16 +383,31 @@ fn tippy_driver_is_vanilla_and_has_no_trust_evidence_escape_route() {
         );
     }
 
+    fn assert_no_evidence_rejection(output: std::process::Output, label: &str) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{label}:\n{stdout}\n{stderr}");
+        assert!(
+            stderr.contains("NoTrustEvidence compiler frontend rejects"),
+            "{label} reported an unexpected rejection:\n{stdout}\n{stderr}",
+        );
+    }
+
     let unbranded_normal = Command::new(TIPPY_DRIVER_BIN)
         .arg("--print=cfg")
         .env_remove("TRUST_NO_VERIFY")
         .output()
         .expect("run unbranded normal lint driver cfg query");
-    let unbranded_override = Command::new(TIPPY_DRIVER_BIN)
+    let unbranded_enable = Command::new(TIPPY_DRIVER_BIN)
         .args(["-Ztrust-verify=on", "--print=cfg"])
         .env_remove("TRUST_NO_VERIFY")
         .output()
-        .expect("run unbranded normal lint driver override probe");
+        .expect("run unbranded verification-enabling probe");
+    let unbranded_off = Command::new(TIPPY_DRIVER_BIN)
+        .args(["-Ztrust-verify=off", "--print=cfg"])
+        .env_remove("TRUST_NO_VERIFY")
+        .output()
+        .expect("run unbranded redundant verification-off probe");
 
     let root = unique_temp_dir("driver-verification-off-switch");
     let bin = root.join("toolchain/bin");
@@ -403,39 +418,66 @@ fn tippy_driver_is_vanilla_and_has_no_trust_evidence_escape_route() {
     let trustc = bin.join("trustc");
     write_executable(&trustc, b"#!/bin/sh\nexit 0\n");
 
-    let joined_args = root.join("joined.args");
-    std::fs::write(&joined_args, "-Ztrust-verify=on\n--print=cfg\n")
-        .expect("write joined response-file arguments");
-    let split_args = root.join("split.args");
-    std::fs::write(&split_args, "-Z\ntrust-verify=on\n--print\ncfg\n")
-        .expect("write split response-file arguments");
+    let joined_off_args = root.join("joined-off.args");
+    std::fs::write(&joined_off_args, "-Ztrust-verify=off\n--print=cfg\n")
+        .expect("write joined redundant-off response-file arguments");
+    let split_off_args = root.join("split-off.args");
+    std::fs::write(&split_off_args, "-Z\ntrust-verify=off\n--print\ncfg\n")
+        .expect("write split redundant-off response-file arguments");
+    let joined_on_args = root.join("joined-on.args");
+    std::fs::write(&joined_on_args, "-Ztrust-verify=on\n--print=cfg\n")
+        .expect("write joined enabling response-file arguments");
+    let split_on_args = root.join("split-on.args");
+    std::fs::write(&split_on_args, "-Z\ntrust-verify=on\n--print\ncfg\n")
+        .expect("write split enabling response-file arguments");
 
     let normal = Command::new(&driver)
         .arg("--print=cfg")
         .env_remove("TRUST_NO_VERIFY")
         .output()
         .expect("run branded normal lint driver cfg query");
-    let normal_override = Command::new(&driver)
+    let normal_enable = Command::new(&driver)
         .args(["-Ztrust-verify=on", "--print=cfg"])
         .env_remove("TRUST_NO_VERIFY")
         .output()
-        .expect("run branded normal lint driver override probe");
-    let wrapped_override = Command::new(&driver)
+        .expect("run branded verification-enabling probe");
+    let normal_off = Command::new(&driver)
+        .args(["-Ztrust-verify=off", "--print=cfg"])
+        .env_remove("TRUST_NO_VERIFY")
+        .output()
+        .expect("run branded redundant verification-off probe");
+    let wrapped_off = Command::new(&driver)
+        .arg(&trustc)
+        .args(["-Ztrust-verify=off", "--print=cfg"])
+        .env_remove("TRUST_NO_VERIFY")
+        .output()
+        .expect("run wrapped redundant verification-off probe");
+    let wrapped_enable = Command::new(&driver)
         .arg(&trustc)
         .args(["-Ztrust-verify=on", "--print=cfg"])
         .env_remove("TRUST_NO_VERIFY")
         .output()
-        .expect("run wrapped normal lint driver override probe");
-    let joined_response_override = Command::new(&driver)
-        .arg(format!("@{}", joined_args.display()))
+        .expect("run wrapped verification-enabling probe");
+    let joined_response_off = Command::new(&driver)
+        .arg(format!("@{}", joined_off_args.display()))
         .env_remove("TRUST_NO_VERIFY")
         .output()
-        .expect("run joined response-file override probe");
-    let split_response_override = Command::new(&driver)
-        .arg(format!("@{}", split_args.display()))
+        .expect("run joined response-file redundant-off probe");
+    let split_response_off = Command::new(&driver)
+        .arg(format!("@{}", split_off_args.display()))
         .env_remove("TRUST_NO_VERIFY")
         .output()
-        .expect("run split response-file override probe");
+        .expect("run split response-file redundant-off probe");
+    let joined_response_enable = Command::new(&driver)
+        .arg(format!("@{}", joined_on_args.display()))
+        .env_remove("TRUST_NO_VERIFY")
+        .output()
+        .expect("run joined response-file verification-enabling probe");
+    let split_response_enable = Command::new(&driver)
+        .arg(format!("@{}", split_on_args.display()))
+        .env_remove("TRUST_NO_VERIFY")
+        .output()
+        .expect("run split response-file verification-enabling probe");
     let consumed_double_dash = Command::new(&driver)
         .args(["--crate-name", "--", "-Ztrust-verify=on", "--print=cfg"])
         .env_remove("TRUST_NO_VERIFY")
@@ -448,16 +490,26 @@ fn tippy_driver_is_vanilla_and_has_no_trust_evidence_escape_route() {
         .expect("run rejected raw trustc cfg query");
 
     assert_cfg_policy(unbranded_normal, "unbranded normal route", false);
-    assert_cfg_policy(unbranded_override, "unbranded false override", false);
+    assert_no_evidence_rejection(unbranded_enable, "unbranded verification-enabling route");
+    assert_cfg_policy(unbranded_off, "unbranded redundant verification-off route", false);
     assert_cfg_policy(normal, "branded normal route", false);
-    assert_cfg_policy(normal_override, "branded false override", false);
-    assert_cfg_policy(wrapped_override, "wrapped false override", false);
-    assert_cfg_policy(joined_response_override, "joined response-file false override", false);
-    assert_cfg_policy(split_response_override, "split response-file false override", false);
-    assert_cfg_policy(
+    assert_no_evidence_rejection(normal_enable, "branded verification-enabling route");
+    assert_cfg_policy(normal_off, "branded redundant verification-off route", false);
+    assert_cfg_policy(wrapped_off, "wrapped redundant verification-off route", false);
+    assert_no_evidence_rejection(wrapped_enable, "wrapped verification-enabling route");
+    assert_cfg_policy(joined_response_off, "joined response-file redundant-off route", false);
+    assert_cfg_policy(split_response_off, "split response-file redundant-off route", false);
+    assert_no_evidence_rejection(
+        joined_response_enable,
+        "joined response-file verification-enabling route",
+    );
+    assert_no_evidence_rejection(
+        split_response_enable,
+        "split response-file verification-enabling route",
+    );
+    assert_no_evidence_rejection(
         consumed_double_dash,
-        "double dash consumed as the crate-name value",
-        false,
+        "verification-enabling option after consumed double dash",
     );
     assert!(!rejected_passthrough.status.success());
     let rejected_stderr = String::from_utf8_lossy(&rejected_passthrough.stderr);

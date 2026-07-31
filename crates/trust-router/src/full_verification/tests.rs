@@ -228,6 +228,7 @@ impl VerificationEngine for CountingTrustVcSpoof {
                 obligation_id: obligation.obligation_id.clone(),
                 engine: self.manifest.clone(),
                 status: EvidenceStatus::Unsupported,
+                decline: None,
                 proof_strength: None,
                 artifacts: Vec::new(),
                 counterexample: None,
@@ -297,6 +298,7 @@ impl VerificationEngine for ReservedDirectTrustVcNamespaceSpoof {
                     obligation_id: obligation.obligation_id.clone(),
                     engine: self.manifest.clone(),
                     status: EvidenceStatus::Proved,
+                    decline: None,
                     proof_strength: Some(ProofStrength::certified(
                         ReasoningKind::OwnershipAnalysis,
                     )),
@@ -1682,7 +1684,9 @@ fn native_ty_lane_fails_closed_without_transported_model() {
     );
 }
 
-fn bundle_with_temporal_model(single_writer: bool) -> TrustContractBundle {
+fn bundle_with_temporal_model(
+    single_writer: trust_types::SingleWriterEvidence,
+) -> TrustContractBundle {
     let mut bundle = bundle_with_obligation(
         ObligationKind::TemporalSafety,
         "obligation-mmap-temporal",
@@ -1712,7 +1716,7 @@ fn full_verifier_accepts_native_ty_temporal_proof() {
     // native bundle is supplied.
     let engine =
         FullVerificationEngine::new(vec![Box::new(NativeTyEngine::new())], route_only_policy());
-    let bundle = bundle_with_temporal_model(true);
+    let bundle = bundle_with_temporal_model(trust_types::SingleWriterEvidence::Verified);
     let result = engine.verify_bundle(&bundle, &VerifierExecutionContext::new("run-ty-proof"));
 
     assert_eq!(result.status, VerificationRunStatus::Proved, "{result:#?}");
@@ -1735,7 +1739,7 @@ fn full_verifier_reports_refuted_native_ty_temporal_model() {
     // run must not be Proved.
     let engine =
         FullVerificationEngine::new(vec![Box::new(NativeTyEngine::new())], route_only_policy());
-    let bundle = bundle_with_temporal_model(false);
+    let bundle = bundle_with_temporal_model(trust_types::SingleWriterEvidence::None);
     let result = engine.verify_bundle(&bundle, &VerifierExecutionContext::new("run-ty-refute"));
 
     assert_ne!(result.status, VerificationRunStatus::Proved, "{result:#?}");
@@ -3086,6 +3090,7 @@ impl VerificationEngine for UnitEngine {
                     obligation_id: obligation.obligation_id.clone(),
                     engine: self.manifest.clone(),
                     status: *status,
+                    decline: None,
                     proof_strength: proof_strength.clone(),
                     artifacts: materialize_complete_unit_fixture_artifacts(
                         &self.manifest.name,
@@ -3144,6 +3149,7 @@ impl VerificationEngine for ProvedFailedConflictEngine {
                     obligation_id: obligation.obligation_id.clone(),
                     engine: self.manifest.clone(),
                     status: EvidenceStatus::Proved,
+                    decline: None,
                     proof_strength: Some(ProofStrength::deductive()),
                     artifacts: exact_fixture_artifacts_for_engine(
                         "trust-wp",
@@ -3159,6 +3165,7 @@ impl VerificationEngine for ProvedFailedConflictEngine {
                     obligation_id: obligation.obligation_id.clone(),
                     engine: self.manifest.clone(),
                     status: EvidenceStatus::Failed,
+                    decline: None,
                     proof_strength: None,
                     artifacts: Vec::new(),
                     counterexample: None,
@@ -3246,6 +3253,7 @@ impl VerificationEngine for BatchCountingEngine {
                 obligation_id: obligation.obligation_id.clone(),
                 engine: self.manifest.clone(),
                 status: EvidenceStatus::Proved,
+                decline: None,
                 proof_strength: Some(ProofStrength {
                     reasoning: ReasoningKind::TemporalModelCheck,
                     assurance: AssuranceLevel::Sound,
@@ -3311,6 +3319,7 @@ impl VerificationEngine for RecordingEngine {
                 obligation_id: obligation.obligation_id.clone(),
                 engine: self.manifest.clone(),
                 status: EvidenceStatus::Proved,
+                decline: None,
                 proof_strength: Some(self.proof_strength.clone()),
                 artifacts: exact_fixture_artifacts_for_engine(
                     &self.manifest.name,
@@ -3406,6 +3415,7 @@ impl VerificationEngine for SlowRecordingEngine {
                 obligation_id: obligation.obligation_id.clone(),
                 engine: self.manifest.clone(),
                 status: EvidenceStatus::Proved,
+                decline: None,
                 proof_strength: Some(self.proof_strength.clone()),
                 artifacts: exact_fixture_artifacts_for_engine(
                     &self.manifest.name,

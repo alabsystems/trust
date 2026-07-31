@@ -470,8 +470,14 @@ pub fn select_logic(formula: &Formula) -> &'static str {
     let mut has_quantifier = false;
     let mut has_int = false;
     let mut has_fp = false;
+    let mut has_datatype = false;
 
     formula.visit(&mut |f| match f {
+        // Lever A: a datatype-sorted (or datatype-back-edge) variable needs the
+        // datatype theory. `ALL` is a safe superset that admits datatypes plus
+        // the BV/Int/UF scalar fields a recursive ADT's leaves produce; it only
+        // widens the theory set and never changes a formula's models.
+        Formula::Var(_, s) | Formula::SymVar(_, s) if s.contains_datatype() => has_datatype = true,
         // FloatingPoint theory: any fp.* operator/literal or FP/RoundingMode var.
         Formula::Var(_, Sort::Float { .. } | Sort::RoundingMode)
         | Formula::SymVar(_, Sort::Float { .. } | Sort::RoundingMode) => has_fp = true,
@@ -515,6 +521,12 @@ pub fn select_logic(formula: &Formula) -> &'static str {
         | Formula::Neg(..) => has_int = true,
         _ => {}
     });
+
+    // Lever A: any datatype content -> `ALL` (admits datatypes + every scalar
+    // theory). Checked first because it subsumes all the cases below.
+    if has_datatype {
+        return "ALL";
+    }
 
     // FloatingPoint theory. Pure quantifier-free FP -> QF_FP; any mix with other
     // theories (notably the bitvector bridge that carries float bit-patterns, or
@@ -920,6 +932,40 @@ mod tests {
             Formula::Gt(Box::new(var("len")), Box::new(Formula::Int(0))),
         ]);
         assert_eq!(select_logic(&f), "ALL");
+    }
+
+    /// Lever A: a datatype-sorted variable — whether a full definition or a
+    /// by-name recursive back-edge — must select the datatype-capable `ALL`,
+    /// never a scalar-only logic that would reject the declaration.
+    #[test]
+    fn test_select_logic_datatype_var_is_all() {
+        let by_name = Sort::Datatype { name: "Expr".into(), constructors: Vec::new() };
+        let f = Formula::Eq(
+            Box::new(Formula::Var("e".into(), by_name.clone())),
+            Box::new(Formula::Var("e".into(), by_name.clone())),
+        );
+        assert_eq!(select_logic(&f), "ALL");
+
+        // A full definition, and a datatype nested behind an Array, both count.
+        let full = Sort::Datatype {
+            name: "Expr".into(),
+            constructors: vec![
+                ("Const".into(), vec![("c".into(), Sort::BitVec(32))]),
+                ("App".into(), vec![("f".into(), by_name.clone()), ("x".into(), by_name)]),
+            ],
+        };
+        let g = Formula::Eq(
+            Box::new(Formula::Var("e".into(), full.clone())),
+            Box::new(Formula::Var("e".into(), full.clone())),
+        );
+        assert_eq!(select_logic(&g), "ALL");
+
+        let arr = Sort::Array(Box::new(Sort::Int), Box::new(full));
+        let h = Formula::Eq(
+            Box::new(Formula::Var("m".into(), arr.clone())),
+            Box::new(Formula::Var("m".into(), arr)),
+        );
+        assert_eq!(select_logic(&h), "ALL");
     }
 
     // --- collect_free_var_decls ---

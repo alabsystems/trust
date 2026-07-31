@@ -199,7 +199,13 @@ pub enum TrustContractSubject {
 /// a sound HIR-to-MIR loop-header mapping exists.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, TyEncodable, TyDecodable, StableHash)]
 pub struct TrustLoopId {
+    /// Dense identity used to group every clause authored on the same loop.
     pub index: u32,
+    /// The source loop expression's compiler-owned HIR-local identity. Unlike
+    /// spans, this distinguishes nested/macro-generated loops even when their
+    /// MIR header terminators are spanless. Consumers may use it only to
+    /// recover and validate a MIR header inside the same owning body.
+    pub hir_local_id: u32,
 }
 
 /// Query-safe MIR location for contract anchors.
@@ -229,6 +235,26 @@ pub struct TrustContractPredicate<'tcx> {
 
     /// The current compiler-native expression shape.
     pub kind: TrustContractPredicateKind,
+
+    /// Exact source identities for whole scalar variables in a native loop
+    /// predicate. The vector is canonicalized by name and contains only
+    /// compiler-owned HIR bindings: synthesized leaves (for example a lowered
+    /// collection length), projections, return-place aliases, and otherwise
+    /// unbound values are intentionally absent.
+    ///
+    /// Static verification consumes `kind`; this sidecar exists solely to
+    /// rebind a certified executable loop monitor to the same source binding
+    /// after MIR lowering without consulting optional debug names.
+    pub source_bindings: Vec<TrustContractSourceBinding>,
+}
+
+/// Exact binding identity for one whole scalar leaf in a native loop
+/// proposition. `hir_local_id` is meaningful within the owning contract
+/// bundle's `DefId`, just like [`TrustLoopId::hir_local_id`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash, TyEncodable, TyDecodable, StableHash)]
+pub struct TrustContractSourceBinding {
+    pub name: Symbol,
+    pub hir_local_id: u32,
 }
 
 /// Honest type carrier for one compiler-query contract payload.
@@ -308,8 +334,14 @@ pub enum TrustContractPropositionDomain {
     /// A target-width Rust integer. Keeping this distinct from a fixed-width
     /// integer prevents (for example) `usize` and `u64` from acquiring the
     /// same proposition identity on a 64-bit target.
-    PointerSizedInt { width: u32, signed: bool },
-    MachineInt { width: u32, signed: bool },
+    PointerSizedInt {
+        width: u32,
+        signed: bool,
+    },
+    MachineInt {
+        width: u32,
+        signed: bool,
+    },
 }
 
 /// First-stage predicate representation.

@@ -45,9 +45,30 @@ use trust_types::{Formula, SourceSpan, VerificationCondition, VerificationResult
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoverageGap {
     ExternallyReachable,
-    IndirectCall { detail: String },
-    UnresolvedCallee { name: String },
+    IndirectCall {
+        detail: String,
+    },
+    UnresolvedCallee {
+        name: String,
+    },
     Recursive,
+    /// The whole-crate caller scan itself could not account for the crate, so NO
+    /// function's caller set is provably exhaustive. Crate-level, not about F: an
+    /// unscannable body or a `global_asm!` item says nothing about F's visibility.
+    ///
+    /// Why this variant exists: the oracle used to fold that poison into
+    /// `is_public`, from which this function could only classify it as
+    /// [`CoverageGap::ExternallyReachable`]. No consumer ever rendered that
+    /// classification — the compiler's sole call site collapses the returned gap
+    /// list to a Total/not-Total test and drops it — so the shipped defect was
+    /// SILENCE: the cause of a crate-wide R1 rejection was stated nowhere.
+    /// Carrying the scan's own words through classification is what lets the one
+    /// real reporting consumer (the compiler's crate-level warning) name the true
+    /// cause, and keeps any future gap consumer from reading a conflated
+    /// external-reachability claim. `reason` is the oracle's rendering, verbatim.
+    ScanIncomplete {
+        reason: String,
+    },
 }
 
 /// Provable exhaustiveness of F's call sites.
@@ -58,12 +79,49 @@ pub enum CallerCoverage {
 }
 
 /// Rustc-derived danger signals the pure graph cannot see (GREENFIELD to compute).
+///
+/// `#[non_exhaustive]` is load-bearing: no field subset is a sufficient rejection
+/// test. The crate-scan poison travels ONLY in `scan_incomplete` — it is
+/// deliberately NOT folded into `is_public` any more — so a consumer that reads
+/// `is_public || address_taken` as "the old conservative bool" is unsound.
+/// [`classify_coverage`] is the sole judge of whether these signals permit
+/// `Total`; ask it, never re-derive the decision from fields. Out-of-crate
+/// producers must construct through [`CoverageSignals::new`], whose signature
+/// names every hazard channel so a newly added channel cannot be silently
+/// defaulted at any production site.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct CoverageSignals {
     pub is_public: bool,
     pub address_taken: bool,
     /// Callee strings at some call site that did not resolve to a node but could be F.
     pub unresolved_callees: Vec<String>,
+    /// Reasons the CRATE-WIDE caller scan is not exhaustive (an unscannable body, a
+    /// `global_asm!` item). Non-empty ⇒ reject: [`classify_coverage`] turns each
+    /// reason into a [`CoverageGap::ScanIncomplete`], a rejection exactly as hard
+    /// as the oracle's old `incomplete`-bool fold into `is_public` was — but the
+    /// cause survives classification instead of being conflated with external
+    /// reachability (which none of these causes establishes). Empty for a
+    /// complete scan.
+    pub scan_incomplete: Vec<String>,
+}
+
+impl CoverageSignals {
+    /// The only out-of-crate constructor (`#[non_exhaustive]` forbids literal and
+    /// functional-update construction there). Every hazard channel is a required
+    /// argument: adding a channel changes this signature, so each producer must
+    /// then decide what to pass — the failure mode this closes is a producer
+    /// narrowing one channel (as `is_public` was narrowed to exclude the scan
+    /// poison) while another construction site silently keeps defaulting it.
+    #[must_use]
+    pub fn new(
+        is_public: bool,
+        address_taken: bool,
+        unresolved_callees: Vec<String>,
+        scan_incomplete: Vec<String>,
+    ) -> Self {
+        Self { is_public, address_taken, unresolved_callees, scan_incomplete }
+    }
 }
 
 /// Reasons R1 declines to flip F (each ⇒ F keeps its honest Failed/Unknown).
@@ -203,6 +261,11 @@ pub fn classify_coverage(
     signals: &CoverageSignals,
 ) -> CallerCoverage {
     let mut gaps = Vec::new();
+    // Crate-level first: when the scan itself is poisoned, that — not anything about
+    // F — is the dominant reason no caller set is exhaustive.
+    for reason in &signals.scan_incomplete {
+        gaps.push(CoverageGap::ScanIncomplete { reason: reason.clone() });
+    }
     if signals.is_public {
         gaps.push(CoverageGap::ExternallyReachable);
     }
@@ -1187,6 +1250,95 @@ mod tests {
         assert!(matches!(classify_coverage("fdef", &rec, &sig), CallerCoverage::Incomplete(_)));
     }
 
+    /// A poisoned crate-wide scan must reject with its OWN reason. It used to
+    /// arrive folded into `is_public`, which classified it as
+    /// `ExternallyReachable` — a claim that is false for every cause of the
+    /// poison (an unscannable body or a `global_asm!` item says nothing about
+    /// F's visibility), though no consumer ever rendered it: the real defect was
+    /// that the cause was dropped unread, leaving the crate-level rejection
+    /// unexplained. This test doubles as the pin on `classify_coverage`'s
+    /// `ScanIncomplete` push: delete that loop and the destructuring below
+    /// panics on `Total`.
+    #[test]
+    fn scan_incomplete_rejects_without_claiming_external_reachability() {
+        let rec = FxHashSet::default();
+        let sig = CoverageSignals {
+            scan_incomplete: vec!["`demo::{{global_asm}}` is a `global_asm!` item".to_string()],
+            ..Default::default()
+        };
+        let CallerCoverage::Incomplete(gaps) = classify_coverage("fdef", &rec, &sig) else {
+            panic!("a poisoned scan must never classify as Total");
+        };
+        assert_eq!(
+            gaps,
+            vec![CoverageGap::ScanIncomplete {
+                reason: "`demo::{{global_asm}}` is a `global_asm!` item".to_string()
+            }],
+            "the scan reason must survive; `ExternallyReachable` would be a false reason"
+        );
+        assert!(!gaps.contains(&CoverageGap::ExternallyReachable));
+    }
+
+    /// END-TO-END PIN for the narrowed `is_public`: with the scan poison as the
+    /// ONLY hazard (`is_public` and `address_taken` both false — exactly the
+    /// world after the poison stopped being folded into `is_public`), the
+    /// signals → `classify_coverage` → `mint_caller_propagation_certificate`
+    /// pipeline must refuse to flip even on perfect kernel-replayed proofs.
+    /// This FAILS if the poison ever stops blocking flips through its own
+    /// `scan_incomplete` channel: were `classify_coverage` to ignore the field,
+    /// coverage would classify `Total` and the mint below would succeed.
+    #[test]
+    fn scan_poison_alone_blocks_the_mint_through_classification() {
+        let reason = "the elaborated MIR of `demo::helper` was already stolen".to_string();
+        let sig = CoverageSignals::new(false, false, vec![], vec![reason.clone()]);
+        let rec = FxHashSet::default();
+        let coverage = classify_coverage("helper", &rec, &sig);
+        let (v, s) = (v_vc(), s_vc());
+        let s_ev = evidence_for(&s);
+        let c_vc = caller_vc("main");
+        let c_ev = evidence_for(&c_vc);
+        assert_eq!(
+            mint_caller_propagation_certificate(
+                &v,
+                &failed(),
+                &p_r1(),
+                &[],
+                &StrengthenedProof { vc: &s, evidence: &s_ev },
+                &coverage,
+                &["main".to_string()],
+                &[caller_proof("main", &c_vc, &c_ev)],
+            )
+            .map(|_| ()),
+            Err(R1Reject::CoverageIncomplete(vec![CoverageGap::ScanIncomplete { reason }]))
+        );
+    }
+
+    /// The reasons must not be swallowed when F ALSO has a real per-function gap:
+    /// both causes are true and both are reported, crate-level cause first.
+    #[test]
+    fn scan_incomplete_accumulates_with_per_function_gaps() {
+        let rec = FxHashSet::default();
+        let sig = CoverageSignals {
+            is_public: true,
+            address_taken: true,
+            scan_incomplete: vec!["`demo::{{global_asm}}` is a `global_asm!` item".to_string()],
+            ..Default::default()
+        };
+        let CallerCoverage::Incomplete(gaps) = classify_coverage("fdef", &rec, &sig) else {
+            panic!("a poisoned scan must never classify as Total");
+        };
+        assert_eq!(
+            gaps,
+            vec![
+                CoverageGap::ScanIncomplete {
+                    reason: "`demo::{{global_asm}}` is a `global_asm!` item".to_string()
+                },
+                CoverageGap::ExternallyReachable,
+                CoverageGap::IndirectCall { detail: "address-taken (fn-ptr/dyn)".into() },
+            ]
+        );
+    }
+
     // ---- the decision (sealed certificate + real kernel replay) ----
     //
     // These tests mint GENUINE clean-kernel certificates via `trust_certify` —
@@ -1405,6 +1557,9 @@ mod tests {
             CoverageGap::ExternallyReachable,
             CoverageGap::IndirectCall { detail: "address-taken (fn-ptr/dyn)".into() },
             CoverageGap::Recursive,
+            // The crate-wide scan poison rejects exactly as hard as the per-function
+            // gaps do; naming its real cause never softened the decision.
+            CoverageGap::ScanIncomplete { reason: "`demo::{{global_asm}}` item".into() },
         ] {
             assert_eq!(
                 mint_caller_propagation_certificate(

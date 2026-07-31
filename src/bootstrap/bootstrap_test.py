@@ -3,8 +3,10 @@
 Run these with `x test bootstrap`, or `python -m unittest src/bootstrap/bootstrap_test.py`."""
 
 from __future__ import absolute_import, division, print_function
+import io
 import os
 import subprocess
+import tarfile
 import unittest
 from unittest.mock import patch
 import tempfile
@@ -928,9 +930,29 @@ class TrustBootstrapCompilerPolicy(unittest.TestCase):
         env = {"RUSTFLAGS_BOOTSTRAP": "-Zthreads=2"}
         with patch.object(
             bootstrap, "rustc_supports_trust_bootstrap_no_verify", return_value=False
+        ), patch.object(
+            bootstrap, "rustc_advertises_retired_no_verify", return_value=False
         ):
             self.assertFalse(bootstrap.apply_trust_bootstrap_compiler_policy("rustc", env))
         self.assertEqual(env, {"RUSTFLAGS_BOOTSTRAP": "-Zthreads=2"})
+
+    def test_pre_rename_trust_seed_gets_the_env_transport(self):
+        # A Trust seed OLDER than the flag rename advertises only the retired
+        # `-Zno-trust-verify`: appending the current spelling would abort it
+        # with `unknown unstable option` at the first build script, and
+        # appending the retired one would abort every post-rename seed. The
+        # policy must reach for the version-invariant nested-process
+        # transport instead, and must NOT append any argv spelling.
+        env = {"RUSTFLAGS_BOOTSTRAP": "-Zthreads=2"}
+        with patch.object(
+            bootstrap, "rustc_supports_trust_bootstrap_no_verify", return_value=False
+        ), patch.object(
+            bootstrap, "rustc_advertises_retired_no_verify", return_value=True
+        ):
+            self.assertFalse(bootstrap.apply_trust_bootstrap_compiler_policy("rustc", env))
+        self.assertEqual(env["TRUST_NO_VERIFY"], "1")
+        self.assertEqual(env["RUSTFLAGS_BOOTSTRAP"], "-Zthreads=2")
+        self.assertNotIn("CARGO_ENCODED_RUSTFLAGS", env)
 
     def test_trust_driver_gets_exact_flag_in_plain_and_encoded_lanes(self):
         env = {
@@ -1003,3 +1025,224 @@ class TrustBootstrapCompilerPolicy(unittest.TestCase):
             base,
             {"RUSTFLAGS_BOOTSTRAP": "-Zthreads=2", "UNRELATED": "preserved"},
         )
+
+
+class Stage0FailClosedRefresh(unittest.TestCase):
+    """The stage0 refresh must never destroy a working seed.
+
+    Regression suite for the 2026-07-29 incident: a refresh triggered by a
+    stale legacy `cargo = .../bin/tcargo` bootstrap.toml pin deleted the
+    entire stage0 seed and reinstalled only the need-scoped Targo half,
+    leaving the tree without any working trustc. The refresh now stages the
+    complete replacement surface, verifies it, and atomically swaps it in;
+    every failure mode must abort with the existing seed untouched.
+    """
+
+    BUILD = "test-triple"
+    DATE = "2026-01-01"
+    VERSION = "9.9.9-test"
+
+    def setUp(self):
+        self.container = tempfile.mkdtemp()
+        self.build_dir = os.path.join(self.container, "build")
+        self.dist_root = os.path.join(self.container, "dist-server")
+
+    def tearDown(self):
+        rmtree(self.container)
+
+    def make_build(self, config_toml=""):
+        build = bootstrap.RustBuild(config_toml=config_toml, args=bootstrap.FakeArgs())
+        build.build_dir = self.build_dir
+        build.build = self.BUILD
+        build.stage0_compiler = bootstrap.Stage0Toolchain(self.DATE, self.VERSION)
+        build.download_url = "file://" + self.dist_root
+        build.stage0_data = {}
+        build.verbose = 0
+        return build
+
+    def write_seed(self, build):
+        """Materialize a complete, valid stage0 surface (the working seed)."""
+        bin_root = build.bin_root()
+        bin_dir = os.path.join(bin_root, "bin")
+        libexec = os.path.join(bin_root, "libexec")
+        os.makedirs(bin_dir)
+        os.makedirs(libexec)
+        for name in bootstrap.STAGE0_REQUIRED_BINS:
+            with open(os.path.join(bin_dir, name + bootstrap.EXE_SUFFIX), "w") as f:
+                f.write("old-" + name)
+        for name in bootstrap.STAGE0_REQUIRED_LIBEXEC_BINS:
+            with open(os.path.join(libexec, name + bootstrap.EXE_SUFFIX), "w") as f:
+                f.write("old-" + name)
+        os.makedirs(os.path.join(bin_root, "lib"))
+        with open(os.path.join(bin_root, "lib", "sentinel"), "w") as f:
+            f.write("old-lib")
+        return bin_root
+
+    def write_stamp(self, build, key=None):
+        with open(build.rustc_stamp(), "w") as f:
+            f.write(key if key is not None else build.stage0_compiler.date)
+
+    def snapshot(self, root):
+        """Map every file under root to its content."""
+        state = {}
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for filename in filenames:
+                path = os.path.join(dirpath, filename)
+                with open(path, "r") as f:
+                    state[os.path.relpath(path, root)] = f.read()
+        return state
+
+    def component_plan(self, build):
+        std_image = "trust-std-{}".format(build.build)
+        return {
+            "trust-std": (
+                std_image,
+                ["lib/rustlib/{}/lib/libstd.rlib".format(build.build)],
+            ),
+            "trustc": (
+                "trustc",
+                [
+                    "bin/trustc",
+                    "bin/rustc",
+                    "bin/trustdoc",
+                    "libexec/trust-analyzer-proc-macro-srv",
+                    "lib/libtrustc-driver.dylib",
+                ],
+            ),
+            "targo": ("targo", ["bin/targo", "bin/cargo"]),
+            "targo-trust": ("targo-trust", ["bin/targo-trust"]),
+            "trustfmt": ("trustfmt", ["bin/trustfmt", "bin/targo-fmt"]),
+            "tippy": ("tippy", ["bin/tippy", "bin/targo-tippy", "bin/tippy-driver"]),
+            "trust-analyzer": ("trust-analyzer", ["bin/trust-analyzer"]),
+        }
+
+    def make_archives(self, build, omit=(), drop_files=()):
+        """Publish pinned component archives on the file:// dist server."""
+        suffix = ".tar.gz" if bootstrap.lzma is None else ".tar.xz"
+        mode = "w:gz" if bootstrap.lzma is None else "w:xz"
+        toolchain_suffix = "{}-{}{}".format(
+            build.stage0_compiler.version, build.build, suffix
+        )
+        dist_dir = os.path.join(
+            self.dist_root, "dist", build.stage0_compiler.date
+        )
+        os.makedirs(dist_dir, exist_ok=True)
+        for component, (image, files) in self.component_plan(build).items():
+            if component in omit:
+                continue
+            filename = "{}-{}".format(component, toolchain_suffix)
+            top = filename.replace(suffix, "")
+            tar_path = os.path.join(dist_dir, filename)
+            with tarfile.open(tar_path, mode) as tar:
+                for rel in files:
+                    if rel in drop_files:
+                        continue
+                    data = "new-{}".format(os.path.basename(rel)).encode("utf-8")
+                    info = tarfile.TarInfo("{}/{}/{}".format(top, image, rel))
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+            with open(tar_path, "rb") as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+            build.stage0_data[
+                "dist/{}/{}".format(build.stage0_compiler.date, filename)
+            ] = digest
+
+    def assert_no_refresh_residue(self, build):
+        bin_root = build.bin_root()
+        self.assertFalse(os.path.exists(bin_root + ".staging"))
+        self.assertFalse(os.path.exists(bin_root + ".previous"))
+
+    def test_healthy_seed_with_fresh_stamp_is_untouched(self):
+        build = self.make_build()
+        bin_root = self.write_seed(build)
+        self.write_stamp(build)
+        before = self.snapshot(bin_root)
+        build.download_toolchain()
+        self.assertEqual(self.snapshot(bin_root), before)
+        self.assert_no_refresh_residue(build)
+
+    def test_forbidden_legacy_tool_pin_fails_closed(self):
+        # The incident trigger: bootstrap.toml pinning cargo to the legacy
+        # tcargo spelling, which a refresh can never produce. The old code
+        # looped destructively; the trigger must now be rejected with the
+        # seed untouched.
+        build = self.make_build()
+        legacy_pin = os.path.join(build.bin_root(), "bin", "tcargo")
+        build = self.make_build(
+            config_toml='[build]\ncargo = "{}"\n'.format(legacy_pin)
+        )
+        bin_root = self.write_seed(build)
+        self.write_stamp(build)
+        before = self.snapshot(bin_root)
+        with self.assertRaisesRegex(RuntimeError, "tcargo"):
+            build.download_toolchain()
+        self.assertEqual(self.snapshot(bin_root), before)
+        self.assert_no_refresh_residue(build)
+
+    def test_missing_archives_abort_before_seed_deletion(self):
+        build = self.make_build()
+        bin_root = self.write_seed(build)
+        self.write_stamp(build, key="1970-01-01")  # stale -> refresh fires
+        before = self.snapshot(bin_root)
+        with self.assertRaisesRegex(RuntimeError, "checksum"):
+            build.download_toolchain()
+        self.assertEqual(self.snapshot(bin_root), before)
+        self.assert_no_refresh_residue(build)
+
+    def test_incident_shape_missing_compiler_archive_leaves_seed_intact(self):
+        # 2026-07-29 regression: everything BUT the compiler half of the
+        # surface is available. The old code deleted the seed and installed
+        # the partial surface; now the refresh must abort first.
+        build = self.make_build()
+        bin_root = self.write_seed(build)
+        self.write_stamp(build, key="1970-01-01")
+        self.make_archives(build, omit=("trustc",))
+        before = self.snapshot(bin_root)
+        with self.assertRaisesRegex(RuntimeError, "trustc"):
+            build.download_toolchain()
+        self.assertEqual(self.snapshot(bin_root), before)
+        trustc = os.path.join(bin_root, "bin", "trustc" + bootstrap.EXE_SUFFIX)
+        with open(trustc, "r") as f:
+            self.assertEqual(f.read(), "old-trustc")
+        self.assert_no_refresh_residue(build)
+
+    def test_incomplete_extraction_fails_before_swap(self):
+        # All archives download and unpack, but the staged surface is
+        # missing bin/trustc: the pre-swap assertion must reject it and the
+        # working seed must survive.
+        build = self.make_build()
+        bin_root = self.write_seed(build)
+        self.write_stamp(build, key="1970-01-01")
+        self.make_archives(build, drop_files=("bin/trustc",))
+        before = self.snapshot(bin_root)
+        with self.assertRaisesRegex(RuntimeError, "missing required"):
+            build.download_toolchain()
+        self.assertEqual(self.snapshot(bin_root), before)
+        self.assert_no_refresh_residue(build)
+
+    def test_refresh_replaces_seed_atomically(self):
+        # A forbidden legacy leftover in the live surface (the realistic
+        # migration trigger) causes a refresh; the complete staged surface
+        # must swap in, the leftover must be gone, and the stamp written.
+        build = self.make_build()
+        bin_root = self.write_seed(build)
+        with open(os.path.join(bin_root, "bin", "tcargo"), "w") as f:
+            f.write("legacy-leftover")
+        self.write_stamp(build)
+        self.make_archives(build)
+        self.assertTrue(build.stage0_tool_surface_needs_refresh())
+        build.download_toolchain()
+        for name in bootstrap.STAGE0_REQUIRED_BINS:
+            path = os.path.join(bin_root, "bin", name + bootstrap.EXE_SUFFIX)
+            with open(path, "r") as f:
+                self.assertEqual(f.read(), "new-" + name, name)
+        for name in bootstrap.STAGE0_REQUIRED_LIBEXEC_BINS:
+            path = os.path.join(bin_root, "libexec", name + bootstrap.EXE_SUFFIX)
+            with open(path, "r") as f:
+                self.assertEqual(f.read(), "new-" + name, name)
+        self.assertFalse(os.path.exists(os.path.join(bin_root, "bin", "tcargo")))
+        self.assertFalse(os.path.exists(os.path.join(bin_root, "lib", "sentinel")))
+        with open(build.rustc_stamp(), "r") as f:
+            self.assertEqual(f.read(), self.DATE)
+        self.assertFalse(build.stage0_tool_surface_needs_refresh())
+        self.assert_no_refresh_residue(build)

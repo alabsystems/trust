@@ -51,7 +51,10 @@
 //! is defense-in-depth. Escape hatch: `-Ztrust-ir-flip=no` (see
 //! `trust_thir_lower::flip_registry`).
 //!
-//! Observability: one `info!` line per flipped body — grep `"compiled from trust-ir"` — with a
+//! Observability: one `info!` line per flipped body — grep `"compiled from trust-ir"` — with the
+//! body's record-time lineage digest (`lineage`, Trust L1: the sha256-domain digest of the
+//! (mini-module, callee ledger) the body was derived from, matchable against the published
+//! artifact row's `lineage` field) and a
 //! running per-Session crate tally (`flipped_so_far`); `warn!` per fallback. The tallies live in
 //! [`rustc_session::Session`] state because a rustc_driver process may compile multiple crates.
 //! Target:
@@ -120,13 +123,16 @@ pub(crate) fn try_flip<'tcx>(
         return None;
     }
 
-    let (body, asserts) = match trust_thir_lower::flip::derive_flip_body(tcx, did, normal) {
+    let (body, asserts, lineage) = match trust_thir_lower::flip::derive_flip_body(tcx, did, normal)
+    {
         trust_thir_lower::flip::FlipAttempt::NotCandidate => return None,
         trust_thir_lower::flip::FlipAttempt::Rejected { reason } => {
             note_fallback(tcx.sess, did, &reason, "gate");
             return None;
         }
-        trust_thir_lower::flip::FlipAttempt::Derived { body, asserts } => (body, asserts),
+        trust_thir_lower::flip::FlipAttempt::Derived { body, asserts, lineage } => {
+            (body, asserts, lineage)
+        }
     };
 
     // Advance Built -> Runtime(PostCleanup) with the same passes the built sibling saw.
@@ -140,7 +146,17 @@ pub(crate) fn try_flip<'tcx>(
     match advanced {
         Ok(Ok(body)) => {
             let flipped = note_flipped(tcx.sess);
-            info!(?did, asserts, flipped_so_far = flipped, "trust-ir-flip: compiled from trust-ir");
+            // Trust (L1): `lineage` is the record-time digest of the (mini-module, callee
+            // ledger) this body was derived from — the value that matches the registry
+            // object and the published artifact row. Always present: `record_green`
+            // declines digest-less bodies, so no flip event can fire without it.
+            info!(
+                ?did,
+                asserts,
+                lineage = %lineage,
+                flipped_so_far = flipped,
+                "trust-ir-flip: compiled from trust-ir"
+            );
             Some(body)
         }
         Ok(Err(reason)) => {
@@ -207,13 +223,16 @@ pub(crate) fn try_flip_ctfe<'tcx>(
         _ => return None,
     }
 
-    let (body, asserts) = match trust_thir_lower::flip::derive_flip_body(tcx, did, normal) {
+    let (body, asserts, lineage) = match trust_thir_lower::flip::derive_flip_body(tcx, did, normal)
+    {
         trust_thir_lower::flip::FlipAttempt::NotCandidate => return None,
         trust_thir_lower::flip::FlipAttempt::Rejected { reason } => {
             note_fallback(tcx.sess, did, &reason, "ctfe-gate");
             return None;
         }
-        trust_thir_lower::flip::FlipAttempt::Derived { body, asserts } => (body, asserts),
+        trust_thir_lower::flip::FlipAttempt::Derived { body, asserts, lineage } => {
+            (body, asserts, lineage)
+        }
     };
 
     // Advance Built -> Runtime(PostCleanup), the phase the const-eval interpreter consumes (this
@@ -226,9 +245,11 @@ pub(crate) fn try_flip_ctfe<'tcx>(
     match advanced {
         Ok(Ok(body)) => {
             let flipped = note_flipped(tcx.sess);
+            // Trust (L1): same lineage attestation as the codegen seam — see `try_flip`.
             info!(
                 ?did,
                 asserts,
+                lineage = %lineage,
                 flipped_so_far = flipped,
                 "trust-ir-flip: CTFE compiled from trust-ir"
             );

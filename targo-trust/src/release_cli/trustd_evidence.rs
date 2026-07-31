@@ -751,7 +751,9 @@ fn require_ignored_untracked_output(
 }
 
 fn require_tracked_ignore_rule(root: &Path, relative: &str) -> Result<(), String> {
-    let mut command = controlled_git::command(root)?;
+    // `check-ignore` accepts literal pathnames but rejects Git's global
+    // pathspec-mode switches (including `--literal-pathspecs`).
+    let mut command = controlled_git::pathname_command(root)?;
     command.args(["check-ignore", "--no-index", "--verbose", "--"]).arg(relative);
     let output = bounded_process::output(
         &mut command,
@@ -999,14 +1001,15 @@ mod tests {
         fs::write(repository.path().join(".gitignore"), "/build/\n")
             .expect("write ignored output policy");
         fs::write(repository.path().join("tracked.json"), "{}\n").expect("write tracked fixture");
+        let error = require_ignored_untracked_output(
+            repository.path(),
+            "build/product-proof/evidence.json",
+            "test output",
+        )
+        .expect_err("untracked .gitignore must not authorize evidence output");
         assert!(
-            require_ignored_untracked_output(
-                repository.path(),
-                "build/product-proof/evidence.json",
-                "test output",
-            )
-            .unwrap_err()
-            .contains("ignore rule source `.gitignore` is not tracked")
+            error.contains("ignore rule source `.gitignore` is not tracked"),
+            "unexpected output-policy error: {error}"
         );
         let mut add = controlled_git::command(repository.path()).expect("controlled Git");
         add.args(["add", "--", ".gitignore", "tracked.json"])

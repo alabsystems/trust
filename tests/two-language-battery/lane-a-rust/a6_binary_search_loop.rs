@@ -11,12 +11,12 @@
 //! This file used to hold binary search, copied from
 //! `tests/ui/trust/native_loop_clauses.rs`. That was a mistake worth recording:
 //! the source fixture runs `-Ztrust-verify=off // check-pass`, so it pins the
-//! GRAMMAR only and is not evidence that the program verifies. The loop-contract
-//! lane walks one body path, following only `Goto` and `Assert` terminators
-//! (`single_path_loop_transition_blocks`); binary search's `if/else if/else`
-//! introduces two `SwitchInt` terminators and a second loop exit, so both its
-//! clauses become UnsupportedMir rows. Binary search now lives in
-//! `a12_FRONTIER_multipath_loop.rs`, scored as the frontier it is.
+//! GRAMMAR only and is not evidence that the program verifies. The E4/E5 lane
+//! now explores bounded acyclic multi-path bodies and accounts for every
+//! backedge, so that old single-path explanation is retired. Binary search
+//! remains in `a12_FRONTIER_multipath_loop.rs` because its `usize` loop state
+//! is guarded by `u32` element comparisons and therefore crosses the current
+//! one-principal-machine-domain boundary.
 //!
 //! What remains is a genuine slice walk: `.len()` appears in both the invariant
 //! and the measure, and `i += 1` under the guard `i < xs.len()` is what makes

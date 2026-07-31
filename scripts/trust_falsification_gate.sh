@@ -295,22 +295,52 @@ contains_tool_error() {
     "$stderr_path"
 }
 
-contains_trust_rejection_verdict() {
+# A REFUTATION PROPER: the verifier exhibited a violated obligation. Only these two
+# spellings are evidence that the compiler CAUGHT something.
+contains_trust_counterexample_verdict() {
   local stderr_path=$1
   LC_ALL=C grep -Eq \
-    'Trust verification found [1-9][0-9]* guaranteed Level 0 safety violation|Trust (strict|full|memory-safe) verification failed|strict Trust verification requires every Level 0 obligation|Level 0 summary: [1-9][0-9]* failed' \
+    'Trust verification found [1-9][0-9]* guaranteed Level 0 safety violation|Level 0 summary: [1-9][0-9]* failed' \
     "$stderr_path"
 }
 
+# INCOMPLETENESS: the strict/full scope refused the build because some obligation was not
+# DISCHARGED — no counterexample, nothing caught. Distinct from a refutation, and the
+# distinction is load-bearing (see `classify_verdict`).
+contains_trust_incompleteness_verdict() {
+  local stderr_path=$1
+  LC_ALL=C grep -Eq \
+    'Trust (strict|full|memory-safe) verification failed|strict Trust verification requires every Level 0 obligation|obligation\(s\) were not fully verified' \
+    "$stderr_path"
+}
+
+# Trust (2026-07-30): `refuted` and `incomplete` are DIFFERENT ANSWERS and were previously
+# one label. The old `contains_trust_rejection_verdict` matched
+# `Trust (strict|full|memory-safe) verification failed` — which is the INCOMPLETENESS header,
+# printed whenever an obligation is merely undischarged — so any declined proof read as a
+# refutation.
+#
+# On the `proved/` lane that only mislabelled a failure. On the `mutant/` lane it was a HOLE
+# IN THE GATE'S CENTRAL CLAIM: a mutant the verifier never caught, but merely declined to
+# discharge, scored PASS and was counted in "N mutants explicitly refuted". The gate could
+# report a green mutation score while catching nothing.
+#
+# Counterexample is checked FIRST because a real refutation prints the header too.
 classify_verdict() {
   local rc=$1 stderr_path=$2
   if ((rc == 0)); then
     printf 'proved\n'
     return 0
   fi
-  if ((rc == 1)) && ! contains_tool_error "$stderr_path" && contains_trust_rejection_verdict "$stderr_path"; then
-    printf 'refuted\n'
-    return 0
+  if ((rc == 1)) && ! contains_tool_error "$stderr_path"; then
+    if contains_trust_counterexample_verdict "$stderr_path"; then
+      printf 'refuted\n'
+      return 0
+    fi
+    if contains_trust_incompleteness_verdict "$stderr_path"; then
+      printf 'incomplete\n'
+      return 0
+    fi
   fi
   printf 'tool-error\n'
   return 0
@@ -550,6 +580,13 @@ main() {
     case $verdict in
       refuted)
         printf 'PASS  mutant   %s  — rejected by an explicit Trust verification verdict\n' "$name"
+        ;;
+      incomplete)
+        # NOT a pass. The verifier declined to discharge the obligation; it did not catch
+        # the mutation. Counting this as a refutation is how a gate reports a mutation score
+        # it has not earned.
+        printf 'FAIL  mutant   %s  — UNCAUGHT MUTANT: verification was incomplete, not refuting\n' "$name"
+        failed=1
         ;;
       proved)
         printf 'FAIL  mutant   %s  — SURVIVING MUTANT: verified when it must fail\n' "$name"

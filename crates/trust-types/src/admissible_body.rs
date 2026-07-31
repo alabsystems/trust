@@ -19,7 +19,7 @@
 
 use crate::{
     BasicBlock, BinOp, BlockId, ConstValue, Operand, Rvalue, Statement, Terminator,
-    VerifiableFunction,
+    Ty, VerifiableFunction,
 };
 
 /// A body shape the kernel-import elaborator can turn into a defining equation.
@@ -162,7 +162,7 @@ pub fn recognize_admissible_body(func: &VerifiableFunction) -> Option<Admissible
 /// place and targeting a bookkeeping-only `Return` block.
 ///
 /// FAITHFULNESS: each node is the recognized primitive (the same
-/// [`arith_op`] gate as the single-call shape), operands resolve to the
+/// [`arith_method`] gate as the single-call shape), operands resolve to the
 /// values the temporaries carry by construction (single assignment, linear
 /// control flow, value-neutral statements only), so the composed tree IS the
 /// body's dataflow; the elaborator renders it fully parenthesized over the
@@ -188,6 +188,7 @@ fn recognize_call_chain(func: &VerifiableFunction) -> Option<AdmissibleBody> {
         .map(|i| (i, ArithExpr::Operand(ArithOperand::Param(i - 1))))
         .collect();
     let mut result: Option<ArithExpr> = None;
+    let mut chain_width: Option<u32> = None;
     for (index, blk) in call_blks.iter().enumerate() {
         if blk.stmts.iter().any(|s| !is_value_neutral(s)) {
             return None;
@@ -199,14 +200,25 @@ fn recognize_call_chain(func: &VerifiableFunction) -> Option<AdmissibleBody> {
         if *target != Some(next.id) || !dest.projections.is_empty() {
             return None;
         }
-        let op = arith_op(callee)?;
+        let (op, width) = arith_method(callee)?;
+        if chain_width.is_some_and(|prior| prior != width)
+            || !function_returns_unsigned_width(func, width)
+            || !bare_local_has_unsigned_width(func, dest.local, width)
+        {
+            return None;
+        }
+        chain_width = Some(width);
         let resolve = |operand: &Operand| -> Option<ArithExpr> {
             match operand {
-                Operand::Constant(ConstValue::Uint(value, _)) => {
+                Operand::Constant(ConstValue::Uint(value, encoded_width))
+                    if *encoded_width == width && uint_fits_width(*value, width) =>
+                {
                     u128::try_from(*value).ok().map(|v| ArithExpr::Operand(ArithOperand::Const(v)))
                 }
                 Operand::Copy(p) | Operand::Move(p) => {
-                    if !p.projections.is_empty() {
+                    if !p.projections.is_empty()
+                        || !bare_local_has_unsigned_width(func, p.local, width)
+                    {
                         return None;
                     }
                     env.get(&p.local).cloned()
@@ -314,11 +326,12 @@ fn recognize_use_chain(func: &VerifiableFunction) -> Option<AdmissibleBody> {
 }
 
 /// The single wrapping-arithmetic shape: a two-block body whose entry is a
-/// `Call` to a primitive `wrapping_add`/`wrapping_mul` on two operands (each a
-/// parameter or a literal), assigned to the return place, returning in the next
-/// block. Fail-closed on anything else, including `wrapping_sub` (whose encoding
-/// differs) and any callee not under the `core::num` primitive path (so a user
-/// function merely NAMED `wrapping_add` is never mistaken for the primitive).
+/// `Call` to a compiler-authenticated primitive
+/// `wrapping_add`/`wrapping_sub`/`wrapping_mul` on two operands (each a
+/// parameter or a literal), assigned to the return place, returning in the
+/// next block. Fail-closed on anything else: unmarked or malformed paths,
+/// excluded carriers, width/type disagreement, and user functions merely
+/// named like a primitive.
 fn recognize_arithmetic(func: &VerifiableFunction) -> Option<AdmissibleBody> {
     let [call_blk, ret_blk] = &func.body.blocks[..] else {
         return None;
@@ -338,16 +351,22 @@ fn recognize_arithmetic(func: &VerifiableFunction) -> Option<AdmissibleBody> {
     let [op1, op2] = &args[..] else {
         return None;
     };
-    let op = arith_op(callee)?;
+    let (op, width) = arith_method(callee)?;
+    if !function_returns_unsigned_width(func, width)
+        || !bare_local_has_unsigned_width(func, dest.local, width)
+    {
+        return None;
+    }
     Some(AdmissibleBody::Arithmetic {
         op,
-        left: arith_operand(op1, func.body.arg_count)?,
-        right: arith_operand(op2, func.body.arg_count)?,
+        left: arith_operand(op1, func, width)?,
+        right: arith_operand(op2, func, width)?,
     })
 }
 
-/// The wrapping arithmetic op a callee path denotes, requiring the `core::num`
-/// primitive path so a same-named user function is not matched.
+/// The wrapping arithmetic operation and width a callee denotes, requiring the
+/// closed compiler-authenticated primitive-method marker so a same-named user
+/// function or serialized lookalike is not matched.
 ///
 /// `wrapping_sub` ADMITTED (E6 widening increment 1, 2026-07-22): the former
 /// exclusion note ("its encoding does not match the machine `-` elaboration")
@@ -359,18 +378,11 @@ fn recognize_arithmetic(func: &VerifiableFunction) -> Option<AdmissibleBody> {
 /// restricts admission to UNSIGNED carriers, so the signed case never
 /// reaches this recognizer's consumers. Faithfulness pinned by
 /// `widening_battery_census_targets_currently_refuse`'s flipped first pin.
-fn arith_op(callee: &str) -> Option<ArithBinOp> {
-    if !callee.contains("core::num") {
-        return None;
-    }
-    if callee.contains("wrapping_add") {
-        Some(ArithBinOp::Add)
-    } else if callee.contains("wrapping_sub") {
-        Some(ArithBinOp::Sub)
-    } else if callee.contains("wrapping_mul") {
-        Some(ArithBinOp::Mul)
-    } else {
-        None
+fn arith_method(callee: &str) -> Option<(ArithBinOp, u32)> {
+    match crate::RustcTotalPrimitiveMethod::classify(callee)? {
+        crate::RustcTotalPrimitiveMethod::WrappingAdd(width) => Some((ArithBinOp::Add, width)),
+        crate::RustcTotalPrimitiveMethod::WrappingSub(width) => Some((ArithBinOp::Sub, width)),
+        crate::RustcTotalPrimitiveMethod::WrappingMul(width) => Some((ArithBinOp::Mul, width)),
     }
 }
 
@@ -393,14 +405,40 @@ pub enum ArithExpr {
 
 /// An arithmetic operand: a bare parameter (`1..=arg_count`) or a machine-integer
 /// literal.
-fn arith_operand(op: &Operand, arg_count: usize) -> Option<ArithOperand> {
+fn bare_local_has_unsigned_width(func: &VerifiableFunction, local: usize, width: u32) -> bool {
+    func.body.locals.get(local).is_some_and(|decl| {
+        decl.index == local && decl.ty == Ty::Int { width, signed: false }
+    })
+}
+
+fn function_returns_unsigned_width(func: &VerifiableFunction, width: u32) -> bool {
+    func.body.return_ty == Ty::Int { width, signed: false }
+        && bare_local_has_unsigned_width(func, 0, width)
+}
+
+fn uint_fits_width(value: u128, width: u32) -> bool {
+    width == 128 || value < (1_u128 << width)
+}
+
+fn arith_operand(
+    op: &Operand,
+    func: &VerifiableFunction,
+    width: u32,
+) -> Option<ArithOperand> {
     match op {
         Operand::Copy(p) | Operand::Move(p)
-            if p.projections.is_empty() && p.local >= 1 && p.local <= arg_count =>
+            if p.projections.is_empty()
+                && p.local >= 1
+                && p.local <= func.body.arg_count
+                && bare_local_has_unsigned_width(func, p.local, width) =>
         {
             Some(ArithOperand::Param(p.local - 1))
         }
-        Operand::Constant(ConstValue::Uint(v, _)) => Some(ArithOperand::Const(*v)),
+        Operand::Constant(ConstValue::Uint(v, encoded_width))
+            if *encoded_width == width && uint_fits_width(*v, width) =>
+        {
+            Some(ArithOperand::Const(*v))
+        }
         _ => None,
     }
 }
@@ -582,7 +620,8 @@ fn branch_arm(block: &BasicBlock, arg_count: usize) -> Option<(usize, usize, Blo
 mod tests {
     use super::*;
     use crate::{
-        BasicBlock, BlockId, Place, Projection, SourceSpan, Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BlockId, LocalDecl, Place, Projection, SourceSpan, Ty, VerifiableBody,
+        VerifiableFunction,
     };
 
     fn func(arg_count: usize, stmts: Vec<Statement>, term: Terminator) -> VerifiableFunction {
@@ -591,10 +630,12 @@ mod tests {
             def_path: "crate::f".into(),
             span: SourceSpan::default(),
             body: VerifiableBody {
-                locals: Vec::new(),
+                locals: (0..8)
+                    .map(|index| LocalDecl { index, ty: Ty::u64(), name: None })
+                    .collect(),
                 blocks: vec![BasicBlock { id: BlockId(0), stmts, terminator: term }],
                 arg_count,
-                return_ty: Ty::Unit,
+                return_ty: Ty::u64(),
             },
             contracts: Vec::new(),
             preconditions: Vec::new(),
@@ -652,7 +693,7 @@ mod tests {
         // admission is already restricted to unsigned carriers. The pin flips
         // POSITIVE with the shape it recognizes.
         let sub = two_block_call(
-            "core::num::<impl u64>::wrapping_sub",
+            "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_sub",
             vec![Operand::Copy(Place::local(1)), Operand::Constant(ConstValue::Uint(1, 64))],
             Place::local(0),
         );
@@ -715,7 +756,7 @@ mod tests {
                     id: BlockId(0),
                     stmts: Vec::new(),
                     terminator: Terminator::Call {
-                        func: "core::num::<impl u64>::wrapping_add".into(),
+                        func: "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add".into(),
                         args: vec![
                             Operand::Copy(Place::local(1)),
                             Operand::Constant(ConstValue::Uint(1, 64)),
@@ -733,7 +774,7 @@ mod tests {
                     id: BlockId(1),
                     stmts: Vec::new(),
                     terminator: Terminator::Call {
-                        func: "core::num::<impl u64>::wrapping_mul".into(),
+                        func: "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_mul".into(),
                         args: vec![
                             Operand::Copy(Place::local(2)),
                             Operand::Constant(ConstValue::Uint(2, 64)),
@@ -804,7 +845,7 @@ mod tests {
                     id: BlockId(1),
                     stmts: Vec::new(),
                     terminator: prim_call(
-                        "core::num::<impl u64>::wrapping_add",
+                        "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add",
                         vec![
                             Operand::Copy(Place::local(2)),
                             Operand::Constant(ConstValue::Uint(1, 64)),
@@ -827,7 +868,7 @@ mod tests {
                     id: BlockId(0),
                     stmts: Vec::new(),
                     terminator: prim_call(
-                        "core::num::<impl u64>::wrapping_add",
+                        "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add",
                         vec![
                             Operand::Copy(Place::local(1)),
                             Operand::Constant(ConstValue::Uint(1, 64)),
@@ -917,7 +958,7 @@ mod tests {
         let mut projected_dest = Place::local(0);
         projected_dest.projections.push(Projection::Field(0));
         let partial = two_block_call(
-            "core::num::<impl u64>::wrapping_add",
+            "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add",
             operands(),
             projected_dest,
         );
@@ -926,7 +967,7 @@ mod tests {
         // (3) the genuine primitive with an EFFECTFUL statement beside the
         // recognized value flow — hidden state change the import would erase.
         let mut effectful = two_block_call(
-            "core::num::<impl u64>::wrapping_add",
+            "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add",
             operands(),
             Place::local(0),
         );
@@ -939,7 +980,7 @@ mod tests {
         // (4) a DIVERGING call (no return target): there is no returned value
         // for a definitional import to be faithful to.
         let mut diverging = two_block_call(
-            "core::num::<impl u64>::wrapping_add",
+            "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add",
             operands(),
             Place::local(0),
         );
@@ -1101,7 +1142,7 @@ mod tests {
             atomic: None,
             is_foreign: false,
             is_unsafe_sig: false,
-    unwind: crate::UnwindEdge::Unreachable,
+            unwind: crate::UnwindEdge::Unreachable,
         };
         let winc = |t: Terminator, argc: usize| {
             func_blocks(
@@ -1114,7 +1155,7 @@ mod tests {
         };
         let f = winc(
             call(
-                "core::num::<impl u64>::wrapping_add",
+                "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add",
                 Operand::Copy(Place::local(1)),
                 Operand::Constant(ConstValue::Uint(1, 64)),
             ),
@@ -1131,7 +1172,7 @@ mod tests {
         // wsum(x, y) = x.wrapping_add(y).
         let g = winc(
             call(
-                "core::num::<impl u64>::wrapping_add",
+                "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add",
                 Operand::Copy(Place::local(1)),
                 Operand::Copy(Place::local(2)),
             ),
@@ -1145,8 +1186,7 @@ mod tests {
                 right: ArithOperand::Param(1),
             })
         );
-        // A user function merely NAMED wrapping_add (not under core::num) fails
-        // closed; wrapping_sub (encoding differs) fails closed.
+        // A user function merely NAMED wrapping_add fails closed.
         let bad = winc(
             call("crate::wrapping_add", Operand::Copy(Place::local(1)), Operand::Copy(Place::local(1))),
             1,
@@ -1154,11 +1194,11 @@ mod tests {
         assert_eq!(recognize_admissible_body(&bad), None);
         // wrapping_sub: recognized since the 2026-07-22 E6 widening
         // increment 1 (the Machine-domain `-` elaboration is the wrapping
-        // carrier sub — see arith_op's doc; the widening battery carries the
+        // carrier sub — see arith_method's doc; the widening battery carries the
         // authoritative pins).
         let sub = winc(
             call(
-                "core::num::<impl u64>::wrapping_sub",
+                "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_sub",
                 Operand::Copy(Place::local(1)),
                 Operand::Constant(ConstValue::Uint(1, 64)),
             ),
@@ -1171,6 +1211,121 @@ mod tests {
                 left: ArithOperand::Param(0),
                 right: ArithOperand::Const(1),
             })
+        );
+    }
+
+    #[test]
+    fn wrapping_arithmetic_marker_width_and_carrier_gate_fail_closed() {
+        let marked_u64 =
+            "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add";
+        let call = |callee: &str, rhs: ConstValue| {
+            two_block_call(
+                callee,
+                vec![Operand::Copy(Place::local(1)), Operand::Constant(rhs)],
+                Place::local(0),
+            )
+        };
+
+        for bad in [
+            call(
+                "core::num::<impl u64>::wrapping_add",
+                ConstValue::Uint(1, 64),
+            ),
+            call(
+                "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add::suffix",
+                ConstValue::Uint(1, 64),
+            ),
+            call(
+                "@trust-rustc-total-primitive-method::core::num::<impl u128>::wrapping_add",
+                ConstValue::Uint(1, 128),
+            ),
+            call(
+                "@trust-rustc-total-primitive-method::core::num::<impl usize>::wrapping_add",
+                ConstValue::Uint(1, 64),
+            ),
+            call(
+                "@trust-rustc-total-primitive-method::core::num::<impl i64>::wrapping_add",
+                ConstValue::Uint(1, 64),
+            ),
+            call(
+                "@trust-rustc-total-primitive-method::core::num::<impl u32>::wrapping_add",
+                ConstValue::Uint(1, 32),
+            ),
+            call(marked_u64, ConstValue::Uint(1, 32)),
+            call(marked_u64, ConstValue::Uint(u64::MAX as u128 + 1, 64)),
+        ] {
+            assert!(
+                recognize_admissible_body(&bad).is_none(),
+                "unmarked, malformed, excluded, or type-incoherent arithmetic must fail closed"
+            );
+        }
+
+        let mut signed = call(marked_u64, ConstValue::Uint(1, 64));
+        signed.body.locals[1].ty = Ty::Int { width: 64, signed: true };
+        assert!(
+            recognize_admissible_body(&signed).is_none(),
+            "signed operand under an unsigned marker"
+        );
+
+        let mut return_mismatch = call(marked_u64, ConstValue::Uint(1, 64));
+        return_mismatch.body.return_ty = Ty::u32();
+        return_mismatch.body.locals[0].ty = Ty::u32();
+        assert!(
+            recognize_admissible_body(&return_mismatch).is_none(),
+            "marker width must agree with the function return domain"
+        );
+    }
+
+    #[test]
+    fn composed_wrapping_chain_rejects_mixed_marker_widths() {
+        let mut chain = func_blocks(
+            1,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: Vec::new(),
+                    terminator: Terminator::Call {
+                        func: "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add".into(),
+                        args: vec![
+                            Operand::Copy(Place::local(1)),
+                            Operand::Constant(ConstValue::Uint(1, 64)),
+                        ],
+                        dest: Place::local(2),
+                        target: Some(BlockId(1)),
+                        span: SourceSpan::default(),
+                        atomic: None,
+                        is_foreign: false,
+                        is_unsafe_sig: false,
+                        unwind: crate::UnwindEdge::Unreachable,
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: Vec::new(),
+                    terminator: Terminator::Call {
+                        func: "@trust-rustc-total-primitive-method::core::num::<impl u32>::wrapping_mul".into(),
+                        args: vec![
+                            Operand::Copy(Place::local(2)),
+                            Operand::Constant(ConstValue::Uint(2, 32)),
+                        ],
+                        dest: Place::local(0),
+                        target: Some(BlockId(2)),
+                        span: SourceSpan::default(),
+                        atomic: None,
+                        is_foreign: false,
+                        is_unsafe_sig: false,
+                        unwind: crate::UnwindEdge::Unreachable,
+                    },
+                },
+                BasicBlock { id: BlockId(2), stmts: Vec::new(), terminator: Terminator::Return },
+            ],
+        );
+        // Even if a hostile artifact rewrites the second temporary's type to
+        // agree with its own marker, the cross-node width disagreement remains.
+        chain.body.locals[2].ty = Ty::u32();
+        assert!(
+            recognize_admissible_body(&chain).is_none(),
+            "S4 chains must use one exact machine domain throughout"
         );
     }
 

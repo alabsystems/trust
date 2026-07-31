@@ -54,7 +54,7 @@ pub struct StructuralFacetScan {
 }
 
 const EVIDENCE: &str =
-    "structural-scan-v1: scalar locals, whitelisted ops, no calls, no back-edges";
+    "structural-scan-v1: scalar locals, whitelisted ops, certified calls, no back-edges";
 
 /// A violation and which facets it poisons. v1 keeps the mapping coarse and
 /// conservative; refinement arrives with the per-facet successor lanes.
@@ -99,6 +99,16 @@ fn apply_audited_firewall(
 
 /// Conservatively scan `func` for the four E6 facets.
 pub fn scan_structural_facets(func: &VerifiableFunction) -> StructuralFacetScan {
+    // No callee context: every call fails closed, which is the pre-closure
+    // behaviour and the right default for a caller that has no whole-set view.
+    scan_structural_facets_with_callees(func, &std::collections::BTreeSet::new())
+}
+
+/// Scan one function, permitting calls to callees already known certified.
+pub fn scan_structural_facets_with_callees(
+    func: &VerifiableFunction,
+    certified_callees: &std::collections::BTreeSet<String>,
+) -> StructuralFacetScan {
     let mut violations: Vec<Violation> = Vec::new();
 
     // Type gate: every local (params, temporaries, return slot) must live in
@@ -126,7 +136,7 @@ pub fn scan_structural_facets(func: &VerifiableFunction) -> StructuralFacetScan 
                 violations.push(v);
             }
         }
-        if let Some(v) = terminator_violation(&block.terminator) {
+        if let Some(v) = terminator_violation(&block.terminator, certified_callees) {
             violations.push(v);
         }
     }
@@ -242,7 +252,10 @@ fn statement_violation(stmt: &Statement) -> Option<Violation> {
     }
 }
 
-fn terminator_violation(term: &Terminator) -> Option<Violation> {
+fn terminator_violation(
+    term: &Terminator,
+    certified_callees: &std::collections::BTreeSet<String>,
+) -> Option<Violation> {
     match term {
         Terminator::Goto(_) | Terminator::SwitchInt { .. } | Terminator::Return => None,
         // A reachable assert poisons ONLY structural NoPanic: purity,
@@ -258,9 +271,41 @@ fn terminator_violation(term: &Terminator) -> Option<Violation> {
             deterministic: false,
             no_panic: true,
         }),
-        Terminator::Call { .. } => Some(Violation::all(
-            "program-function call; facet closure over callees is not yet wired".to_string(),
-        )),
+        Terminator::Call { func: callee, .. } => {
+            // RULED 2026-07-25 (docs/design/2026-07-25-e6-call-admission-ruling-request.md):
+            // a call no longer poisons every facet outright. It is permitted
+            // exactly when the callee is ITSELF structurally certified, which
+            // `scan_structural_facets_closure` establishes as a least fixpoint
+            // over the call graph.
+            //
+            // IDENTITY. `callee` is not a name: `func_operand_name` builds it
+            // from `safe_def_path_str_with_args(tcx, def_id, generic_args)`, so
+            // it is the DefId path plus the exact call-site instantiation
+            // (`crates/trust-mir-extract/src/convert.rs:5334-5349`, which notes
+            // a bare DefId path would alias `f::<bool>` and `f::<i32>`).
+            // Matching is EXACT STRING EQUALITY against a certified function's
+            // own `def_path` — never a suffix, never a bare name. That is what
+            // keeps a same-suffix impostor (`mod evil { fn wrapping_add(..) }`)
+            // out, and it costs the programmer nothing: no annotation, no
+            // allowlist entry, no marker on the callee.
+            //
+            // FAIL-CLOSED AND TERMINATING. An unknown callee still poisons all
+            // four facets. A recursive cycle never certifies, because no member
+            // of the cycle can enter the set before the others — so mutual and
+            // self recursion are refused rather than assumed total, which is
+            // the direction that matters for the Total facet.
+            if certified_callees.contains(callee.as_str())
+                || callee.starts_with(trust_types::TRUST_RUSTC_INTRINSIC_PATH_PREFIX)
+                || trust_types::RustcTotalPrimitiveMethod::classify(callee).is_some()
+            {
+                None
+            } else {
+                Some(Violation::all(format!(
+                    "call to `{callee}`, which is not itself structurally certified \
+                     (facets are closed over callees by exact def-path identity)"
+                )))
+            }
+        }
         other => Some(Violation::all(format!("terminator outside the v1 whitelist: {other:?}"))),
     }
 }

@@ -149,11 +149,7 @@ pub fn canonical_artifact_id_component(value: &str) -> String {
     }
 
     let length = (bytes.len() as u64).to_be_bytes();
-    let digest = stable_sha256_hex_parts(&[
-        b"trust.artifact-id-component.v1\0",
-        &length,
-        bytes,
-    ]);
+    let digest = stable_sha256_hex_parts(&[b"trust.artifact-id-component.v1\0", &length, bytes]);
     format!("h1_{:016x}_{}", bytes.len(), digest)
 }
 
@@ -257,11 +253,7 @@ fn canonical_contract_kind_component(contract_kind: &str) -> String {
     let length = (contract_kind.len() as u64).to_be_bytes();
     format!(
         "%~sha256~{}",
-        stable_sha256_hex_parts(&[
-            b"trust.contract.kind.v1\0",
-            &length,
-            contract_kind.as_bytes(),
-        ]),
+        stable_sha256_hex_parts(&[b"trust.contract.kind.v1\0", &length, contract_kind.as_bytes(),]),
     )
 }
 
@@ -528,6 +520,138 @@ impl SourceSpan {
     pub fn is_binary(&self) -> bool {
         self.binary_address_value().is_some()
     }
+}
+
+/// Render a span's file name for the OBLIGATION-IDENTITY lane: elide the volatile,
+/// machine- and build-specific prefixes from a path, so an obligation's identity does
+/// not move when the compiler is rebuilt or when the same code is compiled on a
+/// different machine.
+///
+/// Two shapes are recognized — the remapped toolchain path and the cargo-registry
+/// path. Everything else passes through VERBATIM.
+///
+/// # 1. The per-build toolchain token
+///
+/// `bootstrap.toml` sets `remap-debuginfo = true`, so a decoded sysroot `SourceFile`
+/// (where a macro-generated obligation's raw LO/HI land) renders as
+/// `/rustc/<token>/library/…` — or `/rustc-dev/<token>/compiler/…` for compiler
+/// sources — where `<token>` is the COMPILER build's commit hash, or its version
+/// string when no sha is available (`bootstrap::Builder::debuginfo_map_to`). That
+/// token names the toolchain BUILD, not anything in the user's program. Unelided it
+/// flowed into `SealedVcIdentity.file` and every exact span comparison, so rebuilding
+/// the compiler at a new commit moved the sealed identity of every macro-generated
+/// obligation although the user's program did not change.
+///
+/// The elision replaces the token with the fixed placeholder `<toolchain>` (angle
+/// brackets, following rustc's own virtual-name convention, e.g. `<anon>`). Within
+/// one compilation session exactly one toolchain build supplies these decoded files,
+/// so the replacement cannot merge two distinct files.
+///
+/// Only a component that plausibly IS a build token is elided: a lowercase-hex
+/// string of length >= 7 (a git sha), a component starting with an ASCII digit (a
+/// version string such as `1.99.0-dev`), or the literal `dev`. Everything else —
+/// user files, `/rustc/llvm` (already a fixed string), the `binary:0x…`
+/// compatibility form — passes through verbatim. Idempotent, because `<toolchain>`
+/// matches none of the token shapes.
+///
+/// # 2. The machine-specific `CARGO_HOME` prefix
+///
+/// `remap-debuginfo` covers the TOOLCHAIN's own sources only. A dependency built from
+/// the cargo registry keeps its real absolute path, so a `SourceFile` for it renders as
+/// `<CARGO_HOME>/registry/src/index.crates.io-<hash>/az-1.3.0/src/lib.rs` — carrying the
+/// generating machine's home directory, and with it the generating USER's name, into
+/// `SealedVcIdentity.file` and every exact span comparison. Two developers compiling the
+/// SAME dependency at the SAME version therefore sealed two different identities for one
+/// obligation, and a sealed identity was not reproducible off the machine that made it.
+///
+/// Only the prefix BEFORE `registry/` is replaced, with the fixed placeholder
+/// `<cargo-home>` (same angle-bracket convention as `<toolchain>`, and it names exactly
+/// what was elided). Everything from `registry/` onward is kept, deliberately: the
+/// `index.crates.io-<hash>` component is cargo's stable hash of the REGISTRY URL, so it
+/// is byte-identical on every machine, and it is what distinguishes crates.io from an
+/// alternative or mirrored registry. That is real information about which source was
+/// compiled, not a build artifact — eliding it would merge two genuinely different files.
+///
+/// Two anchors are accepted, deliberately asymmetric, because a FALSE rewrite (merging
+/// two unrelated files onto one identity) is worse than a missed one:
+///
+/// * `…/.cargo/registry/src/<index>/<tail>` — the default `CARGO_HOME` layout. The
+///   `.cargo/registry/src` triple is specific enough on its own; `<index>` is not
+///   inspected, so an unusual registry directory name is still normalized.
+/// * `…/registry/src/<index>/<tail>` with NO `.cargo` component — accepted ONLY when
+///   `<index>` has cargo's registry-directory shape, `<host>-<>=16 lowercase hex>`
+///   (cargo builds that name as `<registry host>-<short hash of the registry URL>`).
+///   This is what covers a relocated `CARGO_HOME` (`CARGO_HOME=/opt/cargo`, routine in
+///   CI images and containers), where the directory is simply not called `.cargo`. The
+///   hash component is a far stronger signal of "this is a cargo registry checkout" than
+///   the parent directory's name is, which is why dropping the `.cargo` requirement here
+///   does not widen the rule in practice.
+///
+/// A path that merely CONTAINS the word `registry`, a path with `.cargo` that is not the
+/// registry layout (`~/.cargo/bin/trustc`), a bare `<index>` leaf with no file after it,
+/// and a RELATIVE `registry/src/…` all pass through verbatim. The relative case is a
+/// deliberate no-op rather than an oversight: it has no machine-specific prefix to elide,
+/// so rewriting it would only invent one. Cargo's git-dependency checkouts
+/// (`…/.cargo/git/checkouts/…`) are a different layout and are NOT handled here; they
+/// pass through verbatim, which is the safe direction.
+///
+/// Idempotent: re-normalizing `<cargo-home>/registry/src/<index>/<tail>` either misses
+/// (no `/.cargo/`, and `<index>` not hash-shaped) or matches the bare anchor and rebuilds
+/// the very same string. Either way the second application is a no-op.
+///
+/// Callers are the three byte-identical identity-lane converters
+/// (`trust_verify::source_span_from_rustc_span`, `trust_mir_extract::convert_span`,
+/// `trust_r1_oracle::source_span`); applying it at the producers keeps every exact
+/// consumer (R1's call-site multiset check, the box-deref lint drop set,
+/// `SealedVcIdentity`) comparing like against like. Pinned by
+/// `crates/trust-types/tests/span_normalization_parity.rs`.
+#[must_use]
+pub fn stable_obligation_file(file: String) -> String {
+    fn looks_like_toolchain_build_token(token: &str) -> bool {
+        if token == "dev" {
+            return true;
+        }
+        if token.starts_with(|c: char| c.is_ascii_digit()) {
+            return true;
+        }
+        token.len() >= 7 && token.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    }
+
+    /// Cargo's per-registry source directory: `<registry host>-<short hash of the
+    /// registry URL>`, e.g. `index.crates.io-1949cf8c6b5b557f` (sparse crates.io) or
+    /// `github.com-1ecc6299db9ec823` (the older git index). The hash is a fixed-width
+    /// lowercase-hex rendering of a 64-bit hash, hence `>= 16`; `>=` rather than `==` so
+    /// a future widening is still recognized, and a shortening merely misses (safe).
+    fn looks_like_registry_index_dir(component: &str) -> bool {
+        let Some((host, hash)) = component.rsplit_once('-') else { return false };
+        !host.is_empty()
+            && hash.len() >= 16
+            && hash.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    }
+    for prefix in ["/rustc/", "/rustc-dev/"] {
+        if let Some(rest) = file.strip_prefix(prefix) {
+            if let Some((token, tail)) = rest.split_once('/') {
+                if !tail.is_empty() && looks_like_toolchain_build_token(token) {
+                    return format!("{prefix}<toolchain>/{tail}");
+                }
+            }
+        }
+    }
+    // The `.cargo` anchor is checked first, so a default-layout path is normalized on its
+    // own layout evidence. The bare anchor is the relocated-`CARGO_HOME` fallback, and its
+    // `needs_hash` flag makes it decline unless the index directory carries cargo's
+    // registry-hash shape.
+    for (anchor, needs_hash) in [("/.cargo/registry/src/", false), ("/registry/src/", true)] {
+        if let Some(at) = file.find(anchor) {
+            let rest = &file[at + anchor.len()..];
+            if let Some((index, tail)) = rest.split_once('/') {
+                if !tail.is_empty() && (!needs_hash || looks_like_registry_index_dir(index)) {
+                    return format!("<cargo-home>/registry/src/{index}/{tail}");
+                }
+            }
+        }
+    }
+    file
 }
 
 /// Proof trust level for generated artifacts.
@@ -4026,20 +4150,59 @@ impl CompilerContractBundle {
             .iter()
             .filter(|proposition| proposition.source_contract_index == source_contract_index);
         let proposition = candidates.next()?;
-        if candidates.next().is_some()
-            || proposition.kind != contract.kind
-            || proposition.body != contract.body
-        {
+        if candidates.next().is_some() || proposition.kind != contract.kind {
             return None;
+        }
+        if let Some(dense_contract) = self.contracts.get(source_contract_index) {
+            if dense_contract != contract || proposition.body != contract.body {
+                return None;
+            }
+        } else {
+            let loop_index = source_contract_index.checked_sub(self.contracts.len())?;
+            let spec = self.loop_contracts.get(loop_index)?;
+            let expected_kind = match spec.kind {
+                LoopContractKind::Invariant => ContractKind::LoopInvariant,
+                LoopContractKind::Decreases => ContractKind::Decreases,
+            };
+            if contract.kind != expected_kind
+                || contract.span != spec.span
+                || proposition.body != spec.body
+            {
+                return None;
+            }
+            let exact_bound_body = contract
+                .body
+                .strip_prefix("bb")
+                .and_then(|body| body.split_once(": "))
+                .is_some_and(|(header, body)| {
+                    header.parse::<usize>().ok() == spec.mir_header && body == spec.body
+                });
+            let exact_unpaired_body = contract
+                .body
+                .strip_prefix(crate::UNPAIRED_LOOP_CONTRACT_PREFIX)
+                .is_some_and(|body| body == spec.body);
+            if !exact_bound_body && !exact_unpaired_body {
+                return None;
+            }
         }
         let source = proposition.body.strip_prefix(LOWERED_COMPILER_CONTRACT_PREFIX)?;
         let parsed = crate::parse_spec_expr(source)?;
-        if compiler_contract_formula_with_domains(&parsed, &proposition.variable_domains)
-            .as_ref()
+        let expected_class = if matches!(proposition.kind, ContractKind::Decreases) {
+            CompilerContractExpressionClass::Measure
+        } else {
+            CompilerContractExpressionClass::Proposition
+        };
+        if compiler_contract_formula_with_domains_for_class(
+            &parsed,
+            &proposition.variable_domains,
+            expected_class,
+        )
+        .as_ref()
             != Some(&proposition.formula)
-            || compiler_contract_formula_with_domains(
+            || compiler_contract_formula_with_domains_for_class(
                 &proposition.formula,
                 &proposition.variable_domains,
+                expected_class,
             )
             .as_ref()
                 != Some(&proposition.formula)
@@ -4096,11 +4259,24 @@ impl CompilerContractValueDomain {
     fn logical_sort(self) -> crate::Sort {
         match self {
             Self::Bool => crate::Sort::Bool,
-            Self::MathematicalInt
-            | Self::PointerSizedInt { .. }
-            | Self::MachineInt { .. } => crate::Sort::Int,
+            Self::MathematicalInt | Self::PointerSizedInt { .. } | Self::MachineInt { .. } => {
+                crate::Sort::Int
+            }
         }
     }
+}
+
+/// Expected top-level class of a compiler-owned contract expression.
+///
+/// Requires, ensures, and invariants are Boolean propositions. Function and
+/// loop `decreases` clauses are numeric measures. Keeping this distinction at
+/// the exact domain-rebinding boundary prevents a Boolean comparison from
+/// masquerading as E5's measure, while allowing signed/negative measures to
+/// retain their structural compiler carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompilerContractExpressionClass {
+    Proposition,
+    Measure,
 }
 
 /// Rebind the parser's deliberately generic free variables to the exact
@@ -4111,6 +4287,20 @@ impl CompilerContractValueDomain {
 pub fn compiler_contract_formula_with_domains(
     formula: &Formula,
     variable_domains: &[CompilerContractVariableDomain],
+) -> Option<Formula> {
+    compiler_contract_formula_with_domains_for_class(
+        formula,
+        variable_domains,
+        CompilerContractExpressionClass::Proposition,
+    )
+}
+
+/// Class-aware form of [`compiler_contract_formula_with_domains`].
+#[must_use]
+pub fn compiler_contract_formula_with_domains_for_class(
+    formula: &Formula,
+    variable_domains: &[CompilerContractVariableDomain],
+    expected_class: CompilerContractExpressionClass,
 ) -> Option<Formula> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Class {
@@ -4166,10 +4356,8 @@ pub fn compiler_contract_formula_with_domains(
             return None;
         }
     }
-    let domains: BTreeMap<&str, CompilerContractValueDomain> = variable_domains
-        .iter()
-        .map(|entry| (entry.name.as_str(), entry.domain))
-        .collect();
+    let domains: BTreeMap<&str, CompilerContractValueDomain> =
+        variable_domains.iter().map(|entry| (entry.name.as_str(), entry.domain)).collect();
     if domains.len() != variable_domains.len() {
         return None;
     }
@@ -4180,8 +4368,7 @@ pub fn compiler_contract_formula_with_domains(
         domains: &BTreeMap<&str, CompilerContractValueDomain>,
         used: &mut std::collections::BTreeSet<String>,
     ) -> Option<Formula> {
-        let boxed = |formula: &Formula,
-                     used: &mut std::collections::BTreeSet<String>| {
+        let boxed = |formula: &Formula, used: &mut std::collections::BTreeSet<String>| {
             bind(formula, domains, used).map(Box::new)
         };
         Some(match formula {
@@ -4206,9 +4393,7 @@ pub fn compiler_contract_formula_with_domains(
             Formula::Or(terms) => Formula::Or(
                 terms.iter().map(|term| bind(term, domains, used)).collect::<Option<Vec<_>>>()?,
             ),
-            Formula::Implies(lhs, rhs) => {
-                Formula::Implies(boxed(lhs, used)?, boxed(rhs, used)?)
-            }
+            Formula::Implies(lhs, rhs) => Formula::Implies(boxed(lhs, used)?, boxed(rhs, used)?),
             Formula::Eq(lhs, rhs) => Formula::Eq(boxed(lhs, used)?, boxed(rhs, used)?),
             Formula::Lt(lhs, rhs) => Formula::Lt(boxed(lhs, used)?, boxed(rhs, used)?),
             Formula::Le(lhs, rhs) => Formula::Le(boxed(lhs, used)?, boxed(rhs, used)?),
@@ -4225,10 +4410,14 @@ pub fn compiler_contract_formula_with_domains(
     }
 
     let rebound = bind(formula, &domains, &mut used)?;
+    let expected_class = match expected_class {
+        CompilerContractExpressionClass::Proposition => Class::Bool,
+        CompilerContractExpressionClass::Measure => Class::Numeric,
+    };
     (used.len() == domains.len()
         && domains.keys().all(|name| used.contains(*name))
-        && class(&rebound) == Some(Class::Bool))
-        .then_some(rebound)
+        && class(&rebound) == Some(expected_class))
+    .then_some(rebound)
 }
 
 /// Compiler-owned loop clause before its source span is paired with a MIR
@@ -4242,6 +4431,16 @@ pub struct LoopContractSpec {
     /// once and may not let individual clauses select different MIR headers.
     #[serde(default)]
     pub source_loop_id: u32,
+    /// Compiler-owned HIR-local identity of the authored loop expression.
+    /// `None` is reserved for legacy/hand-built bundles and never supplies
+    /// source identity authority by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_hir_local_id: Option<u32>,
+    /// Exact MIR natural-loop header recovered from `source_hir_local_id`
+    /// against the same rustc body. Consumers must independently confirm that
+    /// this is a real dominator-proved header before using it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mir_header: Option<usize>,
     /// Span of the complete source loop (`while ... { ... }`).
     pub loop_head: SourceSpan,
     /// Exact source header span used only as binding evidence after grouping
@@ -4725,7 +4924,6 @@ pub struct EnumLayoutInfo {
     pub variant_field_offsets: Vec<Vec<u64>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct VariantDef {
     /// Variant name (e.g. `Some`, `None`, `A`, `B`).
@@ -5103,7 +5301,8 @@ impl Ty {
             variants: Vec::new(),
             disc_index_safe: false,
             faithful_enum_repr: None,
-            layout: None, enum_layout: None,
+            layout: None,
+            enum_layout: None,
             // Trust: W19 — the generic `Ty::adt` constructor is kind-agnostic (a
             // synthetic/hand-built struct). Only `trust-mir-extract` stamps a real
             // `Some(kind)` from rustc's `AdtDef`; leaving it `None` keeps every
@@ -5138,7 +5337,8 @@ impl Ty {
             variants,
             disc_index_safe: false,
             faithful_enum_repr: None,
-            layout: None, enum_layout: None,
+            layout: None,
+            enum_layout: None,
             // Trust: W19 — kind-agnostic synthetic constructor (see `Ty::adt`).
             adt_kind: None,
         }
@@ -5163,7 +5363,16 @@ impl Ty {
             }
         }
         // Trust: W19 — kind-agnostic synthetic constructor (see `Ty::adt`).
-        Ty::Adt { layout: None,  name: name.into(), fields, variants, disc_index_safe, faithful_enum_repr: None, enum_layout: None, adt_kind: None }
+        Ty::Adt {
+            layout: None,
+            name: name.into(),
+            fields,
+            variants,
+            disc_index_safe,
+            faithful_enum_repr: None,
+            enum_layout: None,
+            adt_kind: None,
+        }
     }
 
     /// Trust: enum-disc-full-native — whether this `Ty::Adt` was classified as
@@ -5193,7 +5402,8 @@ impl Ty {
         }
         match (self, other) {
             (
-                Ty::Adt { layout: _,
+                Ty::Adt {
+                    layout: _,
                     enum_layout: _,
                     name: n1,
                     fields: f1,
@@ -5204,7 +5414,8 @@ impl Ty {
                     // disc_index_safe/layout), ignored by this modulo-flag equality.
                     adt_kind: _,
                 },
-                Ty::Adt { layout: _,
+                Ty::Adt {
+                    layout: _,
                     enum_layout: _,
                     name: n2,
                     fields: f2,
@@ -6922,6 +7133,161 @@ pub enum AssertMessage {
 mod tests {
     use super::*;
 
+    /// The defect this fixes: two builds of the SAME toolchain sources at different
+    /// commits rendered the SAME sysroot file under two different `/rustc/<sha>/`
+    /// names, so an obligation identity keyed on the rendering moved on every
+    /// compiler rebuild. After elision the two renderings are equal.
+    #[test]
+    fn stable_obligation_file_is_invariant_across_toolchain_rebuilds() {
+        let build_a =
+            "/rustc/029b19a1299f0b2b02574e4c3b4a2489ae0161fc/library/core/src/macros/mod.rs";
+        let build_b =
+            "/rustc/f00fdb2f5f8e34aae0b48bdb937fb7fa17b2d282/library/core/src/macros/mod.rs";
+        assert_ne!(build_a, build_b, "the unfixed renderings really differ");
+        let a = stable_obligation_file(build_a.to_string());
+        let b = stable_obligation_file(build_b.to_string());
+        assert_eq!(a, b, "sealed identity must not move with the compiler's commit");
+        assert_eq!(a, "/rustc/<toolchain>/library/core/src/macros/mod.rs");
+    }
+
+    #[test]
+    fn stable_obligation_file_elides_every_build_token_shape() {
+        // A version-string token (bootstrap's fallback when no git sha is available).
+        assert_eq!(
+            stable_obligation_file("/rustc/1.99.0-dev/library/std/src/lib.rs".to_string()),
+            "/rustc/<toolchain>/library/std/src/lib.rs"
+        );
+        // The literal `dev` token.
+        assert_eq!(
+            stable_obligation_file("/rustc/dev/library/std/src/lib.rs".to_string()),
+            "/rustc/<toolchain>/library/std/src/lib.rs"
+        );
+        // The compiler-source scheme (`RemapScheme::Compiler`).
+        assert_eq!(
+            stable_obligation_file(
+                "/rustc-dev/029b19a1299f0b2b02574e4c3b4a2489ae0161fc/compiler/rustc_span/src/lib.rs"
+                    .to_string()
+            ),
+            "/rustc-dev/<toolchain>/compiler/rustc_span/src/lib.rs"
+        );
+    }
+
+    /// The same defect one axis over: a dependency's path is NOT remapped, so it carried
+    /// the generating machine's home directory — and the generating user's name — into the
+    /// sealed identity. Two users compiling the identical dependency sealed different
+    /// identities for the same obligation.
+    #[test]
+    fn stable_obligation_file_is_invariant_across_machines_for_registry_sources() {
+        let machine_a =
+            "/home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/az-1.3.0/src/lib.rs";
+        let machine_b =
+            "/home/other/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/az-1.3.0/src/lib.rs";
+        assert_ne!(machine_a, machine_b, "the unfixed renderings really differ");
+        let a = stable_obligation_file(machine_a.to_string());
+        let b = stable_obligation_file(machine_b.to_string());
+        assert_eq!(a, b, "a sealed identity must not depend on who compiled the dependency");
+        assert_eq!(
+            a, "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/az-1.3.0/src/lib.rs",
+            "everything from `registry/` on is machine-independent and must survive"
+        );
+    }
+
+    #[test]
+    fn stable_obligation_file_elides_every_cargo_home_shape() {
+        // A relocated CARGO_HOME that still uses the `.cargo` directory name.
+        assert_eq!(
+            stable_obligation_file(
+                "/opt/build/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/az-1.3.0/src/lib.rs"
+                    .to_string()
+            ),
+            "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/az-1.3.0/src/lib.rs"
+        );
+        // A relocated CARGO_HOME with NO `.cargo` component (`CARGO_HOME=/opt/cargo`):
+        // recognized only because the index directory carries cargo's registry-hash shape.
+        assert_eq!(
+            stable_obligation_file(
+                "/opt/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/az-1.3.0/src/lib.rs"
+                    .to_string()
+            ),
+            "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/az-1.3.0/src/lib.rs"
+        );
+        // The older git-index registry directory name; the hash still identifies the
+        // registry URL, so it is kept exactly as-is.
+        assert_eq!(
+            stable_obligation_file(
+                "/home/dev/.cargo/registry/src/github.com-1ecc6299db9ec823/libc-0.2.0/src/lib.rs"
+                    .to_string()
+            ),
+            "<cargo-home>/registry/src/github.com-1ecc6299db9ec823/libc-0.2.0/src/lib.rs"
+        );
+        // Distinct registries must NOT be merged: the index hash is real information.
+        assert_ne!(
+            stable_obligation_file(
+                "/home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/az-1.3.0/src/lib.rs"
+                    .to_string()
+            ),
+            stable_obligation_file(
+                "/home/dev/.cargo/registry/src/mirror.example.com-0123456789abcdef/az-1.3.0/src/lib.rs"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn stable_obligation_file_is_idempotent() {
+        let once = stable_obligation_file(
+            "/rustc/029b19a1299f0b2b02574e4c3b4a2489ae0161fc/library/core/src/macros/mod.rs"
+                .to_string(),
+        );
+        assert_eq!(stable_obligation_file(once.clone()), once);
+
+        // The registry case re-enters through the bare `/registry/src/` anchor, so its
+        // no-op is a rewrite to the identical string rather than a miss. Assert it for
+        // both index shapes: hash-shaped (re-matches) and not (misses outright).
+        let once = stable_obligation_file(
+            "/home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/az-1.3.0/src/lib.rs"
+                .to_string(),
+        );
+        assert_eq!(stable_obligation_file(once.clone()), once);
+        let once = stable_obligation_file(
+            "/home/dev/.cargo/registry/src/local-registry/az-1.3.0/src/lib.rs".to_string(),
+        );
+        assert_eq!(stable_obligation_file(once.clone()), once);
+    }
+
+    #[test]
+    fn stable_obligation_file_passes_everything_else_through_verbatim() {
+        for verbatim in [
+            // Ordinary user paths, relative and absolute.
+            "src/main.rs",
+            "/home/dev/project/src/lib.rs",
+            // A non-token component after `/rustc/`: not a sha, version, or `dev`.
+            "/rustc/library/core.rs",
+            "/rustc/llvm/lib/Support/Error.cpp",
+            // A token with nothing after it is a leaf name, not a remap root.
+            "/rustc/029b19a1299f0b2b02574e4c3b4a2489ae0161fc",
+            // Merely containing the word `registry` is not the registry layout.
+            "/home/dev/project/registry/handler.rs",
+            "/home/dev/project/src/registry/src/lookup.rs",
+            // `.cargo`, but not the registry layout.
+            "/home/dev/.cargo/bin/trustc",
+            "/home/dev/.cargo/git/checkouts/serde-9c8e12a4b3f01d76/a1b2c3d/src/lib.rs",
+            // A relative registry path: no machine-specific prefix exists to elide, so
+            // rewriting it would invent one.
+            "registry/src/index.crates.io-1949cf8c6b5b557f/az-1.3.0/src/lib.rs",
+            // Bare `/registry/src/` with an index directory that is not registry-shaped:
+            // the relocated-CARGO_HOME fallback declines rather than guess.
+            "/home/dev/vendor/registry/src/local-mirror/az-1.3.0/src/lib.rs",
+            // An index directory with nothing after it is a leaf name, not a crate root.
+            "/home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f",
+            // The binary-provenance compatibility form and the dummy default.
+            "binary:0x401000",
+            "",
+        ] {
+            assert_eq!(stable_obligation_file(verbatim.to_string()), verbatim);
+        }
+    }
+
     #[test]
     fn contract_source_ids_are_canonical_bounded_and_collision_resistant() {
         let contract = Contract {
@@ -6930,10 +7296,7 @@ mod tests {
             body: "true".to_string(),
         };
 
-        assert_eq!(
-            contract.stable_source_id("demo::f", 0),
-            "trust-contract:demo::f:requires:0"
-        );
+        assert_eq!(contract.stable_source_id("demo::f", 0), "trust-contract:demo::f:requires:0");
         assert_eq!(
             contract.stable_source_id("<demo::Button as demo::Widget>::rank", 7),
             "trust-contract:<demo::Button%20as%20demo::Widget>::rank:requires:7"
@@ -7080,19 +7443,13 @@ mod tests {
         let kind_delimiter = canonical_contract_source_id("a", "b:c", 0);
         let path_delimiter = canonical_contract_source_id("a:b", "c", 0);
         assert_ne!(kind_delimiter, path_delimiter);
-        assert_ne!(
-            kind_delimiter,
-            canonical_contract_source_id("a", "b%3Ac", 0),
-        );
+        assert_ne!(kind_delimiter, canonical_contract_source_id("a", "b%3Ac", 0),);
         assert_eq!(canonical_contract_source_index(&kind_delimiter), None);
 
         let direct_kind = "a".repeat(MAX_DIRECT_CONTRACT_KIND_COMPONENT_BYTES);
         let hashed_kind = "a".repeat(MAX_DIRECT_CONTRACT_KIND_COMPONENT_BYTES + 1);
         assert!(canonical_contract_source_id("demo::f", &direct_kind, 0).contains(&direct_kind));
-        assert!(
-            canonical_contract_source_id("demo::f", &hashed_kind, 0)
-                .contains(":%~sha256~"),
-        );
+        assert!(canonical_contract_source_id("demo::f", &hashed_kind, 0).contains(":%~sha256~"),);
         let long_kind = "x".repeat(10_000);
         let mut distinct_long_kind = long_kind.clone();
         distinct_long_kind.push('y');
@@ -7100,11 +7457,7 @@ mod tests {
         assert!(long_id.len() <= 1024, "contract source ID exceeded verifier cap");
         assert_ne!(
             long_id,
-            canonical_contract_source_id(
-                &"p".repeat(900),
-                &distinct_long_kind,
-                usize::MAX,
-            ),
+            canonical_contract_source_id(&"p".repeat(900), &distinct_long_kind, usize::MAX,),
         );
 
         for malformed in [
@@ -7377,17 +7730,11 @@ mod tests {
             variable_domains: vec![
                 CompilerContractVariableDomain {
                     name: "_0".to_string(),
-                    domain: CompilerContractValueDomain::MachineInt {
-                        width: 8,
-                        signed: false,
-                    },
+                    domain: CompilerContractValueDomain::MachineInt { width: 8, signed: false },
                 },
                 CompilerContractVariableDomain {
                     name: "x".to_string(),
-                    domain: CompilerContractValueDomain::MachineInt {
-                        width: 8,
-                        signed: false,
-                    },
+                    domain: CompilerContractValueDomain::MachineInt { width: 8, signed: false },
                 },
             ],
         };
@@ -7414,10 +7761,7 @@ mod tests {
             .with_typed_propositions(vec![formula_drift]);
         assert!(structurally_stale.typed_proposition(0, &contract).is_none());
 
-        let unprefixed_contract = Contract {
-            body: "result == x".to_string(),
-            ..contract.clone()
-        };
+        let unprefixed_contract = Contract { body: "result == x".to_string(), ..contract.clone() };
         let unprefixed = CompilerContractProposition {
             source_contract_index: 0,
             kind: unprefixed_contract.kind,
@@ -7429,23 +7773,142 @@ mod tests {
             variable_domains: vec![
                 CompilerContractVariableDomain {
                     name: "_0".to_string(),
-                    domain: CompilerContractValueDomain::MachineInt {
-                        width: 8,
-                        signed: false,
-                    },
+                    domain: CompilerContractValueDomain::MachineInt { width: 8, signed: false },
                 },
                 CompilerContractVariableDomain {
                     name: "x".to_string(),
-                    domain: CompilerContractValueDomain::MachineInt {
-                        width: 8,
-                        signed: false,
-                    },
+                    domain: CompilerContractValueDomain::MachineInt { width: 8, signed: false },
                 },
             ],
         };
         let missing_prefix = CompilerContractBundle::new(vec![unprefixed_contract.clone()])
             .with_typed_propositions(vec![unprefixed]);
         assert!(missing_prefix.typed_proposition(0, &unprefixed_contract).is_none());
+    }
+
+    #[test]
+    fn loop_typed_proposition_binds_only_to_exact_bound_or_unpaired_source_body() {
+        let dense = Contract {
+            kind: ContractKind::Requires,
+            span: SourceSpan::default(),
+            body: "__trust_lowered_compiler_contract__:true".to_string(),
+        };
+        let source_body = "__trust_lowered_compiler_contract__:true".to_string();
+        let spec = LoopContractSpec {
+            kind: LoopContractKind::Invariant,
+            source_loop_id: 7,
+            source_hir_local_id: Some(11),
+            mir_header: Some(3),
+            loop_head: SourceSpan::default(),
+            header_span: SourceSpan::default(),
+            span: SourceSpan::default(),
+            body: source_body.clone(),
+        };
+        let proposition = CompilerContractProposition {
+            source_contract_index: 1,
+            kind: ContractKind::LoopInvariant,
+            body: source_body.clone(),
+            formula: Formula::Bool(true),
+            variable_domains: vec![],
+        };
+        let bundle = CompilerContractBundle::new(vec![dense])
+            .with_loop_contracts(vec![spec])
+            .with_typed_propositions(vec![proposition.clone()]);
+        let bound = Contract {
+            kind: ContractKind::LoopInvariant,
+            span: SourceSpan::default(),
+            body: format!("bb3: {source_body}"),
+        };
+        assert_eq!(bundle.typed_proposition(1, &bound), Some(&proposition));
+        let wrong_header = Contract { body: format!("bb4: {source_body}"), ..bound.clone() };
+        assert!(
+            bundle.typed_proposition(1, &wrong_header).is_none(),
+            "a typed loop proposition must not authenticate a different MIR header",
+        );
+
+        let unpaired = Contract {
+            body: format!("{}{source_body}", crate::UNPAIRED_LOOP_CONTRACT_PREFIX),
+            ..bound.clone()
+        };
+        assert_eq!(bundle.typed_proposition(1, &unpaired), Some(&proposition));
+
+        let tampered_body =
+            Contract { body: format!("bb3: {source_body} && true"), ..bound.clone() };
+        assert!(bundle.typed_proposition(1, &tampered_body).is_none());
+        let wrong_kind = Contract { kind: ContractKind::Decreases, ..bound.clone() };
+        assert!(bundle.typed_proposition(1, &wrong_kind).is_none());
+
+        let duplicate =
+            bundle.clone().with_typed_propositions(vec![proposition.clone(), proposition]);
+        assert!(duplicate.typed_proposition(1, &bound).is_none());
+    }
+
+    #[test]
+    fn decreases_typed_proposition_requires_numeric_class_and_preserves_signed_negation() {
+        let source_body = "__trust_lowered_compiler_contract__:-i".to_string();
+        let spec = LoopContractSpec {
+            kind: LoopContractKind::Decreases,
+            source_loop_id: 1,
+            source_hir_local_id: Some(9),
+            mir_header: Some(2),
+            loop_head: SourceSpan::default(),
+            header_span: SourceSpan::default(),
+            span: SourceSpan::default(),
+            body: source_body.clone(),
+        };
+        let signed_domain = vec![CompilerContractVariableDomain {
+            name: "i".to_string(),
+            domain: CompilerContractValueDomain::MachineInt { width: 8, signed: true },
+        }];
+        let proposition = CompilerContractProposition {
+            source_contract_index: 0,
+            kind: ContractKind::Decreases,
+            body: source_body.clone(),
+            formula: Formula::Neg(Box::new(Formula::Var("i".to_string(), crate::Sort::Int))),
+            variable_domains: signed_domain.clone(),
+        };
+        let bundle = CompilerContractBundle::default()
+            .with_loop_contracts(vec![spec])
+            .with_typed_propositions(vec![proposition.clone()]);
+        let bound = Contract {
+            kind: ContractKind::Decreases,
+            span: SourceSpan::default(),
+            body: format!("bb2: {source_body}"),
+        };
+        assert_eq!(bundle.typed_proposition(0, &bound), Some(&proposition));
+        assert_eq!(
+            compiler_contract_formula_with_domains_for_class(
+                &proposition.formula,
+                &signed_domain,
+                CompilerContractExpressionClass::Measure,
+            ),
+            Some(proposition.formula.clone()),
+        );
+        assert!(
+            compiler_contract_formula_with_domains(&proposition.formula, &signed_domain).is_none(),
+            "the proposition-only compatibility binder must not accept a numeric measure",
+        );
+
+        let bool_measure = CompilerContractProposition {
+            body: "__trust_lowered_compiler_contract__:i < 0".to_string(),
+            formula: Formula::Lt(
+                Box::new(Formula::Var("i".to_string(), crate::Sort::Int)),
+                Box::new(Formula::Int(0)),
+            ),
+            ..proposition.clone()
+        };
+        let bool_bound = Contract { body: format!("bb2: {}", bool_measure.body), ..bound.clone() };
+        let mut bool_bundle = bundle.clone().with_typed_propositions(vec![bool_measure.clone()]);
+        bool_bundle.loop_contracts[0].body = bool_measure.body;
+        assert!(
+            bool_bundle.typed_proposition(0, &bool_bound).is_none(),
+            "a Boolean comparison cannot masquerade as an E5 measure",
+        );
+
+        let mut formula_tamper = proposition;
+        formula_tamper.formula = Formula::Int(0);
+        let tampered = bundle.with_typed_propositions(vec![formula_tamper]);
+        assert!(tampered.typed_proposition(0, &bound).is_none());
     }
 
     #[test]
@@ -7483,10 +7946,7 @@ mod tests {
         let u64_digest = typed_contract_proposition_digest(&formula, &domain(64, false));
         let usize_domains = vec![CompilerContractVariableDomain {
             name: "x".to_string(),
-            domain: CompilerContractValueDomain::PointerSizedInt {
-                width: 64,
-                signed: false,
-            },
+            domain: CompilerContractValueDomain::PointerSizedInt { width: 64, signed: false },
         }];
         assert_ne!(u64_digest, typed_contract_proposition_digest(&formula, &usize_domains));
         #[allow(deprecated)]
@@ -7509,8 +7969,8 @@ mod tests {
         }];
         assert_ne!(u8_digest, typed_contract_proposition_digest(&bool_formula, &bool_domains));
         assert_eq!(
-            compiler_contract_formula_with_domains(&
-                Formula::Eq(
+            compiler_contract_formula_with_domains(
+                &Formula::Eq(
                     Box::new(Formula::Var("x".to_string(), crate::Sort::Int)),
                     Box::new(Formula::Bool(true)),
                 ),
@@ -9374,7 +9834,9 @@ mod tests {
     }
 
     fn faithful_enum_adt(repr: Option<Option<EnumReprHint>>) -> Ty {
-        Ty::Adt { adt_kind: None, layout: None,
+        Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "E".into(),
             fields: vec![("__tag".into(), Ty::i64())],
             variants: vec![
@@ -9382,7 +9844,9 @@ mod tests {
                 VariantDef { name: "B".into(), discriminant: 1, fields: vec![] },
             ],
             disc_index_safe: true,
-            faithful_enum_repr: repr, enum_layout: None, }
+            faithful_enum_repr: repr,
+            enum_layout: None,
+        }
     }
 
     fn faithful_enum_repr(ty: &Ty) -> Option<Option<EnumReprHint>> {
@@ -9543,22 +10007,26 @@ mod tests {
         let decoded: Ty = bincode::deserialize(&encoded).expect("deserialize default-metadata ADT");
         assert_eq!(decoded, ty, "binary wire must retain false + outer-None fields");
 
-        let legacy_json = r#"{"Adt":{"name":"Legacy","fields":[],"variants":[],"disc_index_safe":false}}"#;
+        let legacy_json =
+            r#"{"Adt":{"name":"Legacy","fields":[],"variants":[],"disc_index_safe":false}}"#;
         assert_eq!(
             ty.try_stable_shape_hash().expect("hash default-metadata ADT"),
             stable_sha256_hex(legacy_json.as_bytes()),
             "outer-None faithful metadata must preserve the pre-B3 semantic shape hash"
         );
 
-        let marked = Ty::Adt { adt_kind: None, layout: None,
+        let marked = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "Legacy".into(),
             fields: Vec::new(),
             variants: Vec::new(),
             disc_index_safe: false,
-            faithful_enum_repr: Some(None), enum_layout: None, };
+            faithful_enum_repr: Some(None),
+            enum_layout: None,
+        };
         let marked_bytes = bincode::serialize(&marked).expect("serialize marked ADT");
-        let marked_back: Ty =
-            bincode::deserialize(&marked_bytes).expect("deserialize marked ADT");
+        let marked_back: Ty = bincode::deserialize(&marked_bytes).expect("deserialize marked ADT");
         assert_eq!(marked_back, marked, "false + Some(None) must not shift binary fields");
         assert_ne!(
             marked.try_stable_shape_hash().expect("hash marked ADT"),
@@ -9570,7 +10038,8 @@ mod tests {
         // default is hash-invisible (the legacy_json above carries no key and
         // still matched), while a Some(concrete layout) IS hash-visible and
         // round-trips the binary wire.
-        let laid = Ty::Adt { adt_kind: None,
+        let laid = Ty::Adt {
+            adt_kind: None,
             layout: None,
             name: "Legacy".into(),
             fields: Vec::new(),

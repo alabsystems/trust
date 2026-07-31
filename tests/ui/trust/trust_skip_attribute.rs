@@ -26,12 +26,12 @@ pub fn unsafe_div(x: i32, y: i32) -> i32 {
     x / y // would be a strict L0 failure without `#[trust::skip]`
 }
 
-pub fn safe_caller(x: i32) -> i32 { //~ ERROR Trust Level 0 safety verification incomplete
+pub fn safe_caller(x: i32) -> i32 { //~ WARN Trust Level 0 safety verification incomplete
     //~| ERROR Trust strict verification failed for
     if x != 0 { unsafe_div(10, x) } else { 0 }
 }
 
-fn main() { //~ ERROR Trust Level 0 safety verification incomplete
+fn main() { //~ WARN Trust Level 0 safety verification incomplete
     //~| ERROR Trust strict verification failed for
     let _ = safe_caller(5);
 }

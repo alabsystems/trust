@@ -34,6 +34,8 @@ LL | #[kani::proof]
    | ^^-----------^
    |   |
    |   help: use the native harness attribute: `kani::harness`
+   |
+   = note: `kani::harness` is an ingestion-lane spelling and carries no proof authority; Trust's authoritative surfaces are `requires`/`ensures` signature clauses and `clean { .. }` Lean islands
 
 error: legacy contracts attribute; Trust supports first-class signature clauses
   --> tests/ui/trust_legacy_spec_sugar.rs:46:1

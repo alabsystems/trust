@@ -271,18 +271,20 @@ fn child_exit_code(status: &ExitStatus) -> i32 {
 }
 
 fn get_rustfmt_info(args: &[String]) -> Result<i32, io::Error> {
-    let mut command = rustfmt_command()
-        .stdout(std::process::Stdio::inherit())
-        .args(args)
-        .spawn()
-        .map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => io::Error::new(
-                io::ErrorKind::Other,
-                "Could not run trustfmt, please make sure it is in your PATH.",
-            ),
-            _ => e,
-        })?;
-    let result = command.wait()?;
+    let mut command = rustfmt_command();
+    command.stdout(std::process::Stdio::inherit()).args(args);
+    wait_for_formatter(&mut command)
+}
+
+fn wait_for_formatter(command: &mut Command) -> Result<i32, io::Error> {
+    let mut child = command.spawn().map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => io::Error::new(
+            io::ErrorKind::Other,
+            "Could not run trustfmt, please make sure it is in your PATH.",
+        ),
+        _ => e,
+    })?;
+    let result = child.wait()?;
     Ok(child_exit_code(&result))
 }
 
@@ -591,27 +593,20 @@ fn run_rustfmt(
             println!();
         }
 
-        let mut command = rustfmt_command()
+        let mut command = rustfmt_command();
+        command
             .stdout(stdout)
             .args(files)
             .args(["--edition", edition.as_str()])
-            .args(fmt_args)
-            .spawn()
-            .map_err(|e| match e.kind() {
-                io::ErrorKind::NotFound => io::Error::new(
-                    io::ErrorKind::Other,
-                    "Could not run trustfmt, please make sure it is in your PATH.",
-                ),
-                _ => e,
-            })?;
+            .args(fmt_args);
 
-        status.push(command.wait()?);
+        status.push(wait_for_formatter(&mut command)?);
     }
 
     Ok(status
-        .iter()
-        .find(|status| !status.success())
-        .map_or(SUCCESS, child_exit_code))
+        .into_iter()
+        .find(|status| *status != SUCCESS)
+        .unwrap_or(SUCCESS))
 }
 
 fn get_cargo_metadata(manifest_path: Option<&Path>) -> Result<cargo_metadata::Metadata, io::Error> {

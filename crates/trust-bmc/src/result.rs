@@ -333,6 +333,8 @@ pub enum TrustMcPropertyKind {
     Postcondition,
     /// Loop invariant.
     LoopInvariant,
+    /// Loop variant / `decreases` ranking check (termination measure).
+    LoopDecreases,
     /// Other/unclassified check.
     Other,
 }
@@ -356,6 +358,7 @@ impl From<trust_mc_core::PropertyKind> for TrustMcPropertyKind {
             trust_mc_core::PropertyKind::Precondition => Self::Precondition,
             trust_mc_core::PropertyKind::Postcondition => Self::Postcondition,
             trust_mc_core::PropertyKind::LoopInvariant => Self::LoopInvariant,
+            trust_mc_core::PropertyKind::LoopDecreases => Self::LoopDecreases,
             trust_mc_core::PropertyKind::Other => Self::Other,
         }
     }
@@ -380,6 +383,7 @@ impl From<TrustMcPropertyKind> for trust_mc_core::PropertyKind {
             TrustMcPropertyKind::Precondition => Self::Precondition,
             TrustMcPropertyKind::Postcondition => Self::Postcondition,
             TrustMcPropertyKind::LoopInvariant => Self::LoopInvariant,
+            TrustMcPropertyKind::LoopDecreases => Self::LoopDecreases,
             TrustMcPropertyKind::Other => Self::Other,
         }
     }
@@ -677,6 +681,10 @@ mod tests {
             (trust_mc_core::PropertyKind::Precondition, TrustMcPropertyKind::Precondition),
             (trust_mc_core::PropertyKind::Postcondition, TrustMcPropertyKind::Postcondition),
             (trust_mc_core::PropertyKind::LoopInvariant, TrustMcPropertyKind::LoopInvariant),
+            (
+                trust_mc_core::PropertyKind::LoopDecreases,
+                TrustMcPropertyKind::LoopDecreases,
+            ),
             (trust_mc_core::PropertyKind::Other, TrustMcPropertyKind::Other),
         ];
 

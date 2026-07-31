@@ -53,13 +53,14 @@ mod call_graph;
 mod cell_threading;
 pub mod contract_assumption_gate;
 mod convert;
-pub use convert::{
-    collect_certified_paired_condvar_wait_calls, CertifiedPairedCondvarWaitCallSite,
-};
 pub use convert::func_operand_name;
 pub use convert::is_derived_total_method;
 pub use convert::is_total_derived_trait_call;
+pub use convert::tcx_is_authenticated_core_integer_wrapping_method;
 pub use convert::trust_try_total_marker;
+pub use convert::{
+    CertifiedPairedCondvarWaitCallSite, collect_certified_paired_condvar_wait_calls,
+};
 // Research-only backward slicing for VC minimization. No production caller
 // consumes the sliced body yet, so compiling this sizeable analysis into
 // trustc only adds build time and an accidentally-advertised integration
@@ -86,9 +87,9 @@ use rustc_middle::ty::print::{
 use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
 use rustc_span::Symbol;
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
+use std::sync::Arc;
 use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::*;
-use std::sync::Arc;
 #[allow(deprecated)]
 pub use verifier_api::{
     TRUST_COMPILER_STABLE_CRATE_ID_METADATA_KEY, VerifierVcContentIdentity,
@@ -813,7 +814,7 @@ pub fn convert_trust_contract_bundle<'tcx>(
         let kind = convert_trust_contract_kind(index, contract.kind)?;
         convert_trust_contract_subject(index, contract.subject)?;
         let (body, proposition) =
-            convert_trust_contract_predicate(index, &contract.predicate.kind)?;
+            convert_trust_contract_predicate(index, contract.kind, &contract.predicate.kind)?;
         if let Some((formula, variable_domains)) = proposition {
             typed_propositions.push(trust_types::CompilerContractProposition {
                 source_contract_index: index,
@@ -828,6 +829,7 @@ pub fn convert_trust_contract_bundle<'tcx>(
 
     let mut loop_contracts = Vec::with_capacity(bundle.loop_contracts.len());
     for (index, contract) in bundle.loop_contracts.iter().enumerate() {
+        let global_index = bundle.contracts.len() + index;
         let kind = match contract.kind {
             rustc_trust_contract::TrustContractKind::LoopInvariant => {
                 trust_types::LoopContractKind::Invariant
@@ -850,10 +852,29 @@ pub fn convert_trust_contract_bundle<'tcx>(
                 subject: format!("{:?}", contract.subject),
             });
         };
-        let (body, _) = convert_trust_contract_predicate(index, &contract.predicate.kind)?;
+        let (body, proposition) = convert_trust_contract_predicate(
+            global_index,
+            contract.kind,
+            &contract.predicate.kind,
+        )?;
+        let portable_kind = match kind {
+            trust_types::LoopContractKind::Invariant => ContractKind::LoopInvariant,
+            trust_types::LoopContractKind::Decreases => ContractKind::Decreases,
+        };
+        if let Some((formula, variable_domains)) = proposition {
+            typed_propositions.push(trust_types::CompilerContractProposition {
+                source_contract_index: global_index,
+                kind: portable_kind,
+                body: body.clone(),
+                formula,
+                variable_domains,
+            });
+        }
         loop_contracts.push(trust_types::LoopContractSpec {
             kind,
             source_loop_id: id.index,
+            source_hir_local_id: Some(id.hir_local_id),
+            mir_header: None,
             loop_head: convert::convert_span(tcx, loop_span),
             header_span: convert::convert_span(tcx, header_span),
             span: convert::convert_span(tcx, contract.span),
@@ -864,6 +885,222 @@ pub fn convert_trust_contract_bundle<'tcx>(
     Ok(CompilerContractBundle::new(contracts)
         .with_typed_propositions(typed_propositions)
         .with_loop_contracts(loop_contracts))
+}
+
+/// Bind compiler-owned source-loop identities to exact MIR natural-loop
+/// headers in the same rustc body.
+///
+/// The contract query carries the loop expression's HIR-local id. MIR building
+/// stamps the source scope used while lowering that expression. MIR
+/// simplification can retain the stamp on either endpoint of a
+/// dominator-proved backedge, so either endpoint may nominate its exact natural
+/// header. When both endpoint stamps survive they must agree, and the final
+/// HIR-id/header mapping must also be injective across source-loop groups.
+/// Thus cross-loop endpoint pairs reject directly and distinct source groups
+/// cannot merge their authority later. Neither spans nor block allocation
+/// order participate. The resulting `mir_header` remains redundant provenance:
+/// vcgen re-detects the natural loop and rejects a stale/non-header block before
+/// using it.
+///
+/// A miss leaves the field empty and returns a stable blocker code. This is
+/// intentionally fail-closed and lets legacy single-loop bundles retain their
+/// existing span fallback without granting nested-loop authority.
+pub fn stamp_loop_header_provenance(
+    body: &mir::Body<'_>,
+    bundle: &mut CompilerContractBundle,
+) -> Vec<(u32, String)> {
+    let dominators = body.basic_blocks.dominators();
+    let mut backedges = Vec::new();
+    for (latch, block) in body.basic_blocks.iter_enumerated() {
+        if !dominators.is_reachable(latch) {
+            continue;
+        }
+        for header in block.terminator().successors() {
+            if dominators.dominates(header, latch) {
+                backedges.push(StampedNaturalBackedge {
+                    header: header.as_usize(),
+                    header_hir_local_id: source_loop_local_id(body, header),
+                    latch_hir_local_id: source_loop_local_id(body, latch),
+                });
+            }
+        }
+    }
+
+    stamp_loop_header_provenance_from_backedges(&backedges, bundle)
+}
+
+fn source_loop_local_id(body: &mir::Body<'_>, block: mir::BasicBlock) -> Option<u32> {
+    body.source_scopes[body.basic_blocks[block].terminator().source_info.scope]
+        .local_data
+        .as_ref()
+        .unwrap_crate_local()
+        .trust_loop_hir_local_id
+        .map(|local_id| local_id.as_u32())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StampedNaturalBackedge {
+    header: usize,
+    header_hir_local_id: Option<u32>,
+    latch_hir_local_id: Option<u32>,
+}
+
+fn stamp_loop_header_provenance_from_backedges(
+    backedges: &[StampedNaturalBackedge],
+    bundle: &mut CompilerContractBundle,
+) -> Vec<(u32, String)> {
+    // This function is also a restamping boundary for the public portable
+    // bundle. Never let a failed or changed body retain authority minted by a
+    // previous invocation.
+    for spec in &mut bundle.loop_contracts {
+        spec.mir_header = None;
+    }
+
+    let mut source_ids =
+        bundle.loop_contracts.iter().map(|spec| spec.source_loop_id).collect::<Vec<_>>();
+    source_ids.sort_unstable();
+    source_ids.dedup();
+
+    let mut decisions = FxHashMap::<u32, Result<usize, String>>::default();
+    let mut group_hir_ids = FxHashMap::<u32, u32>::default();
+    for &source_loop_id in &source_ids {
+        let group = bundle
+            .loop_contracts
+            .iter()
+            .filter(|spec| spec.source_loop_id == source_loop_id)
+            .collect::<Vec<_>>();
+        let Some(first) = group.first() else { continue };
+        let Some(hir_local_id) = first.source_hir_local_id else {
+            decisions.insert(
+                source_loop_id,
+                Err(
+                    "e45.loop-source.missing-hir-id: compiler loop clause has no HIR-local identity"
+                        .to_string(),
+                ),
+            );
+            continue;
+        };
+        if group.iter().any(|spec| spec.source_hir_local_id != Some(hir_local_id)) {
+            decisions.insert(
+                source_loop_id,
+                Err(
+                    "e45.loop-source.inconsistent-hir-id: clauses on one source loop disagree on HIR identity"
+                        .to_string(),
+                ),
+            );
+            continue;
+        }
+        group_hir_ids.insert(source_loop_id, hir_local_id);
+    }
+
+    // `TrustLoopId::index` and its HIR identity are both compiler-minted
+    // per-function identities. Two distinct source groups claiming one HIR
+    // loop would otherwise share all downstream header authority.
+    let mut hir_owners = FxHashMap::<u32, Vec<u32>>::default();
+    for (&source_loop_id, &hir_local_id) in &group_hir_ids {
+        hir_owners.entry(hir_local_id).or_default().push(source_loop_id);
+    }
+    for (hir_local_id, mut owners) in hir_owners {
+        if owners.len() < 2 {
+            continue;
+        }
+        owners.sort_unstable();
+        let reason = format!(
+            "e45.loop-source.non-injective-hir-id: HIR loop {hir_local_id} is claimed by source loop groups {owners:?}"
+        );
+        for source_loop_id in owners {
+            decisions.insert(source_loop_id, Err(reason.clone()));
+        }
+    }
+
+    for &source_loop_id in &source_ids {
+        if decisions.contains_key(&source_loop_id) {
+            continue;
+        }
+        let Some(&hir_local_id) = group_hir_ids.get(&source_loop_id) else {
+            continue;
+        };
+        let mut candidates = backedges
+            .iter()
+            .filter_map(|backedge| {
+                let endpoints_compatible = match (
+                    backedge.header_hir_local_id,
+                    backedge.latch_hir_local_id,
+                ) {
+                    (Some(header_id), Some(latch_id)) => header_id == latch_id,
+                    _ => true,
+                };
+                (endpoints_compatible
+                    && (backedge.header_hir_local_id == Some(hir_local_id)
+                        || backedge.latch_hir_local_id == Some(hir_local_id)))
+                    .then_some(backedge.header)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
+        candidates.dedup();
+        let decision = match candidates.as_slice() {
+            [header] => Ok(*header),
+            _ => {
+                let code = if candidates.is_empty() {
+                    "e45.loop-source.no-mir-header"
+                } else {
+                    "e45.loop-source.ambiguous-mir-header"
+                };
+                Err(format!(
+                    "{code}: HIR loop {hir_local_id} matched {} dominator-proved MIR header(s)",
+                    candidates.len()
+                ))
+            }
+        };
+        decisions.insert(source_loop_id, decision);
+    }
+
+    // Header identity must be injective across source-loop groups. Runtime
+    // certified-monitor placement groups clauses by this header, so allowing
+    // two source identities to share it would silently merge their monitors.
+    let mut header_owners = FxHashMap::<usize, Vec<u32>>::default();
+    for (&source_loop_id, decision) in &decisions {
+        if let Ok(header) = decision {
+            header_owners.entry(*header).or_default().push(source_loop_id);
+        }
+    }
+    for (header, mut owners) in header_owners {
+        if owners.len() < 2 {
+            continue;
+        }
+        owners.sort_unstable();
+        let reason = format!(
+            "e45.loop-source.non-injective-mir-header: MIR header bb{header} is claimed by source loop groups {owners:?}"
+        );
+        for source_loop_id in owners {
+            decisions.insert(source_loop_id, Err(reason.clone()));
+        }
+    }
+
+    let mut failures = Vec::new();
+    for source_loop_id in source_ids {
+        let Some(decision) = decisions.remove(&source_loop_id) else {
+            failures.push((
+                source_loop_id,
+                "e45.loop-source.missing-binding-decision: compiler loop group has no provenance decision"
+                    .to_string(),
+            ));
+            continue;
+        };
+        match decision {
+            Ok(header) => {
+                for spec in bundle
+                    .loop_contracts
+                    .iter_mut()
+                    .filter(|spec| spec.source_loop_id == source_loop_id)
+                {
+                    spec.mir_header = Some(header);
+                }
+            }
+            Err(reason) => failures.push((source_loop_id, reason)),
+        }
+    }
+    failures
 }
 
 fn convert_trust_contract_kind(
@@ -896,20 +1133,28 @@ fn convert_trust_contract_subject(
 
 fn convert_trust_contract_predicate(
     index: usize,
+    kind: rustc_trust_contract::TrustContractKind,
     predicate: &rustc_trust_contract::TrustContractPredicateKind,
 ) -> Result<
     (String, Option<(Formula, Vec<trust_types::CompilerContractVariableDomain>)>),
     TrustContractBundleConversionError,
 > {
+    let expected_class = if kind == rustc_trust_contract::TrustContractKind::Decreases {
+        trust_types::CompilerContractExpressionClass::Measure
+    } else {
+        trust_types::CompilerContractExpressionClass::Proposition
+    };
     match predicate {
         rustc_trust_contract::TrustContractPredicateKind::Typed { text, proposition } => {
             let body = text.to_string();
-            let (formula, variable_domains) = trust_contract_proposition_to_formula_and_domains(
-                proposition,
-            )
-            .map_err(|reason| {
-                TrustContractBundleConversionError::UnsupportedPredicate { index, reason }
-            })?;
+            let (formula, variable_domains) =
+                trust_contract_proposition_to_formula_and_domains_for_class(
+                    proposition,
+                    expected_class,
+                )
+                .map_err(|reason| {
+                    TrustContractBundleConversionError::UnsupportedPredicate { index, reason }
+                })?;
             let Some(source) = body.strip_prefix(LOWERED_COMPILER_CONTRACT_PREFIX) else {
                 return Err(TrustContractBundleConversionError::UnsupportedPredicate {
                     index,
@@ -918,7 +1163,11 @@ fn convert_trust_contract_predicate(
                 });
             };
             let round_trip = trust_types::parse_spec_expr(source).and_then(|parsed| {
-                trust_types::compiler_contract_formula_with_domains(&parsed, &variable_domains)
+                trust_types::compiler_contract_formula_with_domains_for_class(
+                    &parsed,
+                    &variable_domains,
+                    expected_class,
+                )
             });
             if round_trip.as_ref() != Some(&formula) {
                 return Err(TrustContractBundleConversionError::UnsupportedPredicate {
@@ -932,10 +1181,20 @@ fn convert_trust_contract_predicate(
         rustc_trust_contract::TrustContractPredicateKind::Opaque { text } => {
             Ok((text.to_string(), None))
         }
-        rustc_trust_contract::TrustContractPredicateKind::BoolLiteral { value } => Ok((
-            format!("{LOWERED_COMPILER_CONTRACT_PREFIX}{value}"),
-            Some((Formula::Bool(*value), Vec::new())),
-        )),
+        rustc_trust_contract::TrustContractPredicateKind::BoolLiteral { value } => {
+            if expected_class == trust_types::CompilerContractExpressionClass::Measure {
+                Err(TrustContractBundleConversionError::UnsupportedPredicate {
+                    index,
+                    reason: "decreases clause has a Boolean predicate instead of a numeric measure"
+                        .to_string(),
+                })
+            } else {
+                Ok((
+                    format!("{LOWERED_COMPILER_CONTRACT_PREFIX}{value}"),
+                    Some((Formula::Bool(*value), Vec::new())),
+                ))
+            }
+        }
         rustc_trust_contract::TrustContractPredicateKind::MirLocal { local } => {
             Err(TrustContractBundleConversionError::MirLocalPredicate {
                 index,
@@ -993,6 +1252,18 @@ pub fn trust_contract_proposition_to_formula(
 /// of choosing an arbitrary occurrence.
 pub fn trust_contract_proposition_to_formula_and_domains(
     proposition: &rustc_trust_contract::TrustContractProposition,
+) -> Result<(Formula, Vec<trust_types::CompilerContractVariableDomain>), String> {
+    trust_contract_proposition_to_formula_and_domains_for_class(
+        proposition,
+        trust_types::CompilerContractExpressionClass::Proposition,
+    )
+}
+
+/// Class-aware query-proposition conversion used for Boolean contracts and
+/// numeric function/loop decreases measures.
+pub fn trust_contract_proposition_to_formula_and_domains_for_class(
+    proposition: &rustc_trust_contract::TrustContractProposition,
+    expected_class: trust_types::CompilerContractExpressionClass,
 ) -> Result<(Formula, Vec<trust_types::CompilerContractVariableDomain>), String> {
     use rustc_trust_contract::TrustContractProposition as Proposition;
     use rustc_trust_contract::TrustContractPropositionDomain as Domain;
@@ -1055,7 +1326,12 @@ pub fn trust_contract_proposition_to_formula_and_domains(
         .into_iter()
         .map(|(name, domain)| CompilerContractVariableDomain { name, domain })
         .collect::<Vec<_>>();
-    if trust_types::compiler_contract_formula_with_domains(&formula, &variable_domains).as_ref()
+    if trust_types::compiler_contract_formula_with_domains_for_class(
+        &formula,
+        &variable_domains,
+        expected_class,
+    )
+    .as_ref()
         != Some(&formula)
     {
         return Err(
@@ -1872,7 +2148,10 @@ pub fn extract_contract_panic_annotations(tcx: TyCtxt<'_>, def_id: DefId) -> Vec
     let mut cur = def_id;
     while matches!(
         tcx.def_kind(cur),
-        DefKind::Closure | DefKind::InlineConst | DefKind::AnonConst | DefKind::SyntheticCoroutineBody
+        DefKind::Closure
+            | DefKind::InlineConst
+            | DefKind::AnonConst
+            | DefKind::SyntheticCoroutineBody
     ) {
         let Some(parent) = tcx.opt_parent(cur) else { break };
         out.extend(contract_bodies(parent));
@@ -3764,7 +4043,7 @@ mod tests {
     extern crate rustc_hir;
     extern crate rustc_interface;
 
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -3814,6 +4093,100 @@ fn slice_last(s: &[u8]) -> u8 {
 
 fn option_value(x: i32) -> Option<i32> {
     Some(x)
+}
+
+fn nested_loop_provenance(mut outer: u32, mut inner: i16) {
+    while outer > 0 invariant outer <= 100 decreases outer {
+        while inner > 0 invariant inner <= 100 decreases inner {
+            inner -= 1;
+        }
+        outer -= 1;
+    }
+}
+
+fn independent_loop_provenance(mut left: u32, mut right: u32) {
+    while left > 0 invariant left <= 100 decreases left {
+        left -= 1;
+    }
+    while right > 0 invariant right <= 100 decreases right {
+        right -= 1;
+    }
+}
+
+fn native_function_measure(n: u32) -> u32
+    decreases n
+{
+    n
+}
+
+fn immutable_slice_projection(xs: &[u32], limit: u32) -> u32 {
+    let first = xs[0];
+    let mut index = 0;
+    while index < limit invariant first == xs[0] {
+        index += 1;
+    }
+    first
+}
+
+fn immutable_array_projection(xs: &[u32; 4], limit: u32) -> u32 {
+    let first = xs[0];
+    let mut index = 0;
+    while index < limit invariant first == xs[0] {
+        index += 1;
+    }
+    first
+}
+
+fn out_of_range_fixed_projection(xs: &[u32; 4], keep: bool) {
+    while keep invariant xs[4] == xs[4] {}
+}
+
+// These are deliberate wrong-place tripwires. The native clause resolves the
+// inner HIR binding, while a name-only MIR consumer could otherwise discard
+// that unsupported by-value array and borrow the stable outer argument's
+// collection identity.
+fn shadowed_collection_index(xs: &[u32; 4], keep: bool) -> u32 {
+    let first = xs[0];
+    let xs = [0u32; 4];
+    while keep invariant xs[0] == first {}
+    xs[0]
+}
+
+fn shadowed_collection_length(xs: &[u32; 4], keep: bool) -> usize {
+    let outer_length = xs.len();
+    let xs = [0u32; 2];
+    while keep invariant xs.len() == outer_length {}
+    xs.len()
+}
+
+fn mutable_slice_store(xs: &mut [u32], index: usize, keep: bool) {
+    while keep invariant xs.len() == xs.len() {
+        xs[index] = 7;
+    }
+}
+
+fn mutable_fixed_store(xs: &mut [u32; 4], keep: bool) {
+    while keep invariant xs.len() == 4 {
+        xs[0] = 7;
+    }
+}
+
+#[inline(never)]
+fn mutate_slice_through_call(xs: &mut [u32], index: usize) {
+    xs[index] = 9;
+}
+
+fn mutable_slice_call_escape(xs: &mut [u32], index: usize, keep: bool) {
+    while keep invariant xs.len() == xs.len() {
+        mutate_slice_through_call(xs, index);
+    }
+}
+
+fn mutable_slice_reseat(mut xs: &mut [u32], keep: bool) -> usize {
+    while keep invariant xs.len() == xs.len() {
+        xs = &mut [];
+    }
+    xs.len()
 }
 
 enum TrustRefDir {
@@ -5173,6 +5546,9 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
         functions: BTreeMap<String, VerifiableFunction>,
         metadata: BTreeMap<String, TrustMetadata>,
         empty_bundle_metadata: BTreeMap<String, TrustMetadata>,
+        loop_contract_bundles: BTreeMap<String, CompilerContractBundle>,
+        loop_provenance_failures: BTreeMap<String, Vec<(u32, String)>>,
+        function_decreases_bundle: Option<CompilerContractBundle>,
         conversion_fixture: Option<ContractConversionFixture>,
         query_contracts: Option<CompilerContractBundle>,
     }
@@ -5196,9 +5572,19 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                     // through the typed `trust_contracts` query bundle. A bare
                     // `extract_function(..., None)` cannot and must not recover
                     // them from source text.
-                    let compiler_contracts =
+                    let mut compiler_contracts =
                         convert_trust_contract_bundle(tcx, tcx.trust_contracts(def_id))
                             .expect("rustc query payload should convert for fixture functions");
+                    let provenance_failures =
+                        stamp_loop_header_provenance(body, &mut compiler_contracts);
+                    if !compiler_contracts.loop_contracts.is_empty() {
+                        self.loop_contract_bundles.insert(name.clone(), compiler_contracts.clone());
+                        self.loop_provenance_failures.insert(name.clone(), provenance_failures);
+                    }
+                    if name == "native_function_measure" && self.function_decreases_bundle.is_none()
+                    {
+                        self.function_decreases_bundle = Some(compiler_contracts.clone());
+                    }
                     self.metadata.insert(
                         name.clone(),
                         extract_metadata_with_contract_bundle(tcx, body, Some(&compiler_contracts)),
@@ -5624,6 +6010,9 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
         functions: BTreeMap<String, VerifiableFunction>,
         metadata: BTreeMap<String, TrustMetadata>,
         empty_bundle_metadata: BTreeMap<String, TrustMetadata>,
+        loop_contract_bundles: BTreeMap<String, CompilerContractBundle>,
+        loop_provenance_failures: BTreeMap<String, Vec<(u32, String)>>,
+        function_decreases_bundle: Option<CompilerContractBundle>,
         conversion: ContractConversionFixture,
         query_contracts: Option<CompilerContractBundle>,
     }
@@ -5638,6 +6027,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
         nonconvertible_error: Option<TrustContractBundleConversionError>,
         loop_only: CompilerContractBundle,
         mixed_loop: CompilerContractBundle,
+        typed_loop: CompilerContractBundle,
         mixed_loop_caller_fallback: (Vec<Formula>, Vec<Formula>),
         loop_only_len: usize,
         loop_only_iter_count: usize,
@@ -5707,13 +6097,13 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             tcx,
             &mut loop_only,
             TrustContractKind::LoopInvariant,
-            TrustLoopId { index: 0 },
+            TrustLoopId { index: 0, hir_local_id: 1 },
         );
         push_synthetic_loop_contract(
             tcx,
             &mut loop_only,
             TrustContractKind::Decreases,
-            TrustLoopId { index: 0 },
+            TrustLoopId { index: 0, hir_local_id: 1 },
         );
         refresh_synthetic_summary(&mut loop_only);
         let loop_only_len = loop_only.len();
@@ -5725,9 +6115,28 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             tcx,
             &mut mixed_loop,
             TrustContractKind::LoopInvariant,
-            TrustLoopId { index: 0 },
+            TrustLoopId { index: 0, hir_local_id: 1 },
         );
         refresh_synthetic_summary(&mut mixed_loop);
+        let mut typed_loop = supported.clone();
+        typed_loop.loop_contracts.push(TrustContract {
+            kind: TrustContractKind::LoopInvariant,
+            source: TrustContractSource::Native,
+            subject: TrustContractSubject::HirLoop {
+                id: TrustLoopId { index: 0, hir_local_id: 1 },
+                loop_span: DUMMY_SP,
+                header_span: DUMMY_SP,
+            },
+            citation: None,
+            predicate: TrustContractPredicate {
+                ty: TrustContractPayloadType::Verifier(TrustContractVerifierSort::Bool),
+                kind: TrustContractPredicateKind::BoolLiteral { value: true },
+                source_bindings: Vec::new(),
+            },
+            span: DUMMY_SP,
+            keyword_span: Some(DUMMY_SP),
+        });
+        refresh_synthetic_summary(&mut typed_loop);
         let mixed_loop_caller_fallback =
             fail_closed_caller_formulas_for_conversion_error(&mixed_loop);
         ContractConversionFixture {
@@ -5753,6 +6162,8 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                 .expect("loop-only bundle should retain every authored loop clause"),
             mixed_loop: convert_trust_contract_bundle(tcx, &mixed_loop)
                 .expect("mixed bundle should retain function and loop lanes"),
+            typed_loop: convert_trust_contract_bundle(tcx, &typed_loop)
+                .expect("typed loop predicate should retain structural provenance"),
             mixed_loop_caller_fallback,
             loop_only_len,
             loop_only_iter_count,
@@ -5775,6 +6186,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             predicate: TrustContractPredicate {
                 ty: TrustContractPayloadType::Rust(tcx.types.bool),
                 kind: predicate_kind,
+                source_bindings: Vec::new(),
             },
             span: DUMMY_SP,
             keyword_span: None,
@@ -5805,6 +6217,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                 kind: TrustContractPredicateKind::Unsupported {
                     reason: sym::trust_test_contract_not_lowered,
                 },
+                source_bindings: Vec::new(),
             },
             span: DUMMY_SP,
             keyword_span: Some(DUMMY_SP),
@@ -5843,6 +6256,9 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             functions: BTreeMap::new(),
             metadata: BTreeMap::new(),
             empty_bundle_metadata: BTreeMap::new(),
+            loop_contract_bundles: BTreeMap::new(),
+            loop_provenance_failures: BTreeMap::new(),
+            function_decreases_bundle: None,
             conversion_fixture: None,
             query_contracts: None,
         };
@@ -5858,9 +6274,11 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             // All embedded compiler fixtures stop during analysis.  Select
             // rustc's built-in dummy backend explicitly so unit tests neither
             // dlopen the staged default nor poison the process-global backend
-            // loader when a test sysroot is incomplete.
+            // loader when a test sysroot is incomplete. Embedded `run_compiler`
+            // already selects `EmbeddedNoOfficialEvidence`; that policy both
+            // disables official Trust evidence and rejects `-Ztrust-verify`,
+            // including an explicit `off`.
             "-Zcodegen-backend=dummy".to_string(),
-            "-Ztrust-verify=off".to_string(),
         ];
         args.push("--sysroot".to_string());
         args.push(compiler_sysroot());
@@ -5876,6 +6294,9 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             functions: callbacks.functions,
             metadata: callbacks.metadata,
             empty_bundle_metadata: callbacks.empty_bundle_metadata,
+            loop_contract_bundles: callbacks.loop_contract_bundles,
+            loop_provenance_failures: callbacks.loop_provenance_failures,
+            function_decreases_bundle: callbacks.function_decreases_bundle,
             conversion: callbacks
                 .conversion_fixture
                 .expect("synthetic contract conversion fixture should be built"),
@@ -5897,7 +6318,6 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             "-Zmir-opt-level=3".to_string(),
             "-Zno-codegen".to_string(),
             "-Zcodegen-backend=dummy".to_string(),
-            "-Ztrust-verify=off".to_string(),
             "-Ainternal_features".to_string(),
         ];
 
@@ -5924,7 +6344,6 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             "-Cdebug-assertions=yes".to_string(),
             "-Zno-codegen".to_string(),
             "-Zcodegen-backend=dummy".to_string(),
-            "-Ztrust-verify=off".to_string(),
         ];
         args.push("--sysroot".to_string());
         args.push(compiler_sysroot());
@@ -5951,7 +6370,6 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             "-Zmir-opt-level=3".to_string(),
             "-Zno-codegen".to_string(),
             "-Zcodegen-backend=dummy".to_string(),
-            "-Ztrust-verify=off".to_string(),
             "-Ainternal_features".to_string(),
         ];
 
@@ -5970,12 +6388,10 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
         // no_core fixture: no `--sysroot` (no extern crates), `-Ainternal_features`
         // to allow `#![feature(lang_items, no_core)]` — mirrors the option-return
         // fixture's invocation, which compiles in-process where std fixtures ICE.
-        // `-Ztrust-verify=off`: this stage2 rustc runs the native Trust verification
-        // pass ON EVERY COMPILE (batteries-on default); it hard-errors on
-        // `make_level` (a raw-pointer-bearing datatype it treats as an unmodeled
-        // construct), which flakily aborts the fixture compile. We only need the
-        // extracted `Level` type here, not to verify the fixture, so opt out (the
-        // `TRUST_VANILLA_RUSTC_FLAG` compiletest uses for the same reason).
+        // Embedded `run_compiler` uses `EmbeddedNoOfficialEvidence`, so native
+        // Trust verification is already disabled for this extraction-only
+        // fixture. The policy rejects semantic/evidence control flags; do not
+        // pass the old explicit `-Ztrust-verify=off`.
         let args = vec![
             "rustc".to_string(),
             LEVEL_FIXTURE_PATH.to_string(),
@@ -5986,7 +6402,6 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             "-Zmir-opt-level=3".to_string(),
             "-Zno-codegen".to_string(),
             "-Zcodegen-backend=dummy".to_string(),
-            "-Ztrust-verify=off".to_string(),
             "-Ainternal_features".to_string(),
         ];
 
@@ -6006,9 +6421,8 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
     }
 
     /// Lever A step 5 — compile the expr fixture in-process and return the
-    /// extracted `(ExprKind, Expr)` types. Same invocation as the Level fixture
-    /// (`--crate-name clean_kernel`, `no_core`, `-Ztrust-verify=off` to opt out of
-    /// the batteries-on native trust-verify pass that ICEs on raw-pointer datatypes).
+    /// extracted `(ExprKind, Expr)` types. Same embedded-no-evidence invocation
+    /// as the Level fixture (`--crate-name clean_kernel`, `no_core`).
     fn extract_expr_datatypes_fixture() -> (Ty, Ty) {
         let mut callbacks =
             ExprExtractionCallbacks { exprkind_ty: None, expr_ty: None, probe: Vec::new() };
@@ -6022,7 +6436,6 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             "-Zmir-opt-level=3".to_string(),
             "-Zno-codegen".to_string(),
             "-Zcodegen-backend=dummy".to_string(),
-            "-Ztrust-verify=off".to_string(),
             "-Ainternal_features".to_string(),
         ];
 
@@ -6059,7 +6472,6 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             "-Zmir-opt-level=3".to_string(),
             "-Zno-codegen".to_string(),
             "-Zcodegen-backend=dummy".to_string(),
-            "-Ztrust-verify=off".to_string(),
             "-Ainternal_features".to_string(),
         ];
         let result =
@@ -6150,8 +6562,8 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
     }
 
     /// WALL C — compile the mirror fixture and extract every free function's
-    /// real MIR body as a `VerifiableFunction`. Same invocation as the Expr
-    /// fixture (`--crate-name clean_kernel`, `no_core`, `-Ztrust-verify=off`).
+    /// real MIR body as a `VerifiableFunction`. Same embedded-no-evidence
+    /// invocation as the Expr fixture (`--crate-name clean_kernel`, `no_core`).
     fn extract_mirror_fixture_bodies() -> BTreeMap<String, VerifiableFunction> {
         let mut callbacks = MirrorBodyCallbacks { functions: BTreeMap::new() };
         let args = vec![
@@ -6164,7 +6576,6 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             "-Zmir-opt-level=3".to_string(),
             "-Zno-codegen".to_string(),
             "-Zcodegen-backend=dummy".to_string(),
-            "-Ztrust-verify=off".to_string(),
             "-Ainternal_features".to_string(),
         ];
         let result =
@@ -6191,7 +6602,6 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             "-Zmir-opt-level=3".to_string(),
             "-Zno-codegen".to_string(),
             "-Zcodegen-backend=dummy".to_string(),
-            "-Ztrust-verify=off".to_string(),
             "-Ainternal_features".to_string(),
         ];
         let result =
@@ -6218,7 +6628,6 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             "-Zmir-opt-level=3".to_string(),
             "-Zno-codegen".to_string(),
             "-Zcodegen-backend=dummy".to_string(),
-            "-Ztrust-verify=off".to_string(),
             "-Ainternal_features".to_string(),
         ];
         let result =
@@ -6314,7 +6723,6 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             "-Zmir-opt-level=3".to_string(),
             "-Zno-codegen".to_string(),
             "-Zcodegen-backend=dummy".to_string(),
-            "-Ztrust-verify=off".to_string(),
             "-Ainternal_features".to_string(),
         ];
         let result =
@@ -7661,7 +8069,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                 ),
             };
             assert_eq!(
-                convert_trust_contract_predicate(0, &exact),
+                convert_trust_contract_predicate(0, TrustContractKind::Ensures, &exact),
                 Ok((
                     "__trust_lowered_compiler_contract__:x == 0".to_string(),
                     Some((
@@ -7690,7 +8098,10 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                     Box::new(Proposition::Int(0)),
                 ),
             };
-            assert!(convert_trust_contract_predicate(0, &missing_prefix).is_err());
+            assert!(
+                convert_trust_contract_predicate(0, TrustContractKind::Ensures, &missing_prefix,)
+                    .is_err()
+            );
 
             let structural_drift = TrustContractPredicateKind::Typed {
                 text: Symbol::intern("__trust_lowered_compiler_contract__:x == 0"),
@@ -7702,7 +8113,44 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                     Box::new(Proposition::Int(0)),
                 ),
             };
-            assert!(convert_trust_contract_predicate(0, &structural_drift).is_err());
+            assert!(
+                convert_trust_contract_predicate(0, TrustContractKind::Ensures, &structural_drift,)
+                    .is_err()
+            );
+
+            let signed_measure = TrustContractPredicateKind::Typed {
+                text: Symbol::intern("__trust_lowered_compiler_contract__:-i"),
+                proposition: Proposition::Neg(Box::new(Proposition::Var {
+                    name: Symbol::intern("i"),
+                    domain: Domain::MachineInt { width: 16, signed: true },
+                })),
+            };
+            assert_eq!(
+                convert_trust_contract_predicate(1, TrustContractKind::Decreases, &signed_measure,),
+                Ok((
+                    "__trust_lowered_compiler_contract__:-i".to_string(),
+                    Some((
+                        Formula::Neg(Box::new(Formula::Var("i".to_string(), Sort::Int,))),
+                        vec![trust_types::CompilerContractVariableDomain {
+                            name: "i".to_string(),
+                            domain: trust_types::CompilerContractValueDomain::MachineInt {
+                                width: 16,
+                                signed: true,
+                            },
+                        }],
+                    )),
+                )),
+                "a signed negative decreases measure retains its numeric typed carrier",
+            );
+            assert!(
+                convert_trust_contract_predicate(
+                    1,
+                    TrustContractKind::LoopInvariant,
+                    &signed_measure,
+                )
+                .is_err(),
+                "a numeric measure cannot bind to a Boolean invariant kind",
+            );
         });
     }
 
@@ -7713,12 +8161,22 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
         assert_eq!(
             convert_trust_contract_predicate(
                 0,
+                TrustContractKind::Ensures,
                 &TrustContractPredicateKind::BoolLiteral { value: true },
             ),
             Ok((
                 format!("{LOWERED_COMPILER_CONTRACT_PREFIX}true"),
                 Some((Formula::Bool(true), Vec::new())),
             ))
+        );
+        assert!(
+            convert_trust_contract_predicate(
+                0,
+                TrustContractKind::Decreases,
+                &TrustContractPredicateKind::BoolLiteral { value: true },
+            )
+            .is_err(),
+            "a Boolean literal is not an E5 numeric measure",
         );
     }
 
@@ -8304,6 +8762,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             );
             let (body, proposition) = convert_trust_contract_predicate(
                 index,
+                TrustContractKind::Decreases,
                 &TrustContractPredicateKind::Opaque { text: sym::trust_test_contract_x_gt_zero },
             )
             .expect("function decreases payload should remain visible");
@@ -8391,6 +8850,631 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
         );
         assert_eq!(fixture.conversion.mixed_loop.contracts.len(), 2);
         assert_eq!(fixture.conversion.mixed_loop.loop_contracts.len(), 1);
+
+        let typed_loop = &fixture.conversion.typed_loop;
+        assert_eq!(typed_loop.contracts.len(), 2);
+        assert_eq!(typed_loop.loop_contracts.len(), 1);
+        assert_eq!(
+            typed_loop.typed_propositions.last(),
+            Some(&CompilerContractProposition {
+                source_contract_index: 2,
+                kind: ContractKind::LoopInvariant,
+                body: format!("{LOWERED_COMPILER_CONTRACT_PREFIX}true"),
+                formula: Formula::Bool(true),
+                variable_domains: vec![],
+            }),
+            "loop propositions occupy the global dense+loop index and retain their exact source body",
+        );
+    }
+
+    fn portable_loop_spec(
+        kind: LoopContractKind,
+        source_loop_id: u32,
+        source_hir_local_id: u32,
+        mir_header: Option<usize>,
+    ) -> LoopContractSpec {
+        LoopContractSpec {
+            kind,
+            source_loop_id,
+            source_hir_local_id: Some(source_hir_local_id),
+            mir_header,
+            loop_head: SourceSpan::default(),
+            header_span: SourceSpan::default(),
+            span: SourceSpan::default(),
+            body: "true".to_string(),
+        }
+    }
+
+    #[test]
+    fn loop_header_provenance_rejects_conflicting_endpoint_identities() {
+        let mut bundle = CompilerContractBundle::new(vec![]).with_loop_contracts(vec![
+            portable_loop_spec(LoopContractKind::Invariant, 0, 10, Some(90)),
+            portable_loop_spec(LoopContractKind::Invariant, 1, 20, Some(91)),
+        ]);
+        let failures = stamp_loop_header_provenance_from_backedges(
+            &[StampedNaturalBackedge {
+                header: 3,
+                header_hir_local_id: Some(10),
+                latch_hir_local_id: Some(20),
+            }],
+            &mut bundle,
+        );
+
+        assert_eq!(failures.iter().map(|(source, _)| *source).collect::<Vec<_>>(), [0, 1]);
+        assert!(
+            failures.iter().all(|(_, reason)| reason.contains("e45.loop-source.no-mir-header")),
+            "conflicting endpoint stamps must mint no header authority: {failures:?}",
+        );
+        assert!(
+            bundle.loop_contracts.iter().all(|spec| spec.mir_header.is_none()),
+            "failed restamping must clear every stale header",
+        );
+    }
+
+    #[test]
+    fn loop_header_provenance_accepts_header_only_and_latch_only_stamps() {
+        for (label, header_hir_local_id, latch_hir_local_id, duplicate_edge) in [
+            ("header-only", Some(10), None, true),
+            ("latch-only", None, Some(10), false),
+        ]
+        {
+            let mut bundle = CompilerContractBundle::new(vec![]).with_loop_contracts(vec![
+                portable_loop_spec(LoopContractKind::Invariant, 0, 10, None),
+                portable_loop_spec(LoopContractKind::Decreases, 0, 10, None),
+            ]);
+            let backedge = StampedNaturalBackedge {
+                header: 3,
+                header_hir_local_id,
+                latch_hir_local_id,
+            };
+            let backedges =
+                if duplicate_edge { vec![backedge, backedge] } else { vec![backedge] };
+            let failures = stamp_loop_header_provenance_from_backedges(&backedges, &mut bundle);
+
+            assert!(
+                failures.is_empty(),
+                "{label} compiler stamp must bind: {failures:?}"
+            );
+            assert!(
+                bundle.loop_contracts.iter().all(|spec| spec.mir_header == Some(3)),
+                "{label}: every clause in one source group must receive the same exact header",
+            );
+        }
+    }
+
+    #[test]
+    fn loop_header_provenance_rejects_one_sided_identity_on_distinct_headers() {
+        let mut bundle = CompilerContractBundle::new(vec![]).with_loop_contracts(vec![
+            portable_loop_spec(LoopContractKind::Invariant, 0, 10, Some(90)),
+            portable_loop_spec(LoopContractKind::Decreases, 0, 10, Some(90)),
+        ]);
+        let failures = stamp_loop_header_provenance_from_backedges(
+            &[
+                StampedNaturalBackedge {
+                    header: 3,
+                    header_hir_local_id: Some(10),
+                    latch_hir_local_id: None,
+                },
+                // Model a stale outer stamp surviving on one endpoint of a
+                // distinct nested natural loop. One source identity must not
+                // select either header by order or span.
+                StampedNaturalBackedge {
+                    header: 7,
+                    header_hir_local_id: None,
+                    latch_hir_local_id: Some(10),
+                },
+            ],
+            &mut bundle,
+        );
+
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].1.contains("e45.loop-source.ambiguous-mir-header"),
+            "one-sided cross-header identity reuse must fail closed: {failures:?}"
+        );
+        assert!(
+            bundle.loop_contracts.iter().all(|spec| spec.mir_header.is_none()),
+            "ambiguous one-sided provenance must clear every stale binding"
+        );
+    }
+
+    #[test]
+    fn loop_header_provenance_rejects_duplicate_hir_and_header_authority() {
+        let mut duplicate_hir =
+            CompilerContractBundle::new(vec![]).with_loop_contracts(vec![
+                portable_loop_spec(LoopContractKind::Invariant, 0, 10, Some(80)),
+                portable_loop_spec(LoopContractKind::Invariant, 1, 10, Some(81)),
+            ]);
+        let failures = stamp_loop_header_provenance_from_backedges(
+            &[StampedNaturalBackedge {
+                header: 3,
+                header_hir_local_id: Some(10),
+                latch_hir_local_id: Some(10),
+            }],
+            &mut duplicate_hir,
+        );
+        assert_eq!(failures.len(), 2);
+        assert!(
+            failures
+                .iter()
+                .all(|(_, reason)| reason.contains("e45.loop-source.non-injective-hir-id")),
+            "one HIR loop cannot authenticate two source groups: {failures:?}",
+        );
+        assert!(duplicate_hir.loop_contracts.iter().all(|spec| spec.mir_header.is_none()));
+
+        let mut duplicate_header =
+            CompilerContractBundle::new(vec![]).with_loop_contracts(vec![
+                portable_loop_spec(LoopContractKind::Invariant, 0, 10, Some(80)),
+                portable_loop_spec(LoopContractKind::Invariant, 1, 20, Some(81)),
+            ]);
+        let failures = stamp_loop_header_provenance_from_backedges(
+            &[
+                StampedNaturalBackedge {
+                    header: 3,
+                    header_hir_local_id: Some(10),
+                    latch_hir_local_id: Some(10),
+                },
+                StampedNaturalBackedge {
+                    header: 3,
+                    header_hir_local_id: Some(20),
+                    latch_hir_local_id: Some(20),
+                },
+            ],
+            &mut duplicate_header,
+        );
+        assert_eq!(failures.len(), 2);
+        assert!(
+            failures.iter().all(|(_, reason)| {
+                reason.contains("e45.loop-source.non-injective-mir-header")
+            }),
+            "one MIR header cannot merge two source-loop groups: {failures:?}",
+        );
+        assert!(duplicate_header.loop_contracts.iter().all(|spec| spec.mir_header.is_none()));
+    }
+
+    #[test]
+    fn loop_header_provenance_clears_stale_header_when_no_binding_exists() {
+        let mut bundle = CompilerContractBundle::new(vec![]).with_loop_contracts(vec![
+            portable_loop_spec(LoopContractKind::Invariant, 0, 10, Some(99)),
+        ]);
+        let failures = stamp_loop_header_provenance_from_backedges(&[], &mut bundle);
+
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].1.contains("e45.loop-source.no-mir-header"));
+        assert_eq!(bundle.loop_contracts[0].mir_header, None);
+    }
+
+    #[test]
+    fn ordinary_rustc_config_stamps_nested_and_independent_loop_headers() {
+        let fixture = extract_contract_fixture();
+
+        for name in ["nested_loop_provenance", "independent_loop_provenance"] {
+            let failures = fixture
+                .loop_provenance_failures
+                .get(name)
+                .unwrap_or_else(|| panic!("{name}: loop provenance result must be recorded"));
+            assert!(failures.is_empty(), "{name}: provenance failures: {failures:?}");
+
+            let bundle = fixture
+                .loop_contract_bundles
+                .get(name)
+                .unwrap_or_else(|| panic!("{name}: converted loop bundle must be recorded"));
+            assert_eq!(bundle.loop_contracts.len(), 4, "{name}: two clauses per loop");
+            assert_eq!(
+                bundle.typed_propositions.len(),
+                4,
+                "{name}: real native loop clauses must cross the query as structural propositions",
+            );
+            assert!(
+                bundle.typed_propositions.iter().all(|proposition| {
+                    proposition.body.starts_with(LOWERED_COMPILER_CONTRACT_PREFIX)
+                        && !proposition.variable_domains.is_empty()
+                }),
+                "{name}: each loop proposition must retain exact visible variable domains",
+            );
+            if name == "nested_loop_provenance" {
+                for proposition in &bundle.typed_propositions {
+                    let (variable, expected_domain) =
+                        if proposition.body.contains("inner") {
+                            (
+                                "inner",
+                                CompilerContractValueDomain::MachineInt {
+                                    width: 16,
+                                    signed: true,
+                                },
+                            )
+                        } else {
+                            (
+                                "outer",
+                                CompilerContractValueDomain::MachineInt {
+                                    width: 32,
+                                    signed: false,
+                                },
+                            )
+                        };
+                    assert_eq!(
+                        proposition.variable_domains,
+                        vec![CompilerContractVariableDomain {
+                            name: variable.to_string(),
+                            domain: expected_domain,
+                        }],
+                        "{name}: nested loop domains must retain each visible binding's exact width and signedness",
+                    );
+                }
+            }
+            assert!(
+                bundle.loop_contracts.iter().all(|spec| {
+                    spec.source_hir_local_id.is_some() && spec.mir_header.is_some()
+                }),
+                "{name}: every clause must carry authenticated source and MIR identities",
+            );
+
+            let mut clauses_by_source = BTreeMap::<u32, Vec<&LoopContractSpec>>::new();
+            for spec in &bundle.loop_contracts {
+                clauses_by_source.entry(spec.source_loop_id).or_default().push(spec);
+            }
+            assert_eq!(clauses_by_source.len(), 2, "{name}: two distinct source loops");
+            let headers = clauses_by_source
+                .values()
+                .map(|clauses| {
+                    assert_eq!(clauses.len(), 2, "{name}: invariant/decreases pair");
+                    assert_eq!(
+                        clauses[0].source_hir_local_id, clauses[1].source_hir_local_id,
+                        "{name}: a clause pair must agree on its source loop",
+                    );
+                    assert_eq!(
+                        clauses[0].mir_header, clauses[1].mir_header,
+                        "{name}: a clause pair must agree on its MIR header",
+                    );
+                    clauses[0].mir_header.expect("checked above")
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(headers.len(), 2, "{name}: source loops must bind distinct headers");
+
+            let mut function = fixture
+                .functions
+                .get(name)
+                .unwrap_or_else(|| panic!("{name}: function must be extracted"))
+                .clone();
+            let bind_failures =
+                trust_vcgen::bind_compiler_loop_contract_bundle(&mut function, bundle);
+            assert!(bind_failures.is_empty(), "{name}: bind failures: {bind_failures:?}");
+            let bound_loop_contracts = function
+                .contracts
+                .iter()
+                .filter(|contract| {
+                    matches!(contract.kind, ContractKind::LoopInvariant | ContractKind::Decreases)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(bound_loop_contracts.len(), 4);
+            for contract in bound_loop_contracts {
+                assert!(
+                    bundle.loop_contracts.iter().any(|spec| {
+                        let kind = match spec.kind {
+                            LoopContractKind::Invariant => ContractKind::LoopInvariant,
+                            LoopContractKind::Decreases => ContractKind::Decreases,
+                        };
+                        contract.kind == kind
+                            && contract.span == spec.span
+                            && spec.mir_header.is_some_and(|header| {
+                                contract.body == format!("bb{header}: {}", spec.body)
+                            })
+                    }),
+                    "{name}: compiler loop clause must be canonically bound to its exact header",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_rustc_config_binds_typed_literal_collection_projections() {
+        let fixture = extract_contract_fixture();
+
+        for name in ["immutable_slice_projection", "immutable_array_projection"] {
+            let bundle = fixture
+                .loop_contract_bundles
+                .get(name)
+                .unwrap_or_else(|| panic!("{name}: loop contract bundle must be recorded"));
+            assert_eq!(bundle.loop_contracts.len(), 1, "{name}: one authored invariant");
+            assert_eq!(bundle.typed_propositions.len(), 1, "{name}: one exact typed invariant");
+            let proposition = &bundle.typed_propositions[0];
+            assert_eq!(proposition.kind, ContractKind::LoopInvariant);
+            assert!(
+                proposition.body.starts_with(LOWERED_COMPILER_CONTRACT_PREFIX),
+                "{name}: compiler schema prefix is part of source provenance",
+            );
+            assert_eq!(
+                proposition
+                    .variable_domains
+                    .iter()
+                    .find(|domain| domain.name == "xs[0]")
+                    .map(|domain| domain.domain),
+                Some(CompilerContractValueDomain::MachineInt { width: 32, signed: false }),
+                "{name}: the projected element must retain its exact u32 domain",
+            );
+
+            let mut function = fixture
+                .functions
+                .get(name)
+                .unwrap_or_else(|| panic!("{name}: function must be extracted"))
+                .clone();
+            let failures = trust_vcgen::bind_compiler_loop_contract_bundle(&mut function, bundle);
+            assert!(failures.is_empty(), "{name}: exact typed binding failed: {failures:?}");
+            let vcs = trust_vcgen::generate_vcs(&function);
+            assert_eq!(
+                vcs.iter()
+                    .filter(|vc| matches!(
+                        vc.kind,
+                        VcKind::LoopInvariantInitiation { .. }
+                            | VcKind::LoopInvariantConsecution { .. }
+                    ))
+                    .count(),
+                2,
+                "{name}: the production typed path must retain the E4 proof pair: {vcs:#?}",
+            );
+            assert!(
+                !vcs.iter().any(|vc| matches!(
+                    &vc.kind,
+                    VcKind::UnsupportedMir { detail, .. }
+                        if detail.contains("UserLoopContractUnsupported")
+                            || detail.contains("e45.collection")
+                )),
+                "{name}: a stable immutable literal read must not hit a collection frontier: \
+                 {vcs:#?}",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_rustc_config_denies_shadowed_collection_projection_authority() {
+        let fixture = extract_contract_fixture();
+
+        for name in ["shadowed_collection_index", "shadowed_collection_length"] {
+            let bundle = fixture
+                .loop_contract_bundles
+                .get(name)
+                .unwrap_or_else(|| panic!("{name}: loop contract bundle must be recorded"));
+            assert_eq!(bundle.loop_contracts.len(), 1, "{name}: one authored invariant");
+            assert!(
+                bundle.typed_propositions.is_empty(),
+                "{name}: a loop-local collection shadow must remain opaque until exact HIR-to-MIR source-place provenance is transported",
+            );
+
+            let mut function = fixture
+                .functions
+                .get(name)
+                .unwrap_or_else(|| panic!("{name}: function must be extracted"))
+                .clone();
+            let failures = trust_vcgen::bind_compiler_loop_contract_bundle(&mut function, bundle);
+            assert_eq!(
+                failures.len(),
+                1,
+                "{name}: the strict production binder must reject the opaque shadowed clause",
+            );
+            let vcs = trust_vcgen::generate_vcs(&function);
+            assert!(
+                !vcs.iter().any(|vc| matches!(
+                    vc.kind,
+                    VcKind::LoopInvariantInitiation { .. }
+                        | VcKind::LoopInvariantConsecution { .. }
+                )),
+                "{name}: wrong-place collection rebinding must not mint E4 rows: {vcs:#?}",
+            );
+            assert!(
+                vcs.iter().any(|vc| matches!(
+                    &vc.kind,
+                    VcKind::UnsupportedMir { detail, .. }
+                        if detail.contains("no unique exact compiler-typed proposition")
+                            || detail.contains("unsupported or ambiguous MIR value")
+                )),
+                "{name}: the denied clause must remain a visible fail-closed row: {vcs:#?}",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_rustc_config_denies_out_of_range_fixed_projection_authority() {
+        let fixture = extract_contract_fixture();
+        let name = "out_of_range_fixed_projection";
+        let bundle = fixture
+            .loop_contract_bundles
+            .get(name)
+            .expect("out-of-range loop contract bundle must be recorded");
+        assert_eq!(bundle.loop_contracts.len(), 1);
+        assert_eq!(bundle.loop_contracts[0].body, "xs[4] == xs[4]");
+        assert!(
+            bundle.typed_propositions.is_empty(),
+            "the compiler query must not mint a projected identity at the `[T; N]` bound",
+        );
+
+        let mut function = fixture.functions.get(name).expect("function must be extracted").clone();
+        let failures = trust_vcgen::bind_compiler_loop_contract_bundle(&mut function, bundle);
+        assert_eq!(failures.len(), 1, "the strict binder must retain the opaque clause failure");
+        let vcs = trust_vcgen::generate_vcs(&function);
+        assert!(
+            !vcs.iter().any(|vc| matches!(
+                vc.kind,
+                VcKind::LoopInvariantInitiation { .. } | VcKind::LoopInvariantConsecution { .. }
+            )),
+            "VCgen must independently reject the out-of-range fixed-array leaf: {vcs:#?}",
+        );
+        assert!(
+            vcs.iter().any(|vc| matches!(
+                &vc.kind,
+                VcKind::UnsupportedMir { detail, .. }
+                    if detail.contains("unsupported or ambiguous MIR value")
+            )),
+            "the out-of-range clause must remain a visible fail-closed row: {vcs:#?}",
+        );
+    }
+
+    #[test]
+    fn ordinary_rustc_config_extracts_exact_guarded_mutable_collection_stores() {
+        let fixture = extract_contract_fixture();
+
+        for name in ["mutable_slice_store", "mutable_fixed_store"] {
+            let mut function = fixture
+                .functions
+                .get(name)
+                .unwrap_or_else(|| panic!("{name}: function must be extracted"))
+                .clone();
+            let xs_local = function
+                .body
+                .locals
+                .iter()
+                .find(|decl| decl.name.as_deref() == Some("xs"))
+                .unwrap_or_else(|| panic!("{name}: source collection local must retain its name"))
+                .index;
+            assert!(matches!(
+                &function.body.locals[xs_local].ty,
+                Ty::Ref {
+                    mutable: true,
+                    inner,
+                } if matches!(inner.as_ref(), Ty::Slice { elem } | Ty::Array { elem, .. }
+                    if elem.as_ref() == &Ty::u32())
+            ));
+
+            let stores = function
+                .body
+                .blocks
+                .iter()
+                .flat_map(|block| {
+                    block.stmts.iter().enumerate().filter_map(move |(statement, stmt)| {
+                        matches!(stmt, Statement::Assign { place, .. }
+                            if place.local == xs_local
+                                && place.projections.first() == Some(&Projection::Deref))
+                        .then_some((block.id, statement, stmt))
+                    })
+                })
+                .collect::<Vec<_>>();
+            let [(store_block, _, Statement::Assign { place: store_place, rvalue, .. })] =
+                stores.as_slice()
+            else {
+                panic!("{name}: expected one exact projected store, got {stores:#?}");
+            };
+            assert!(matches!(
+                store_place.projections.as_slice(),
+                [Projection::Deref, Projection::Index(_)]
+                    | [Projection::Deref, Projection::ConstantIndex { from_end: false, .. }]
+            ));
+            let Rvalue::Use(store_value) = rvalue else {
+                panic!("{name}: store value must be a direct operand, got {rvalue:?}");
+            };
+            let store_value_is_u32 = match store_value {
+                Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => {
+                    function.body.locals.get(place.local).is_some_and(|decl| decl.ty == Ty::u32())
+                }
+                Operand::Constant(ConstValue::Uint(_, 32)) => true,
+                _ => false,
+            };
+            assert!(
+                store_value_is_u32,
+                "{name}: extracted store value must retain the exact element type",
+            );
+
+            if name == "mutable_slice_store" {
+                assert!(
+                    function.body.blocks.iter().any(|block| {
+                        matches!(
+                            &block.terminator,
+                            Terminator::Assert {
+                                msg: AssertMessage::BoundsCheck,
+                                target,
+                                expected: true,
+                                ..
+                            } if target == store_block
+                        )
+                    }),
+                    "{name}: the slice store must retain rustc's direct BoundsCheck edge",
+                );
+            }
+
+            let bundle = fixture
+                .loop_contract_bundles
+                .get(name)
+                .unwrap_or_else(|| panic!("{name}: native loop contract bundle must be recorded"));
+            let failures = trust_vcgen::bind_compiler_loop_contract_bundle(&mut function, bundle);
+            assert!(failures.is_empty(), "{name}: loop binding failures: {failures:?}");
+            let vcs = trust_vcgen::generate_vcs(&function);
+            assert_eq!(
+                vcs.iter()
+                    .filter(|vc| matches!(
+                        vc.kind,
+                        VcKind::LoopInvariantInitiation { .. }
+                            | VcKind::LoopInvariantConsecution { .. }
+                    ))
+                    .count(),
+                2,
+                "{name}: exact extracted mutable store must retain its E4 pair: {vcs:#?}",
+            );
+            assert!(
+                !vcs.iter().any(|vc| matches!(
+                    &vc.kind,
+                    VcKind::UnsupportedMir { detail, .. } if detail.contains("e45.collection")
+                        || detail.contains("e45.transition")
+                )),
+                "{name}: exact extracted mutable store must not hit an E4/E5 collection frontier: \
+                 {vcs:#?}",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_rustc_config_rejects_mutable_collection_call_alias_and_reseat_frontiers() {
+        let fixture = extract_contract_fixture();
+        for name in ["mutable_slice_call_escape", "mutable_slice_reseat"] {
+            let mut function =
+                fixture.functions.get(name).expect("function must be extracted").clone();
+            let bundle = fixture
+                .loop_contract_bundles
+                .get(name)
+                .expect("loop contract bundle must be recorded");
+            let failures = trust_vcgen::bind_compiler_loop_contract_bundle(&mut function, bundle);
+            assert!(failures.is_empty(), "{name}: loop binding failures: {failures:?}");
+            let vcs = trust_vcgen::generate_vcs(&function);
+            assert!(
+                !vcs.iter().any(|vc| matches!(
+                    vc.kind,
+                    VcKind::LoopInvariantInitiation { .. }
+                        | VcKind::LoopInvariantConsecution { .. }
+                )),
+                "{name}: a call/reborrow/reseat must not mint E4 rows: {vcs:#?}",
+            );
+            assert!(
+                vcs.iter().any(|vc| matches!(
+                    &vc.kind,
+                    VcKind::UnsupportedMir { detail, .. }
+                        if detail.contains("e45.collection.alias")
+                            || detail.contains("e45.collection.call")
+                            || detail.contains("e45.collection.mutation")
+                            || detail.contains("e45.collection.unstable")
+                )),
+                "{name}: the excluded call/reborrow/reseat frontier must stay visible: {vcs:#?}",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_rustc_config_carries_typed_numeric_function_measure() {
+        let fixture = extract_contract_fixture();
+        let bundle = fixture
+            .function_decreases_bundle
+            .expect("native function decreases bundle must be recorded");
+        assert_eq!(bundle.contracts.len(), 1);
+        assert_eq!(bundle.contracts[0].kind, ContractKind::Decreases);
+        assert_eq!(bundle.contracts[0].body, format!("{LOWERED_COMPILER_CONTRACT_PREFIX}n"),);
+        assert_eq!(bundle.typed_propositions.len(), 1);
+        let proposition = &bundle.typed_propositions[0];
+        assert_eq!(proposition.kind, ContractKind::Decreases);
+        assert_eq!(proposition.formula, Formula::Var("n".to_string(), Sort::Int));
+        assert_eq!(
+            proposition.variable_domains,
+            vec![CompilerContractVariableDomain {
+                name: "n".to_string(),
+                domain: CompilerContractValueDomain::MachineInt { width: 32, signed: false },
+            }],
+        );
+        assert_eq!(bundle.typed_proposition(0, &bundle.contracts[0]), Some(proposition));
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //! scalar-integer SAFETY machine — is `FullyReplaced` by the live Clean lane
 //! (owner policy flip 2026-07-21): author a temporal `Model` (or a
 //! `clean { … }` island) and certify it with
-//! `certify_clean_scalar_model_with_ty`. The formerly narrower Clean admission
+//! `certify_bound_clean_scalar_model_with_ty`. The formerly narrower Clean admission
 //! domain now covers the owner-ratified operational macro-parity domain — the
 //! process-global interner and its name caps were deleted, the
 //! expression-depth cap was widened to a 65_536-level decode-cost guard, and
@@ -88,7 +88,7 @@ use syn::parse_macro_input;
 /// DELETION remains separately gated (retirement blockers).
 #[proc_macro]
 #[deprecated(note = "author a temporal Model (or a `clean { … }` island) and certify with \
-            `certify_clean_scalar_model_with_ty` — the Clean scalar lane is the closed, \
+            `certify_bound_clean_scalar_model_with_ty` — the bound Clean scalar lane is the closed, \
             byte-identical replacement (R5 scorecard, owner policy flip 2026-07-21)")]
 pub fn trust_model(input: TokenStream) -> TokenStream {
     let def = parse_macro_input!(input as ModelDef);
@@ -109,7 +109,7 @@ pub fn trust_model(input: TokenStream) -> TokenStream {
 /// process-owned registry as program evidence and unconditionally reject the
 /// automatic route with unbound-evidence exit 2. Model discovery is explicit:
 /// the caller or build integration invokes
-/// `certify_clean_scalar_model_with_ty` (or the explicit `check_models_*`
+/// `certify_bound_clean_scalar_model_with_ty` (or the explicit `check_models_*`
 /// APIs) for the exact definitions it owns.
 ///
 /// D1+ ratchet (owner policy flip 2026-07-21): `temporal_model!` carries the
@@ -120,7 +120,7 @@ pub fn trust_model(input: TokenStream) -> TokenStream {
 /// unavailable. Only macro DELETION is gated (retirement blockers).
 #[proc_macro]
 #[deprecated(note = "author a temporal Model (or a `clean { … }` island) and certify with \
-            `certify_clean_scalar_model_with_ty` — the Clean scalar lane is the closed, \
+            `certify_bound_clean_scalar_model_with_ty` — the bound Clean scalar lane is the closed, \
             byte-identical replacement (R5 scorecard, owner policy flip 2026-07-21)")]
 pub fn temporal_model(input: TokenStream) -> TokenStream {
     let def = parse_macro_input!(input as ModelDef);

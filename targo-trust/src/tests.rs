@@ -15157,7 +15157,10 @@ fn copied_real_targo_for_contract_e2e(root: &Path) -> PathBuf {
 /// This is ignored in the ordinary crate-only test pass because it requires a
 /// freshly built in-tree trustc + branded Targo pair. It is a mandatory manual
 /// release/integration gate and can be run directly after `./x.py build`.
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
 #[test]
 #[ignore = "requires a freshly built in-tree trustc and Targo"]
 fn real_targo_test_instruments_library_used_by_integration_test() {
@@ -15219,7 +15222,10 @@ fn violated_library_clause_aborts() {{
 /// and that the exact authorized integration-test executable is actually run;
 /// the negative fixture separately proves that its linked library is
 /// instrumented.
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
 #[test]
 #[ignore = "requires a freshly built in-tree trustc and Targo"]
 fn real_targo_test_executes_authorized_satisfying_integration_test() {
@@ -15331,7 +15337,10 @@ fn satisfying_library_clause_returns() {{
 
 /// `harness = false` replaces libtest with an arbitrary target `main`, so it
 /// cannot claim the evidence-grade phase-B test-harness boundary.
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
 #[test]
 #[ignore = "requires a freshly built in-tree trustc and Targo"]
 fn real_targo_test_rejects_unharnessed_test_target_before_execution() {

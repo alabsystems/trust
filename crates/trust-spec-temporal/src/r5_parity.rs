@@ -33,9 +33,17 @@
 //! (`macro_expressible: false`, empty surfaces, guard-test-pinned in
 //! `r5_scorecard`), so those Model-ABI ambitions cannot gate deleting the
 //! macros.  They are now tracked, non-gating, in
-//! [`R5_MODEL_ABI_AMBITION_BLOCKERS`].  The applied Clean proposition bridge
-//! remains a retirement blocker pending a separate owner decision.  This
-//! report is implementation status, never proof evidence.
+//! [`R5_MODEL_ABI_AMBITION_BLOCKERS`].  The v2 bound certificate kernel-binds
+//! the exact authored applied `StateMachine` safety claim to the same model
+//! artifact whose ty evidence is replayed.  The v3 proof-carrying route also
+//! accepts an independently authored, constructive, axiom-free Clean
+//! inhabitant of that exact claim and rejects wrong-model, wrong-invariant, and
+//! cross-artifact splices.  That is a real proof route, but it is not automatic
+//! macro migration: `FiniteModel.safetyClaimOfStrengthening` supplies the
+//! generic temporal theorem, but no exact reflection currently transports the
+//! separate ty/S4 reachable invariant `J` and its three proof legs into the
+//! applied `FiniteModel` semantics. Physical macro retirement therefore
+//! remains blocked. This report is implementation status, never proof evidence.
 
 /// Legacy schema identifier retained so stored v1 reports can still be named.
 ///
@@ -62,7 +70,10 @@ pub enum R5TemporalParityBlocker {
     /// Historical blocker ID: the ty certificate was not bound to its authored
     /// Clean theorem statement.
     TyCertificateNotBoundToCleanProposition,
-    /// Historical coarse ID for incomplete certified temporal property classes.
+    /// General indexed weak/strong fairness is available to authored Clean
+    /// proofs, but automatic ty certification still recognizes only selected
+    /// property classes. This non-macro-expressible ambition does not gate
+    /// macro retirement.
     CertifiedTemporalPropertyClassesIncomplete,
     /// `Init` and `Next` still come from a hand-written macro model, with no
     /// kernel-checked refinement from the literal program transition system.
@@ -76,19 +87,38 @@ pub enum R5TemporalParityBlocker {
     /// Historical blocker ID: no Clean replacement preserved and bound the
     /// macro lane's `Buggy = 1` counterexample ratchet.
     CleanReplacementBuggyOneRatchetMissing,
-    /// The legacy `Model` union also supports function-valued variables and
-    /// function access/update/comprehension expressions; the Clean v1 model
-    /// decoder is deliberately scalar-only.  Not macro-expressible, so it does
-    /// not gate macro retirement (owner override 2026-07-20); tracked in
-    /// [`R5_MODEL_ABI_AMBITION_BLOCKERS`].
+    /// Historical blocker ID: the Clean v1 decoder was scalar-only. The v2
+    /// finite-model ABI now supports function-valued variables and
+    /// access/update/comprehension expressions.
     FunctionValuedModelReplacementMissing,
-    /// The decoded scalar data model is not yet accompanied by a kernel theorem
-    /// tying it to the exact applied Clean `StateMachine` proposition.
+    /// Stable blocker ID for exact reflection of the separately replayed ty/S4
+    /// reachable invariant into the applied Clean proposition. The established
+    /// V2 wire ID is retained for report compatibility. The v2 identity
+    /// binding, v3 author-supplied inhabitant route, and generic
+    /// `FiniteModel.safetyClaimOfStrengthening` theorem are live, but macro
+    /// migration cannot yet construct the theorem's exact model-specific
+    /// premises from ty/S4 evidence.
+    ///
+    /// Direct finite-state reflection does not currently fill this gap:
+    /// `ScalarModel` coordinates range over `Nat` and carry no finite-domain
+    /// witness, and the Clean model vocabulary has no quoted finite-state
+    /// enumeration/decoder with soundness and exhaustiveness theorems relating
+    /// it to relational `Initial`, `Next`, and `InvariantHolds`.
+    /// `safetyClaimOfStrengthening` supplies the final temporal induction step;
+    /// what remains is exact reflection of one strengthening `J`, including
+    /// kernel proofs of J-initiation, J-consecution, and J-to-authored-safety
+    /// preservation for the same applied model. Using authored safety itself
+    /// is insufficient: a certifiably safe model can have a safe unreachable
+    /// state with an unsafe successor. A finite reflector would cover only a
+    /// sublane: admitted macro models include unbounded affine `Nat` counters
+    /// whose current ty evidence is parametric, so those require exact
+    /// relational transport rather than an invented finite bound.
     AppliedCleanPropositionBindingMissing,
-    /// Certified liveness handles selected recognized classes, not an arbitrary
-    /// authored `F ~> G` proposition with general fairness assumptions.  Not
-    /// macro-expressible, so it does not gate macro retirement (owner override
-    /// 2026-07-20); tracked in [`R5_MODEL_ABI_AMBITION_BLOCKERS`].
+    /// Arbitrary authored `F ~> G` propositions and general fairness assumptions
+    /// can be proved in Clean and kernel-replayed, but automatic ty discharge
+    /// remains limited to selected recognized classes. Not macro-expressible,
+    /// so it does not gate macro retirement (owner override 2026-07-20);
+    /// tracked in [`R5_MODEL_ABI_AMBITION_BLOCKERS`].
     ArbitraryLeadsToDischargeMissing,
     /// Historical blocker ID (closed by the owner policy flip 2026-07-21).
     /// The Clean scalar decoder used to impose three Clean-only resource caps
@@ -171,11 +201,16 @@ pub const R5_TEMPORAL_MACRO_DEPRECATION_ALLOWED: bool = true;
 ///
 /// Scoped to the MACRO domain (owner override 2026-07-20): a capability the
 /// macro grammar provably cannot express cannot gate deleting the macros, so
-/// the function-valued and arbitrary-`~>` Model-ABI ambitions live in the
+/// general automatic fairness and arbitrary-`~>` Model-ABI ambitions live in the
 /// non-gating [`R5_MODEL_ABI_AMBITION_BLOCKERS`] tracker instead.
-/// `AppliedCleanPropositionBindingMissing` stays pending a separate owner
-/// decision — since the 2026-07-21 policy flip closed the two scalar
-/// migration prerequisites, it is the SOLE remaining retirement blocker.
+/// The v2 bound scalar/full certificate route kernel-checks exact
+/// applied-proposition identity and prevents cross-model evidence splicing.
+/// The v3 route additionally checks an authored constructive inhabitant at the
+/// exact canonical claim and anti-splice-binds both proof legs to one model.
+/// It still lacks exact transport from the separately replayed ty/S4 safety
+/// result (or a direct Clean reflection certificate carrying one strengthening
+/// `J` plus exact J-initiation, J-consecution, and J-to-safety judgments), so
+/// the retirement blocker remains.
 /// Literal-program refinement is separately graded in both the
 /// legacy and target surfaces, so it is not a macro-retirement prerequisite.
 /// Likewise, final-artifact authentication belongs to compiler/build evidence
@@ -185,15 +220,15 @@ pub const R5_TEMPORAL_RETIREMENT_BLOCKERS: &[R5TemporalParityBlocker] =
 
 /// Non-gating tracker for Model-ABI ambitions beyond the macro domain.
 ///
-/// These gaps are real (the broader `Model`/temporal ABI still lacks a
-/// function-valued replacement and arbitrary `F ~> G` discharge) but the
-/// compatibility macros provably cannot express either capability
+/// These gaps are real (automatic certification still lacks general indexed
+/// fairness and arbitrary `F ~> G` discharge) but the compatibility macros
+/// provably cannot express either capability
 /// (`macro_expressible: false`, empty surfaces, guard-test-pinned in
 /// `r5_scorecard`), so per the owner override of 2026-07-20 they gate
 /// NOTHING — not migration, not deprecation, not macro retirement.  They are
 /// recorded here only so the ambition remains tracked under a stable ID.
 pub const R5_MODEL_ABI_AMBITION_BLOCKERS: &[R5TemporalParityBlocker] = &[
-    R5TemporalParityBlocker::FunctionValuedModelReplacementMissing,
+    R5TemporalParityBlocker::CertifiedTemporalPropertyClassesIncomplete,
     R5TemporalParityBlocker::ArbitraryLeadsToDischargeMissing,
 ];
 
@@ -408,8 +443,9 @@ mod tests {
         assert!(report.macro_migration_blockers.is_empty());
         assert!(R5_TEMPORAL_MACRO_DEPRECATION_ALLOWED);
 
-        // Retirement (macro DELETION) stays honestly blocked on the applied
-        // Clean proposition binding — a separate, still-pending owner decision.
+        // Exact proposition identity and the generic strengthening theorem are
+        // live, but no exact reflection yet carries ty/S4's J and proof legs
+        // into that proposition.
         assert_eq!(report.macro_retirement_status, R5TemporalParityStatus::Blocked);
         assert!(!report.macro_retirement_allowed);
         assert_eq!(
@@ -428,6 +464,8 @@ mod tests {
         assert_eq!(value["macro_migration_blockers"], serde_json::json!([]));
         assert_eq!(value["macro_retirement_status"], "blocked");
         assert_eq!(value["macro_retirement_allowed"], false);
+        // Retain the established V2 wire ID while its documented meaning
+        // narrows to the missing ty-J-to-FiniteModel reflection.
         assert_eq!(
             value["macro_retirement_blockers"],
             serde_json::json!(["applied_clean_proposition_binding_missing"])
@@ -437,14 +475,14 @@ mod tests {
     }
 
     /// Pin the owner override of 2026-07-20: the Model-ABI ambition tracker is
-    /// exactly the two non-macro-expressible gaps, and its IDs appear in NO
+    /// exactly the two automatic-discharge gaps, and its IDs appear in NO
     /// gating constant and NO emitted report field.
     #[test]
     fn model_abi_ambition_tracker_gates_nothing() {
         assert_eq!(
             R5_MODEL_ABI_AMBITION_BLOCKERS,
             &[
-                R5TemporalParityBlocker::FunctionValuedModelReplacementMissing,
+                R5TemporalParityBlocker::CertifiedTemporalPropertyClassesIncomplete,
                 R5TemporalParityBlocker::ArbitraryLeadsToDischargeMissing,
             ],
         );
@@ -461,8 +499,8 @@ mod tests {
     fn aggregate_status_and_retirement_decisions_are_derived_consistently() {
         let report = r5_temporal_parity_report();
         assert!(report.macro_deprecation_allowed);
-        // Migration blockers emptied by the 2026-07-21 flip; retirement still
-        // carries the applied-proposition-binding blocker.
+        // Migration blockers were emptied by the 2026-07-21 flip; retirement
+        // still carries the missing proof-transport blocker.
         assert!(report.macro_migration_blockers.is_empty());
         assert!(!report.macro_retirement_blockers.is_empty());
         assert_eq!(report.macro_migration_status, status(&report.macro_migration_blockers));
@@ -585,7 +623,9 @@ mod tests {
         omitted_report.macro_retirement_blockers.clear();
         assert_eq!(
             omitted_report.validate(),
-            Err(R5TemporalParityReportValidationError::BlockerSetMismatch { gate: "retirement" })
+            Err(R5TemporalParityReportValidationError::RetirementOmitsMigrationBlocker {
+                blocker: R5TemporalParityBlocker::AppliedCleanPropositionBindingMissing,
+            })
         );
 
         // Keep the subset-validation error live even while the current

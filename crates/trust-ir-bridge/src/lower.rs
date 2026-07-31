@@ -21,10 +21,10 @@ use trust_ir::{
 };
 use trust_types::fx::{FxHashMap, FxHashSet, FxIndexMap};
 use trust_types::{
-    AggregateKind, AssertMessage,
-    BasicBlock as TrustBlock, BinOp, BlockId, CallableKind, ConstValue, ContractKind, FnSig,
-    Formula, LocalDecl,
-    Operand, Place, Projection, Rvalue, Sort, SourceSpan as TrustSourceSpan, Statement, Terminator,
+    AggregateKind, AssertMessage, BasicBlock as TrustBlock, BinOp, BlockId, CallableKind,
+    ConstValue, ContractKind, FnSig, Formula, LocalDecl, Operand, Place, Projection,
+    RustcTotalPrimitiveMethod, RustcWrappingRefutationCarrier, RustcWrappingRefutationMethod,
+    RustcWrappingRefutationOp, Rvalue, Sort, SourceSpan as TrustSourceSpan, Statement, Terminator,
     Ty, UnOp, VcKind, VerifiableFunction, VerificationCondition, infer_sort,
 };
 
@@ -11209,36 +11209,120 @@ fn is_panic_call(callee: &str) -> bool {
 // `resolve_call_target` would reject them. Recognize the family so the call site
 // lowers directly to a modular `BinOp` (tagged `Wrapping`) instead of an
 // unsupported-call error. Returns the equivalent trust-types `BinOp`.
+fn wrapping_operand_has_exact_destination_type(
+    operand: &Operand,
+    destination: &Ty,
+    ctx: &LoweringCtx<'_>,
+) -> Result<bool, BridgeError> {
+    let destination_width = destination.int_width();
+    Ok(match operand {
+        Operand::Copy(place) | Operand::Move(place) => place_type(place, ctx)? == *destination,
+        // Signed constants lose their source width during extraction, so the
+        // authenticated destination may restore it after an exact-fit check.
+        // The signed/unsigned variant itself is still proof-relevant: accepting
+        // an `Int` under an unsigned marker would let hand-edited IR change the
+        // source carrier while inheriting modular semantics.
+        Operand::Constant(ConstValue::Int(value)) => {
+            destination.is_signed() && int_constant_fits_trust_type(*value, destination)
+        }
+        // Unsigned constants retain their extracted width. Require both that
+        // width and their signedness spelling to agree with the destination;
+        // mere representability is not enough at this authority boundary.
+        Operand::Constant(ConstValue::Uint(value, encoded_width)) => {
+            !destination.is_signed()
+                && destination_width == Some(*encoded_width)
+                && uint_constant_fits_trust_type(*value, destination)
+        }
+        // Typed opaque/const-param operands keep an exact contextless type.
+        // Symbolic or future operands must do the same rather than borrowing
+        // the authenticated call's destination as a type annotation.
+        _ => operand_trust_type(operand, ctx)? == *destination,
+    })
+}
+
 fn core_int_arith_intrinsic(
     callee: &str,
     args: &[Operand],
     dest: &Place,
+    is_unsafe_sig: bool,
+    is_foreign: bool,
+    has_atomic_metadata: bool,
+    has_normal_return_target: bool,
     ctx: &LoweringCtx<'_>,
 ) -> Result<Option<BinOp>, BridgeError> {
-    let normalized = strip_generics(callee);
-    let method = normalized.rsplit("::").next().unwrap_or_default();
-    if !is_exact_primitive_num_method(&normalized, method) || args.len() != 2 {
+    // The marker authenticates the selected DefId, not arbitrary call-site
+    // metadata. Precise lowering is valid only for an ordinary safe Rust call
+    // that returns normally. In particular, never let hand-edited serialized
+    // call metadata combine the marker with foreign/unsafe/atomic/diverging
+    // behavior and inherit the summary.
+    if is_unsafe_sig || is_foreign || has_atomic_metadata || !has_normal_return_target {
         return Ok(None);
     }
-    let lhs_ty = operand_trust_type(&args[0], ctx)?;
-    let rhs_ty = operand_trust_type(&args[1], ctx)?;
-    let dest_ty = place_type(dest, ctx)?;
-    if !matches!(lhs_ty, Ty::Int { .. }) || rhs_ty != lhs_ty || dest_ty != lhs_ty {
+    if args.len() != 2 {
         return Ok(None);
     }
-    // wrapping_{add,sub,mul} map exactly to a modular BinOp (tagged `Wrapping`).
-    // checked_/overflowing_/saturating_ need Inst::Overflow (consumer support
-    // pending) and are intentionally NOT matched here.
-    let op = if method == "wrapping_add" {
-        Some(BinOp::Add)
-    } else if method == "wrapping_sub" {
-        Some(BinOp::Sub)
-    } else if method == "wrapping_mul" {
-        Some(BinOp::Mul)
-    } else {
-        None
+
+    let total_method = RustcTotalPrimitiveMethod::classify(callee);
+    let refutation_method = total_method
+        .is_none()
+        .then(|| RustcWrappingRefutationMethod::classify(callee))
+        .flatten();
+    let op = match (total_method, refutation_method) {
+        (Some(RustcTotalPrimitiveMethod::WrappingAdd(_)), _) => BinOp::Add,
+        (Some(RustcTotalPrimitiveMethod::WrappingSub(_)), _) => BinOp::Sub,
+        (Some(RustcTotalPrimitiveMethod::WrappingMul(_)), _) => BinOp::Mul,
+        (None, Some(method)) => match method.op {
+            RustcWrappingRefutationOp::Add => BinOp::Add,
+            RustcWrappingRefutationOp::Sub => BinOp::Sub,
+        },
+        (None, None) => return Ok(None),
     };
-    Ok(op)
+    let carrier_matches = |ty: &Ty| {
+        if let Some(method) = total_method {
+            return *ty == Ty::Int { width: method.width(), signed: false };
+        }
+        match (refutation_method.map(|method| method.carrier), ty) {
+            (
+                Some(RustcWrappingRefutationCarrier::Fixed { width, signed }),
+                Ty::Int { width: actual_width, signed: actual_signed },
+            ) => width == *actual_width && signed == *actual_signed,
+            (
+                Some(RustcWrappingRefutationCarrier::PointerSized { signed }),
+                Ty::PtrSizedInt { signed: actual_signed },
+            ) => signed == *actual_signed,
+            // The compatibility extractor still spells usize/isize as fixed-
+            // width integers on Trust's pinned 64-bit target. The marker
+            // retains the identity lost by that legacy representation.
+            (
+                Some(RustcWrappingRefutationCarrier::PointerSized { signed }),
+                Ty::Int { width: 64, signed: actual_signed },
+            ) => signed == *actual_signed,
+            _ => false,
+        }
+    };
+
+    let dest_ty = place_type(dest, ctx)?;
+    if !carrier_matches(&dest_ty)
+        || !wrapping_operand_has_exact_destination_type(&args[0], &dest_ty, ctx)?
+        || !wrapping_operand_has_exact_destination_type(&args[1], &dest_ty, ctx)?
+    {
+        return Ok(None);
+    }
+    // Width-less MIR integer literals inherit the authenticated destination
+    // carrier only when exactly representable. Without this contextual typing,
+    // `i32::wrapping_add(x, 1)` sees the literal as the bridge's fallback i64
+    // and spuriously misses the precise model. A non-fitting literal retains
+    // its contextless type and fails the equality checks below.
+    let lhs_ty = operand_trust_type_with_context(&args[0], Some(&dest_ty), ctx)?;
+    let rhs_ty = operand_trust_type_with_context(&args[1], Some(&dest_ty), ctx)?;
+    if lhs_ty != rhs_ty
+        || lhs_ty != dest_ty
+        || !carrier_matches(&lhs_ty)
+        || !carrier_matches(&rhs_ty)
+    {
+        return Ok(None);
+    }
+    Ok(Some(op))
 }
 
 fn is_exact_primitive_num_method(normalized: &str, method: &str) -> bool {
@@ -13402,18 +13486,6 @@ fn is_primitive_int_total_arith_absent_callee(
             | "overflowing_add"
             | "overflowing_sub"
             | "overflowing_mul"
-            // `wrapping_{add,sub,mul}` are ALSO total (defined modular
-            // semantics, no panic path). Where the precise
-            // `core_int_arith_intrinsic` BinOp model fires, the call never
-            // reaches the absent-callee arm and keeps its exact semantics;
-            // this fallback covers the call SHAPES that model misses (the
-            // measured casualty: `*x = x.wrapping_add(1)` through a slice
-            // iterator's `&mut` yield). Result stays opaque — sound, any
-            // dependent obligation fails closed.
-            | "wrapping_add"
-            | "wrapping_sub"
-            | "wrapping_mul"
-            | "wrapping_neg"
     ) {
         return Ok(false);
     }
@@ -21693,8 +21765,8 @@ fn lower_terminator(
             body.push(InstrNode::new(Inst::Br { target, args }));
         }
         Terminator::Call {
-            is_foreign: _,
-            is_unsafe_sig: _,
+            is_foreign,
+            is_unsafe_sig,
             func: callee,
             args,
             dest,
@@ -21752,18 +21824,31 @@ fn lower_terminator(
             // it a zero-obligation fast path would turn forgeable metadata into
             // proof authority, so quarantine every such call until compiler-held
             // DefId plus validated ordering evidence reaches this bridge.
+            let core_int_arith = core_int_arith_intrinsic(
+                callee,
+                args,
+                dest,
+                *is_unsafe_sig,
+                *is_foreign,
+                atomic.is_some(),
+                target.is_some(),
+                ctx,
+            )?;
             if atomic.is_some() {
                 return Err(BridgeError::UnsupportedOp(format!(
                     "atomic call `{callee}` lacks compiler-authenticated operation and ordering evidence"
                 )));
-            } else if let Some(bin_op) = core_int_arith_intrinsic(callee, args, dest, ctx)? {
+            } else if let Some(bin_op) = core_int_arith {
                 // Trust Gap 3: lower core integer wrapping arithmetic to a modular
                 // `BinOp` tagged `Wrapping`, so the verifier skips the no-overflow
                 // obligation (wrap-around is defined, not UB). The (bodyless-to-us)
                 // core fn is otherwise rejected by `resolve_call_target`.
-                let lhs = ctx.resolve_operand(&args[0], body)?;
-                let rhs = ctx.resolve_operand(&args[1], body)?;
                 let dest_ty = place_type(dest, ctx)?;
+                // Pair the classifier's fit-checked contextual literal typing
+                // with width-faithful emission. `resolve_operand` alone would
+                // re-expand a width-less i32 literal to the i64 fallback.
+                let lhs = ctx.resolve_operand_as_trust_type(&args[0], &dest_ty, body)?;
+                let rhs = ctx.resolve_operand_as_trust_type(&args[1], &dest_ty, body)?;
                 let signed = dest_ty.is_signed();
                 let result = ctx.fresh_value();
                 match map_binop(bin_op, signed)? {
@@ -24492,6 +24577,7 @@ mod aggregate_projection_tests {
                         name: "UnionLike".into(),
                         variant: 0,
                         active_field: Some(1),
+                        args: None,
                     },
                     vec![Operand::Constant(ConstValue::Int(7))],
                 ),
@@ -24742,7 +24828,12 @@ mod aggregate_projection_tests {
             vec![Statement::Assign {
                 place: Place::local(1),
                 rvalue: Rvalue::Aggregate(
-                    AggregateKind::Adt { name: "OptionI32".into(), variant: 0, active_field: None },
+                    AggregateKind::Adt {
+                        name: "OptionI32".into(),
+                        variant: 0,
+                        active_field: None,
+                        args: None,
+                    },
                     vec![],
                 ),
                 span: SourceSpan::default(),
@@ -25836,7 +25927,12 @@ mod step_by_full_native_tests {
         next_on_cycle: bool,
     ) -> Vec<TrustBlock> {
         let range_rv = Rvalue::Aggregate(
-            AggregateKind::Adt { name: range_name.into(), variant: 0, active_field: None },
+            AggregateKind::Adt {
+                name: range_name.into(),
+                variant: 0,
+                active_field: None,
+                args: None,
+            },
             vec![int_const(lo), int_const(hi)],
         );
         // bb0: build range, into_iter, step_by.
@@ -26040,7 +26136,12 @@ mod step_by_full_native_tests {
         // A symbolic `end` (a Copy of a runtime local, not a constant) => the trace finds
         // the Range but `acc_operand_const_int` on the end operand is None.
         let range_rv = Rvalue::Aggregate(
-            AggregateKind::Adt { name: "core::ops::Range".into(), variant: 0, active_field: None },
+            AggregateKind::Adt {
+                name: "core::ops::Range".into(),
+                variant: 0,
+                active_field: None,
+                args: None,
+            },
             vec![int_const(0), Operand::Copy(Place::local(9))],
         );
         let mut blocks = step_by_blocks("core::ops::Range", 0, 8, usize_const(2), true);
@@ -26223,6 +26324,7 @@ mod step_by_full_native_tests {
                             name: "core::ops::Range".into(),
                             variant: 0,
                             active_field: None,
+                            args: None,
                         },
                         vec![int_const(0), int_const(8)],
                     ),

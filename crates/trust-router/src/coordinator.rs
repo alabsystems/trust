@@ -2636,7 +2636,27 @@ where
 #[cfg(unix)]
 pub fn daemon_matches_executable(sock: &Path, executable: &Path) -> bool {
     daemon_identity_for_executable(executable)
-        .is_ok_and(|expected| compatible_daemon_at(sock, &expected))
+        .is_ok_and(|expected| daemon_matches_bound_identity(sock, executable, &expected))
+}
+
+/// Return whether `sock` is a healthy daemon bound to an explicitly supplied
+/// build identity and the exact bytes at `executable`.
+///
+/// This is the cross-version companion to [`daemon_matches_executable`].
+/// Release/self-verification code may inspect a candidate toolchain whose
+/// release and commit intentionally differ from the client library doing the
+/// inspection. The caller-supplied identity is accepted only after its closed
+/// schema validates and its executable digest is independently recomputed.
+#[must_use]
+#[cfg(unix)]
+pub fn daemon_matches_bound_identity(
+    sock: &Path,
+    executable: &Path,
+    expected: &DaemonIdentity,
+) -> bool {
+    expected.has_valid_invariants()
+        && executable_sha256(executable).is_ok_and(|digest| digest == expected.executable_sha256)
+        && compatible_daemon_at(sock, expected)
 }
 
 /// Best-effort: ensure a compatible daemon is listening on `sock`. Readiness
@@ -2728,6 +2748,26 @@ pub fn exercise_daemon_at(
     expected_executable: &Path,
     label: &str,
 ) -> Result<DaemonSmoke, String> {
+    let expected = daemon_identity_for_executable(expected_executable)
+        .map_err(|error| format!("could not bind expected daemon executable: {error}"))?;
+    exercise_daemon_at_with_identity(sock, expected_executable, &expected, label)
+}
+
+/// Exercise the complete release-diagnostic protocol for an explicitly bound
+/// candidate identity.
+///
+/// Unlike [`exercise_daemon_at`], this entry point does not assume the daemon
+/// was built from the same release/commit as the client library. It still
+/// hashes `expected_executable` itself before the first and final identity
+/// checks, so an asserted digest or cross-version label cannot replace byte
+/// identity.
+#[cfg(unix)]
+pub fn exercise_daemon_at_with_identity(
+    sock: &Path,
+    expected_executable: &Path,
+    expected: &DaemonIdentity,
+    label: &str,
+) -> Result<DaemonSmoke, String> {
     const SMOKE_BYTES: u64 = 1;
 
     if label.is_empty() || label.len() > MAX_LABEL_BYTES || label.contains(['\n', '\r']) {
@@ -2736,7 +2776,7 @@ pub fn exercise_daemon_at(
                 .to_string(),
         );
     }
-    if !daemon_matches_executable(sock, expected_executable) {
+    if !daemon_matches_bound_identity(sock, expected_executable, expected) {
         return Err("daemon endpoint does not match the exact expected executable".to_string());
     }
     if !ping_at(sock) {
@@ -2780,7 +2820,7 @@ pub fn exercise_daemon_at(
     if !daemon_smoke_transition_is_valid(&before, &reserved, Some(&released), pid, token, label) {
         return Err("daemon released STATUS violated the smoke transition invariants".to_string());
     }
-    if !daemon_matches_executable(sock, expected_executable) {
+    if !daemon_matches_bound_identity(sock, expected_executable, expected) {
         return Err("daemon identity changed during the smoke exchange".to_string());
     }
 
@@ -3526,6 +3566,43 @@ mod tests {
             "STATUS v1 compatibility cannot override a mismatched executable hash"
         );
         server.join().expect("wrong identity server joined");
+    }
+
+    #[test]
+    fn explicit_cross_version_identity_still_binds_exact_executable_bytes() {
+        let fixture = TestSocket::new("explicit-cross-version-identity");
+        let executable = fixture.path.parent().expect("fixture parent").join("trustd");
+        std::fs::write(&executable, b"cross-version packaged trustd").expect("write executable");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("make executable private");
+        let identity = DaemonIdentity {
+            version: IDENTITY_VERSION.to_string(),
+            protocol: STATUS_VERSION.to_string(),
+            release: "9.99.0-candidate".to_string(),
+            commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            executable_sha256: executable_sha256(&executable).expect("hash executable"),
+        };
+        let listener = UnixListener::bind(&fixture.path).expect("bind cross-version daemon");
+        make_socket_private(&fixture.path);
+        let daemon = Daemon::with_budget_and_identity(1, identity.clone());
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept cross-version client");
+            daemon.serve_conn(stream);
+        });
+
+        let mut asserted = identity.clone();
+        asserted.executable_sha256 = "0".repeat(64);
+        assert!(
+            !daemon_matches_bound_identity(&fixture.path, &executable, &asserted),
+            "an asserted cross-version digest must not replace independent byte hashing"
+        );
+        assert!(
+            daemon_matches_bound_identity(&fixture.path, &executable, &identity),
+            "an explicitly supplied candidate identity should permit a cross-version probe"
+        );
+        server.join().expect("cross-version server joined");
+
+        std::fs::remove_file(executable).expect("remove executable fixture");
     }
 
     #[test]

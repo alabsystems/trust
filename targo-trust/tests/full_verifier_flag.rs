@@ -9,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+#[path = "support/fake_trustd.rs"]
+mod fake_trustd;
 #[path = "support/publication_transport.rs"]
 mod publication_transport;
 
@@ -96,7 +98,10 @@ fn default_targo_check_uses_batteries_on_strict_policy() {
         !capture_has_z_flag(&capture, "trust-policy=advisory"),
         "the default lane is strict, never advisory: {capture:?}"
     );
-    assert!(capture_has_z_flag(&capture, "trust-verify-hardened"));
+    assert!(
+        !capture_has_z_flag(&capture, "trust-verify-hardened"),
+        "the selected profile is the sole hardened-policy carrier: {capture:?}"
+    );
     assert!(capture_has_z_flag(&capture, "trust-verify-profile=unix_hardened"));
     assert!(!capture_has_z_flag(&capture, "trust-compiler-cache=no"));
     assert!(capture_has_z_flag(&capture, "trust-verify-timeout-ms=5000"));
@@ -249,6 +254,7 @@ fn exact_report_unsafe_memory_writes_domination_wrapper() {
     let targo_trust = install_targo_trust_binary(&bin_dir);
     write_executable(&bin_dir.join("trustc"), fake_trustc_script());
     write_executable(&bin_dir.join("targo"), fake_targo_script());
+    let _trustd = fake_trustd::install(&bin_dir);
 
     let output = Command::new(targo_trust)
         .args(["report", "--unsafe-memory"])
@@ -344,7 +350,7 @@ fn public_modes_override_ambient_memory_safe_and_survey_policy() {
     assert_eq!(default_capture.trust_verify_survey, "");
     assert_eq!(default_capture.trust_verify_memory_safe, "");
     assert!(
-        !capture_has_z_flag(&default_capture, "trust-verify-memory-safe"),
+        !capture_has_z_flag(&default_capture, "trust-policy=memory-safe"),
         "default/explicit full verification must not carry the advisory memory-safe policy: {default_capture:?}"
     );
 
@@ -356,7 +362,7 @@ fn public_modes_override_ambient_memory_safe_and_survey_policy() {
     assert_eq!(strict_status, Some(0));
     assert_eq!(strict_capture.trust_verify_memory_safe, "");
     assert_eq!(strict_capture.trust_verify_survey, "");
-    assert!(!capture_has_z_flag(&strict_capture, "trust-verify-memory-safe"));
+    assert!(!capture_has_z_flag(&strict_capture, "trust-policy=memory-safe"));
 
     let (advisory_capture, _, _, advisory_status) =
         run_targo_trust_check_with_fake_toolchain_args_env(
@@ -367,7 +373,7 @@ fn public_modes_override_ambient_memory_safe_and_survey_policy() {
     assert_eq!(advisory_status, Some(0));
     assert_eq!(advisory_capture.trust_verify_memory_safe, "");
     assert!(
-        capture_has_z_flag(&advisory_capture, "trust-verify-memory-safe"),
+        capture_has_z_flag(&advisory_capture, "trust-policy=memory-safe"),
         "the advisory memory-safe policy must be a tracked compiler flag: {advisory_capture:?}"
     );
 
@@ -379,7 +385,7 @@ fn public_modes_override_ambient_memory_safe_and_survey_policy() {
     assert_eq!(survey_capture.trust_verify_survey, "");
     assert!(capture_has_z_flag(&survey_capture, "trust-policy=advisory"));
     assert_eq!(survey_capture.trust_verify_memory_safe, "");
-    assert!(!capture_has_z_flag(&survey_capture, "trust-verify-memory-safe"));
+    assert!(!capture_has_z_flag(&survey_capture, "trust-policy=memory-safe"));
 }
 
 #[test]
@@ -543,7 +549,7 @@ fn default_targo_check_fails_closed_on_recorded_assumptions() {
         Some(0),
         "the narrow memory-safe lane must permit its authenticated safe-code assumption as a conditional success\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    assert!(capture_has_z_flag(&capture, "trust-verify-memory-safe"));
+    assert!(capture_has_z_flag(&capture, "trust-policy=memory-safe"));
     assert!(!capture_has_z_flag(&capture, "trust-policy=advisory"));
     assert_eq!(capture_codegen_option_values(&capture, "overflow-checks"), ["yes"]);
     assert_eq!(capture_codegen_option_values(&capture, "debug-assertions"), ["yes"]);
@@ -627,6 +633,7 @@ fn default_native_rejects_text_only_proved_when_json_transport_capability_is_mis
     let targo_trust = install_targo_trust_binary(&bin_dir);
     write_executable(&bin_dir.join("trustc"), fake_trustc_script());
     write_executable(&bin_dir.join("targo"), fake_targo_script());
+    let _trustd = fake_trustd::install(&bin_dir);
 
     let output = Command::new(targo_trust)
         .arg("check")
@@ -826,7 +833,10 @@ fn trust_profile_sets_tracked_hardened_options() {
 
     assert_eq!(capture.trust_hardened, "");
     assert_eq!(capture.trust_profile, "");
-    assert!(capture_has_z_flag(&capture, "trust-verify-hardened"));
+    assert!(
+        !capture_has_z_flag(&capture, "trust-verify-hardened"),
+        "the selected profile is the sole hardened-policy carrier: {capture:?}"
+    );
     assert!(capture_has_z_flag(&capture, "trust-verify-profile=coreutils_hardened"));
 }
 
@@ -864,6 +874,7 @@ fn crate_mode_ignores_inherited_cargo_env() {
     let targo_trust = install_targo_trust_binary(&bin_dir);
     write_executable(&bin_dir.join("trustc"), fake_trustc_script());
     write_executable(&bin_dir.join("targo"), fake_targo_script());
+    let _trustd = fake_trustd::install(&bin_dir);
 
     let cargo = bin_dir.join("cargo");
     let capture_path = tmp_dir.join("capture.txt");
@@ -1017,6 +1028,7 @@ fn run_targo_trust_check_with_fake_toolchain_maybe_capture(
     // stays on canonical trustc even when an alias is present.
     write_executable(&bin_dir.join("rustc"), fake_trustc_script());
     write_executable(&bin_dir.join("ay"), "#!/bin/sh\nprintf 'ay 0.0.0\\n'\n");
+    let _trustd = fake_trustd::install(&bin_dir);
 
     let mut command = Command::new(targo_trust);
     command
@@ -1091,6 +1103,7 @@ fn run_targo_trust_check_with_policy(
     let targo_trust = install_targo_trust_binary(&bin_dir);
     write_executable(&bin_dir.join("trustc"), fake_trustc_script());
     write_executable(&bin_dir.join("targo"), fake_targo_script());
+    let _trustd = fake_trustd::install(&bin_dir);
 
     let output = Command::new(targo_trust)
         .arg("check")
@@ -1268,7 +1281,7 @@ else
 fi
 if [ "$outcome" = "assumption" ] && [ "${TRUST_FAKE_TARGO_UNMARKED_ASSUMPTION:-0}" != "1" ]; then
   case "$RUSTFLAGS$CARGO_ENCODED_RUSTFLAGS" in
-    *trust-verify-memory-safe*)
+    *trust-policy=memory-safe*)
       solver=trust-memory-safe
       kind=assumption:memory-safe-panic
       ;;

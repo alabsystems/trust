@@ -52,10 +52,11 @@ pub(crate) enum Subcommand {
     /// Build: verify and produce a binary.
     Build,
     /// Test: verify, compile, and execute Cargo-selected test executables with
-    /// kernel-certified monitors installed. Evidence-grade execution currently
-    /// requires Linux x86-64/aarch64's sealed handle-bound launch and fails
-    /// closed elsewhere. Only clauses reached by those test processes are
-    /// checked at runtime; this is not monitor-coverage proof.
+    /// kernel-certified monitors installed. Evidence-grade execution uses
+    /// sealed handle-bound launch on Linux or suspended-process/CDHash
+    /// authentication on macOS, on x86-64/aarch64, and fails closed elsewhere.
+    /// Only clauses reached by those test processes are checked at runtime;
+    /// this is not monitor-coverage proof.
     Test,
     /// Report: generate a verification report in the requested format.
     Report,

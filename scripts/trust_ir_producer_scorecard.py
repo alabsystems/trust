@@ -158,7 +158,13 @@ RUSTC_LOG_FILTER = (
     "rustc_mir_build::builder::block=off,"
     "rustc_mir_build::builder::custom=off,"
     "rustc_mir_build::builder::cfg=off,"
-    "rustc_mir_build::builder=debug"
+    "rustc_mir_build::builder=debug,"
+    # Trust (#181): the producer's self-validation tripwire lives in the trust-thir-lower CRATE,
+    # not in the rustc hook, so it needs its own filter entry. Without this the summary event
+    # never appears and every module reports UNMEASURED — which is what the first run did, and
+    # is exactly why the parser distinguishes "no summary event" from "total=0". A filter that
+    # silently omits an instrument is the same failure as a gate that cannot fail.
+    "trust_thir_lower::crate_module=debug"
 )
 
 UNSUP_RE = re.compile(
@@ -183,6 +189,37 @@ COLLECT_RE = re.compile(
     r"n=(?P<n>\d+), class=\"(?P<cls>primary|cascade)\"\s*$",
     re.MULTILINE,
 )
+# Trust (measurement honesty): the per-body CLASS event. `symbolic=true` marks a body whose
+# module carries a value-less opaque carrier (symbolic assoc const / const-generic param global,
+# or the opaque `Ty::Unit` spelling of a bare generic param). Such a body can be tag-free —
+# "lowered clean" — while being excluded from BOTH the interpretation differential and the
+# executable splice. Reported separately so the clean-rate never silently conflates a modelled
+# body with a placeholder one.
+#   trust-ir-lower: body class, def=DefId(0:N ~ path), symbolic=<bool>, clean=<bool>
+CLASS_RE = re.compile(
+    r"trust-ir-lower: body class, "
+    r"def=DefId\([^~]*~\s*(?P<path>.+?)\), symbolic=(?P<symbolic>true|false), "
+    r"opaque=(?P<opaque>true|false), clean=(?P<clean>true|false)\s*$",
+    re.MULTILINE,
+)
+# Trust (#181): the producer's SELF-VALIDATION tripwire. `validate_module` runs on the assembled
+# crate module and emits one event per error CLASS plus a total. This is the ONLY instrument that
+# answers "is the emitted module well-formed?" — the coverage ratchet answers "did the body lower
+# without a fail-closed tag", a different question, and the gap between them hid ~31% of modules
+# being REJECTED across four classes, two of them real defects.
+#   trust-ir-lower: module validation error, class="<Variant>", n=<count>
+#   trust-ir-lower: module validation summary, total=<count>
+VALERR_RE = re.compile(
+    # Accepts BOTH the quoted form (a `&str` field) and the bare form (a `Display`-formatted
+    # `String` field, `class = %class`). The emitter switched from the former to the latter when
+    # the hand-written class allowlist was removed, and this regex silently stopped matching —
+    # the per-class histogram went empty while the TOTAL kept reporting, which is the only reason
+    # it was visible at all. Tolerate both spellings so the parser cannot be desynced again by a
+    # field-formatting change.
+    r"trust-ir-lower: module validation error, class=\"?(?P<class>[A-Za-z_][A-Za-z0-9_]*)\"?, "
+    r"n=(?P<n>\d+)"
+)
+VALSUM_RE = re.compile(r"trust-ir-lower: module validation summary, total=(?P<total>\d+)")
 DIFF_RE = re.compile(
     r"trust-ir-lower: differential, "
     r"def=DefId\([^~]*~\s*(?P<path>.+?)\), equal=(?P<equal>true|false), "
@@ -284,6 +321,23 @@ def body_kind(def_path: str) -> str:
     return "named"  # fn / method / const-item body (indistinguishable in the log)
 
 
+def parse_validation(stderr: str):
+    """Trust (#181): the module-validation tripwire's per-class counts for one file.
+
+    Returns `{"total": int, "classes": {name: count}}`, or None when the summary event is
+    ABSENT — which means the binary predates the tripwire, NOT that the module was clean. That
+    distinction is the whole point: a missing instrument and a passing one must never read the
+    same, which is the failure mode a silent sweep produced twice before this existed.
+    """
+    m = VALSUM_RE.search(stderr)
+    if not m:
+        return None
+    classes = {}
+    for e in VALERR_RE.finditer(stderr):
+        classes[e.group("class")] = classes.get(e.group("class"), 0) + int(e.group("n"))
+    return {"total": int(m.group("total")), "classes": classes}
+
+
 def parse_bodies(stderr: str):
     """Parse per-body events. Returns (bodies, anomalies)."""
     unsup = {}
@@ -296,6 +350,11 @@ def parse_bodies(stderr: str):
     reasons = collections.defaultdict(list)
     for m in SHAPE_RE.finditer(stderr):
         reasons[m.group("path")].append(m.group("what"))
+    symbolic = {}
+    opaque = {}
+    for m in CLASS_RE.finditer(stderr):
+        symbolic[m.group("path")] = m.group("symbolic") == "true"
+        opaque[m.group("path")] = m.group("opaque") == "true"
     collect_primary = collections.defaultdict(list)
     collect_cascade = collections.defaultdict(list)
     for m in COLLECT_RE.finditer(stderr):
@@ -324,6 +383,10 @@ def parse_bodies(stderr: str):
             "equal": m.group("equal") == "true",
             "samples": int(m.group("samples")),
             "mode": mode,
+            # Absent (older log, or a lane that skipped the class event) is reported as
+            # None, NOT as False — "not measured" must stay distinguishable from "modelled".
+            "symbolic": symbolic.get(p),
+            "opaque_collapse": opaque.get(p),
             "note_class": classify_note(mode, note),
             "note": note[:160],
             "collect_primary": collect_primary.get(p, []),
@@ -373,7 +436,17 @@ def measure_file(trustc: str, src: str, edition: str, timeout: int, scratch: str
     code, stderr = run_one(trustc, src, edition, timeout, True, scratch)
     if code == 0:
         bodies, anomalies = parse_bodies(stderr)
-        return {"file": src, "outcome": "ok", "bodies": bodies, "anomalies": anomalies}
+        return {
+            "file": src,
+            "outcome": "ok",
+            "bodies": bodies,
+            "anomalies": anomalies,
+            # Trust (#181): per-class counts from the producer's self-validation tripwire, and
+            # the total. `None` (absent summary) means NOT MEASURED — a pre-tripwire binary —
+            # and must stay distinguishable from a measured zero, exactly as the body-class
+            # `symbolic` field does.
+            "validation": parse_validation(stderr),
+        }
     if code is None:
         return {"file": src, "outcome": "timeout", "bodies": []}
     ice = code == 101 or "internal compiler error" in stderr
@@ -467,6 +540,26 @@ def aggregate(results):
             "total": len(bs),
             "lowered_clean": len(clean),
             "lowered_clean_pct": round(100.0 * len(clean) / len(bs), 1) if bs else None,
+            # Trust (measurement honesty): split the clean population. A SYMBOLIC clean body
+            # lowered without a fail-closed tag but carries an opaque, value-less placeholder,
+            # so it is excluded from the interpretation differential AND from the executable
+            # splice — it can never be `Agreed` and can never run. Converting a tag into an
+            # opaque spelling therefore moves a body between these two lines without closing
+            # a gap; reporting only the sum would make that read as progress.
+            # Trust (#173): three-way, most-dishonest-wins. A body can be BOTH symbolic and
+            # opaque-collapsed; it is counted once, under symbolic, so the three lines sum to
+            # `lowered_clean`. MODELLED is now the residual: tag-free AND no opaque carrier AND
+            # no collapsed live value.
+            "lowered_clean_symbolic": sum(1 for b in clean if b.get("symbolic") is True),
+            "lowered_clean_opaque": sum(
+                1 for b in clean
+                if b.get("symbolic") is False and b.get("opaque_collapse") is True
+            ),
+            "lowered_clean_modelled": sum(
+                1 for b in clean
+                if b.get("symbolic") is False and b.get("opaque_collapse") is False
+            ),
+            "lowered_clean_class_unmeasured": sum(1 for b in clean if b.get("symbolic") is None),
             "by_kind": dict(collections.Counter(b["kind"] for b in bs)),
             "clean_by_kind": dict(collections.Counter(b["kind"] for b in clean)),
             "note_class_histogram": dict(collections.Counter(b["note_class"] for b in bs)),
@@ -476,6 +569,44 @@ def aggregate(results):
             "divergence_note_histogram": dict(collections.Counter(
                 b["note"] for b in bs if b["mode"] == "MirOracle")),
         }
+
+    # Trust (#181): MODULE-level validation, from the producer's self-validation tripwire. This is
+
+    # a different denominator from every body-level number above — a MODULE is one compiled file,
+
+    # a body is one fn. Never mix them: "31% of modules fail" and "132 error occurrences" describe
+
+    # different things, and conflating them mis-scoped this work once already.
+
+    # `measured` counts files whose binary actually emitted the tripwire; a file with no summary
+
+    # event is NOT counted as passing.
+
+    _val = [r.get("validation") for r in results if r.get("outcome") == "ok"]
+
+    _val_measured = [v for v in _val if v is not None]
+
+    validation = {
+
+        "modules_measured": len(_val_measured),
+
+        "modules_unmeasured": sum(1 for v in _val if v is None),
+
+        "modules_invalid": sum(1 for v in _val_measured if v["total"] > 0),
+
+        "error_occurrences": sum(v["total"] for v in _val_measured),
+
+    }
+
+    _cls = collections.Counter()
+
+    for v in _val_measured:
+
+        for k, c in v["classes"].items():
+
+            _cls[k] += c
+
+    validation["class_histogram"] = dict(_cls.most_common())
 
     ices = collections.Counter(
         r.get("ice_signature", "") for r in results
@@ -492,6 +623,11 @@ def aggregate(results):
                 a["unsupported_event_without_differential_event"])
     return {
         "file_outcomes": dict(files),
+        # Trust (#181): MODULE-level well-formedness, from the producer's self-validation
+        # tripwire. Sibling of, never merged into, the body-level stats below — a MODULE is one
+        # compiled file, a BODY is one fn, and reporting an occurrence count against a module
+        # denominator mis-scoped this work once already.
+        "validation": validation,
         "bodies": body_stats(bodies),
         "partial_bodies_from_flag_induced_failures": body_stats(partial),
         "bodies_including_partial": {
@@ -544,6 +680,26 @@ def render_markdown(data):
         out.append(f"- bodies reached (in files that fully compiled under the flag): **{b['total']}**")
         out.append(f"- lowered clean (0 unsupported shapes): **{b['lowered_clean']}"
                    f" ({b['lowered_clean_pct']}%)**")
+        if b.get("lowered_clean_symbolic") is not None:
+            unm = b.get("lowered_clean_class_unmeasured", 0)
+            unm_s = f", class-unmeasured {unm}" if unm else ""
+            out.append(
+                f"  - of which MODELLED {b['lowered_clean_modelled']}"
+                f" · SYMBOLIC (value-less opaque carrier — excluded from the differential and"
+                f" the splice, can never be Agreed) {b['lowered_clean_symbolic']}"
+                f" · OPAQUE-COLLAPSE (a live value typed as a placeholder; the differential"
+                f" refuses to sample it) {b.get('lowered_clean_opaque', 0)}{unm_s}"
+            )
+        v = agg.get("validation")
+        if v and (v["modules_measured"] or v["modules_unmeasured"]):
+            unm = f", {v['modules_unmeasured']} UNMEASURED" if v["modules_unmeasured"] else ""
+            out.append(
+                f"- module well-formedness (`validate_module` on the assembled module):"
+                f" **{v['modules_invalid']} of {v['modules_measured']} INVALID**"
+                f" ({v['error_occurrences']} error occurrences){unm}"
+            )
+            if v["class_histogram"]:
+                out.append(f"  - by class: {v['class_histogram']}")
         out.append(f"- by kind: {b['by_kind']} (clean: {b['clean_by_kind']})")
         out.append(f"- note-class histogram: {b['note_class_histogram']}")
         tags = list(b["reason_tag_histogram"].items())

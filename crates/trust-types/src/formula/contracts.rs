@@ -175,6 +175,44 @@ impl ContractMetadata {
     }
 }
 
+/// Provenance of the single-writer invariant the mmap temporal model rests on.
+///
+/// SOUNDNESS: this exists so the unsound case is *unrepresentable*. Removing the
+/// `Truncate` environment action from the model is equivalent to asserting the
+/// hazard away, so only evidence that was actually CHECKED may do it. A bare
+/// `bool` could not tell a caller's promise apart from a discharged obligation,
+/// and the promise silently won — `#[trust::single_writer]` is set by an
+/// attribute-presence test with no verification, and it used to reduce the model
+/// to two states with no bad state at all, which a complete exploration then
+/// graded `AssuranceLevel::Sound`. That is an unverified assertion laundered into
+/// a proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SingleWriterEvidence {
+    /// No single-writer invariant is claimed. The hazard is modeled.
+    None,
+    /// DECLARED by `#[trust::single_writer]` — an unverified caller assertion,
+    /// exactly the promise `MmapMut::map_mut`'s `unsafe` contract asks of the
+    /// caller. It is a real obligation *on the caller*, not a discharged one, so
+    /// it must NOT remove the hazard: the model keeps `Truncate` and `ty`
+    /// fail-closes. Over-rejection is the correct direction here.
+    Declared,
+    /// VERIFIED — the single-writer invariant was discharged by a checked proof
+    /// rather than asserted. Only this may disable `Truncate`.
+    ///
+    /// Nothing constructs this yet. It is the seam a future single-writer proof
+    /// plugs into; until such a proof exists, the mmap lane fail-closes, and that
+    /// is intended.
+    Verified,
+}
+
+impl SingleWriterEvidence {
+    /// True only when the invariant was CHECKED. A declaration is not a proof.
+    #[must_use]
+    pub fn discharges_truncate(self) -> bool {
+        matches!(self, Self::Verified)
+    }
+}
+
 impl StateMachineMetadata {
     /// The SOUND temporal model of the mmap captured-length hazard, checked with
     /// the CTL property `AG !bad` (no reachable access-while-stale state).
@@ -183,20 +221,22 @@ impl StateMachineMetadata {
     /// backing file. CRITICAL SOUNDNESS POINT: re-validation does NOT remove the
     /// hazard (a TOCTOU lets `Truncate` fire between the live-size re-read and the
     /// access), so the model enables `Truncate` from the mapped state whenever the
-    /// file is concurrently truncatable. Only a SINGLE-WRITER invariant —
-    /// `single_writer == true`, exactly what `MmapMut::map_mut`'s `unsafe` contract
-    /// promises — disables `Truncate`, making the bad state unreachable so `ty`
-    /// PROVES safety. Without it the stale access is reachable and `ty` CATCHES it
-    /// with the `Mapped → truncate → stale_access` trace.
+    /// file is concurrently truncatable, and `ty` CATCHES the stale access with
+    /// the `Mapped → truncate → stale_access` trace.
+    ///
+    /// Only a **verified** single-writer invariant disables `Truncate`. A
+    /// `#[trust::single_writer]` declaration does not: see
+    /// [`SingleWriterEvidence`] for why the distinction is a type rather than a
+    /// `bool`.
     #[must_use]
-    pub fn mmap_temporal_model(single_writer: bool) -> Self {
+    pub fn mmap_temporal_model(single_writer: SingleWriterEvidence) -> Self {
         let mut labels = FxHashMap::default();
         // Always-present states: Mapped (init) and a safe access; self-loops keep
         // the transition relation total for the CTL model checker.
         let mut states = vec!["Mapped".to_string(), "SafeAccess".to_string()];
         let mut transitions =
             vec![(0usize, "access".to_string(), 1usize), (1, "idle".to_string(), 1)];
-        if !single_writer {
+        if !single_writer.discharges_truncate() {
             // Truncatable file: env can shrink the mapping (Mapped → Stale), and
             // an access while stale reaches the bad state.
             states.push("Stale".to_string()); // 2

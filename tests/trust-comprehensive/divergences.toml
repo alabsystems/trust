@@ -102,14 +102,13 @@ id = "upstream.trust-compat.2026-05-07.rustdoc-linkcheck-drift"
 gate_id = "upstream.trust-compat"
 status = "active"
 owner = "@trust-release"
-reason = "The strict stage2 upstream-compat lane still contains rustdoc output and linkcheck drift. This is a release blocker unless each output change is a reviewed Trust-owned documentation/name change."
-issue = "local:reports/trust-comprehensive/upstream.trust-compat#rustdoc"
-reviewed_on = "2026-07-23"
-expires_on = "2026-08-06"
-note = "2026-07-23 review: changes since the prior review include branded expectation adoption, parser-island support, check-cfg hygiene, and the ENV_MUTATION lint, but no rustdoc/linkcheck root-cause fix, reviewed complete wording-patch set, or full strict stage2 rustdoc pass. The divergence therefore remains a release blocker pending fresh evidence; this short renewal is not acceptance."
+reason = "The strict stage2 upstream-compat lane still contains rustdoc OUTPUT drift (suite=rustdoc-ui). This is a release blocker unless each output change is a reviewed Trust-owned documentation/name change. The linkcheck half of this row was RETIRED 2026-07-30 as unproducible — see note."
+issue = "local:reports/2026-07-30-upstream-compat-ledger-audit.md#rustdoc"
+reviewed_on = "2026-07-30"
+expires_on = "2026-09-10"
+note = "2026-07-30 review — the FIRST renewal carrying a measurement rather than a restatement. (1) The linkcheck half is RETIRED and its `broken link` pattern deleted: `Linkcheck::is_default_step` returns `builder.config.docs` (src/bootstrap/src/core/build_steps/test.rs:134), `scripts/recreate_bootstrap.py:2262` writes `docs = false` into every generated bootstrap.toml, and this tree's bootstrap.toml:17 agrees — so the linkchecker is not a default step in any standard Trust build and THIS GATE CANNOT PRODUCE A BROKEN-LINK FAILURE. The row had claimed that blocker through five renewals. (2) The `issue` anchor was dead: `local:reports/trust-comprehensive/...` has never existed in this repository (0 commits across all history); it now points at a real artifact. (3) STILL UNMEASURED, stated plainly: the rustdoc-ui output drift itself. Confirming or clearing it needs a full strict stage2 vanilla pass, which was not run. This renewal narrows a false claim and fixes a dead reference; it does not accept the remaining divergence, and the next renewal must carry the suite run or retire the row."
 allowed_exit_codes = [1]
 allowed_patterns = [
-    "broken link",
     "Some tests failed in compiletest suite=rustdoc-ui",
 ]
 classification = "rustdoc_output_drift"
@@ -122,10 +121,10 @@ gate_id = "upstream.trust-compat"
 status = "active"
 owner = "@trust-release"
 reason = "The strict stage2 upstream-compat lane still contains run-make failures around Trust naming and default verification behavior. Trust naming may require expected-output patches; verification leakage into vanilla upstream compatibility is a blocker."
-issue = "local:reports/trust-comprehensive/upstream.trust-compat#run-make"
-reviewed_on = "2026-07-23"
-expires_on = "2026-08-06"
-note = "2026-07-23 review: the run-make tree and compiler launch/default surfaces changed substantially after the prior review. The focused certified-monitor run-make gate is green, but that is not a vanilla-mode full run-make compatibility pass and cannot establish that verification/default behavior never leaks into inherited tests. The category remains a release blocker pending the full strict stage2 lane; this short renewal is not acceptance."
+issue = "local:reports/2026-07-30-upstream-compat-ledger-audit.md#run-make"
+reviewed_on = "2026-07-30"
+expires_on = "2026-09-10"
+note = "2026-07-30 review. The `issue` anchor was DEAD — `local:reports/trust-comprehensive/...` has never existed in this repository (0 commits across all history) — so five renewals cited evidence a reader could not open; it now points at a real artifact. The divergence itself remains UNMEASURED and this renewal says so rather than restating the prior note in new words: confirming or clearing it needs a vanilla-mode full run-make pass, which was not run. The focused certified-monitor run-make gate being green is NOT that pass and cannot establish that verification or default behaviour never leaks into inherited tests. This is the sixth consecutive renewal without a full-lane measurement; per the repo rule that a ledger row must not be a hiding place, the next renewal must either carry that measurement or break this category into per-test entries."
 allowed_exit_codes = [1]
 allowed_patterns = [
     "tests/run-make/const-trait-stable-toolchain",

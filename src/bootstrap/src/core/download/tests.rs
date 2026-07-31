@@ -620,3 +620,54 @@ fn allows_non_rust_download_hosts_and_file_urls() {
         );
     }
 }
+
+fn unique_tmp_dir(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "trust-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos()
+    ))
+}
+
+#[test]
+fn swap_verified_toolchain_replaces_existing_root_atomically() {
+    // 2026-07-29 regression: the refresh must only replace the live
+    // toolchain root with a complete staged tree, and must clean up both the
+    // staging and previous trees afterwards.
+    let tmp = unique_tmp_dir("swap-existing");
+    let bin_root = tmp.join("stage0");
+    let staging_root = tmp.join("stage0.staging");
+    fs::create_dir_all(bin_root.join("bin")).expect("create old root");
+    fs::write(bin_root.join("bin").join("trustc"), b"old").expect("write old trustc");
+    fs::create_dir_all(staging_root.join("bin")).expect("create staging root");
+    fs::write(staging_root.join("bin").join("trustc"), b"new").expect("write new trustc");
+
+    super::swap_verified_toolchain(&bin_root, &staging_root);
+
+    let content = fs::read(bin_root.join("bin").join("trustc")).expect("read swapped trustc");
+    assert_eq!(content, b"new");
+    assert!(!staging_root.exists(), "staging tree must be promoted away");
+    assert!(!tmp.join("stage0.previous").exists(), "previous tree must be cleaned up");
+
+    fs::remove_dir_all(&tmp).expect("remove temp swap dir");
+}
+
+#[test]
+fn swap_verified_toolchain_installs_fresh_root() {
+    let tmp = unique_tmp_dir("swap-fresh");
+    let bin_root = tmp.join("stage0");
+    let staging_root = tmp.join("stage0.staging");
+    fs::create_dir_all(staging_root.join("bin")).expect("create staging root");
+    fs::write(staging_root.join("bin").join("trustc"), b"new").expect("write new trustc");
+
+    super::swap_verified_toolchain(&bin_root, &staging_root);
+
+    let content = fs::read(bin_root.join("bin").join("trustc")).expect("read installed trustc");
+    assert_eq!(content, b"new");
+    assert!(!staging_root.exists(), "staging tree must be promoted away");
+
+    fs::remove_dir_all(&tmp).expect("remove temp swap dir");
+}

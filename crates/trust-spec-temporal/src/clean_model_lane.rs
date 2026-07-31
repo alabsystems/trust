@@ -23,20 +23,30 @@
 //! syntax.  Malformed structures accepted by the legacy parser fail validation
 //! before ty lowering.
 //!
-//! Honest scope: the result is proof evidence about the exact finite model that
-//! was decoded and rendered for ty.  This module does not claim that its data
-//! decoder is a kernel proof of a `Trust.Temporal.StateMachine` proposition.
-//! Function-valued variables and general `~>` discharge remain outside v1.
+//! The v2 applied route additionally binds the exact decoded definition to
+//! `FiniteModel.ScalarModel.safetyClaim` (or `FiniteModel.SafetyClaim` for the
+//! function-valued ABI) with a kernel-checked transport.  The Clean data now
+//! denotes an actual `StateMachine`; the reviewed Clean-data→ty renderer remains
+//! an explicit TCB adapter rather than a claimed cross-language theorem.  The
+//! v3 proof-carrying route additionally requires an authored constructive Clean
+//! theorem to inhabit that exact applied claim and binds it to the same model
+//! artifact as the replayed ty/S4 evidence.  It does not synthesize that Clean
+//! theorem from the ty certificate.
 
 use std::collections::BTreeSet;
+use std::sync::OnceLock;
 
-use clean_kernel::ConstantKind;
+use clean_elab::FileContext;
 use clean_kernel::env::Environment;
-use clean_kernel::expr::{Expr as KernelExpr, ExprKind, Literal};
+use clean_kernel::expr::{BinderInfo, Expr as KernelExpr, ExprKind, Literal};
 use clean_kernel::name::Name;
 use clean_kernel::tc::TypeChecker;
+use clean_kernel::{ConstantKind, FVarId};
 
-use crate::clean_surface::{CleanTemporalCertificateError, elaborate_temporal_definitions};
+use crate::clean_surface::{
+    CleanTemporalCertificateError, elaborate_suffix_with_parser_prelude,
+    fresh_temporal_prelude_context,
+};
 use crate::{
     Action, BoundTyCert, Expr, FnVar, Invariant, Model, ModelVerdict, StateVar, TyCertifyError,
     Update, bind_model_configuration, certify_model, parse_and_bind_ty_cert,
@@ -48,9 +58,34 @@ pub const FINITE_MODEL_PRELUDE: &str = include_str!("../clean/Trust/FiniteModel.
 
 /// Versioned artifact/certificate schema for this lane.
 pub const CLEAN_SCALAR_MODEL_SCHEMA_V1: &str = "trust.clean-scalar-model/v1";
+/// Function-valued Clean model artifact/certificate schema.
+pub const CLEAN_FINITE_MODEL_SCHEMA_V2: &str = "trust.clean-finite-model/v2";
+/// Exact applied proposition-binding schema shared by scalar and full models.
+pub const CLEAN_APPLIED_MODEL_BINDING_SCHEMA_V1: &str = "trust.clean-applied-model-binding/v1";
+/// Scalar safety certificate composed with an applied Clean proposition.
+pub const CLEAN_BOUND_SCALAR_MODEL_SCHEMA_V2: &str = "trust.clean-bound-scalar-model/v2";
+/// Full finite safety certificate composed with an applied Clean proposition.
+pub const CLEAN_BOUND_FINITE_MODEL_SCHEMA_V2: &str = "trust.clean-bound-finite-model/v2";
+/// A constructive Clean inhabitant of an exact applied model safety claim.
+pub const CLEAN_APPLIED_MODEL_PROOF_SCHEMA_V1: &str = "trust.clean-applied-model-proof/v1";
+/// Scalar ty evidence composed with an inhabited applied Clean proposition.
+pub const CLEAN_PROVED_BOUND_SCALAR_MODEL_SCHEMA_V3: &str =
+    "trust.clean-proved-bound-scalar-model/v3";
+/// Full finite ty evidence composed with an inhabited applied Clean proposition.
+pub const CLEAN_PROVED_BOUND_FINITE_MODEL_SCHEMA_V3: &str =
+    "trust.clean-proved-bound-finite-model/v3";
 
 const SCALAR_MODEL_TYPE: &str = "Trust.Temporal.FiniteModel.ScalarModel";
+const FINITE_MODEL_TYPE: &str = "Trust.Temporal.FiniteModel.Model";
 const PREFIX: &str = "Trust.Temporal.FiniteModel";
+/// Stack reserved for Clean's currently recursive kernel/elaborator traversals.
+///
+/// The finite semantic prelude is materially deeper than the notation-only
+/// temporal prelude.  Running it on an ordinary test/application thread can
+/// therefore abort the whole process before Clean has an opportunity to
+/// decline. Keep the recursive implementation detail isolated here; decoded
+/// model walks remain iterative.
+const FINITE_KERNEL_STACK_BYTES: usize = 64 * 1024 * 1024;
 /// Per-section list-length cap for decoded Clean models.
 ///
 /// Kept finite purely as a decode-cost (DoS) guard: the list walk is
@@ -173,6 +208,9 @@ pub enum CleanScalarExpr {
     If(Box<Self>, Box<Self>, Box<Self>),
     Iff(Box<Self>, Box<Self>),
     Forall(String, Box<Self>, Box<Self>, Box<Self>),
+    FnAccess(String, Box<Self>),
+    Except(String, Box<Self>, Box<Self>),
+    Comprehension(String, Box<Self>, Box<Self>, Box<Self>),
     Bool(bool),
 }
 
@@ -192,15 +230,19 @@ impl CleanScalarExpr {
             | Self::Neq(left, right)
             | Self::Or(left, right)
             | Self::And(left, right)
-            | Self::Iff(left, right) => {
+            | Self::Iff(left, right)
+            | Self::Except(_, left, right) => {
                 pending.push(detach(left));
                 pending.push(detach(right));
             }
-            Self::If(first, second, third) | Self::Forall(_, first, second, third) => {
+            Self::If(first, second, third)
+            | Self::Forall(_, first, second, third)
+            | Self::Comprehension(_, first, second, third) => {
                 pending.push(detach(first));
                 pending.push(detach(second));
                 pending.push(detach(third));
             }
+            Self::FnAccess(_, child) => pending.push(detach(child)),
             Self::Int(_) | Self::Var(_) | Self::ConstRef(_) | Self::Bool(_) => {}
         }
     }
@@ -226,6 +268,12 @@ pub struct CleanScalarConstant {
 pub struct CleanScalarStateVar {
     pub name: String,
     pub init: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CleanFunctionVar {
+    pub name: String,
+    pub range_constant: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -257,6 +305,13 @@ pub struct CleanScalarModel {
     pub invariants: Vec<CleanScalarInvariant>,
 }
 
+/// Full finite Clean Model ABI, including Boolean function-valued state.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CleanFiniteModel {
+    pub scalar: CleanScalarModel,
+    pub function_variables: Vec<CleanFunctionVar>,
+}
+
 /// Exact Clean definition artifact.  Both type and value are serialized because
 /// replay must reject a same-named definition whose elaborated meaning changed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -278,6 +333,103 @@ pub struct CleanScalarModelCertificate {
     pub safety_certificate_json: String,
     pub buggy_config_src: String,
     pub buggy_counterexample_json: String,
+}
+
+/// Exact Clean full-model definition artifact.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanFiniteModelArtifact {
+    pub schema: String,
+    pub clean_source: String,
+    pub model_definition: String,
+    pub type_expr: Vec<u8>,
+    pub value_expr: Vec<u8>,
+}
+
+/// Exact positive and negative evidence for one function-capable Clean model.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanFiniteModelCertificate {
+    pub schema: String,
+    pub model: CleanFiniteModelArtifact,
+    pub spec_src: String,
+    pub config_src: String,
+    pub safety_certificate_json: String,
+    pub buggy_config_src: String,
+    pub buggy_counterexample_json: String,
+}
+
+/// Kernel-checked binding from the exact decoded model value to an authored
+/// applied `StateMachine` safety proposition.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanAppliedModelBinding {
+    pub schema: String,
+    pub clean_source: String,
+    pub model_definition: String,
+    pub claim_definition: String,
+    pub model_type: Vec<u8>,
+    pub model_value: Vec<u8>,
+    pub claim_type: Vec<u8>,
+    pub claim_value: Vec<u8>,
+    pub canonical_claim: Vec<u8>,
+    pub transport_type: Vec<u8>,
+    pub transport_proof: Vec<u8>,
+}
+
+/// A freshly checked, constructive inhabitant of the exact applied model claim.
+///
+/// This is intentionally stronger than [`CleanAppliedModelBinding`].  The
+/// binding proves proposition identity only; this artifact stores an actual
+/// proof term which the kernel checks at the exact canonical applied claim.
+/// The named theorem must also have an empty axiom closure and pass Clean's
+/// strict reachable-provenance audit.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanAppliedModelProof {
+    pub schema: String,
+    pub binding: CleanAppliedModelBinding,
+    pub proof_definition: String,
+    pub proof_type: Vec<u8>,
+    pub proof_value: Vec<u8>,
+    pub canonical_inhabitant_type: Vec<u8>,
+    pub canonical_inhabitant: Vec<u8>,
+}
+
+/// Legacy scalar ty evidence composed with its exact applied Clean claim.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanBoundScalarModelCertificate {
+    pub schema: String,
+    pub scalar: CleanScalarModelCertificate,
+    pub applied: CleanAppliedModelBinding,
+}
+
+/// Function-valued ty evidence composed with its exact applied Clean claim.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanBoundFiniteModelCertificate {
+    pub schema: String,
+    pub finite: CleanFiniteModelCertificate,
+    pub applied: CleanAppliedModelBinding,
+}
+
+/// Scalar ty evidence plus a constructive proof of the exact applied claim.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanProvedBoundScalarModelCertificate {
+    pub schema: String,
+    pub scalar: CleanScalarModelCertificate,
+    pub applied_proof: CleanAppliedModelProof,
+}
+
+/// Function-valued ty evidence plus a constructive proof of the exact claim.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanProvedBoundFiniteModelCertificate {
+    pub schema: String,
+    pub finite: CleanFiniteModelCertificate,
+    pub applied_proof: CleanAppliedModelProof,
 }
 
 /// Fail-closed errors from Clean model extraction, validation, or replay.
@@ -320,21 +472,70 @@ impl From<TyCertifyError> for CleanScalarModelError {
     }
 }
 
+fn on_finite_kernel_stack<T: Send>(
+    operation: impl FnOnce() -> Result<T, CleanScalarModelError> + Send,
+) -> Result<T, CleanScalarModelError> {
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("trust-clean-finite-model".to_owned())
+            .stack_size(FINITE_KERNEL_STACK_BYTES)
+            .spawn_scoped(scope, operation)
+            .map_err(|error| {
+                CleanScalarModelError::ArtifactMismatch(format!(
+                    "could not start isolated Clean finite-model worker: {error}"
+                ))
+            })?;
+        worker.join().map_err(|_| {
+            CleanScalarModelError::ArtifactMismatch(
+                "isolated Clean finite-model worker panicked".to_owned(),
+            )
+        })?
+    })
+}
+
 fn encoded(expression: &KernelExpr) -> Result<Vec<u8>, CleanScalarModelError> {
     serde_json::to_vec(expression)
         .map_err(|error| CleanScalarModelError::ArtifactMismatch(error.to_string()))
 }
 
+fn fresh_finite_model_context() -> Result<(Environment, FileContext), CleanScalarModelError> {
+    static FINITE_PRELUDE: OnceLock<
+        Result<(Environment, FileContext), CleanTemporalCertificateError>,
+    > = OnceLock::new();
+    let cached = FINITE_PRELUDE.get_or_init(|| {
+        let (mut environment, mut context) = fresh_temporal_prelude_context()?;
+        elaborate_suffix_with_parser_prelude(
+            &mut environment,
+            &mut context,
+            crate::clean_surface::CLEAN_TEMPORAL_PRELUDE,
+            FINITE_MODEL_PRELUDE,
+            "finite-model prelude",
+        )?;
+        Ok((environment, context))
+    });
+    Ok(cached.clone()?)
+}
+
 fn finite_environment(source: &str) -> Result<Environment, CleanScalarModelError> {
-    // `elaborate_temporal_definitions` prepends the temporal prelude and uses a
-    // fresh environment with external imports disabled.  Appending this fixed
-    // data vocabulary before user source gives the model constructors the same
-    // fresh-context and no-shadow guarantees.
-    let mut combined = String::with_capacity(FINITE_MODEL_PRELUDE.len() + source.len() + 1);
-    combined.push_str(FINITE_MODEL_PRELUDE);
-    combined.push('\n');
-    combined.push_str(source);
-    Ok(elaborate_temporal_definitions(&combined)?)
+    // Clone both the kernel declarations and Clean's parser/elaborator context,
+    // then admit only ordinary declarations in the authored suffix. This keeps
+    // fresh-context/no-shadow guarantees without re-elaborating the 58-decl
+    // semantic prelude for every extraction and replay.
+    let (mut environment, mut context) = fresh_finite_model_context()?;
+    let mut parser_prelude = String::with_capacity(
+        crate::clean_surface::CLEAN_TEMPORAL_PRELUDE.len() + FINITE_MODEL_PRELUDE.len() + 1,
+    );
+    parser_prelude.push_str(crate::clean_surface::CLEAN_TEMPORAL_PRELUDE);
+    parser_prelude.push('\n');
+    parser_prelude.push_str(FINITE_MODEL_PRELUDE);
+    elaborate_suffix_with_parser_prelude(
+        &mut environment,
+        &mut context,
+        &parser_prelude,
+        source,
+        "authored source",
+    )?;
+    Ok(environment)
 }
 
 struct Decoder<'environment> {
@@ -468,6 +669,9 @@ impl<'environment> Decoder<'environment> {
             Binary(fn(Box<CleanScalarExpr>, Box<CleanScalarExpr>) -> CleanScalarExpr),
             If,
             Forall(String),
+            FnAccess(String),
+            Except(String),
+            Comprehension(String),
         }
         enum Task {
             Decode(KernelExpr, usize),
@@ -500,6 +704,31 @@ impl<'environment> Decoder<'environment> {
                     let high = decoded.pop().expect("forallIn decode scheduled three operands");
                     let low = decoded.pop().expect("forallIn decode scheduled three operands");
                     decoded.push(CleanScalarExpr::Forall(
+                        index,
+                        Box::new(low),
+                        Box::new(high),
+                        Box::new(body),
+                    ));
+                    continue;
+                }
+                Task::Assemble(Assemble::FnAccess(name)) => {
+                    let index = decoded.pop().expect("fnAccess decode scheduled one operand");
+                    decoded.push(CleanScalarExpr::FnAccess(name, Box::new(index)));
+                    continue;
+                }
+                Task::Assemble(Assemble::Except(name)) => {
+                    let value = decoded.pop().expect("except decode scheduled two operands");
+                    let index = decoded.pop().expect("except decode scheduled two operands");
+                    decoded.push(CleanScalarExpr::Except(name, Box::new(index), Box::new(value)));
+                    continue;
+                }
+                Task::Assemble(Assemble::Comprehension(index)) => {
+                    let body =
+                        decoded.pop().expect("comprehension decode scheduled three operands");
+                    let high =
+                        decoded.pop().expect("comprehension decode scheduled three operands");
+                    let low = decoded.pop().expect("comprehension decode scheduled three operands");
+                    decoded.push(CleanScalarExpr::Comprehension(
                         index,
                         Box::new(low),
                         Box::new(high),
@@ -600,6 +829,39 @@ impl<'environment> Decoder<'environment> {
                     tasks.push(Task::Decode(high, depth + 1));
                     tasks.push(Task::Decode(low, depth + 1));
                 }
+                name if name == format!("{PREFIX}.ScalarExpr.fnAccess") => {
+                    if args.len() != 2 {
+                        return Err(CleanScalarModelError::Definition(
+                            "ScalarExpr.fnAccess arity drift".to_owned(),
+                        ));
+                    }
+                    let name = self.string(&args[0])?;
+                    tasks.push(Task::Assemble(Assemble::FnAccess(name)));
+                    tasks.push(Task::Decode(args[1].clone(), depth + 1));
+                }
+                name if name == format!("{PREFIX}.ScalarExpr.except") => {
+                    if args.len() != 3 {
+                        return Err(CleanScalarModelError::Definition(
+                            "ScalarExpr.except arity drift".to_owned(),
+                        ));
+                    }
+                    let name = self.string(&args[0])?;
+                    tasks.push(Task::Assemble(Assemble::Except(name)));
+                    tasks.push(Task::Decode(args[2].clone(), depth + 1));
+                    tasks.push(Task::Decode(args[1].clone(), depth + 1));
+                }
+                name if name == format!("{PREFIX}.ScalarExpr.comprehension") => {
+                    if args.len() != 4 {
+                        return Err(CleanScalarModelError::Definition(
+                            "ScalarExpr.comprehension arity drift".to_owned(),
+                        ));
+                    }
+                    let index = self.string(&args[0])?;
+                    tasks.push(Task::Assemble(Assemble::Comprehension(index)));
+                    tasks.push(Task::Decode(args[3].clone(), depth + 1));
+                    tasks.push(Task::Decode(args[2].clone(), depth + 1));
+                    tasks.push(Task::Decode(args[1].clone(), depth + 1));
+                }
                 name if name == format!("{PREFIX}.ScalarExpr.bool") => {
                     if args.len() != 1 {
                         return Err(CleanScalarModelError::Definition(
@@ -632,6 +894,17 @@ impl<'environment> Decoder<'environment> {
     ) -> Result<CleanScalarStateVar, CleanScalarModelError> {
         let args = self.constructor_args(expression, &format!("{PREFIX}.StateVar.mk"), 2)?;
         Ok(CleanScalarStateVar { name: self.string(&args[0])?, init: self.integer(&args[1])? })
+    }
+
+    fn function_var(
+        &self,
+        expression: &KernelExpr,
+    ) -> Result<CleanFunctionVar, CleanScalarModelError> {
+        let args = self.constructor_args(expression, &format!("{PREFIX}.FunctionVar.mk"), 2)?;
+        Ok(CleanFunctionVar {
+            name: self.string(&args[0])?,
+            range_constant: self.string(&args[1])?,
+        })
     }
 
     fn update(&self, expression: &KernelExpr) -> Result<CleanScalarUpdate, CleanScalarModelError> {
@@ -686,6 +959,25 @@ impl<'environment> Decoder<'environment> {
             invariants: self.list(&args[4], Self::invariant)?,
         };
         model.validate()?;
+        Ok(model)
+    }
+
+    fn finite_model(
+        &self,
+        expression: &KernelExpr,
+    ) -> Result<CleanFiniteModel, CleanScalarModelError> {
+        let args = self.constructor_args(expression, &format!("{PREFIX}.Model.mk"), 6)?;
+        let model = CleanFiniteModel {
+            scalar: CleanScalarModel {
+                name: self.string(&args[0])?,
+                constants: self.list(&args[1], Self::constant)?,
+                variables: self.list(&args[2], Self::state_var)?,
+                actions: self.list(&args[4], Self::action)?,
+                invariants: self.list(&args[5], Self::invariant)?,
+            },
+            function_variables: self.list(&args[3], Self::function_var)?,
+        };
+        model.to_model()?;
         Ok(model)
     }
 }
@@ -840,6 +1132,12 @@ impl CleanScalarModel {
                     tasks.push(Task::Expect(ScalarSort::Int, "forall lower bound"));
                     tasks.push(Task::Sort(low));
                 }
+                E::FnAccess(..) | E::Except(..) | E::Comprehension(..) => {
+                    return Err(CleanScalarModelError::Definition(
+                        "function expressions require `FiniteModel.Model`, not `ScalarModel`"
+                            .to_owned(),
+                    ));
+                }
             }
         }
         Ok(sorts.pop().expect("iterative validation produced exactly one root sort"))
@@ -928,7 +1226,13 @@ impl CleanScalarModel {
     /// on unrelated earlier conversions.
     pub fn to_model(&self) -> Result<Model<String>, CleanScalarModelError> {
         self.validate()?;
+        self.to_model_with_function_vars(&[])
+    }
 
+    fn to_model_with_function_vars(
+        &self,
+        function_variables: &[CleanFunctionVar],
+    ) -> Result<Model<String>, CleanScalarModelError> {
         /// Convert one decoded expression to the certification carrier with an
         /// explicit heap stack (iterative, so conversion depth is bounded by
         /// heap, not the Rust stack).
@@ -937,6 +1241,9 @@ impl CleanScalarModel {
                 Binary(fn(Box<Expr<String>>, Box<Expr<String>>) -> Expr<String>),
                 If,
                 Forall(String),
+                FnAccess(String),
+                Except(String),
+                Comprehension(String),
             }
             enum Task<'e> {
                 Convert(&'e CleanScalarExpr),
@@ -984,6 +1291,38 @@ impl CleanScalarModel {
                         ));
                         continue;
                     }
+                    Task::Build(Build::FnAccess(name)) => {
+                        let index =
+                            converted.pop().expect("fnAccess conversion scheduled one operand");
+                        converted.push(Expr::FnAccess(name, Box::new(index)));
+                        continue;
+                    }
+                    Task::Build(Build::Except(name)) => {
+                        let value =
+                            converted.pop().expect("except conversion scheduled two operands");
+                        let index =
+                            converted.pop().expect("except conversion scheduled two operands");
+                        converted.push(Expr::Except(name, Box::new(index), Box::new(value)));
+                        continue;
+                    }
+                    Task::Build(Build::Comprehension(index)) => {
+                        let body = converted
+                            .pop()
+                            .expect("comprehension conversion scheduled three operands");
+                        let high = converted
+                            .pop()
+                            .expect("comprehension conversion scheduled three operands");
+                        let low = converted
+                            .pop()
+                            .expect("comprehension conversion scheduled three operands");
+                        converted.push(Expr::Comprehension(
+                            index,
+                            Box::new(low),
+                            Box::new(high),
+                            Box::new(body),
+                        ));
+                        continue;
+                    }
                     Task::Convert(node) => node,
                 };
                 match node {
@@ -1014,6 +1353,21 @@ impl CleanScalarModel {
                         tasks.push(Task::Convert(high));
                         tasks.push(Task::Convert(low));
                     }
+                    CleanScalarExpr::FnAccess(name, index) => {
+                        tasks.push(Task::Build(Build::FnAccess(name.clone())));
+                        tasks.push(Task::Convert(index));
+                    }
+                    CleanScalarExpr::Except(name, index, value) => {
+                        tasks.push(Task::Build(Build::Except(name.clone())));
+                        tasks.push(Task::Convert(value));
+                        tasks.push(Task::Convert(index));
+                    }
+                    CleanScalarExpr::Comprehension(index, low, high, body) => {
+                        tasks.push(Task::Build(Build::Comprehension(index.clone())));
+                        tasks.push(Task::Convert(body));
+                        tasks.push(Task::Convert(high));
+                        tasks.push(Task::Convert(low));
+                    }
                 }
             }
             converted.pop().expect("iterative conversion produced exactly one root expression")
@@ -1027,7 +1381,13 @@ impl CleanScalarModel {
                 .iter()
                 .map(|entry| StateVar { name: entry.name.clone(), init: entry.init })
                 .collect(),
-            fn_vars: Vec::<FnVar<String>>::new(),
+            fn_vars: function_variables
+                .iter()
+                .map(|entry| FnVar {
+                    name: entry.name.clone(),
+                    range: entry.range_constant.clone(),
+                })
+                .collect(),
             actions: self
                 .actions
                 .iter()
@@ -1056,8 +1416,26 @@ impl CleanScalarModel {
     }
 }
 
+impl CleanFiniteModel {
+    /// Convert the function-capable Clean value through the same shared
+    /// `Model<String>` validator, renderer, ty producer, and kernel finite-
+    /// product rechecker as hand-authored Rust models.
+    pub fn to_model(&self) -> Result<Model<String>, CleanScalarModelError> {
+        self.scalar.to_model_with_function_vars(&self.function_variables)
+    }
+}
+
 /// Freshly elaborate and decode one fully qualified Clean `ScalarModel` definition.
 pub fn extract_clean_scalar_model(
+    clean_source: &str,
+    model_definition: &str,
+) -> Result<(CleanScalarModelArtifact, CleanScalarModel), CleanScalarModelError> {
+    on_finite_kernel_stack(|| {
+        extract_clean_scalar_model_on_kernel_stack(clean_source, model_definition)
+    })
+}
+
+fn extract_clean_scalar_model_on_kernel_stack(
     clean_source: &str,
     model_definition: &str,
 ) -> Result<(CleanScalarModelArtifact, CleanScalarModel), CleanScalarModelError> {
@@ -1117,6 +1495,82 @@ pub fn recheck_clean_scalar_model_artifact(
     if fresh.type_expr != artifact.type_expr || fresh.value_expr != artifact.value_expr {
         return Err(CleanScalarModelError::ArtifactMismatch(
             "fresh kernel elaboration differs from stored model definition".to_owned(),
+        ));
+    }
+    Ok(model)
+}
+
+/// Freshly elaborate and decode one fully qualified function-capable Clean
+/// `FiniteModel.Model` definition.
+pub fn extract_clean_finite_model(
+    clean_source: &str,
+    model_definition: &str,
+) -> Result<(CleanFiniteModelArtifact, CleanFiniteModel), CleanScalarModelError> {
+    on_finite_kernel_stack(|| {
+        extract_clean_finite_model_on_kernel_stack(clean_source, model_definition)
+    })
+}
+
+fn extract_clean_finite_model_on_kernel_stack(
+    clean_source: &str,
+    model_definition: &str,
+) -> Result<(CleanFiniteModelArtifact, CleanFiniteModel), CleanScalarModelError> {
+    let environment = finite_environment(clean_source)?;
+    let declaration =
+        environment.get_const(&Name::from_string(model_definition)).ok_or_else(|| {
+            CleanScalarModelError::Definition(format!("missing `{model_definition}`"))
+        })?;
+    if declaration.kind != ConstantKind::Definition {
+        return Err(CleanScalarModelError::Definition(format!(
+            "`{model_definition}` is {:?}, not a definition",
+            declaration.kind
+        )));
+    }
+    let value = declaration.value.as_ref().ok_or_else(|| {
+        CleanScalarModelError::Definition(format!("`{model_definition}` has no value"))
+    })?;
+    let decoder = Decoder::new(&environment);
+    let normalized_type = decoder.whnf(&declaration.type_);
+    match normalized_type.kind() {
+        ExprKind::Const(name, _) if name.to_string() == FINITE_MODEL_TYPE => {}
+        other => {
+            return Err(CleanScalarModelError::Definition(format!(
+                "`{model_definition}` must have type `{FINITE_MODEL_TYPE}`, got {other:?}"
+            )));
+        }
+    }
+    let model = decoder.finite_model(value)?;
+    let artifact = CleanFiniteModelArtifact {
+        schema: CLEAN_FINITE_MODEL_SCHEMA_V2.to_owned(),
+        clean_source: clean_source.to_owned(),
+        model_definition: model_definition.to_owned(),
+        type_expr: encoded(&declaration.type_)?,
+        value_expr: encoded(value)?,
+    };
+    Ok((artifact, model))
+}
+
+/// Freshly replay a full-model extraction artifact.
+pub fn recheck_clean_finite_model_artifact(
+    artifact: &CleanFiniteModelArtifact,
+    expected_clean_source: &str,
+) -> Result<CleanFiniteModel, CleanScalarModelError> {
+    if artifact.schema != CLEAN_FINITE_MODEL_SCHEMA_V2 {
+        return Err(CleanScalarModelError::ArtifactMismatch(format!(
+            "unsupported schema `{}`",
+            artifact.schema
+        )));
+    }
+    if artifact.clean_source != expected_clean_source {
+        return Err(CleanScalarModelError::ArtifactMismatch(
+            "authored Clean source changed".to_owned(),
+        ));
+    }
+    let (fresh, model) =
+        extract_clean_finite_model(expected_clean_source, &artifact.model_definition)?;
+    if fresh.type_expr != artifact.type_expr || fresh.value_expr != artifact.value_expr {
+        return Err(CleanScalarModelError::ArtifactMismatch(
+            "fresh kernel elaboration differs from stored full-model definition".to_owned(),
         ));
     }
     Ok(model)
@@ -1280,6 +1734,686 @@ pub fn recheck_clean_scalar_model_with_ty(
         )));
     }
     Ok(())
+}
+
+/// Certify the exact kernel-elaborated function-capable model through the
+/// pinned ty finite-product lane.
+pub fn certify_clean_finite_model_with_ty(
+    clean_source: &str,
+    model_definition: &str,
+) -> Result<CleanFiniteModelCertificate, CleanScalarModelError> {
+    let _ty_transaction = crate::in_process_ty_transaction_lock();
+    let (artifact, decoded) = extract_clean_finite_model(clean_source, model_definition)?;
+    crate::validate_committed_buggy_values(
+        decoded
+            .scalar
+            .constants
+            .iter()
+            .filter_map(|constant| (constant.name == "Buggy").then_some(constant.value)),
+    )?;
+    let model = decoded.to_model()?;
+    crate::validate_committed_buggy_baseline(&model)?;
+    let outcome = certify_model(&model);
+    if outcome.verdict != ModelVerdict::Proved {
+        return Err(CleanScalarModelError::Temporal(format!(
+            "positive/kernel/non-vacuity gates did not close: {:?}",
+            outcome.verdict
+        )));
+    }
+    let safety = outcome.bound.map_err(CleanScalarModelError::from)?;
+    if !safety.kernel_rechecked {
+        return Err(CleanScalarModelError::Temporal(
+            "positive certificate was not kernel-rechecked".to_owned(),
+        ));
+    }
+    let buggy = buggy_envelope(&model)?;
+    Ok(CleanFiniteModelCertificate {
+        schema: CLEAN_FINITE_MODEL_SCHEMA_V2.to_owned(),
+        model: artifact,
+        spec_src: model.to_tla(),
+        config_src: model.to_cfg(),
+        safety_certificate_json: safety.raw_json,
+        buggy_config_src: model.to_replay_cfg_with(&[("Buggy", 1)]),
+        buggy_counterexample_json: buggy.to_json(),
+    })
+}
+
+/// Replay the Clean full-model extraction and both stored ty evidence legs.
+pub fn recheck_clean_finite_model_with_ty(
+    certificate: &CleanFiniteModelCertificate,
+    expected_clean_source: &str,
+) -> Result<(), CleanScalarModelError> {
+    let _ty_transaction = crate::in_process_ty_transaction_lock();
+    if certificate.schema != CLEAN_FINITE_MODEL_SCHEMA_V2 {
+        return Err(CleanScalarModelError::ArtifactMismatch(format!(
+            "unsupported schema `{}`",
+            certificate.schema
+        )));
+    }
+    let decoded = recheck_clean_finite_model_artifact(&certificate.model, expected_clean_source)?;
+    crate::validate_committed_buggy_values(
+        decoded
+            .scalar
+            .constants
+            .iter()
+            .filter_map(|constant| (constant.name == "Buggy").then_some(constant.value)),
+    )?;
+    let model = decoded.to_model()?;
+    crate::validate_committed_buggy_baseline(&model)?;
+    if model.to_tla() != certificate.spec_src || model.to_cfg() != certificate.config_src {
+        return Err(CleanScalarModelError::ArtifactMismatch(
+            "freshly decoded full model generates different ty inputs".to_owned(),
+        ));
+    }
+    replay_safety(&certificate.safety_certificate_json, &model)?;
+
+    let _ty_transaction = crate::in_process_ty_transaction_lock();
+    let expected_buggy_config = model.to_replay_cfg_with(&[("Buggy", 1)]);
+    if certificate.buggy_config_src != expected_buggy_config {
+        return Err(CleanScalarModelError::ArtifactMismatch(
+            "Buggy=1 configuration differs from the decoded full model".to_owned(),
+        ));
+    }
+    let envelope =
+        tla_check::verdict::VerdictEnvelope::from_json(&certificate.buggy_counterexample_json)
+            .map_err(CleanScalarModelError::ArtifactMismatch)?;
+    if envelope.spec_src != certificate.spec_src
+        || envelope.config_src.as_deref() != Some(expected_buggy_config.as_str())
+        || !matches!(envelope.kind, tla_check::verdict::ViolationKind::Invariant)
+        || !envelope
+            .violated
+            .as_deref()
+            .is_some_and(|name| model.invariants.iter().any(|invariant| invariant.name == name))
+    {
+        return Err(CleanScalarModelError::ArtifactMismatch(
+            "Buggy=1 envelope is not bound to this full model and its invariants".to_owned(),
+        ));
+    }
+    let report = tla_check::verdict::verify_violation_envelope(&envelope);
+    if !matches!(report.verdict, tla_check::verdict::VerdictVerdict::Verified) {
+        return Err(CleanScalarModelError::Temporal(format!(
+            "stored Buggy=1 counterexample declined replay: {}",
+            report.detail
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum AppliedModelKind {
+    Scalar,
+    Finite,
+}
+
+fn expression_mentions(expression: &KernelExpr, expected_name: &str) -> bool {
+    match expression.kind() {
+        ExprKind::Const(name, _) => name.to_string() == expected_name,
+        ExprKind::App(function, argument) => {
+            expression_mentions(function, expected_name)
+                || expression_mentions(argument, expected_name)
+        }
+        ExprKind::Lam(_, domain, body) | ExprKind::Pi(_, domain, body) => {
+            expression_mentions(domain, expected_name) || expression_mentions(body, expected_name)
+        }
+        ExprKind::Let(_, type_, value, body, _) => {
+            expression_mentions(type_, expected_name)
+                || expression_mentions(value, expected_name)
+                || expression_mentions(body, expected_name)
+        }
+        ExprKind::Proj(_, _, structure) => expression_mentions(structure, expected_name),
+        ExprKind::MData(_, inner) => expression_mentions(inner, expected_name),
+        _ => false,
+    }
+}
+
+fn applied_model_binding(
+    clean_source: &str,
+    model_definition: &str,
+    claim_definition: &str,
+    kind: AppliedModelKind,
+) -> Result<CleanAppliedModelBinding, CleanScalarModelError> {
+    on_finite_kernel_stack(|| {
+        applied_model_binding_on_kernel_stack(
+            clean_source,
+            model_definition,
+            claim_definition,
+            kind,
+        )
+    })
+}
+
+fn applied_model_binding_on_kernel_stack(
+    clean_source: &str,
+    model_definition: &str,
+    claim_definition: &str,
+    kind: AppliedModelKind,
+) -> Result<CleanAppliedModelBinding, CleanScalarModelError> {
+    let environment = finite_environment(clean_source)?;
+    applied_model_binding_in_environment(
+        &environment,
+        clean_source,
+        model_definition,
+        claim_definition,
+        kind,
+    )
+}
+
+fn applied_model_binding_in_environment(
+    environment: &Environment,
+    clean_source: &str,
+    model_definition: &str,
+    claim_definition: &str,
+    kind: AppliedModelKind,
+) -> Result<CleanAppliedModelBinding, CleanScalarModelError> {
+    let model = environment.get_const(&Name::from_string(model_definition)).ok_or_else(|| {
+        CleanScalarModelError::Definition(format!("missing `{model_definition}`"))
+    })?;
+    let claim = environment.get_const(&Name::from_string(claim_definition)).ok_or_else(|| {
+        CleanScalarModelError::Definition(format!("missing `{claim_definition}`"))
+    })?;
+    if model.kind != ConstantKind::Definition || claim.kind != ConstantKind::Definition {
+        return Err(CleanScalarModelError::Definition(
+            "the selected model and applied claim must both be definitions".to_owned(),
+        ));
+    }
+    let model_value = model.value.as_ref().ok_or_else(|| {
+        CleanScalarModelError::Definition(format!("`{model_definition}` has no value"))
+    })?;
+    let claim_value = claim.value.as_ref().ok_or_else(|| {
+        CleanScalarModelError::Definition(format!("`{claim_definition}` has no value"))
+    })?;
+    let checker = TypeChecker::with_mode(&environment, environment.mode());
+    let (expected_model_type, canonical_operator) = match kind {
+        AppliedModelKind::Scalar => {
+            (SCALAR_MODEL_TYPE, "Trust.Temporal.FiniteModel.ScalarModel.safetyClaim")
+        }
+        AppliedModelKind::Finite => (FINITE_MODEL_TYPE, "Trust.Temporal.FiniteModel.SafetyClaim"),
+    };
+    let normalized_model_type = checker.whnf(&model.type_);
+    if !matches!(
+        normalized_model_type.kind(),
+        ExprKind::Const(name, _) if name.to_string() == expected_model_type
+    ) {
+        return Err(CleanScalarModelError::Definition(format!(
+            "`{model_definition}` must have type `{expected_model_type}`"
+        )));
+    }
+    if !checker.is_def_eq(&claim.type_, &KernelExpr::prop()) {
+        return Err(CleanScalarModelError::Definition(format!(
+            "`{claim_definition}` must have type Prop"
+        )));
+    }
+    if !expression_mentions(claim_value, model_definition) {
+        return Err(CleanScalarModelError::Definition(
+            "the applied claim must name the selected model definition".to_owned(),
+        ));
+    }
+
+    // The canonical side is built from the exact registered model VALUE.  The
+    // authored side names the selected definition.  A hypothesis of the first
+    // type can inhabit the second only when the kernel unfolds all model data
+    // and finds the complete applied StateMachine safety propositions
+    // definitionally equal.
+    let canonical_claim = KernelExpr::app(
+        KernelExpr::const_(Name::from_string(canonical_operator), vec![]),
+        model_value.clone(),
+    );
+    let hypothesis_id = FVarId::new(0xF510_0000_0000_0001);
+    let hypothesis = KernelExpr::fvar(hypothesis_id);
+    let transport_proof = KernelExpr::lam(
+        BinderInfo::Default,
+        canonical_claim.clone(),
+        hypothesis.abstract_fvar(hypothesis_id),
+    );
+    let transport_type = KernelExpr::arrow(canonical_claim.clone(), claim_value.clone());
+    checker.check_type(&transport_proof, &transport_type).map_err(|error| {
+        CleanScalarModelError::Definition(format!(
+            "`{claim_definition}` is not the exact applied safety claim for \
+             `{model_definition}`: {error}"
+        ))
+    })?;
+
+    Ok(CleanAppliedModelBinding {
+        schema: CLEAN_APPLIED_MODEL_BINDING_SCHEMA_V1.to_owned(),
+        clean_source: clean_source.to_owned(),
+        model_definition: model_definition.to_owned(),
+        claim_definition: claim_definition.to_owned(),
+        model_type: encoded(&model.type_)?,
+        model_value: encoded(model_value)?,
+        claim_type: encoded(&claim.type_)?,
+        claim_value: encoded(claim_value)?,
+        canonical_claim: encoded(&canonical_claim)?,
+        transport_type: encoded(&transport_type)?,
+        transport_proof: encoded(&transport_proof)?,
+    })
+}
+
+/// Bind a scalar Clean definition to its exact applied
+/// `ScalarModel.safetyClaim`.
+pub fn bind_clean_scalar_model_safety_claim(
+    clean_source: &str,
+    model_definition: &str,
+    claim_definition: &str,
+) -> Result<CleanAppliedModelBinding, CleanScalarModelError> {
+    applied_model_binding(
+        clean_source,
+        model_definition,
+        claim_definition,
+        AppliedModelKind::Scalar,
+    )
+}
+
+/// Bind a function-capable Clean definition to its exact applied
+/// `FiniteModel.SafetyClaim`.
+pub fn bind_clean_finite_model_safety_claim(
+    clean_source: &str,
+    model_definition: &str,
+    claim_definition: &str,
+) -> Result<CleanAppliedModelBinding, CleanScalarModelError> {
+    applied_model_binding(
+        clean_source,
+        model_definition,
+        claim_definition,
+        AppliedModelKind::Finite,
+    )
+}
+
+fn recheck_applied_model_binding(
+    binding: &CleanAppliedModelBinding,
+    expected_clean_source: &str,
+    kind: AppliedModelKind,
+) -> Result<(), CleanScalarModelError> {
+    if binding.schema != CLEAN_APPLIED_MODEL_BINDING_SCHEMA_V1 {
+        return Err(CleanScalarModelError::ArtifactMismatch(format!(
+            "unsupported applied-binding schema `{}`",
+            binding.schema
+        )));
+    }
+    if binding.clean_source != expected_clean_source {
+        return Err(CleanScalarModelError::ArtifactMismatch(
+            "authored Clean source changed".to_owned(),
+        ));
+    }
+    let fresh = applied_model_binding(
+        expected_clean_source,
+        &binding.model_definition,
+        &binding.claim_definition,
+        kind,
+    )?;
+    if fresh != *binding {
+        return Err(CleanScalarModelError::ArtifactMismatch(
+            "fresh kernel applied-proposition binding differs".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Freshly replay a scalar model's standalone exact applied-claim binding.
+///
+/// This grants proposition-identity evidence only; it does not manufacture an
+/// inhabitant of the applied safety claim.
+pub fn recheck_clean_scalar_model_safety_claim_binding(
+    binding: &CleanAppliedModelBinding,
+    expected_clean_source: &str,
+) -> Result<(), CleanScalarModelError> {
+    recheck_applied_model_binding(binding, expected_clean_source, AppliedModelKind::Scalar)
+}
+
+/// Freshly replay a function-capable model's standalone exact applied-claim
+/// binding. This verifies identity, not an inhabitant of the safety claim.
+pub fn recheck_clean_finite_model_safety_claim_binding(
+    binding: &CleanAppliedModelBinding,
+    expected_clean_source: &str,
+) -> Result<(), CleanScalarModelError> {
+    recheck_applied_model_binding(binding, expected_clean_source, AppliedModelKind::Finite)
+}
+
+fn applied_model_proof(
+    clean_source: &str,
+    model_definition: &str,
+    claim_definition: &str,
+    proof_definition: &str,
+    kind: AppliedModelKind,
+) -> Result<CleanAppliedModelProof, CleanScalarModelError> {
+    on_finite_kernel_stack(|| {
+        let environment = finite_environment(clean_source)?;
+        let binding = applied_model_binding_in_environment(
+            &environment,
+            clean_source,
+            model_definition,
+            claim_definition,
+            kind,
+        )?;
+        let model =
+            environment.get_const(&Name::from_string(model_definition)).ok_or_else(|| {
+                CleanScalarModelError::Definition(format!("missing `{model_definition}`"))
+            })?;
+        let model_value = model.value.as_ref().ok_or_else(|| {
+            CleanScalarModelError::Definition(format!("`{model_definition}` has no value"))
+        })?;
+        let claim =
+            environment.get_const(&Name::from_string(claim_definition)).ok_or_else(|| {
+                CleanScalarModelError::Definition(format!("missing `{claim_definition}`"))
+            })?;
+        let claim_value = claim.value.as_ref().ok_or_else(|| {
+            CleanScalarModelError::Definition(format!("`{claim_definition}` has no value"))
+        })?;
+        let (proof_type, proof_value) =
+            crate::clean_surface::checked_theorem(&environment, proof_definition)?;
+        let checker = TypeChecker::with_mode(&environment, environment.mode());
+
+        // Requiring the theorem statement to name the selected authored claim
+        // prevents callers from presenting an unrelated theorem which merely
+        // happens to normalize to the same proposition today.  Definitional
+        // equality then pins the complete applied proposition.
+        if !expression_mentions(proof_type, claim_definition)
+            || !checker.is_def_eq(proof_type, claim_value)
+        {
+            return Err(CleanScalarModelError::Definition(format!(
+                "`{proof_definition}` must prove the selected applied claim \
+                 `{claim_definition}`"
+            )));
+        }
+
+        let canonical_operator = match kind {
+            AppliedModelKind::Scalar => "Trust.Temporal.FiniteModel.ScalarModel.safetyClaim",
+            AppliedModelKind::Finite => "Trust.Temporal.FiniteModel.SafetyClaim",
+        };
+        let canonical_claim = KernelExpr::app(
+            KernelExpr::const_(Name::from_string(canonical_operator), vec![]),
+            model_value.clone(),
+        );
+
+        // This is the crucial distinction from the v2 identity transport:
+        // `proof_value` itself must inhabit the canonical applied claim.  The
+        // kernel checks that judgment in the fresh model environment.
+        checker.check_type(proof_value, &canonical_claim).map_err(|error| {
+            CleanScalarModelError::Definition(format!(
+                "`{proof_definition}` does not inhabit the exact applied safety \
+                 claim for `{model_definition}`: {error}"
+            ))
+        })?;
+        let canonical_inhabitant_type = encoded(&canonical_claim)?;
+        if canonical_inhabitant_type != binding.canonical_claim {
+            return Err(CleanScalarModelError::ArtifactMismatch(
+                "inhabitant and applied binding constructed different canonical claims".to_owned(),
+            ));
+        }
+
+        Ok(CleanAppliedModelProof {
+            schema: CLEAN_APPLIED_MODEL_PROOF_SCHEMA_V1.to_owned(),
+            binding,
+            proof_definition: proof_definition.to_owned(),
+            proof_type: encoded(proof_type)?,
+            proof_value: encoded(proof_value)?,
+            canonical_inhabitant_type,
+            canonical_inhabitant: encoded(proof_value)?,
+        })
+    })
+}
+
+/// Check an axiom-free Clean theorem which inhabits the exact scalar-model
+/// applied safety claim.
+pub fn prove_clean_scalar_model_safety_claim(
+    clean_source: &str,
+    model_definition: &str,
+    claim_definition: &str,
+    proof_definition: &str,
+) -> Result<CleanAppliedModelProof, CleanScalarModelError> {
+    applied_model_proof(
+        clean_source,
+        model_definition,
+        claim_definition,
+        proof_definition,
+        AppliedModelKind::Scalar,
+    )
+}
+
+/// Check an axiom-free Clean theorem which inhabits the exact function-capable
+/// finite-model applied safety claim.
+pub fn prove_clean_finite_model_safety_claim(
+    clean_source: &str,
+    model_definition: &str,
+    claim_definition: &str,
+    proof_definition: &str,
+) -> Result<CleanAppliedModelProof, CleanScalarModelError> {
+    applied_model_proof(
+        clean_source,
+        model_definition,
+        claim_definition,
+        proof_definition,
+        AppliedModelKind::Finite,
+    )
+}
+
+fn recheck_applied_model_proof(
+    proof: &CleanAppliedModelProof,
+    expected_clean_source: &str,
+    kind: AppliedModelKind,
+) -> Result<(), CleanScalarModelError> {
+    if proof.schema != CLEAN_APPLIED_MODEL_PROOF_SCHEMA_V1 {
+        return Err(CleanScalarModelError::ArtifactMismatch(format!(
+            "unsupported applied-proof schema `{}`",
+            proof.schema
+        )));
+    }
+    let fresh = applied_model_proof(
+        expected_clean_source,
+        &proof.binding.model_definition,
+        &proof.binding.claim_definition,
+        &proof.proof_definition,
+        kind,
+    )?;
+    if fresh != *proof {
+        return Err(CleanScalarModelError::ArtifactMismatch(
+            "fresh kernel applied-claim proof differs".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Freshly replay a constructive scalar-model applied safety proof.
+pub fn recheck_clean_scalar_model_safety_claim_proof(
+    proof: &CleanAppliedModelProof,
+    expected_clean_source: &str,
+) -> Result<(), CleanScalarModelError> {
+    recheck_applied_model_proof(proof, expected_clean_source, AppliedModelKind::Scalar)
+}
+
+/// Freshly replay a constructive function-capable applied safety proof.
+pub fn recheck_clean_finite_model_safety_claim_proof(
+    proof: &CleanAppliedModelProof,
+    expected_clean_source: &str,
+) -> Result<(), CleanScalarModelError> {
+    recheck_applied_model_proof(proof, expected_clean_source, AppliedModelKind::Finite)
+}
+
+fn bind_scalar_and_applied_artifacts(
+    scalar: &CleanScalarModelCertificate,
+    applied: &CleanAppliedModelBinding,
+) -> Result<(), CleanScalarModelError> {
+    if scalar.model.model_definition != applied.model_definition
+        || scalar.model.type_expr != applied.model_type
+        || scalar.model.value_expr != applied.model_value
+    {
+        return Err(CleanScalarModelError::ArtifactMismatch(
+            "scalar ty evidence and applied Clean claim name different model artifacts".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn bind_finite_and_applied_artifacts(
+    finite: &CleanFiniteModelCertificate,
+    applied: &CleanAppliedModelBinding,
+) -> Result<(), CleanScalarModelError> {
+    if finite.model.model_definition != applied.model_definition
+        || finite.model.type_expr != applied.model_type
+        || finite.model.value_expr != applied.model_value
+    {
+        return Err(CleanScalarModelError::ArtifactMismatch(
+            "full-model ty evidence and applied Clean claim name different model artifacts"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Compose scalar ty evidence and the exact applied Clean safety claim.
+pub fn certify_bound_clean_scalar_model_with_ty(
+    clean_source: &str,
+    model_definition: &str,
+    claim_definition: &str,
+) -> Result<CleanBoundScalarModelCertificate, CleanScalarModelError> {
+    let scalar = certify_clean_scalar_model_with_ty(clean_source, model_definition)?;
+    let applied =
+        bind_clean_scalar_model_safety_claim(clean_source, model_definition, claim_definition)?;
+    bind_scalar_and_applied_artifacts(&scalar, &applied)?;
+    Ok(CleanBoundScalarModelCertificate {
+        schema: CLEAN_BOUND_SCALAR_MODEL_SCHEMA_V2.to_owned(),
+        scalar,
+        applied,
+    })
+}
+
+/// Replay scalar ty evidence and its applied Clean proposition together.
+pub fn recheck_bound_clean_scalar_model_with_ty(
+    certificate: &CleanBoundScalarModelCertificate,
+    expected_clean_source: &str,
+) -> Result<(), CleanScalarModelError> {
+    if certificate.schema != CLEAN_BOUND_SCALAR_MODEL_SCHEMA_V2 {
+        return Err(CleanScalarModelError::ArtifactMismatch(format!(
+            "unsupported bound-scalar schema `{}`",
+            certificate.schema
+        )));
+    }
+    bind_scalar_and_applied_artifacts(&certificate.scalar, &certificate.applied)?;
+    recheck_clean_scalar_model_with_ty(&certificate.scalar, expected_clean_source)?;
+    recheck_applied_model_binding(
+        &certificate.applied,
+        expected_clean_source,
+        AppliedModelKind::Scalar,
+    )
+}
+
+/// Compose function-valued ty evidence and its exact applied Clean claim.
+pub fn certify_bound_clean_finite_model_with_ty(
+    clean_source: &str,
+    model_definition: &str,
+    claim_definition: &str,
+) -> Result<CleanBoundFiniteModelCertificate, CleanScalarModelError> {
+    let finite = certify_clean_finite_model_with_ty(clean_source, model_definition)?;
+    let applied =
+        bind_clean_finite_model_safety_claim(clean_source, model_definition, claim_definition)?;
+    bind_finite_and_applied_artifacts(&finite, &applied)?;
+    Ok(CleanBoundFiniteModelCertificate {
+        schema: CLEAN_BOUND_FINITE_MODEL_SCHEMA_V2.to_owned(),
+        finite,
+        applied,
+    })
+}
+
+/// Replay function-valued ty evidence and its applied Clean proposition.
+pub fn recheck_bound_clean_finite_model_with_ty(
+    certificate: &CleanBoundFiniteModelCertificate,
+    expected_clean_source: &str,
+) -> Result<(), CleanScalarModelError> {
+    if certificate.schema != CLEAN_BOUND_FINITE_MODEL_SCHEMA_V2 {
+        return Err(CleanScalarModelError::ArtifactMismatch(format!(
+            "unsupported bound-finite schema `{}`",
+            certificate.schema
+        )));
+    }
+    bind_finite_and_applied_artifacts(&certificate.finite, &certificate.applied)?;
+    recheck_clean_finite_model_with_ty(&certificate.finite, expected_clean_source)?;
+    recheck_applied_model_binding(
+        &certificate.applied,
+        expected_clean_source,
+        AppliedModelKind::Finite,
+    )
+}
+
+/// Compose scalar ty/S4 evidence with an independently constructed,
+/// kernel-checked inhabitant of the exact applied Clean claim.
+///
+/// This route does not pretend that the ty term and the Clean theorem share a
+/// semantic carrier: both legs are checked and anti-splice-bound to the same
+/// model artifact.  A future automatic transport may replace the authored
+/// theorem only after a kernel theorem relates those carriers.
+pub fn certify_proved_bound_clean_scalar_model_with_ty(
+    clean_source: &str,
+    model_definition: &str,
+    claim_definition: &str,
+    proof_definition: &str,
+) -> Result<CleanProvedBoundScalarModelCertificate, CleanScalarModelError> {
+    let scalar = certify_clean_scalar_model_with_ty(clean_source, model_definition)?;
+    let applied_proof = prove_clean_scalar_model_safety_claim(
+        clean_source,
+        model_definition,
+        claim_definition,
+        proof_definition,
+    )?;
+    bind_scalar_and_applied_artifacts(&scalar, &applied_proof.binding)?;
+    Ok(CleanProvedBoundScalarModelCertificate {
+        schema: CLEAN_PROVED_BOUND_SCALAR_MODEL_SCHEMA_V3.to_owned(),
+        scalar,
+        applied_proof,
+    })
+}
+
+/// Freshly replay scalar ty/S4 evidence and the constructive applied proof.
+pub fn recheck_proved_bound_clean_scalar_model_with_ty(
+    certificate: &CleanProvedBoundScalarModelCertificate,
+    expected_clean_source: &str,
+) -> Result<(), CleanScalarModelError> {
+    if certificate.schema != CLEAN_PROVED_BOUND_SCALAR_MODEL_SCHEMA_V3 {
+        return Err(CleanScalarModelError::ArtifactMismatch(format!(
+            "unsupported proved-bound-scalar schema `{}`",
+            certificate.schema
+        )));
+    }
+    bind_scalar_and_applied_artifacts(&certificate.scalar, &certificate.applied_proof.binding)?;
+    recheck_clean_scalar_model_with_ty(&certificate.scalar, expected_clean_source)?;
+    recheck_clean_scalar_model_safety_claim_proof(&certificate.applied_proof, expected_clean_source)
+}
+
+/// Compose function-valued ty/S4 evidence with an independently constructed,
+/// kernel-checked inhabitant of the exact applied Clean claim.
+pub fn certify_proved_bound_clean_finite_model_with_ty(
+    clean_source: &str,
+    model_definition: &str,
+    claim_definition: &str,
+    proof_definition: &str,
+) -> Result<CleanProvedBoundFiniteModelCertificate, CleanScalarModelError> {
+    let finite = certify_clean_finite_model_with_ty(clean_source, model_definition)?;
+    let applied_proof = prove_clean_finite_model_safety_claim(
+        clean_source,
+        model_definition,
+        claim_definition,
+        proof_definition,
+    )?;
+    bind_finite_and_applied_artifacts(&finite, &applied_proof.binding)?;
+    Ok(CleanProvedBoundFiniteModelCertificate {
+        schema: CLEAN_PROVED_BOUND_FINITE_MODEL_SCHEMA_V3.to_owned(),
+        finite,
+        applied_proof,
+    })
+}
+
+/// Freshly replay function-valued ty/S4 evidence and its constructive proof.
+pub fn recheck_proved_bound_clean_finite_model_with_ty(
+    certificate: &CleanProvedBoundFiniteModelCertificate,
+    expected_clean_source: &str,
+) -> Result<(), CleanScalarModelError> {
+    if certificate.schema != CLEAN_PROVED_BOUND_FINITE_MODEL_SCHEMA_V3 {
+        return Err(CleanScalarModelError::ArtifactMismatch(format!(
+            "unsupported proved-bound-finite schema `{}`",
+            certificate.schema
+        )));
+    }
+    bind_finite_and_applied_artifacts(&certificate.finite, &certificate.applied_proof.binding)?;
+    recheck_clean_finite_model_with_ty(&certificate.finite, expected_clean_source)?;
+    recheck_clean_finite_model_safety_claim_proof(&certificate.applied_proof, expected_clean_source)
 }
 
 #[cfg(test)]
@@ -1587,6 +2721,257 @@ CHECK_DEADLOCK FALSE\n";
 
     const COMPLETE_AUTHORITY_SOURCE: &str = include_str!("../examples/clean_scalar_complete.lean");
 
+    fn complete_authority_with_applied_claim() -> String {
+        COMPLETE_AUTHORITY_SOURCE.to_owned()
+    }
+
+    const FUNCTION_MODEL_SOURCE: &str = r#"
+namespace FunctionExample
+
+def One : Trust.Temporal.FiniteModel.ScalarExpr :=
+  Trust.Temporal.FiniteModel.ScalarExpr.int 1
+def Limit : Trust.Temporal.FiniteModel.ScalarExpr :=
+  Trust.Temporal.FiniteModel.ScalarExpr.constRef "Limit"
+def Buggy : Trust.Temporal.FiniteModel.ScalarExpr :=
+  Trust.Temporal.FiniteModel.ScalarExpr.constRef "Buggy"
+def Index : Trust.Temporal.FiniteModel.ScalarExpr :=
+  Trust.Temporal.FiniteModel.ScalarExpr.var "n"
+def LiveAtIndex : Trust.Temporal.FiniteModel.ScalarExpr :=
+  Trust.Temporal.FiniteModel.ScalarExpr.fnAccess "live" Index
+def CopyLive : Trust.Temporal.FiniteModel.ScalarExpr :=
+  Trust.Temporal.FiniteModel.ScalarExpr.comprehension "n" One Limit LiveAtIndex
+def WholeLive : Trust.Temporal.FiniteModel.ScalarExpr :=
+  Trust.Temporal.FiniteModel.ScalarExpr.var "live"
+def ClearFirst : Trust.Temporal.FiniteModel.ScalarExpr :=
+  Trust.Temporal.FiniteModel.ScalarExpr.except "live" One
+    (Trust.Temporal.FiniteModel.ScalarExpr.bool false)
+def AllFalse : Trust.Temporal.FiniteModel.ScalarExpr :=
+  Trust.Temporal.FiniteModel.ScalarExpr.forallIn "n" One Limit
+    (Trust.Temporal.FiniteModel.ScalarExpr.iff LiveAtIndex
+      (Trust.Temporal.FiniteModel.ScalarExpr.bool false))
+def DialOff : Trust.Temporal.FiniteModel.ScalarExpr :=
+  Trust.Temporal.FiniteModel.ScalarExpr.eq Buggy
+    (Trust.Temporal.FiniteModel.ScalarExpr.int 0)
+
+def FunctionModel : Trust.Temporal.FiniteModel.Model :=
+  Trust.Temporal.FiniteModel.Model.mk "CleanFunction"
+    [Trust.Temporal.FiniteModel.Constant.mk "Buggy" 0,
+     Trust.Temporal.FiniteModel.Constant.mk "Limit" 2]
+    []
+    [Trust.Temporal.FiniteModel.FunctionVar.mk "live" "Limit"]
+    [Trust.Temporal.FiniteModel.Action.mk "CopyRange"
+       Trust.Temporal.FiniteModel.Guard.always
+       [Trust.Temporal.FiniteModel.Update.mk "live" CopyLive],
+     Trust.Temporal.FiniteModel.Action.mk "CopyWhole"
+       Trust.Temporal.FiniteModel.Guard.always
+       [Trust.Temporal.FiniteModel.Update.mk "live" WholeLive],
+     Trust.Temporal.FiniteModel.Action.mk "Clear"
+       Trust.Temporal.FiniteModel.Guard.always
+       [Trust.Temporal.FiniteModel.Update.mk "live" ClearFirst]]
+    [Trust.Temporal.FiniteModel.Invariant.mk "Safe"
+       (Trust.Temporal.FiniteModel.ScalarExpr.and DialOff AllFalse)]
+
+def AppliedSafety : Prop :=
+  Trust.Temporal.FiniteModel.SafetyClaim FunctionModel
+
+end FunctionExample
+"#;
+
+    const INHABITED_SCALAR_SOURCE: &str = r#"
+namespace InhabitedExample
+
+open Trust.Temporal.FiniteModel
+
+def Buggy : Trust.Temporal.FiniteModel.ScalarExpr :=
+  Trust.Temporal.FiniteModel.ScalarExpr.constRef "Buggy"
+def Zero : Trust.Temporal.FiniteModel.ScalarExpr :=
+  Trust.Temporal.FiniteModel.ScalarExpr.int 0
+def DialOff : Trust.Temporal.FiniteModel.ScalarExpr :=
+  Trust.Temporal.FiniteModel.ScalarExpr.eq Buggy Zero
+def DialOffInvariant : Trust.Temporal.FiniteModel.Invariant :=
+  Trust.Temporal.FiniteModel.Invariant.mk "DialOff" DialOff
+
+def Model : Trust.Temporal.FiniteModel.ScalarModel :=
+  Trust.Temporal.FiniteModel.ScalarModel.mk "Inhabited"
+    [Trust.Temporal.FiniteModel.Constant.mk "Buggy" 0]
+    [Trust.Temporal.FiniteModel.StateVar.mk "x" 0]
+    [Trust.Temporal.FiniteModel.Action.mk "Stutter"
+       Trust.Temporal.FiniteModel.Guard.always []]
+    [DialOffInvariant]
+
+def AppliedSafety : Prop :=
+  Trust.Temporal.FiniteModel.ScalarModel.safetyClaim Model
+
+theorem dialOffHolds (state : Trust.Temporal.FiniteModel.State) :
+    Trust.Temporal.FiniteModel.InvariantHolds Model.asModel DialOffInvariant state :=
+  Trust.Temporal.FiniteModel.Evaluates.eqTrue Buggy Zero 0 0
+    (Trust.Temporal.FiniteModel.Evaluates.constRef "Buggy" 0
+      ⟨Trust.Temporal.FiniteModel.Constant.mk "Buggy" 0,
+       Trust.Temporal.FiniteModel.Member.head [],
+       rfl, rfl⟩)
+    (Trust.Temporal.FiniteModel.Evaluates.int 0)
+    rfl
+
+theorem noMemberNil {α : Type} {value : α}
+    (member : Trust.Temporal.FiniteModel.Member value []) : False :=
+  @Member.rec α value
+    (fun list _ =>
+      match list with
+      | [] => False
+      | _ :: _ => True)
+    (fun _ => True.intro)
+    (fun _ _ _ _ => True.intro)
+    [] member
+
+theorem memberUncons {α : Type} {value head : α} {tail : List α}
+    (member : Trust.Temporal.FiniteModel.Member value (head :: tail)) :
+    value = head ∨ Trust.Temporal.FiniteModel.Member value tail :=
+  @Member.rec α value
+    (fun list _ =>
+      match list with
+      | [] => True
+      | first :: rest =>
+          value = first ∨ Trust.Temporal.FiniteModel.Member value rest)
+    (fun _ => Or.inl rfl)
+    (fun _ _ previous _ => Or.inr previous)
+    (head :: tail) member
+
+theorem memberSingleton {α : Type} {value only : α}
+    (member : Trust.Temporal.FiniteModel.Member value [only]) :
+    value = only :=
+  match memberUncons member with
+  | Or.inl same => same
+  | Or.inr impossible =>
+      False.elim (noMemberNil impossible)
+
+theorem allInvariantsHold (state : Trust.Temporal.FiniteModel.State) :
+    Trust.Temporal.FiniteModel.AllInvariantsHold Model.asModel state := by
+  intro invariant member
+  have same : invariant = DialOffInvariant := memberSingleton member
+  rw [same]
+  exact dialOffHolds state
+
+def Strengthening (_state : Trust.Temporal.FiniteModel.State) : Prop :=
+  True
+
+theorem AppliedSafetyProof : AppliedSafety :=
+  Trust.Temporal.FiniteModel.safetyClaimOfStrengthening Model.asModel Strengthening
+    (fun _ _ => True.intro)
+    (fun _ _ _ _ => True.intro)
+    (fun state _ => allInvariantsHold state)
+
+theorem UnrelatedProof : True :=
+  True.intro
+
+axiom AppliedSafetyEscape : AppliedSafety
+
+theorem AxiomBackedProof : AppliedSafety :=
+  AppliedSafetyEscape
+
+def One : Trust.Temporal.FiniteModel.ScalarExpr :=
+  Trust.Temporal.FiniteModel.ScalarExpr.int 1
+def DialOn : Trust.Temporal.FiniteModel.ScalarExpr :=
+  Trust.Temporal.FiniteModel.ScalarExpr.eq Buggy One
+def DialOnInvariant : Trust.Temporal.FiniteModel.Invariant :=
+  Trust.Temporal.FiniteModel.Invariant.mk "DialOn" DialOn
+
+def WrongModel : Trust.Temporal.FiniteModel.ScalarModel :=
+  Trust.Temporal.FiniteModel.ScalarModel.mk "WrongInvariant"
+    [Trust.Temporal.FiniteModel.Constant.mk "Buggy" 0]
+    [Trust.Temporal.FiniteModel.StateVar.mk "x" 0]
+    [Trust.Temporal.FiniteModel.Action.mk "Stutter"
+       Trust.Temporal.FiniteModel.Guard.always []]
+    [DialOnInvariant]
+
+def WrongAppliedSafety : Prop :=
+  Trust.Temporal.FiniteModel.ScalarModel.safetyClaim WrongModel
+
+end InhabitedExample
+
+namespace InhabitedFunctionExample
+
+open Trust.Temporal.FiniteModel
+
+def Buggy : Trust.Temporal.FiniteModel.ScalarExpr :=
+  Trust.Temporal.FiniteModel.ScalarExpr.constRef "Buggy"
+def Zero : Trust.Temporal.FiniteModel.ScalarExpr :=
+  Trust.Temporal.FiniteModel.ScalarExpr.int 0
+def DialOff : Trust.Temporal.FiniteModel.ScalarExpr :=
+  Trust.Temporal.FiniteModel.ScalarExpr.eq Buggy Zero
+def DialOffInvariant : Trust.Temporal.FiniteModel.Invariant :=
+  Trust.Temporal.FiniteModel.Invariant.mk "DialOff" DialOff
+
+def Model : Trust.Temporal.FiniteModel.Model :=
+  Trust.Temporal.FiniteModel.Model.mk "InhabitedFunction"
+    [Trust.Temporal.FiniteModel.Constant.mk "Buggy" 0,
+     Trust.Temporal.FiniteModel.Constant.mk "Limit" 1]
+    []
+    [Trust.Temporal.FiniteModel.FunctionVar.mk "live" "Limit"]
+    [Trust.Temporal.FiniteModel.Action.mk "Stutter"
+       Trust.Temporal.FiniteModel.Guard.always []]
+    [DialOffInvariant]
+
+def AppliedSafety : Prop :=
+  Trust.Temporal.FiniteModel.SafetyClaim Model
+
+theorem dialOffHolds (state : Trust.Temporal.FiniteModel.State) :
+    Trust.Temporal.FiniteModel.InvariantHolds Model DialOffInvariant state :=
+  Trust.Temporal.FiniteModel.Evaluates.eqTrue Buggy Zero 0 0
+    (Trust.Temporal.FiniteModel.Evaluates.constRef "Buggy" 0
+      ⟨Trust.Temporal.FiniteModel.Constant.mk "Buggy" 0,
+       Trust.Temporal.FiniteModel.Member.head
+         [Trust.Temporal.FiniteModel.Constant.mk "Limit" 1],
+       rfl, rfl⟩)
+    (Trust.Temporal.FiniteModel.Evaluates.int 0)
+    rfl
+
+theorem noMemberNil {α : Type} {value : α}
+    (member : Trust.Temporal.FiniteModel.Member value []) : False :=
+  @Member.rec α value
+    (fun list _ =>
+      match list with
+      | [] => False
+      | _ :: _ => True)
+    (fun _ => True.intro)
+    (fun _ _ _ _ => True.intro)
+    [] member
+
+theorem memberUncons {α : Type} {value head : α} {tail : List α}
+    (member : Trust.Temporal.FiniteModel.Member value (head :: tail)) :
+    value = head ∨ Trust.Temporal.FiniteModel.Member value tail :=
+  @Member.rec α value
+    (fun list _ =>
+      match list with
+      | [] => True
+      | first :: rest =>
+          value = first ∨ Trust.Temporal.FiniteModel.Member value rest)
+    (fun _ => Or.inl rfl)
+    (fun _ _ previous _ => Or.inr previous)
+    (head :: tail) member
+
+theorem memberSingleton {α : Type} {value only : α}
+    (member : Trust.Temporal.FiniteModel.Member value [only]) :
+    value = only :=
+  match memberUncons member with
+  | Or.inl same => same
+  | Or.inr impossible =>
+      False.elim (noMemberNil impossible)
+
+theorem allInvariantsHold (state : Trust.Temporal.FiniteModel.State) :
+    Trust.Temporal.FiniteModel.AllInvariantsHold Model state := by
+  intro invariant member
+  have same : invariant = DialOffInvariant := memberSingleton member
+  rw [same]
+  exact dialOffHolds state
+
+theorem AppliedSafetyProof : AppliedSafety :=
+  Trust.Temporal.FiniteModel.safetyClaimOfInductive Model
+    (fun state _ => allInvariantsHold state)
+    (fun _ after _ _ => allInvariantsHold after)
+
+end InhabitedFunctionExample
+"#;
+
     fn buggy_baseline_source_variants() -> [(String, &'static str); 3] {
         let missing = SOURCE
             .replace(
@@ -1646,6 +3031,333 @@ CHECK_DEADLOCK FALSE\n";
                     || detail.contains("the explicit-fixpoint certificate lane declined")),
             "grammar parity remains exact, but this richer fixture must stay below the Certified \
              authority tier until the mandatory TY producer accepts it: {error:?}"
+        );
+    }
+
+    #[test]
+    fn function_valued_clean_model_decodes_all_expression_forms_and_replays() {
+        let (artifact, decoded) =
+            extract_clean_finite_model(FUNCTION_MODEL_SOURCE, "FunctionExample.FunctionModel")
+                .expect("the function-valued Clean model must decode");
+        assert_eq!(artifact.schema, CLEAN_FINITE_MODEL_SCHEMA_V2);
+        assert_eq!(
+            decoded.function_variables,
+            vec![CleanFunctionVar { name: "live".to_owned(), range_constant: "Limit".to_owned() }]
+        );
+        let model = decoded.to_model().expect("the decoded finite model must validate");
+        assert_eq!(model.fn_vars.len(), 1);
+        let tla = model.to_tla();
+        assert!(tla.contains("live = [n \\in 1..Limit |-> FALSE]"));
+        assert!(tla.contains("[n \\in 1..Limit |-> live[n]]"));
+        assert!(tla.contains("CopyWhole == live' = live"));
+        assert!(tla.contains("[live EXCEPT ![1] = FALSE]"));
+        assert!(tla.contains("\\A n \\in 1..Limit : (live[n] <=> FALSE)"));
+        assert_eq!(
+            recheck_clean_finite_model_artifact(&artifact, FUNCTION_MODEL_SOURCE),
+            Ok(decoded)
+        );
+        assert!(matches!(
+            extract_clean_scalar_model(
+                FUNCTION_MODEL_SOURCE,
+                "FunctionExample.FunctionModel"
+            ),
+            Err(CleanScalarModelError::Definition(ref detail))
+                if detail.contains(SCALAR_MODEL_TYPE)
+        ));
+    }
+
+    #[test]
+    fn applied_model_binding_is_exact_and_fails_closed_on_claim_drift() {
+        let source = complete_authority_with_applied_claim();
+        let binding = bind_clean_scalar_model_safety_claim(
+            &source,
+            "AuthorityExample.CompleteAuthority",
+            "AuthorityExample.AppliedSafety",
+        )
+        .expect("the exact scalar applied claim must kernel-bind");
+        assert_eq!(binding.schema, CLEAN_APPLIED_MODEL_BINDING_SCHEMA_V1);
+        recheck_clean_scalar_model_safety_claim_binding(&binding, &source)
+            .expect("the exact applied binding must freshly replay");
+
+        let unrelated = source.replace(
+            "Trust.Temporal.FiniteModel.ScalarModel.safetyClaim CompleteAuthority",
+            "Trust.Temporal.FiniteModel.SafetyClaim \
+             (Trust.Temporal.FiniteModel.Model.mk \"Other\" [] [] [] [] [])",
+        );
+        let unrelated_error = bind_clean_scalar_model_safety_claim(
+            &unrelated,
+            "AuthorityExample.CompleteAuthority",
+            "AuthorityExample.AppliedSafety",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                unrelated_error,
+                CleanScalarModelError::Definition(ref detail)
+                    if detail.contains("must name the selected model")
+            ),
+            "unexpected unrelated-claim diagnostic: {unrelated_error:?}"
+        );
+
+        let changed_claim = source.replace(
+            "Trust.Temporal.FiniteModel.ScalarModel.safetyClaim CompleteAuthority",
+            "(Trust.Temporal.FiniteModel.ScalarModel.safetyClaim CompleteAuthority ∧ \
+              Trust.Temporal.FiniteModel.ScalarModel.safetyClaim CompleteAuthority)",
+        );
+        assert!(
+            bind_clean_scalar_model_safety_claim(
+                &changed_claim,
+                "AuthorityExample.CompleteAuthority",
+                "AuthorityExample.AppliedSafety",
+            )
+            .is_err()
+        );
+
+        let mut forged = binding;
+        forged.transport_proof = encoded(&KernelExpr::bvar(0)).unwrap();
+        assert!(matches!(
+            recheck_clean_scalar_model_safety_claim_binding(&forged, &source),
+            Err(CleanScalarModelError::ArtifactMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn function_model_applied_claim_kernel_binds() {
+        let binding = bind_clean_finite_model_safety_claim(
+            FUNCTION_MODEL_SOURCE,
+            "FunctionExample.FunctionModel",
+            "FunctionExample.AppliedSafety",
+        )
+        .expect("the full finite model must bind to its exact applied safety claim");
+        recheck_clean_finite_model_safety_claim_binding(&binding, FUNCTION_MODEL_SOURCE)
+            .expect("the function-valued applied claim must freshly replay");
+    }
+
+    #[test]
+    fn constructive_applied_proof_inhabits_exact_scalar_claim() {
+        // `AppliedSafetyProof` deliberately goes through
+        // `safetyClaimOfStrengthening` with a `True` strengthening distinct
+        // from the authored invariant. Construction and the fresh recheck
+        // below are the end-to-end kernel/replay regression for that theorem.
+        let proof = prove_clean_scalar_model_safety_claim(
+            INHABITED_SCALAR_SOURCE,
+            "InhabitedExample.Model",
+            "InhabitedExample.AppliedSafety",
+            "InhabitedExample.AppliedSafetyProof",
+        )
+        .expect("the constructive theorem must inhabit the exact applied claim");
+        assert_eq!(proof.schema, CLEAN_APPLIED_MODEL_PROOF_SCHEMA_V1);
+        assert_eq!(proof.canonical_inhabitant_type, proof.binding.canonical_claim);
+        recheck_clean_scalar_model_safety_claim_proof(&proof, INHABITED_SCALAR_SOURCE)
+            .expect("the exact constructive proof must freshly replay");
+
+        let unrelated = prove_clean_scalar_model_safety_claim(
+            INHABITED_SCALAR_SOURCE,
+            "InhabitedExample.Model",
+            "InhabitedExample.AppliedSafety",
+            "InhabitedExample.UnrelatedProof",
+        );
+        assert!(matches!(
+            unrelated,
+            Err(CleanScalarModelError::Definition(ref detail))
+                if detail.contains("must prove the selected applied claim")
+        ));
+
+        let wrong_invariant = prove_clean_scalar_model_safety_claim(
+            INHABITED_SCALAR_SOURCE,
+            "InhabitedExample.WrongModel",
+            "InhabitedExample.WrongAppliedSafety",
+            "InhabitedExample.AppliedSafetyProof",
+        );
+        assert!(matches!(
+            wrong_invariant,
+            Err(CleanScalarModelError::Definition(ref detail))
+                if detail.contains("must prove the selected applied claim")
+        ));
+
+        let axiom_backed = prove_clean_scalar_model_safety_claim(
+            INHABITED_SCALAR_SOURCE,
+            "InhabitedExample.Model",
+            "InhabitedExample.AppliedSafety",
+            "InhabitedExample.AxiomBackedProof",
+        );
+        assert!(matches!(
+            axiom_backed,
+            Err(CleanScalarModelError::Clean(
+                CleanTemporalCertificateError::NonConstructive { .. }
+                    | CleanTemporalCertificateError::ForbiddenAxiom { .. }
+            ))
+        ));
+
+        let mut tampered = proof.clone();
+        tampered.canonical_inhabitant.push(0);
+        assert!(matches!(
+            recheck_clean_scalar_model_safety_claim_proof(&tampered, INHABITED_SCALAR_SOURCE),
+            Err(CleanScalarModelError::ArtifactMismatch(_))
+        ));
+
+        let mut wrong_model = proof;
+        wrong_model.binding.model_definition = "InhabitedExample.WrongModel".to_owned();
+        assert!(
+            recheck_clean_scalar_model_safety_claim_proof(&wrong_model, INHABITED_SCALAR_SOURCE)
+                .is_err(),
+            "a proof artifact cannot be retargeted to another model",
+        );
+    }
+
+    #[test]
+    fn constructive_applied_proof_inhabits_exact_function_model_claim() {
+        let proof = prove_clean_finite_model_safety_claim(
+            INHABITED_SCALAR_SOURCE,
+            "InhabitedFunctionExample.Model",
+            "InhabitedFunctionExample.AppliedSafety",
+            "InhabitedFunctionExample.AppliedSafetyProof",
+        )
+        .expect("the constructive theorem must inhabit the exact function-model claim");
+        assert_eq!(proof.canonical_inhabitant_type, proof.binding.canonical_claim);
+        recheck_clean_finite_model_safety_claim_proof(&proof, INHABITED_SCALAR_SOURCE)
+            .expect("the exact function-model proof must freshly replay");
+    }
+
+    #[test]
+    fn proved_bound_certificates_replay_ty_and_exact_clean_inhabitants() {
+        let scalar = certify_proved_bound_clean_scalar_model_with_ty(
+            INHABITED_SCALAR_SOURCE,
+            "InhabitedExample.Model",
+            "InhabitedExample.AppliedSafety",
+            "InhabitedExample.AppliedSafetyProof",
+        )
+        .expect("scalar ty evidence and its exact Clean inhabitant must compose");
+        assert_eq!(scalar.schema, CLEAN_PROVED_BOUND_SCALAR_MODEL_SCHEMA_V3);
+        recheck_proved_bound_clean_scalar_model_with_ty(&scalar, INHABITED_SCALAR_SOURCE)
+            .expect("the scalar proof-carrying certificate must freshly replay");
+
+        let finite = certify_proved_bound_clean_finite_model_with_ty(
+            INHABITED_SCALAR_SOURCE,
+            "InhabitedFunctionExample.Model",
+            "InhabitedFunctionExample.AppliedSafety",
+            "InhabitedFunctionExample.AppliedSafetyProof",
+        )
+        .expect("function-valued ty evidence and its exact Clean inhabitant must compose");
+        assert_eq!(finite.schema, CLEAN_PROVED_BOUND_FINITE_MODEL_SCHEMA_V3);
+        recheck_proved_bound_clean_finite_model_with_ty(&finite, INHABITED_SCALAR_SOURCE)
+            .expect("the function proof-carrying certificate must freshly replay");
+
+        let mut spliced = scalar;
+        spliced.applied_proof = finite.applied_proof;
+        assert!(matches!(
+            recheck_proved_bound_clean_scalar_model_with_ty(
+                &spliced,
+                INHABITED_SCALAR_SOURCE
+            ),
+            Err(CleanScalarModelError::ArtifactMismatch(ref detail))
+                if detail.contains("different model artifacts")
+        ));
+    }
+
+    #[test]
+    fn new_certificate_schemas_reject_unknown_json_fields() {
+        fn reject_unknown<T, U>(value: T, label: &str)
+        where
+            T: serde::Serialize,
+            U: serde::de::DeserializeOwned,
+        {
+            let mut encoded = serde_json::to_value(value)
+                .expect("authority artifact must serialize to an object");
+            encoded
+                .as_object_mut()
+                .expect("derived struct serialization is an object")
+                .insert("future_authority".to_owned(), serde_json::Value::Bool(true));
+            assert!(
+                serde_json::from_value::<U>(encoded).is_err(),
+                "unknown fields must not be silently ignored by {label}",
+            );
+        }
+
+        let applied = CleanAppliedModelBinding {
+            schema: CLEAN_APPLIED_MODEL_BINDING_SCHEMA_V1.to_owned(),
+            clean_source: String::new(),
+            model_definition: String::new(),
+            claim_definition: String::new(),
+            model_type: Vec::new(),
+            model_value: Vec::new(),
+            claim_type: Vec::new(),
+            claim_value: Vec::new(),
+            canonical_claim: Vec::new(),
+            transport_type: Vec::new(),
+            transport_proof: Vec::new(),
+        };
+        reject_unknown::<_, CleanAppliedModelBinding>(
+            applied.clone(),
+            "the applied-binding schema",
+        );
+
+        let artifact = CleanFiniteModelArtifact {
+            schema: CLEAN_FINITE_MODEL_SCHEMA_V2.to_owned(),
+            clean_source: String::new(),
+            model_definition: String::new(),
+            type_expr: Vec::new(),
+            value_expr: Vec::new(),
+        };
+        reject_unknown::<_, CleanFiniteModelArtifact>(
+            artifact.clone(),
+            "the full-model artifact schema",
+        );
+
+        let applied_proof = CleanAppliedModelProof {
+            schema: CLEAN_APPLIED_MODEL_PROOF_SCHEMA_V1.to_owned(),
+            binding: applied,
+            proof_definition: String::new(),
+            proof_type: Vec::new(),
+            proof_value: Vec::new(),
+            canonical_inhabitant_type: Vec::new(),
+            canonical_inhabitant: Vec::new(),
+        };
+        reject_unknown::<_, CleanAppliedModelProof>(
+            applied_proof.clone(),
+            "the applied-proof schema",
+        );
+
+        let scalar = CleanScalarModelCertificate {
+            schema: CLEAN_SCALAR_MODEL_SCHEMA_V1.to_owned(),
+            model: CleanScalarModelArtifact {
+                schema: CLEAN_SCALAR_MODEL_SCHEMA_V1.to_owned(),
+                clean_source: String::new(),
+                model_definition: String::new(),
+                type_expr: Vec::new(),
+                value_expr: Vec::new(),
+            },
+            spec_src: String::new(),
+            config_src: String::new(),
+            safety_certificate_json: String::new(),
+            buggy_config_src: String::new(),
+            buggy_counterexample_json: String::new(),
+        };
+        reject_unknown::<_, CleanProvedBoundScalarModelCertificate>(
+            CleanProvedBoundScalarModelCertificate {
+                schema: CLEAN_PROVED_BOUND_SCALAR_MODEL_SCHEMA_V3.to_owned(),
+                scalar,
+                applied_proof: applied_proof.clone(),
+            },
+            "the proof-carrying scalar schema",
+        );
+
+        let finite = CleanFiniteModelCertificate {
+            schema: CLEAN_FINITE_MODEL_SCHEMA_V2.to_owned(),
+            model: artifact,
+            spec_src: String::new(),
+            config_src: String::new(),
+            safety_certificate_json: String::new(),
+            buggy_config_src: String::new(),
+            buggy_counterexample_json: String::new(),
+        };
+        reject_unknown::<_, CleanProvedBoundFiniteModelCertificate>(
+            CleanProvedBoundFiniteModelCertificate {
+                schema: CLEAN_PROVED_BOUND_FINITE_MODEL_SCHEMA_V3.to_owned(),
+                finite,
+                applied_proof,
+            },
+            "the proof-carrying finite schema",
         );
     }
 
@@ -2018,6 +3730,56 @@ CHECK_DEADLOCK FALSE\n";
         tampered.buggy_config_src = tampered.buggy_config_src.replace("Buggy = 1", "Buggy = 0");
         assert!(matches!(
             recheck_clean_scalar_model_with_ty(&tampered, COMPLETE_AUTHORITY_SOURCE),
+            Err(CleanScalarModelError::ArtifactMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn bound_scalar_certificate_replays_ty_and_applied_clean_claim() {
+        let source = complete_authority_with_applied_claim();
+        let certificate = certify_bound_clean_scalar_model_with_ty(
+            &source,
+            "AuthorityExample.CompleteAuthority",
+            "AuthorityExample.AppliedSafety",
+        )
+        .expect("the scalar ty evidence and applied Clean claim must certify together");
+        recheck_bound_clean_scalar_model_with_ty(&certificate, &source)
+            .expect("the bound scalar certificate must freshly replay");
+
+        let mut spliced = certificate.clone();
+        spliced.applied.model_definition = "AuthorityExample.OtherAuthority".to_owned();
+        assert!(matches!(
+            recheck_bound_clean_scalar_model_with_ty(&spliced, &source),
+            Err(CleanScalarModelError::ArtifactMismatch(ref detail))
+                if detail.contains("different model artifacts")
+        ));
+
+        let mut tampered = certificate;
+        tampered.applied.canonical_claim.push(0);
+        assert!(matches!(
+            recheck_bound_clean_scalar_model_with_ty(&tampered, &source),
+            Err(CleanScalarModelError::ArtifactMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn function_model_certifies_replays_and_preserves_buggy_ratchet() {
+        let certificate = certify_bound_clean_finite_model_with_ty(
+            FUNCTION_MODEL_SOURCE,
+            "FunctionExample.FunctionModel",
+            "FunctionExample.AppliedSafety",
+        )
+        .expect("the function-valued model must reach the finite-product kernel lane");
+        recheck_bound_clean_finite_model_with_ty(&certificate, FUNCTION_MODEL_SOURCE)
+            .expect("the function-valued certificate must freshly replay");
+        assert!(certificate.finite.spec_src.contains("VARIABLES live"));
+        assert!(certificate.finite.spec_src.contains("live = [n \\in 1..Limit |-> FALSE]"));
+
+        let mut tampered = certificate;
+        tampered.finite.buggy_config_src =
+            tampered.finite.buggy_config_src.replace("Buggy = 1", "Buggy = 0");
+        assert!(matches!(
+            recheck_bound_clean_finite_model_with_ty(&tampered, FUNCTION_MODEL_SOURCE),
             Err(CleanScalarModelError::ArtifactMismatch(_))
         ));
     }

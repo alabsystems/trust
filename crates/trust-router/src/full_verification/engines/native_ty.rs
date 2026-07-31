@@ -169,6 +169,7 @@ impl NativeTyEngine {
                 obligation_id: obligation.obligation_id.clone(),
                 engine: self.manifest.clone(),
                 status: EvidenceStatus::Unknown,
+                decline: None,
                 proof_strength: None,
                 artifacts: Vec::new(),
                 counterexample: None,
@@ -182,6 +183,7 @@ impl NativeTyEngine {
                 obligation_id: obligation.obligation_id.clone(),
                 engine: self.manifest.clone(),
                 status: EvidenceStatus::Unknown,
+                decline: None,
                 proof_strength: None,
                 artifacts: Vec::new(),
                 counterexample: None,
@@ -288,6 +290,7 @@ impl NativeTyEngine {
             obligation_id: obligation.obligation_id.clone(),
             engine: self.manifest.clone(),
             status: EvidenceStatus::Proved,
+            decline: None,
             proof_strength: Some(strength),
             artifacts,
             counterexample: None,
@@ -323,6 +326,7 @@ impl NativeTyEngine {
             obligation_id: obligation.obligation_id.clone(),
             engine: self.manifest.clone(),
             status: EvidenceStatus::Failed,
+            decline: None,
             proof_strength: None,
             artifacts: Vec::new(),
             counterexample: Some(Counterexample { format: TY_EVIDENCE_SCHEMA.to_string(), data }),
@@ -340,6 +344,7 @@ impl NativeTyEngine {
             obligation_id: obligation.obligation_id.clone(),
             engine: self.manifest.clone(),
             status: EvidenceStatus::Unsupported,
+            decline: None,
             proof_strength: None,
             artifacts: Vec::new(),
             counterexample: None,
@@ -558,7 +563,7 @@ mod tests {
         }
     }
 
-    fn mmap_model_metadata(single_writer: bool) -> MetadataEntry {
+    fn mmap_model_metadata(single_writer: trust_types::SingleWriterEvidence) -> MetadataEntry {
         temporal_model_metadata("AG !bad", StateMachineMetadata::mmap_temporal_model(single_writer))
     }
 
@@ -595,7 +600,7 @@ mod tests {
     #[test]
     fn proves_single_writer_mmap_model_sound_with_artifacts() {
         let engine = NativeTyEngine::new();
-        let obligation = temporal_obligation(vec![mmap_model_metadata(true)]);
+        let obligation = temporal_obligation(vec![mmap_model_metadata(trust_types::SingleWriterEvidence::Verified)]);
         let evidence = engine.verify(&bundle(&obligation), &[obligation]);
         assert_eq!(evidence.len(), 1);
         let evidence = &evidence[0];
@@ -644,7 +649,7 @@ mod tests {
     #[test]
     fn ty_proof_artifacts_cannot_be_transplanted_to_another_obligation() {
         let engine = NativeTyEngine::new();
-        let obligation = temporal_obligation(vec![mmap_model_metadata(true)]);
+        let obligation = temporal_obligation(vec![mmap_model_metadata(trust_types::SingleWriterEvidence::Verified)]);
         let mut evidence = engine.verify(&bundle(&obligation), &[obligation]).remove(0);
         assert!(evidence.satisfies_proof_artifact_policy());
 
@@ -658,7 +663,7 @@ mod tests {
     #[test]
     fn ty_transcript_check_pair_without_statement_lineage_is_rejected() {
         let engine = NativeTyEngine::new();
-        let obligation = temporal_obligation(vec![mmap_model_metadata(true)]);
+        let obligation = temporal_obligation(vec![mmap_model_metadata(trust_types::SingleWriterEvidence::Verified)]);
         let mut evidence =
             engine.verify(&bundle(&obligation), std::slice::from_ref(&obligation)).remove(0);
         let transcript = inline_artifact(
@@ -691,7 +696,7 @@ mod tests {
     #[test]
     fn refutes_multi_writer_mmap_model_with_trace() {
         let engine = NativeTyEngine::new();
-        let obligation = temporal_obligation(vec![mmap_model_metadata(false)]);
+        let obligation = temporal_obligation(vec![mmap_model_metadata(trust_types::SingleWriterEvidence::None)]);
         let evidence = engine.verify(&bundle(&obligation), &[obligation]);
         assert_eq!(evidence.len(), 1);
         let evidence = &evidence[0];

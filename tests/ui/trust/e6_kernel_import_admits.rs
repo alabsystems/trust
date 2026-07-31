@@ -18,16 +18,14 @@
 //!    citations then fail on a SEPARATE, later constraint — the exact-statement
 //!    binding (`triv : True` does not prove the clause, and the clause carries
 //!    an extra `result` binder) — NOT on the E6 gate.
-//!  - `winc` (wrapping arithmetic) does NOT pass the gate. This comment used to
-//!    claim it did, reaching NoPanic "via the call-graph closure over
-//!    `wrapping_add`"; the fixture's own expected diagnostic at `c_arith`
-//!    contradicts that, saying "at least one E6 structural facet of `winc` is
-//!    not established". The Arithmetic shape is built from a CALL, and the
-//!    facet gate poisons on any `Terminator::Call`
-//!    (`crates/trust-vcgen/src/facets.rs:261`), so the recognizer matches and
-//!    admission still refuses — shapes S3 (Arithmetic) and S4 (Composed) are
-//!    unreachable today. Independently measured as `admissible=false` by
-//!    `tests/e6-fragment-probe/probes/f10_arith_wrapping.rs`.
+//!  - `winc` (wrapping arithmetic) passes through a narrower external-call
+//!    lane. rustc authenticates the exact inherent `core` primitive DefId and
+//!    safe `(uN, uN) -> uN` signature, then stamps a closed marker distinct
+//!    from the intrinsic marker. Facet inference and body recognition recheck
+//!    that marker and exact width/type agreement. This admits S3/S4 for
+//!    `u8`/`u16`/`u32`/`u64`, while unmarked paths, lookalikes, malformed
+//!    markers, signed/`usize`/`u128` carriers, and mixed-width chains fail
+//!    closed. The stage-2 corpus pins S3 and S4 separately in `f10`/`f21`.
 //!
 //! That "bindings are not exact" diagnostic is the marker that the
 //!    function WAS admitted (contrast `not_pure` below).
@@ -56,9 +54,8 @@ fn fst(x: u64, y: u64) -> u64 { x }
 /// Select body (min): `min2(a, b) = if a < b { a } else { b }`. Admitted.
 fn min2(a: u64, b: u64) -> u64 { if a < b { a } else { b } }
 
-/// Wrapping-arithmetic body: `winc(x) = x.wrapping_add(1)`. NoPanic holds only
-/// via the call-graph closure over the trusted external `wrapping_add`, so this
-/// is the case that requires minting from the COMPOSED facet table.
+/// Wrapping-arithmetic body: `winc(x) = x.wrapping_add(1)`. The exact core
+/// primitive identity supplies the external pure/total/no-panic authority.
 fn winc(x: u64) -> u64 { x.wrapping_add(1) }
 
 /// Debug-checked `+` ⇒ overflow `Assert` ⇒ structural NoPanic deficit. NOT
@@ -93,7 +90,7 @@ fn c_arith(x: u64) -> u64
     //~^ ERROR Trust Level 0 safety verification incomplete for `e6_kernel_import_admits::c_arith`
     //~| ERROR Trust strict verification failed for `e6_kernel_import_admits::c_arith`
     ensures winc(x) >= x by triv
-    //~^ ERROR citation `triv` cannot be validated because this clause is outside the exact statement fragment: at least one E6 structural facet of `winc` is not established
+    //~^ ERROR citation `triv` failed the strict Clean statement/certification audit
 { x }
 
 fn c_not_pure(x: u64, y: u64) -> u64

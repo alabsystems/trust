@@ -159,14 +159,23 @@ pub fn parse_value_from_args<'a>(args: &'a [OsString], key: &str) -> Option<&'a 
     None
 }
 
-/// Any spelling or value of the verification switch. Matching the option NAME
-/// rather than one value is what makes the strip total: a caller-authored
+/// Any spelling or value of the verification switch — INCLUDING the retired
+/// `-Zno-trust-verify` name, which is the same option in its pre-consolidation
+/// spelling (576db732cd renamed it; the pinned seed's binaries still speak it,
+/// and the seed's targo injects it into the rustc invocations it drives). The
+/// mixed-vintage bootstrap therefore sees both spellings in one process tree,
+/// and each vintage of the compiler parses exactly one of them: recognizing
+/// both here is what lets `canonicalize_trust_no_verify` NORMALIZE a
+/// seed-authored retired spelling into the current one for a current driver —
+/// which breaks the seed-targo/stage1-rustc deadlock without re-forking the
+/// flag surface with a compiler-side alias. Matching the option NAME rather
+/// than one value is what makes the strip total: a caller-authored
 /// `-Ztrust-verify=on` has to be removed too, or bootstrap's own final
 /// `-Ztrust-verify=off` would be competing with it instead of replacing it.
 fn is_trust_verify_option(option: &OsStr) -> bool {
     option.to_str().is_some_and(|option| {
-        option.split_once('=').map_or(option, |(name, _)| name).replace('_', "-")
-            == "trust-verify"
+        let name = option.split_once('=').map_or(option, |(name, _)| name).replace('_', "-");
+        name == "trust-verify" || name == "no-trust-verify"
     })
 }
 
@@ -219,6 +228,87 @@ pub fn finalize_trust_no_verify(
     } else if applies_to_compile {
         canonicalize_trust_no_verify(args);
     }
+}
+
+/// Whether the rustc-style options request the Trust off-switch
+/// (`-Ztrust-verify=off`, either token shape) before the positional `--`
+/// boundary. This is how the BUILDER's intent reaches a snapshot compile:
+/// bootstrap delivers the off-switch to host units (build scripts, proc
+/// macros) through `RUSTC_HOST_FLAGS`, which the shim has already folded into
+/// the assembled args by the time the snapshot finalizer runs.
+fn args_request_trust_no_verify_off(args: &[OsString]) -> bool {
+    let mut iter = args.iter().take_while(|arg| *arg != "--").peekable();
+    while let Some(arg) = iter.next() {
+        if arg == "-Z" {
+            if iter.peek().is_some_and(|option| is_trust_verify_off_option(option)) {
+                return true;
+            }
+        } else if arg
+            .as_os_str()
+            .to_str()
+            .and_then(|arg| arg.strip_prefix("-Z"))
+            .filter(|option| !option.is_empty())
+            .is_some_and(|option| is_trust_verify_off_option(OsStr::new(option)))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_trust_verify_off_option(option: &OsStr) -> bool {
+    option.to_str().is_some_and(|option| {
+        let (name, value) = option.split_once('=').map_or((option, ""), |(name, value)| {
+            (name, value)
+        });
+        match name.replace('_', "-").as_str() {
+            "trust-verify" => value == "off",
+            // The retired spelling is a boolean whose truthy values (and bare
+            // form) request verification OFF; only an explicit `=no` does not.
+            "no-trust-verify" => value != "no",
+            _ => false,
+        }
+    })
+}
+
+/// The SNAPSHOT variant of [`finalize_trust_no_verify`], for a driver whose
+/// vintage is the SEED PIN's, not this source tree's. A bootstrap-managed
+/// stage0 snapshot may predate the current `-Ztrust-verify=off` spelling
+/// entirely — the pinned 2026-07-13 seed advertises only the retired
+/// `-Zno-trust-verify`, so there is NO argv spelling this source tree knows
+/// that every legitimate seed can parse. Handing it the current spelling
+/// aborted every fresh-machine build at the first build script
+/// (`error: unknown unstable option: trust-verify`); handing it the retired
+/// one would abort under any post-rename seed, which deleted it.
+///
+/// So: every argv spelling is stripped, and the return value tells the caller
+/// whether to address the driver through the version-invariant nested-process
+/// transport `TRUST_NO_VERIFY=1` instead — the compiler translates that env
+/// into its own off-switch before option parsing on every Trust vintage
+/// (`trust_verify.rs`, `verification_enabled`), and a stock upstream driver
+/// ignores it as an unknown environment variable.
+///
+/// The transport fires on EITHER signal, because the off-switch reaches a
+/// snapshot compile on two distinct lanes and `applies_to_compile` only
+/// models one of them: the shim's own add-path (`trust_bootstrap_no_verify_applies`,
+/// whose driver gate deliberately answers false for a seed on host units) and
+/// the builder's `RUSTC_HOST_FLAGS` lane, which materializes the off-switch
+/// directly in the assembled args for build scripts and proc macros. A
+/// stripped-but-unhonored off-request would silently re-enable batteries-on
+/// verification of the whole bootstrap dependency tree — the memchr wall.
+/// An `=on` request never rides the transport: only the exact off value
+/// counts. In-tree drivers (`trustc` stem, stage1+) never take this path:
+/// their vintage matches this shim's own source by construction, so the
+/// canonical argv spelling stays authoritative and auditable for them.
+#[must_use]
+pub fn finalize_trust_no_verify_snapshot(
+    args: &mut Vec<OsString>,
+    driver_supports_no_verify: bool,
+    applies_to_compile: bool,
+) -> bool {
+    let off_requested = args_request_trust_no_verify_off(args);
+    strip_trust_no_verify(args);
+    driver_supports_no_verify && (applies_to_compile || off_requested)
 }
 
 /// Ordinary Cargo fixture isolation may disable verification, but an

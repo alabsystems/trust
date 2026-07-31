@@ -4558,8 +4558,17 @@ pub const INSTANTIATOR_ORD_LEAF_DEF_PATH: &str =
 // already reflects the unwind-carrying schema. The value is the live
 // `load_instantiator_ordering_leaf().content_hash()` and is asserted exactly by
 // `instantiator_ordering_leaf_exact_vc_hash_and_discharge`.
+// Re-pinned 2026-07-28 for the SECOND hash-visible schema extension, by the same
+// argument as the unwind one above: `AggregateKind::Adt` gained a serde-defaulted
+// `args: Option<String>` discriminator (the C1 generic-args change, 701d94eccc7),
+// which IS hash-visible; the fixture bytes are untouched in git and decode with
+// `args: None`, so the audited SEMANTICS are unchanged. NOTE the failure mode this
+// re-pin ends: the stale hash did not merely fail its test — `adt_shapes.rs` gates
+// the `sem_adt_return_opaque_ord_shape_of` recognizer on this constant, so the
+// recognizer had been silently DEAD since the schema change (its own test could not
+// compile over the same period, for the same incomplete sync, so nothing noticed).
 pub const INSTANTIATOR_ORD_LEAF_CONTENT_HASH: &str =
-    "b278bfb4d47462acaacc8863d4262cf43b536dd3881b74c69f5a8944c08c1c10";
+    "c83cbee15c718d99bb64d2343c64e0da26efc729bdf950ae5f4c2d0af55cee3f";
 
 /// Kernel-witness input for the exact ordering-dispatch leaf.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7842,3 +7851,17 @@ mod w6_map_compose_recognizer_tests;
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod record_inc2_recognizer_tests;
+// ---------------------------------------------------------------------------
+// Trust: SHIFT-CORE SELECTION (2026-07-29) — the shift VC's violation core must be
+// read off the emitter's own construction, never picked as the first hypothesis
+// conjunct that happens to share its shape.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod shift_core_selection_tests;
+// ---------------------------------------------------------------------------
+// Trust: OBLIGATION-REGION SELECTION (2026-07-29) — the seven remaining
+// `safety_vc_is_faithful_formula_aware` sites must read each VC's OWN emitted
+// violation, never a hypothesis conjunct of the wrapped formula.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod obligation_region_tests;

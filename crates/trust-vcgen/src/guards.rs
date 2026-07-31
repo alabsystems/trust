@@ -777,6 +777,149 @@ pub(crate) fn guarded_formula(
     Formula::And(vec![assumption, vc_formula])
 }
 
+/// The single, well-typed checked integer operation whose overflow flag an
+/// `Assert(expected = false)` consumes.
+///
+/// This is a proof-authority boundary, not just a MIR convenience recognizer.
+/// Synthetic/imported TrustIR can violate rustc's ordinary SSA and typing
+/// invariants, so fail closed unless all of them are explicit here:
+///
+/// - the condition is exactly the asserted tuple's `.1` field;
+/// - that tuple has one and only one write in the block, a whole-local
+///   `CheckedBinaryOp(Add|Sub|Mul)`;
+/// - both operands and the tuple result have one identical integer type;
+/// - the checked operation does not read its own pre-write tuple; and
+/// - no value-affecting statement follows the snapshot before the Assert.
+///
+/// The last two conditions prevent an unversioned formula such as
+/// `checked.0 == a + b` from silently referring to a different value at the
+/// block exit than the one the checked operation actually read.
+fn checked_operand_matches_type(
+    func: &VerifiableFunction,
+    operand: &Operand,
+    expected: &Ty,
+) -> bool {
+    match operand {
+        // Signed MIR constants deliberately lose their source width in the
+        // portable VF (`ConstValue::Int`). Recover it only from the checked
+        // tuple's authenticated value type, and only when the value is exactly
+        // representable there. This admits genuine `i32 + 1` without allowing
+        // a forged `i8 + 128` to mint impossible success-edge facts.
+        Operand::Constant(ConstValue::Int(value)) => match expected {
+            Ty::Int { width: 8, signed: true } => i8::try_from(*value).is_ok(),
+            Ty::Int { width: 16, signed: true } => i16::try_from(*value).is_ok(),
+            Ty::Int { width: 32, signed: true } => i32::try_from(*value).is_ok(),
+            Ty::Int { width: 64, signed: true } | Ty::PtrSizedInt { signed: true } => {
+                i64::try_from(*value).is_ok()
+            }
+            Ty::Int { width: 128, signed: true } => true,
+            _ => false,
+        },
+        // Unsigned constants retain their compiler-extracted width. Require it
+        // to agree exactly with the checked tuple carrier (including the
+        // faithful pointer-sized spelling) and independently validate the
+        // serialized value's range.
+        Operand::Constant(ConstValue::Uint(value, source_width)) => {
+            let expected_width = match expected {
+                Ty::Int { width, signed: false } => *width,
+                Ty::PtrSizedInt { signed: false } => 64,
+                _ => return false,
+            };
+            if *source_width != expected_width {
+                return false;
+            }
+            match expected_width {
+                8 => u8::try_from(*value).is_ok(),
+                16 => u16::try_from(*value).is_ok(),
+                32 => u32::try_from(*value).is_ok(),
+                64 => u64::try_from(*value).is_ok(),
+                128 => true,
+                _ => false,
+            }
+        }
+        _ => crate::operand_ty_cow(func, operand).as_deref() == Some(expected),
+    }
+}
+
+fn exact_asserted_checked_binary_op<'a>(
+    func: &VerifiableFunction,
+    block: &'a BasicBlock,
+) -> Option<(usize, BinOp, &'a Operand, &'a Operand, Ty)> {
+    let Terminator::Assert { cond, expected: false, .. } = &block.terminator else {
+        return None;
+    };
+    let cond_place = match cond {
+        Operand::Copy(place) | Operand::Move(place)
+            if matches!(place.projections.as_slice(), [trust_types::Projection::Field(1)]) =>
+        {
+            place
+        }
+        _ => return None,
+    };
+    let tuple_local = cond_place.local;
+
+    let mut checked = None;
+    for (idx, stmt) in block.stmts.iter().enumerate() {
+        match stmt {
+            Statement::Assign { place, rvalue, .. } if place.local == tuple_local => {
+                // A projection write or second whole-local write makes the
+                // asserted tuple's reaching definition ambiguous.
+                if !place.projections.is_empty() || checked.is_some() {
+                    return None;
+                }
+                let Rvalue::CheckedBinaryOp(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul), lhs, rhs) =
+                    rvalue
+                else {
+                    return None;
+                };
+                checked = Some((idx, *op, lhs, rhs));
+            }
+            Statement::SetDiscriminant { place, .. } | Statement::Deinit { place }
+                if place.local == tuple_local =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    let (checked_idx, op, lhs, rhs) = checked?;
+
+    if block.stmts.iter().skip(checked_idx + 1).any(|stmt| {
+        !matches!(
+            stmt,
+            Statement::StorageLive(_)
+                | Statement::StorageDead(_)
+                | Statement::Retag { .. }
+                | Statement::PlaceMention(_)
+                | Statement::Coverage
+                | Statement::ConstEvalCounter
+                | Statement::Nop
+        )
+    }) {
+        return None;
+    }
+    if [lhs, rhs].iter().any(|operand| {
+        matches!(operand, Operand::Copy(place) | Operand::Move(place) if place.local == tuple_local)
+    }) {
+        return None;
+    }
+
+    let Ty::Tuple(fields) = &func.body.locals.get(tuple_local)?.ty else {
+        return None;
+    };
+    let [value_ty, Ty::Bool] = fields.as_slice() else {
+        return None;
+    };
+    if !matches!(value_ty, Ty::Int { .. } | Ty::PtrSizedInt { .. })
+        || !checked_operand_matches_type(func, lhs, value_ty)
+        || !checked_operand_matches_type(func, rhs, value_ty)
+    {
+        return None;
+    }
+
+    Some((tuple_local, op, lhs, rhs, value_ty.clone()))
+}
+
 /// Extract semantic assert-passed guards from a block.
 ///
 /// When a block contains a CheckedBinaryOp assignment followed by an Assert
@@ -797,112 +940,74 @@ pub(crate) fn extract_assert_passed_semantics(
     func: &VerifiableFunction,
     block: &BasicBlock,
 ) -> Vec<Formula> {
-    // Pattern: Assert { cond: Copy(_N.1), expected: false, target } means
-    // "continue to target only if _N.1 is false (no overflow)".
-    // We need to find the CheckedBinaryOp that defines _N.
-    let Terminator::Assert { cond, expected: false, .. } = &block.terminator else {
+    let Some((tuple_local, op, lhs, rhs, value_ty)) = exact_asserted_checked_binary_op(func, block)
+    else {
         return Vec::new();
     };
 
-    // The cond operand should be a field projection .1 on a tuple local
-    // produced by CheckedBinaryOp.
-    let cond_place = match cond {
-        trust_types::Operand::Copy(p) | trust_types::Operand::Move(p) => p,
+    let lhs_f = operand_to_formula(func, lhs);
+    let rhs_f = operand_to_formula(func, rhs);
+    let Some(width) = value_ty.int_width() else {
+        return Vec::new();
+    };
+    let signed = value_ty.is_signed();
+
+    let result = match op {
+        BinOp::Add => Formula::Add(Box::new(lhs_f.clone()), Box::new(rhs_f.clone())),
+        BinOp::Sub => Formula::Sub(Box::new(lhs_f.clone()), Box::new(rhs_f.clone())),
+        BinOp::Mul => Formula::Mul(Box::new(lhs_f.clone()), Box::new(rhs_f.clone())),
         _ => return Vec::new(),
     };
 
-    // Check it's a .1 field projection (the overflow flag)
-    if cond_place.projections.len() != 1 {
-        return Vec::new();
+    // No-overflow means result is in [min, max] for the type.
+    let min_f = type_min_formula(width, signed);
+    let max_f = type_max_formula(width, signed);
+
+    let in_range = Formula::And(vec![
+        Formula::Le(Box::new(min_f), Box::new(result.clone())),
+        Formula::Le(Box::new(result.clone()), Box::new(max_f)),
+    ]);
+
+    // Also define _N.0 = result_formula. This connects the
+    // tuple's result field to the actual arithmetic expression, enabling
+    // dataflow tracking when _N.0 is read in subsequent blocks.
+    let tuple_name = func
+        .body
+        .locals
+        .get(tuple_local)
+        .and_then(|d| d.name.as_deref())
+        .map_or_else(|| format!("_{tuple_local}"), |n| n.to_string());
+    let result_field_name = format!("{tuple_name}.0");
+    let result_def =
+        Formula::Eq(Box::new(Formula::Var(result_field_name, Sort::Int)), Box::new(result));
+
+    // Include input range constraints for the operands of the
+    // CheckedBinaryOp. Without these, variables like `hi` that appear in the
+    // semantic guard but not in the downstream VC formula would be unconstrained,
+    // allowing the solver to pick out-of-range values (e.g., hi > u64::MAX)
+    // that satisfy the guard while still causing a false overflow violation.
+    let lhs_range = crate::range::input_range_constraint(&lhs_f, width, signed);
+    let rhs_range = crate::range::input_range_constraint(&rhs_f, width, signed);
+
+    let mut facts = vec![in_range, result_def, lhs_range, rhs_range];
+    // Tighten a WIDENED operand (`_4 = a as u16`) to its SOURCE type's range
+    // (`0 <= _4 <= 255` for a u8 source), not the wider ADD-operand range
+    // (`0 <= _4 <= 65535`). Without this the solver picks an out-of-source-range
+    // value for the widened operand and fabricates a false overflow — the
+    // hardened panic_boundary OVER-REFUTATION of a provably-safe
+    // `a as u16 + b as u16` (the operand range above, keyed on the wider add
+    // type, admits `_4 = _5 = 65535`). Sound: the source-width range is an
+    // unconditional truth about a value-preserving widening cast (monotone — a
+    // true conjunct can only discharge a false-FAIL, never manufacture a
+    // false-PROVE). A non-widened operand (e.g. plain `u32 + u32`) yields None,
+    // so a genuinely-overflowing add still refutes.
+    if let Some(range) = widening_operand_source_range(func, lhs) {
+        facts.push(range);
     }
-    let trust_types::Projection::Field(1) = &cond_place.projections[0] else {
-        return Vec::new();
-    };
-
-    let tuple_local = cond_place.local;
-
-    // Find the CheckedBinaryOp statement that assigns to this local.
-    for stmt in &block.stmts {
-        let Statement::Assign { place, rvalue, .. } = stmt else {
-            continue;
-        };
-        if place.local != tuple_local || !place.projections.is_empty() {
-            continue;
-        }
-        let Rvalue::CheckedBinaryOp(op, lhs, rhs) = rvalue else {
-            continue;
-        };
-
-        // Found the pattern. Build the semantic formulas.
-        let lhs_f = operand_to_formula(func, lhs);
-        let rhs_f = operand_to_formula(func, rhs);
-        let Some(lhs_ty) = crate::operand_ty_cow(func, lhs) else {
-            return Vec::new();
-        };
-        let Some(width) = lhs_ty.int_width() else {
-            return Vec::new();
-        };
-        let signed = lhs_ty.is_signed();
-
-        let result = match op {
-            BinOp::Add => Formula::Add(Box::new(lhs_f.clone()), Box::new(rhs_f.clone())),
-            BinOp::Sub => Formula::Sub(Box::new(lhs_f.clone()), Box::new(rhs_f.clone())),
-            BinOp::Mul => Formula::Mul(Box::new(lhs_f.clone()), Box::new(rhs_f.clone())),
-            _ => return Vec::new(),
-        };
-
-        // No-overflow means result is in [min, max] for the type.
-        let min_f = type_min_formula(width, signed);
-        let max_f = type_max_formula(width, signed);
-
-        let in_range = Formula::And(vec![
-            Formula::Le(Box::new(min_f), Box::new(result.clone())),
-            Formula::Le(Box::new(result.clone()), Box::new(max_f)),
-        ]);
-
-        // Also define _N.0 = result_formula. This connects the
-        // tuple's result field to the actual arithmetic expression, enabling
-        // dataflow tracking when _N.0 is read in subsequent blocks.
-        let tuple_name = func
-            .body
-            .locals
-            .get(tuple_local)
-            .and_then(|d| d.name.as_deref())
-            .map_or_else(|| format!("_{tuple_local}"), |n| n.to_string());
-        let result_field_name = format!("{tuple_name}.0");
-        let result_def =
-            Formula::Eq(Box::new(Formula::Var(result_field_name, Sort::Int)), Box::new(result));
-
-        // Include input range constraints for the operands of the
-        // CheckedBinaryOp. Without these, variables like `hi` that appear in the
-        // semantic guard but not in the downstream VC formula would be unconstrained,
-        // allowing the solver to pick out-of-range values (e.g., hi > u64::MAX)
-        // that satisfy the guard while still causing a false overflow violation.
-        let lhs_range = crate::range::input_range_constraint(&lhs_f, width, signed);
-        let rhs_range = crate::range::input_range_constraint(&rhs_f, width, signed);
-
-        let mut facts = vec![in_range, result_def, lhs_range, rhs_range];
-        // Tighten a WIDENED operand (`_4 = a as u16`) to its SOURCE type's range
-        // (`0 <= _4 <= 255` for a u8 source), not the wider ADD-operand range
-        // (`0 <= _4 <= 65535`). Without this the solver picks an out-of-source-range
-        // value for the widened operand and fabricates a false overflow — the
-        // hardened panic_boundary OVER-REFUTATION of a provably-safe
-        // `a as u16 + b as u16` (the operand range above, keyed on the wider add
-        // type, admits `_4 = _5 = 65535`). Sound: the source-width range is an
-        // unconditional truth about a value-preserving widening cast (monotone — a
-        // true conjunct can only discharge a false-FAIL, never manufacture a
-        // false-PROVE). A non-widened operand (e.g. plain `u32 + u32`) yields None,
-        // so a genuinely-overflowing add still refutes.
-        if let Some(range) = widening_operand_source_range(func, lhs) {
-            facts.push(range);
-        }
-        if let Some(range) = widening_operand_source_range(func, rhs) {
-            facts.push(range);
-        }
-        return facts;
+    if let Some(range) = widening_operand_source_range(func, rhs) {
+        facts.push(range);
     }
-
-    Vec::new()
+    facts
 }
 
 /// If `operand` is `Copy/Move(_n)` where `_n` is defined by a value-preserving
@@ -924,6 +1029,14 @@ fn widening_operand_source_range(func: &VerifiableFunction, operand: &Operand) -
         return None;
     }
     let local = place.local;
+    // The whole-function cast scan below is only an exact reaching definition
+    // when this operand local is SSA-stable. A reassigned/mutably-borrowed local
+    // can carry a later value outside the cast's source range; injecting the
+    // stale narrow bound would contradict that value and vacuously prove a real
+    // overflow. Withhold the optional precision fact on any instability.
+    if value_local_is_unstable(func, local) {
+        return None;
+    }
     let dest_name = func
         .body
         .locals
@@ -951,11 +1064,9 @@ fn widening_operand_source_range(func: &VerifiableFunction, operand: &Operand) -
 }
 
 /// Define the checked-arithmetic OVERFLOW FLAG `_N.1` in terms of the operands,
-/// for the hardened-boundary panic VC (which asserts the FAILURE direction
-/// `_N.1`, not the assert-passed direction). Returns
-/// `[_N.0 == lhs op rhs, _N.1 <=> (result < min ∨ result > max), lhs_range,
-/// rhs_range]`, or empty when the block is not a `CheckedBinaryOp` + overflow
-/// `Assert`.
+/// for consumers that model both the success and failure edges. Returns
+/// `[_N.1 <=> (result < min ∨ result > max), lhs_range, rhs_range]`, or empty
+/// when the block is not a `CheckedBinaryOp` + overflow `Assert`.
 ///
 /// Without this the assert-failure condition `_N.1` is a FREE boolean, so every
 /// arithmetic panic boundary fails spuriously even when a dominating guard makes
@@ -966,83 +1077,58 @@ fn widening_operand_source_range(func: &VerifiableFunction, operand: &Operand) -
 /// range), a true fact at the assert: under a guard that forces the result in
 /// range the failure is UNSAT (proves); with no guard the overflow stays
 /// reachable (fails closed).
+///
+/// Deliberately do NOT define `_N.0` here. MIR's value field wraps when overflow
+/// is true, so `_N.0 ==` the unbounded mathematical result holds only on the
+/// Assert success edge. [`extract_assert_passed_semantics`] owns that
+/// success-only equation and the path-definition fixpoint transports it only
+/// along the normal edge.
 pub(crate) fn extract_overflow_flag_semantics(
     func: &VerifiableFunction,
     block: &BasicBlock,
 ) -> Vec<Formula> {
-    let Terminator::Assert { cond, expected: false, .. } = &block.terminator else {
+    let Some((tuple_local, op, lhs, rhs, value_ty)) = exact_asserted_checked_binary_op(func, block)
+    else {
         return Vec::new();
     };
-    let cond_place = match cond {
-        trust_types::Operand::Copy(p) | trust_types::Operand::Move(p) => p,
+
+    let lhs_f = operand_to_formula(func, lhs);
+    let rhs_f = operand_to_formula(func, rhs);
+    let Some(width) = value_ty.int_width() else {
+        return Vec::new();
+    };
+    let signed = value_ty.is_signed();
+
+    let result = match op {
+        BinOp::Add => Formula::Add(Box::new(lhs_f.clone()), Box::new(rhs_f.clone())),
+        BinOp::Sub => Formula::Sub(Box::new(lhs_f.clone()), Box::new(rhs_f.clone())),
+        BinOp::Mul => Formula::Mul(Box::new(lhs_f.clone()), Box::new(rhs_f.clone())),
         _ => return Vec::new(),
     };
-    if cond_place.projections.len() != 1 {
-        return Vec::new();
-    }
-    let trust_types::Projection::Field(1) = &cond_place.projections[0] else {
-        return Vec::new();
-    };
-    let tuple_local = cond_place.local;
 
-    for stmt in &block.stmts {
-        let Statement::Assign { place, rvalue, .. } = stmt else {
-            continue;
-        };
-        if place.local != tuple_local || !place.projections.is_empty() {
-            continue;
-        }
-        let Rvalue::CheckedBinaryOp(op, lhs, rhs) = rvalue else {
-            continue;
-        };
+    let min_f = type_min_formula(width, signed);
+    let max_f = type_max_formula(width, signed);
 
-        let lhs_f = operand_to_formula(func, lhs);
-        let rhs_f = operand_to_formula(func, rhs);
-        let Some(lhs_ty) = crate::operand_ty_cow(func, lhs) else {
-            return Vec::new();
-        };
-        let Some(width) = lhs_ty.int_width() else {
-            return Vec::new();
-        };
-        let signed = lhs_ty.is_signed();
+    let tuple_name = func
+        .body
+        .locals
+        .get(tuple_local)
+        .and_then(|d| d.name.as_deref())
+        .map_or_else(|| format!("_{tuple_local}"), |n| n.to_string());
 
-        let result = match op {
-            BinOp::Add => Formula::Add(Box::new(lhs_f.clone()), Box::new(rhs_f.clone())),
-            BinOp::Sub => Formula::Sub(Box::new(lhs_f.clone()), Box::new(rhs_f.clone())),
-            BinOp::Mul => Formula::Mul(Box::new(lhs_f.clone()), Box::new(rhs_f.clone())),
-            _ => return Vec::new(),
-        };
+    // `_N.1` is true exactly when the unbounded result leaves the type range.
+    let overflowed = Formula::Or(vec![
+        Formula::Lt(Box::new(result.clone()), Box::new(min_f)),
+        Formula::Gt(Box::new(result), Box::new(max_f)),
+    ]);
+    let flag_def = Formula::Eq(
+        Box::new(Formula::Var(format!("{tuple_name}.1"), Sort::Bool)),
+        Box::new(overflowed),
+    );
+    let lhs_range = crate::range::input_range_constraint(&lhs_f, width, signed);
+    let rhs_range = crate::range::input_range_constraint(&rhs_f, width, signed);
 
-        let min_f = type_min_formula(width, signed);
-        let max_f = type_max_formula(width, signed);
-
-        let tuple_name = func
-            .body
-            .locals
-            .get(tuple_local)
-            .and_then(|d| d.name.as_deref())
-            .map_or_else(|| format!("_{tuple_local}"), |n| n.to_string());
-
-        let result_def = Formula::Eq(
-            Box::new(Formula::Var(format!("{tuple_name}.0"), Sort::Int)),
-            Box::new(result.clone()),
-        );
-        // `_N.1` is true exactly when the unbounded result leaves the type range.
-        let overflowed = Formula::Or(vec![
-            Formula::Lt(Box::new(result.clone()), Box::new(min_f)),
-            Formula::Gt(Box::new(result), Box::new(max_f)),
-        ]);
-        let flag_def = Formula::Eq(
-            Box::new(Formula::Var(format!("{tuple_name}.1"), Sort::Bool)),
-            Box::new(overflowed),
-        );
-        let lhs_range = crate::range::input_range_constraint(&lhs_f, width, signed);
-        let rhs_range = crate::range::input_range_constraint(&rhs_f, width, signed);
-
-        return vec![result_def, flag_def, lhs_range, rhs_range];
-    }
-
-    Vec::new()
+    vec![flag_def, lhs_range, rhs_range]
 }
 
 /// Extract dataflow definitions from a block's assignment statements.
@@ -1646,6 +1732,41 @@ fn extract_block_definitions_until_impl(
     defs
 }
 
+/// Every name a block may write while a proof snapshot is being transported,
+/// or `None` when the statement surface is not known to be value-transparent.
+///
+/// `generate::block_written_names` supplies the canonical alias-aware set
+/// (including opaque dereference havoc and terminator destinations). Add every
+/// explicit place destination as a belt-and-suspenders gate because ordinary
+/// definition extraction intentionally declines some rvalues. Unknown/future
+/// statements fail closed: a newly added write-capable variant must never
+/// silently preserve a stale branch or checked-arithmetic snapshot.
+fn conservative_snapshot_writes(
+    func: &VerifiableFunction,
+    block: &BasicBlock,
+) -> Option<FxHashSet<String>> {
+    let mut writes = crate::generate::block_written_names(func, block);
+    for stmt in &block.stmts {
+        match stmt {
+            Statement::Assign { place, .. }
+            | Statement::SetDiscriminant { place, .. }
+            | Statement::Deinit { place } => {
+                writes.insert(crate::place_to_var_name(func, place));
+            }
+            Statement::StorageLive(_)
+            | Statement::StorageDead(_)
+            | Statement::Retag { .. }
+            | Statement::PlaceMention(_)
+            | Statement::Coverage
+            | Statement::ConstEvalCounter
+            | Statement::Nop => {}
+            Statement::Intrinsic { .. } | Statement::Unsupported { .. } => return None,
+            _ => return None,
+        }
+    }
+    Some(writes)
+}
+
 /// Recover the merged-local invariant at an n-arm `SwitchInt` join.
 ///
 /// The path-definition BFS weakens to `true` at any join reached with differing
@@ -1714,22 +1835,59 @@ pub(crate) fn branch_merge_definitions(
     let goto_arms: Vec<BlockId> = join_preds.iter().copied().filter(|p| is_goto_arm(*p)).collect();
     let direct: Vec<BlockId> = join_preds.iter().copied().filter(|p| !is_goto_arm(*p)).collect();
 
+    // The nearest switch predecessor of a join arm. In addition to the direct
+    // `SwitchInt -> arm -> Goto(join)` diamond, accept exactly one intervening
+    // successful `Assert`:
+    //
+    //   SwitchInt -> checked-op/Assert -> value arm -> Goto(join)
+    //
+    // rustc emits this shape when one branch computes a checked integer value.
+    // The Assert's failure edge does not reach `join`; therefore every execution
+    // that does reach the join through this branch took the authenticated success
+    // edge, and the original switch still partitions the join's incoming paths.
+    // Ordinary Goto/Call/Drop hops remain rejected: unlike an Assert success edge,
+    // they are not this narrowly authenticated branch extension.
+    let branch_switch_predecessor = |arm: BlockId| -> Option<BlockId> {
+        let [parent] = preds[arm.0].as_slice() else {
+            return None;
+        };
+        if matches!(blocks[parent.0].terminator, Terminator::SwitchInt { .. }) {
+            return Some(*parent);
+        }
+        let Terminator::Assert { target, unwind, .. } = &blocks[parent.0].terminator else {
+            return None;
+        };
+        if *target != arm || unwind.cleanup_target() == Some(arm) {
+            return None;
+        }
+        let [switch] = preds[parent.0].as_slice() else {
+            return None;
+        };
+        matches!(blocks[switch.0].terminator, Terminator::SwitchInt { .. }).then_some(*switch)
+    };
+
     // Identify the single `SwitchInt` every arm descends from.
     let switch_id = match direct.as_slice() {
         // Clean diamond: every join predecessor is a Goto arm; all must share one
-        // switch predecessor.
+        // switch predecessor, possibly through the exact Assert-success extension
+        // above.
         [] => {
-            let s = preds[goto_arms[0].0][0];
-            if !goto_arms.iter().all(|a| preds[a.0][0] == s) {
+            let Some(s) = goto_arms.first().and_then(|a| branch_switch_predecessor(*a)) else {
+                return Vec::new();
+            };
+            if !goto_arms.iter().all(|a| branch_switch_predecessor(*a) == Some(s)) {
                 return Vec::new();
             }
             s
         }
         // if-without-else: the lone direct predecessor is the switch, and every
-        // Goto arm must descend from it.
+        // Goto arm must descend from it (again allowing the exact Assert-success
+        // extension).
         [s] => {
             let s = *s;
-            if !goto_arms.iter().all(|a| preds[a.0] == [s]) {
+            if !matches!(blocks[s.0].terminator, Terminator::SwitchInt { .. })
+                || !goto_arms.iter().all(|a| branch_switch_predecessor(*a) == Some(s))
+            {
                 return Vec::new();
             }
             s
@@ -1743,6 +1901,44 @@ pub(crate) fn branch_merge_definitions(
         return Vec::new();
     };
 
+    // A merge equality needs the switch guard's exact characteristic function,
+    // not the precision-oriented guard assumption used by ordinary VCs (that
+    // API may deliberately weaken a predicate's false arm to `true`). Validate
+    // every raw table value now, including values that may later become the
+    // catch-all arm, and reject duplicate values even when malformed TrustIR
+    // routes them to different destinations.
+    let mut seen_values = FxHashSet::default();
+    if targets.iter().any(|(value, _)| {
+        !seen_values.insert(*value) || exact_switch_value_guard(func, discr, *value).is_none()
+    }) {
+        return Vec::new();
+    }
+
+    // The raw discriminator denotes its value at the switch. Because formulas
+    // here are intentionally unversioned, any write to that place (or an
+    // alias/ancestor/descendant) before the join would make an Ite guard read a
+    // different value and assert a false merge equality. Check every admitted
+    // post-switch block: the direct value arm, plus its unique Assert parent
+    // when present. Unknown statement effects fail closed.
+    let discr_names = operand_to_formula(func, discr).free_variables();
+    for arm in &goto_arms {
+        let [parent] = preds[arm.0].as_slice() else {
+            return Vec::new();
+        };
+        for path_block in
+            [Some(*arm), (*parent != switch_id).then_some(*parent)].into_iter().flatten()
+        {
+            let Some(writes) = conservative_snapshot_writes(func, &blocks[path_block.0]) else {
+                return Vec::new();
+            };
+            if discr_names.iter().any(|name| {
+                writes.iter().any(|written| crate::generate::place_names_overlap(name, written))
+            }) {
+                return Vec::new();
+            }
+        }
+    }
+
     // The block whose *exit* state supplies an arm's merged value, given a switch
     // destination `tb`: the join reached directly (the skip edge) takes the
     // switch's own exit; a Goto arm takes that arm block's exit; anything else
@@ -1754,6 +1950,13 @@ pub(crate) fn branch_merge_definitions(
             Some(switch_id)
         } else if goto_arms.contains(&tb) {
             Some(tb)
+        } else if let Terminator::Assert { target, unwind, .. } = &blocks[tb.0].terminator
+            && goto_arms.contains(target)
+            && preds[target.0] == [tb]
+            && preds[tb.0] == [switch_id]
+            && unwind.cleanup_target() != Some(*target)
+        {
+            Some(*target)
         } else {
             None
         }
@@ -1809,10 +2012,83 @@ pub(crate) fn branch_merge_definitions(
         return Vec::new();
     }
 
-    // Per-arm `(name, sort, value)` maps; the else arm sits last.
+    // Per-arm `(name, sort, value)` maps; the else arm sits last. For the exact
+    // Assert-success extension, the value arm commonly copies the checked
+    // tuple's `.0` field:
+    //
+    //   checked = CheckedAdd(a, b); Assert(!checked.1) -> arm
+    //   arm: merged = checked.0; Goto(join)
+    //
+    // `checked.0` is not defined on the sibling arm, so the ordinary
+    // intersection correctly drops its definition and would leave the merged
+    // value free. Inline only the semantic equalities authenticated by that
+    // unique Assert-success edge (`checked.0 == a + b`, etc.) into that arm's
+    // values. This is not a general predecessor walk: it requires the exact
+    // parent/target/switch identity already admitted above, and
+    // `extract_assert_passed_semantics` itself requires the checked-op tuple
+    // and overflow-flag projection shape.
+    let arm_definition_map_with_checked_assert = |arm: BlockId| {
+        let mut defs = arm_definition_map(func, arm);
+        let [parent] = preds[arm.0].as_slice() else {
+            return defs;
+        };
+        let Terminator::Assert { target, unwind, .. } = &blocks[parent.0].terminator else {
+            return defs;
+        };
+        if *target != arm
+            || unwind.cleanup_target() == Some(arm)
+            || preds[parent.0] != [switch_id]
+        {
+            return defs;
+        }
+
+        let Some((tuple_local, _, _, _, _)) =
+            exact_asserted_checked_binary_op(func, &blocks[parent.0])
+        else {
+            return defs;
+        };
+        let tuple_name = func
+            .body
+            .locals
+            .get(tuple_local)
+            .and_then(|decl| decl.name.as_deref())
+            .map_or_else(|| format!("_{tuple_local}"), str::to_string);
+        let result_name = format!("{tuple_name}.0");
+        let Some(result_rhs) = extract_assert_passed_semantics(func, &blocks[parent.0])
+            .into_iter()
+            .find_map(|semantic| match semantic {
+                Formula::Eq(lhs, rhs) if lhs.var_name() == Some(result_name.as_str()) => Some(*rhs),
+                _ => None,
+            })
+        else {
+            return defs;
+        };
+
+        // Substitution must preserve the value snapshot taken by CheckedBinaryOp.
+        // If the success arm writes either the checked field or any operand used
+        // by its mathematical RHS, replacing `checked.0` with the arm-exit name
+        // would read the *new* value and could manufacture a false proof. Use the
+        // canonical alias-aware write set, plus every explicit place destination
+        // (including rvalues the definition extractor intentionally declines).
+        let Some(arm_writes) = conservative_snapshot_writes(func, &blocks[arm.0]) else {
+            return defs;
+        };
+        let snapshot_names =
+            result_rhs.free_variables().into_iter().chain(std::iter::once(result_name.clone()));
+        if snapshot_names.into_iter().any(|name| {
+            arm_writes.iter().any(|written| crate::generate::place_names_overlap(&name, written))
+        }) {
+            return defs;
+        }
+
+        for (_, _, value) in &mut defs {
+            *value = crate::quantifier_tiers::substitute(value, &result_name, &result_rhs);
+        }
+        defs
+    };
     let mut arm_defs: Vec<Vec<(String, Sort, Formula)>> =
-        explicit.iter().map(|(b, _)| arm_definition_map(func, *b)).collect();
-    arm_defs.push(arm_definition_map(func, else_source));
+        explicit.iter().map(|(b, _)| arm_definition_map_with_checked_assert(*b)).collect();
+    arm_defs.push(arm_definition_map_with_checked_assert(else_source));
 
     // if-without-else skip edge. The arm whose def-source is the switch
     // block runs no statement between the switch and the join, so a local it does
@@ -1898,7 +2174,18 @@ pub(crate) fn branch_merge_definitions(
         // Fold innermost-last: Ite(g_0, v_0, Ite(g_1, v_1, … else_value)).
         let mut acc = else_value;
         for idx in (0..explicit.len()).rev() {
-            let guard = arm_guard(func, discr, &explicit[idx].1);
+            let mut guards = Vec::with_capacity(explicit[idx].1.len());
+            for value in &explicit[idx].1 {
+                let Some(guard) = exact_switch_value_guard(func, discr, *value) else {
+                    return Vec::new();
+                };
+                guards.push(guard);
+            }
+            let guard = match guards.len() {
+                0 => return Vec::new(),
+                1 => guards.pop().unwrap_or_else(|| unreachable!("one exact switch guard")),
+                _ => Formula::Or(guards),
+            };
             acc = Formula::Ite(Box::new(guard), Box::new(per_arm[idx].clone()), Box::new(acc));
         }
         out.push(Formula::Eq(Box::new(Formula::Var(name.clone(), sort.clone())), Box::new(acc)));
@@ -1906,22 +2193,36 @@ pub(crate) fn branch_merge_definitions(
     out
 }
 
-/// Guard for a switch arm reached by `values` (a disjunction when an
-/// or-pattern routes several discriminant values to the same block).
-fn arm_guard(func: &VerifiableFunction, discr: &Operand, values: &[u128]) -> Formula {
-    let mut guards: Vec<Formula> = values
-        .iter()
-        .map(|value| {
-            guard_to_formula(
-                func,
-                &GuardCondition::SwitchIntMatch { discr: discr.clone(), value: *value },
-            )
-        })
-        .collect();
-    match guards.len() {
-        0 => Formula::Bool(false),
-        1 => guards.pop().unwrap_or(Formula::Bool(false)),
-        _ => Formula::Or(guards),
+/// Exact raw route guard for one `SwitchInt` table value.
+///
+/// Do not call [`guard_to_formula`] here: it is an assumption-strengthening API
+/// and deliberately returns one-way facts for some boolean predicates. An Ite
+/// selector requires equality with the raw discriminator value. Signed MIR
+/// targets need sign-extension before comparison; this narrow merge lane
+/// currently fails closed on signed discriminators rather than risk interpreting
+/// (for example) i8 `-1`'s raw `0xff` as mathematical `255`.
+fn exact_switch_value_guard(
+    func: &VerifiableFunction,
+    discr: &Operand,
+    value: u128,
+) -> Option<Formula> {
+    let ty = crate::operand_ty_cow(func, discr)?;
+    let raw = operand_to_formula(func, discr);
+    match ty.as_ref() {
+        Ty::Bool if value <= 1 => Some(if value == 0 { Formula::Not(Box::new(raw)) } else { raw }),
+        Ty::Int { width, signed: false } if *width > 0 && *width <= 128 => {
+            if *width < 128 && value >= (1u128 << *width) {
+                return None;
+            }
+            Some(Formula::Eq(Box::new(raw), Box::new(u128_to_formula(value))))
+        }
+        Ty::PtrSizedInt { signed: false } if value <= u64::MAX as u128 => {
+            Some(Formula::Eq(Box::new(raw), Box::new(u128_to_formula(value))))
+        }
+        Ty::Char if value <= char::MAX as u128 && !(0xD800..=0xDFFF).contains(&(value as u32)) => {
+            Some(Formula::Eq(Box::new(raw), Box::new(u128_to_formula(value))))
+        }
+        _ => None,
     }
 }
 
@@ -3824,6 +4125,94 @@ mod tests {
         }
     }
 
+    fn checked_literal_func(value_ty: Ty, lhs: Operand, rhs: Operand) -> VerifiableFunction {
+        VerifiableFunction {
+            name: "checked_literal".into(),
+            def_path: "test::checked_literal".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: value_ty.clone(), name: Some("ret".into()) },
+                    LocalDecl { index: 1, ty: value_ty.clone(), name: Some("x".into()) },
+                    LocalDecl {
+                        index: 2,
+                        ty: Ty::Tuple(vec![value_ty.clone(), Ty::Bool]),
+                        name: Some("checked".into()),
+                    },
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![Statement::Assign {
+                            place: Place::local(2),
+                            rvalue: Rvalue::CheckedBinaryOp(BinOp::Add, lhs, rhs),
+                            span: SourceSpan::default(),
+                        }],
+                        terminator: Terminator::Assert {
+                            cond: Operand::Move(Place {
+                                local: 2,
+                                projections: vec![trust_types::Projection::Field(1)],
+                            }),
+                            expected: false,
+                            msg: AssertMessage::Overflow(BinOp::Add),
+                            target: BlockId(1),
+                            span: SourceSpan::default(),
+                            unwind: UnwindEdge::Unreachable,
+                        },
+                    },
+                    BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                ],
+                arg_count: 1,
+                return_ty: value_ty,
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        }
+    }
+
+    #[test]
+    fn checked_assert_semantics_contextualize_signed_narrow_literals_exactly() {
+        let x = Operand::Copy(Place::local(1));
+        for (lhs, rhs) in [
+            (x.clone(), Operand::Constant(ConstValue::Int(1))),
+            (Operand::Constant(ConstValue::Int(1)), x.clone()),
+        ] {
+            let func = checked_literal_func(Ty::i32(), lhs, rhs);
+            let success = extract_assert_passed_semantics(&func, &func.body.blocks[0]);
+            let failure = extract_overflow_flag_semantics(&func, &func.body.blocks[0]);
+            assert!(!success.is_empty(), "representable i32 literal must retain success facts");
+            assert!(!failure.is_empty(), "representable i32 literal must retain overflow facts");
+
+            let success_smt = Formula::And(success).to_smtlib();
+            assert!(
+                success_smt.contains("(= checked.0 (+"),
+                "success facts must define the checked value: {success_smt}"
+            );
+            assert!(
+                success_smt.contains("2147483648")
+                    && success_smt.contains("2147483647")
+                    && !success_smt.contains("9223372036854775808"),
+                "the tuple's authenticated i32 domain—not the literal fallback i64—must drive the facts: {success_smt}"
+            );
+        }
+
+        let out_of_range = checked_literal_func(
+            Ty::i8(),
+            Operand::Copy(Place::local(1)),
+            Operand::Constant(ConstValue::Int(128)),
+        );
+        assert!(
+            extract_assert_passed_semantics(&out_of_range, &out_of_range.body.blocks[0]).is_empty(),
+            "an out-of-range i8 literal must not mint success-edge arithmetic facts"
+        );
+        assert!(
+            extract_overflow_flag_semantics(&out_of_range, &out_of_range.body.blocks[0]).is_empty(),
+            "an out-of-range i8 literal must not mint overflow-flag arithmetic facts"
+        );
+    }
+
     #[test]
     fn enum_aggregate_write_constrains_downcast_payload_place() {
         // Trust: `let o: Option<u32> = Some(7)` lowers to an ADT aggregate whose
@@ -4142,6 +4531,23 @@ mod tests {
     }
 
     #[test]
+    fn widened_operand_source_range_rejects_reassigned_cast_local() {
+        // The first definition says `w` came from a u8, but the second gives it
+        // a legal u16 value far outside the u8 range. A whole-function first-cast
+        // scan must not inject the stale `w <= 255` fact into a later checked op.
+        let mut func = single_cast_func(Ty::u8(), Ty::u16());
+        func.body.blocks[0].stmts.push(Statement::Assign {
+            place: Place::local(2),
+            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(60_000, 16))),
+            span: SourceSpan::default(),
+        });
+        assert!(
+            widening_operand_source_range(&func, &Operand::Copy(Place::local(2))).is_none(),
+            "a reassigned widened local must not retain its first cast's source range"
+        );
+    }
+
+    #[test]
     fn narrowing_cast_emits_target_type_range_not_source_width() {
         // u64 -> u32 is a truncating (defined) cast — no CastOverflow VC. It is
         // type-tracked: the result is a u32, so `0 <= dest <= u32::MAX` is emitted
@@ -4448,6 +4854,245 @@ mod tests {
             }
             other => panic!("merged invariant must be an Eq, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_branch_merge_keeps_switch_identity_across_checked_assert_success() {
+        // `let x = if flag { checked_add_value } else { 10 };`
+        //
+        // rustc splits the checked arm through an overflow Assert:
+        //
+        //   bb0: SwitchInt(flag) -> [0: bb2, otherwise: bb1]
+        //   bb1: x = 10; goto bb4
+        //   bb2: checked = AddWithOverflow(..);
+        //        Assert(!checked.1) -> bb3
+        //   bb3: x = checked.0; goto bb4
+        //   bb4: return
+        //
+        // The Assert failure edge never reaches bb4, so bb0 still partitions
+        // every execution that reaches the join. Losing that identity leaves x
+        // free and falsely refutes valid postconditions over guarded arithmetic.
+        let mut func = test_func();
+        func.body.locals = vec![
+            LocalDecl { index: 0, ty: Ty::u32(), name: Some("ret".into()) },
+            LocalDecl { index: 1, ty: Ty::u32(), name: Some("x".into()) },
+            LocalDecl { index: 2, ty: Ty::Bool, name: Some("flag".into()) },
+            LocalDecl {
+                index: 3,
+                ty: Ty::Tuple(vec![Ty::u32(), Ty::Bool]),
+                name: Some("checked".into()),
+            },
+            LocalDecl { index: 4, ty: Ty::u32(), name: Some("a".into()) },
+            LocalDecl { index: 5, ty: Ty::u32(), name: Some("b".into()) },
+        ];
+        func.body.blocks = vec![
+            BasicBlock {
+                id: trust_types::BlockId(0),
+                stmts: vec![],
+                terminator: Terminator::SwitchInt {
+                    discr: Operand::Copy(Place::local(2)),
+                    targets: vec![(0, trust_types::BlockId(2))],
+                    otherwise: trust_types::BlockId(1),
+                    exhaustive_enum_unreachable: false,
+                    span: SourceSpan::default(),
+                },
+            },
+            BasicBlock {
+                id: trust_types::BlockId(1),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(1),
+                    rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(10))),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Goto(trust_types::BlockId(4)),
+            },
+            BasicBlock {
+                id: trust_types::BlockId(2),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(3),
+                    rvalue: Rvalue::CheckedBinaryOp(
+                        BinOp::Add,
+                        Operand::Copy(Place::local(4)),
+                        Operand::Copy(Place::local(5)),
+                    ),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Assert {
+                    cond: Operand::Move(Place {
+                        local: 3,
+                        projections: vec![trust_types::Projection::Field(1)],
+                    }),
+                    expected: false,
+                    msg: AssertMessage::Overflow(BinOp::Add),
+                    target: trust_types::BlockId(3),
+                    span: SourceSpan::default(),
+                    unwind: UnwindEdge::Continue,
+                },
+            },
+            BasicBlock {
+                id: trust_types::BlockId(3),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(1),
+                    rvalue: Rvalue::Use(Operand::Copy(Place {
+                        local: 3,
+                        projections: vec![trust_types::Projection::Field(0)],
+                    })),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Goto(trust_types::BlockId(4)),
+            },
+            BasicBlock {
+                id: trust_types::BlockId(4),
+                stmts: vec![],
+                terminator: Terminator::Return,
+            },
+        ];
+        let pristine = func.clone();
+
+        let merged = branch_merge_definitions(&func, trust_types::BlockId(4), &Default::default());
+        assert_eq!(merged.len(), 1, "expected one exact checked-arm merge, got {merged:?}");
+        let Formula::Eq(lhs, rhs) = &merged[0] else {
+            panic!("merged invariant must be an Eq, got: {:?}", merged[0]);
+        };
+        assert_eq!(lhs.var_name(), Some("x"));
+        let Formula::Ite(cond, checked, fallback) = rhs.as_ref() else {
+            panic!("merged rhs must be an Ite, got: {rhs:?}");
+        };
+        assert!(
+            matches!(cond.as_ref(), Formula::Not(inner) if inner.var_name() == Some("flag")),
+            "value 0 must select the checked arm under Not(flag): {cond:?}"
+        );
+        assert_eq!(
+            **checked,
+            Formula::Add(
+                Box::new(Formula::Var("a".into(), Sort::Int)),
+                Box::new(Formula::Var("b".into(), Sort::Int)),
+            ),
+            "the uniquely dominated checked result must be inlined before the join"
+        );
+        assert_eq!(**fallback, Formula::Int(10));
+
+        // A write in the value arm changes the meaning of the unversioned name
+        // `a` but not the snapshot already stored in `checked.0`. Inlining to
+        // the arm-exit `a + b` here would be a false fact and could false-PROVE.
+        // Keep the exact control-flow merge, but leave the checked field opaque.
+        func.body.blocks[3].stmts.insert(
+            0,
+            Statement::Assign {
+                place: Place::local(4),
+                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(99))),
+                span: SourceSpan::default(),
+            },
+        );
+        let stale = branch_merge_definitions(&func, trust_types::BlockId(4), &Default::default());
+        let Formula::Eq(_, stale_rhs) = &stale[0] else {
+            panic!("stale-arm merge must remain an Eq, got: {:?}", stale[0]);
+        };
+        let Formula::Ite(_, stale_checked, _) = stale_rhs.as_ref() else {
+            panic!("stale-arm merge rhs must remain an Ite, got: {stale_rhs:?}");
+        };
+        assert_eq!(
+            stale_checked.var_name(),
+            Some("checked.0"),
+            "a clobbered checked operand must block snapshot substitution"
+        );
+
+        // The Ite selector is the raw switch discriminator. Reassigning it on an
+        // incoming arm makes the unversioned name stale, so the entire merge
+        // must be withheld (not merely the checked-result substitution).
+        func.body.blocks[3].stmts.push(Statement::Assign {
+            place: Place::local(2),
+            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Bool(true))),
+            span: SourceSpan::default(),
+        });
+        assert!(
+            branch_merge_definitions(&func, trust_types::BlockId(4), &Default::default())
+                .is_empty(),
+            "a post-switch discriminant write must fail closed"
+        );
+
+        let false_route = exact_switch_value_guard(&pristine, &Operand::Copy(Place::local(2)), 0);
+        assert!(
+            matches!(false_route, Some(Formula::Not(inner)) if inner.var_name() == Some("flag")),
+            "a branch selector needs exact raw Bool polarity, never a weakened `true` guard"
+        );
+        let mut signed = pristine.clone();
+        signed.body.locals[2].ty = Ty::Int { width: 8, signed: true };
+        assert!(
+            exact_switch_value_guard(&signed, &Operand::Copy(Place::local(2)), 0xff).is_none(),
+            "raw signed SwitchInt targets must fail closed until sign-extension is modeled"
+        );
+
+        let mut duplicate = pristine.clone();
+        let Terminator::SwitchInt { targets, .. } = &mut duplicate.body.blocks[0].terminator else {
+            unreachable!("fixture root is a SwitchInt");
+        };
+        targets.push((0, trust_types::BlockId(1)));
+        assert!(
+            branch_merge_definitions(&duplicate, trust_types::BlockId(4), &Default::default())
+                .is_empty(),
+            "duplicate raw switch values must not mint overlapping Ite arms"
+        );
+
+        let mut failure_reaches_value_arm = pristine.clone();
+        let Terminator::Assert { unwind, .. } =
+            &mut failure_reaches_value_arm.body.blocks[2].terminator
+        else {
+            unreachable!("fixture checked block is an Assert");
+        };
+        *unwind = UnwindEdge::Cleanup(trust_types::BlockId(3));
+        assert!(
+            branch_merge_definitions(
+                &failure_reaches_value_arm,
+                trust_types::BlockId(4),
+                &Default::default(),
+            )
+            .is_empty(),
+            "an Assert failure edge reaching its value arm is not success-authenticated"
+        );
+
+        // The shared checked-Assert recognizer is itself proof authority for
+        // semantic/path maps. Multiple reaching tuple definitions or a write
+        // after the checked snapshot must yield no facts in either direction.
+        let mut multiple_checked = pristine.clone();
+        multiple_checked.body.blocks[2].stmts.push(Statement::Assign {
+            place: Place::local(3),
+            rvalue: Rvalue::CheckedBinaryOp(
+                BinOp::Add,
+                Operand::Copy(Place::local(4)),
+                Operand::Copy(Place::local(5)),
+            ),
+            span: SourceSpan::default(),
+        });
+        assert!(
+            extract_assert_passed_semantics(&multiple_checked, &multiple_checked.body.blocks[2])
+                .is_empty()
+        );
+        assert!(
+            extract_overflow_flag_semantics(&multiple_checked, &multiple_checked.body.blocks[2])
+                .is_empty()
+        );
+
+        let mut post_snapshot_write = pristine;
+        post_snapshot_write.body.blocks[2].stmts.push(Statement::Assign {
+            place: Place::local(4),
+            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(7, 32))),
+            span: SourceSpan::default(),
+        });
+        assert!(
+            extract_assert_passed_semantics(
+                &post_snapshot_write,
+                &post_snapshot_write.body.blocks[2]
+            )
+            .is_empty()
+        );
+        assert!(
+            extract_overflow_flag_semantics(
+                &post_snapshot_write,
+                &post_snapshot_write.body.blocks[2]
+            )
+            .is_empty()
+        );
     }
 
     // Helpers shared by the n-arm merge tests below.

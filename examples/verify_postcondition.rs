@@ -1,18 +1,17 @@
 // Trust test: postcondition violation
 // VcKind: Postcondition
-// Expected: Postcondition UNKNOWN
-// Current expectation: fail-closed unknown, exit 1.
-//   The postcondition (result >= 0) is genuinely violated for negative inputs
-//   and the trust-mc typed-CHC lane still REFUTES the body VC, but at tip the
-//   fieldless Refuted demotes to unknown (the 47ffee63479 merge dropped the
-//   b62 `bundle_is_certified_havoc_free` Refuted->Failed arm; the v1/ay bridge
-//   deliberately substitutes only Proved for VcKind::Postcondition because SAT
-//   of an under-approximating ensures goal is not a sound refutation), and the
-//   def-site catalog marker (obligation:...:postcondition:0, same public kind
-//   `postcond`) stays unknown: the failed-rekey that flipped it alongside a
-//   refuted body row (`failed_postcondition_refutations`, live at 4788dfc13d0)
-//   is gone at tip. "Postcondition FAILED" becomes assertable again once a
-//   sound Failed lane returns AND the def-site marker rekey is restored.
+// Expected: Postcondition FAILED
+// The refutation is a witnessed counterexample, exit 1.
+//   The postcondition (result >= 0) is genuinely violated for negative inputs.
+//   This example previously asserted a fail-closed unknown, because the fieldless
+//   Refuted demoted to unknown and the def-site catalog marker
+//   (obligation:...:postcondition:0, same public kind `postcond`) stayed unknown
+//   beside it. Both preconditions that header named have since been met: the
+//   typed `TrustSpecPredicate` of a body-aware `#[ensures]` VC is admitted to
+//   trust-mc's CHC lane (`trust_mc_can_emit_direct_typed_chc_input`), and the
+//   acyclic direct-SMT refutation returns a witnessed Failed. Both rows —
+//   `obligation:...:postcondition:0` and `vc:...:postcondition:0` — now report
+//   failed under solver `trust-full-verifier`.
 // NOTE: This single-file regression example still uses the legacy contracts
 // surface. New crate-based public examples should prefer `trust-spec` and
 // `#[trust::ensures(...)]`.

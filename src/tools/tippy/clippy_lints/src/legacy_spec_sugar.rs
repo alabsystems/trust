@@ -71,7 +71,8 @@ impl EarlyLintPass for LegacySpecSugar {
         {
             check_contracts_attr(cx, attr, item, "ensures", "Q");
         } else if path_ends_with(&item.path, &[sym::kani, sym::proof]) {
-            // NOT `#[kani::harness]` — that is the native surface.
+            // `#[kani::harness]` is the ratified spelling WITHIN the Kani
+            // ingestion lane — it is not a Trust authoritative surface.
             span_lint_and_then(
                 cx,
                 TRUST_LEGACY_SPEC_SUGAR,
@@ -85,6 +86,17 @@ impl EarlyLintPass for LegacySpecSugar {
                         "use the native harness attribute",
                         "kani::harness",
                         Applicability::MachineApplicable,
+                    );
+                    // Without this the fix reads as the terminus, which would
+                    // overstate what it buys: Kani is a zero-authority
+                    // ingestion lane (two-language design v5, §3.2), so the
+                    // harness carries no proof authority no matter how it is
+                    // spelled. The contracts arm of this same lint already
+                    // points at the authoritative surfaces; say so here too.
+                    diag.note(
+                        "`kani::harness` is an ingestion-lane spelling and carries no proof \
+                         authority; Trust's authoritative surfaces are `requires`/`ensures` \
+                         signature clauses and `clean { .. }` Lean islands",
                     );
                 },
             );

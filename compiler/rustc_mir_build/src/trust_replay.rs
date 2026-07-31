@@ -159,6 +159,13 @@ pub(crate) fn replay_hook<'tcx>(
     // also holds free-fn/ctor calls. `mintable` admits only ground monomorphic
     // AssocFn picks, so `want` is the exact ground FnDef the corresponding Call
     // carries.
+    // `rederived` is a set because the checker accumulates the union across the
+    // forest. Iteration order cannot affect this gate: the closure is a pure
+    // existential equality test, performs no diagnostic emission or mutation,
+    // and every element is compared against the same `want`. Keep the internal
+    // query-stability exemption local to that order-independent membership
+    // check so a future order-sensitive use still trips the lint.
+    #[allow(rustc::potential_query_instability)]
     let coverage_ok = candidate.type_dependent_defs().items_in_stable_order().into_iter().all(
         |(local_id, res)| {
             let did = match res {

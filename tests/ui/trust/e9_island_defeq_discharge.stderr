@@ -1,0 +1,21 @@
+note: Clean island kernel-checked: 1 declaration(s) registered (ident_isl)
+  --> $DIR/e9_island_defeq_discharge.rs:16:5
+   |
+LL |     def ident_isl (x : UInt64) : UInt64 := x
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+
+=== Trust Verification Report (e9_island_defeq_discharge) ===
+
+note: Trust verification: 4 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 4 obligation(s)
+  --> $DIR/e9_island_defeq_discharge.rs:19:1
+   |
+LL | / fn pass_through(x: u64) -> u64
+LL | |     ensures result == ident_isl(x)
+LL | |     ensures result == ident_isl(x)
+...  |
+LL | | }
+   | |_^
+   |
+   = note: of which 4 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+

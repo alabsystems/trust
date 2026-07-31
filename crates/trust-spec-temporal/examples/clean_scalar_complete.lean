@@ -25,4 +25,7 @@ def CompleteAuthority : Trust.Temporal.FiniteModel.ScalarModel :=
     [Trust.Temporal.FiniteModel.Invariant.mk "Safe"
        (Trust.Temporal.FiniteModel.ScalarExpr.le Buggy X)]
 
+def AppliedSafety : Prop :=
+  Trust.Temporal.FiniteModel.ScalarModel.safetyClaim CompleteAuthority
+
 end AuthorityExample

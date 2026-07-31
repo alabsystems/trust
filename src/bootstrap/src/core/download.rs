@@ -1154,15 +1154,31 @@ fn download_toolchain<'a>(
         if dwn_ctx.exec_ctx.dry_run() {
             return;
         }
-        if bin_root.exists() {
-            t!(fs::remove_dir_all(&bin_root));
+        // Fail-closed (2026-07-29 seed-destruction incident): never delete
+        // the live toolchain before its replacement is fully downloaded,
+        // extracted, and surface-verified. Everything lands in a staging
+        // sibling first; the live tree is only touched by the final atomic
+        // swap in `swap_verified_toolchain`.
+        let staging_destination = format!("{destination}.staging");
+        let staging_root = out.join(host).join(&staging_destination);
+        if staging_root.exists() {
+            t!(fs::remove_dir_all(&staging_root));
         }
+        t!(fs::create_dir_all(&staging_root));
         let std_component = if destination == "stage0" { "trust-std" } else { "rust-std" };
         let compiler_component = if destination == "stage0" { "trustc" } else { "rustc" };
 
         let filename = format!("{std_component}-{version}-{host}.tar.xz");
         let pattern = format!("{std_component}-{host}");
-        download_component(dwn_ctx, out, mode.clone(), filename, &pattern, stamp_key, destination);
+        download_component(
+            dwn_ctx,
+            out,
+            mode.clone(),
+            filename,
+            &pattern,
+            stamp_key,
+            &staging_destination,
+        );
         let filename = format!("{compiler_component}-{version}-{host}.tar.xz");
         download_component(
             dwn_ctx,
@@ -1171,7 +1187,7 @@ fn download_toolchain<'a>(
             filename,
             compiler_component,
             stamp_key,
-            destination,
+            &staging_destination,
         );
 
         let mut legacy_targo_components = Vec::new();
@@ -1221,59 +1237,62 @@ fn download_toolchain<'a>(
                 filename,
                 &prefix,
                 stamp_key,
-                destination,
+                &staging_destination,
             );
         }
 
         if !legacy_targo_components.is_empty() {
             translate_legacy_targo_stage0_surface(
-                &bin_root,
+                &staging_root,
                 dwn_ctx.host_target,
                 &legacy_targo_components,
             );
         }
         if translate_legacy_tippy {
-            translate_legacy_tippy_stage0_surface(&bin_root, dwn_ctx.host_target);
+            translate_legacy_tippy_stage0_surface(&staging_root, dwn_ctx.host_target);
         }
 
-        assert_stage0_tool_surface(&bin_root, dwn_ctx.host_target, destination);
+        // Verify the STAGED surface before the live tree is touched: an
+        // incomplete replacement panics here with the working toolchain
+        // still in place.
+        assert_stage0_tool_surface(&staging_root, dwn_ctx.host_target, destination);
 
         if should_fix_bins_and_dylibs(dwn_ctx.patch_binaries_for_nix, dwn_ctx.exec_ctx) {
             if destination == "stage0" {
                 for tool in stage0_required_bins() {
                     fix_bin_or_dylib(
                         out,
-                        &bin_root.join("bin").join(exe(tool, dwn_ctx.host_target)),
+                        &staging_root.join("bin").join(exe(tool, dwn_ctx.host_target)),
                         dwn_ctx.exec_ctx,
                     );
                 }
                 for tool in stage0_required_libexec_bins() {
                     fix_bin_or_dylib(
                         out,
-                        &bin_root.join("libexec").join(exe(tool, dwn_ctx.host_target)),
+                        &staging_root.join("libexec").join(exe(tool, dwn_ctx.host_target)),
                         dwn_ctx.exec_ctx,
                     );
                 }
             } else {
                 fix_bin_or_dylib(
                     out,
-                    &bin_root.join("bin").join(exe("rustc", dwn_ctx.host_target)),
+                    &staging_root.join("bin").join(exe("rustc", dwn_ctx.host_target)),
                     dwn_ctx.exec_ctx,
                 );
                 fix_bin_or_dylib(
                     out,
-                    &bin_root.join("bin").join(exe("rustdoc", dwn_ctx.host_target)),
+                    &staging_root.join("bin").join(exe("rustdoc", dwn_ctx.host_target)),
                     dwn_ctx.exec_ctx,
                 );
                 fix_bin_or_dylib(
                     out,
-                    &bin_root
+                    &staging_root
                         .join("libexec")
                         .join(exe("rust-analyzer-proc-macro-srv", dwn_ctx.host_target)),
                     dwn_ctx.exec_ctx,
                 );
             }
-            let lib_dir = bin_root.join("lib");
+            let lib_dir = staging_root.join("lib");
             for lib in t!(fs::read_dir(&lib_dir), lib_dir.display().to_string()) {
                 let lib = t!(lib);
                 if path_is_dylib(&lib.path()) {
@@ -1282,7 +1301,37 @@ fn download_toolchain<'a>(
             }
         }
 
+        swap_verified_toolchain(&bin_root, &staging_root);
+
         t!(rustc_stamp.write());
+    }
+}
+
+/// Atomically promote a fully-extracted, surface-verified staging tree to be
+/// the live toolchain root. The live root is only ever touched here, and a
+/// failed promotion restores the previous tree — the root is never left
+/// absent. (2026-07-29: the previous delete-then-redownload order destroyed
+/// the stage0 seed when a partial refresh deleted the whole surface but
+/// reinstalled only part of it.)
+fn swap_verified_toolchain(bin_root: &Path, staging_root: &Path) {
+    let previous_root = bin_root.with_extension("previous");
+    if previous_root.exists() {
+        t!(fs::remove_dir_all(&previous_root));
+    }
+    if bin_root.exists() {
+        t!(fs::rename(bin_root, &previous_root));
+        if let Err(err) = fs::rename(staging_root, bin_root) {
+            // Roll the working toolchain back; never leave the root absent.
+            t!(fs::rename(&previous_root, bin_root));
+            panic!(
+                "failed to swap staged toolchain {} into {}: {err}",
+                staging_root.display(),
+                bin_root.display()
+            );
+        }
+        t!(fs::remove_dir_all(&previous_root));
+    } else {
+        t!(fs::rename(staging_root, bin_root));
     }
 }
 

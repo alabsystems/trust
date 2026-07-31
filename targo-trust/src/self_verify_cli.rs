@@ -1710,6 +1710,13 @@ fn live_stage2_trustd_protocol_smoke(
     })?;
     let pid = child.id();
     let mut child = TrustdSmokeChild { child, pid };
+    let expected_identity = trust_router::coordinator::DaemonIdentity {
+        version: trust_router::coordinator::IDENTITY_VERSION.to_string(),
+        protocol: version.protocol.clone(),
+        release: version.release.clone(),
+        commit: version.commit.clone(),
+        executable_sha256: executable.sha256.clone(),
+    };
     let deadline = Instant::now()
         .checked_add(TRUSTD_READY_TIMEOUT)
         .ok_or_else(|| "trustd live-smoke readiness deadline overflowed".to_string())?;
@@ -1724,8 +1731,11 @@ fn live_stage2_trustd_protocol_smoke(
             }
         }
 
-        if trust_router::coordinator::daemon_matches_executable(&socket, &executable.canonical_path)
-        {
+        if trust_router::coordinator::daemon_matches_bound_identity(
+            &socket,
+            &executable.canonical_path,
+            &expected_identity,
+        ) {
             break;
         }
         if Instant::now() >= deadline {
@@ -1742,9 +1752,10 @@ fn live_stage2_trustd_protocol_smoke(
         return Err("exact stage2 trustd exited before the live exchange".to_string());
     }
 
-    let observed = trust_router::coordinator::exercise_daemon_at(
+    let observed = trust_router::coordinator::exercise_daemon_at_with_identity(
         &socket,
         &executable.canonical_path,
+        &expected_identity,
         TRUSTD_SMOKE_RESERVATION_LABEL,
     )?;
     let smoke = materialize_stage2_trustd_protocol_smoke(observed, executable, version)?;

@@ -279,10 +279,29 @@ impl FullVerificationEngine {
         verifier
     }
 
-    /// Build a verifier with the required native trust-wp/trust-vc/trust-mc/TY engines.
+    /// Build a verifier with the required native trust-wp/trust-vc/trust-mc/TY
+    /// engines at the `-Z trust-verify-timeout-ms` *default* budget.
+    ///
+    /// Session-less callers only. Compiler paths should use
+    /// [`Self::with_required_native_engines_timeout_ms`] so a user who raises
+    /// the flag actually gets the budget they asked for.
     #[must_use]
     pub fn with_required_native_engines() -> Self {
         Self::new(super::engines::required_native_engines(), FullVerificationPolicy::default())
+    }
+
+    /// Build a verifier with the required native engines at the compiler's
+    /// configured per-obligation SMT budget.
+    ///
+    /// SOUND: the budget bounds only how long a sound solver lane may run. A
+    /// larger budget can turn Unknown into a definite verdict; it can never turn
+    /// an unproved obligation into a proof.
+    #[must_use]
+    pub fn with_required_native_engines_timeout_ms(timeout_ms: u64) -> Self {
+        Self::new(
+            super::engines::required_native_engines_with_timeout_ms(timeout_ms),
+            FullVerificationPolicy::default(),
+        )
     }
 
     /// Run full verification and return the fail-closed run envelope.
@@ -1094,6 +1113,7 @@ impl FullVerificationEngine {
             obligation_id: obligation.obligation_id.clone(),
             engine: self.manifest.clone(),
             status,
+            decline: None,
             proof_strength,
             artifacts: Vec::new(),
             counterexample: None::<Counterexample>,
@@ -1485,6 +1505,7 @@ mod fresh_receipt_tests {
             obligation_id: "fresh-row".to_string(),
             engine: EngineManifest::new("trust-mc", API_VERSION, EngineKind::Reachability),
             status,
+            decline: None,
             proof_strength: (status == EvidenceStatus::Proved).then(|| ProofStrength {
                 reasoning: ReasoningKind::Pdr,
                 assurance: trust_verifier_api::AssuranceLevel::SmtBacked,

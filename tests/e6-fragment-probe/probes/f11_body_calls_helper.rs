@@ -1,7 +1,8 @@
 //@ probe-shape: none
 //@ probe-expect: clause-outside-fragment
-//@ probe-note: The same Call restriction seen from ordinary code: a body that calls
-//@ probe-note: ANY function cannot be admitted, which excludes almost all real Rust.
+//@ probe-note: Unknown-callee negative control. Exact certified same-unit callees can
+//@ probe-note: participate in facet closure; this helper has no E6 admission, so its
+//@ probe-note: caller must not borrow purity/totality authority from the function name.
 clean { def ident_isl (x : UInt64) : UInt64 := x }
 pub fn helper(x: u64) -> u64 { x }
 pub fn caller(x: u64) -> u64

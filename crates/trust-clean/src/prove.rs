@@ -17042,9 +17042,11 @@ mod tests {
     #[test]
     fn cluster_tag_distinguishes_safety_gap_from_shape_gap() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/call-spine-corpus");
-        if !dir.exists() {
-            return; // fixture not present in this checkout
-        }
+        // Trust (2026-07-29): was `if !dir.exists() { return; }` — a silent skip
+        // that turns a moved/renamed corpus into a vacuous pass. The corpus is
+        // checked in, so its absence is a defect. See the NO-VACUOUS-CORPUS-TEST
+        // note in `mirsem/tests.rs`.
+        assert!(dir.is_dir(), "required fixture corpus {} is missing", dir.display());
         let empty = std::collections::BTreeMap::new();
         let mut saw_safety_gap = false;
         for entry in std::fs::read_dir(&dir).unwrap().filter_map(Result::ok) {
@@ -17241,9 +17243,9 @@ mod tests {
 
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures/w2-iter-harvest-2026-07-20/dumps");
-        if !dir.exists() {
-            return; // fixture not present in this checkout
-        }
+        // Trust (2026-07-29): was `if !dir.exists() { return; }` — see the
+        // NO-VACUOUS-CORPUS-TEST note in `mirsem/tests.rs`.
+        assert!(dir.is_dir(), "required fixture corpus {} is missing", dir.display());
         let empty = std::collections::BTreeMap::new();
         let mut seen_offset_bodies = 0usize;
         for entry in std::fs::read_dir(&dir).unwrap().filter_map(Result::ok) {
@@ -25081,7 +25083,7 @@ mod tests {
                 if !census_is_safety_vc_kind(&vc.kind) {
                     continue;
                 }
-                match crate::trustir_safety::trustir_safety_vc_adequate(&vc) {
+                match crate::trustir_safety::trustir_safety_vc_adequate(func, &vc) {
                     V::ProvenModulo3 => {}
                     v => {
                         let mut msg = format!("{v:?}");

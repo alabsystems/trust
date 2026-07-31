@@ -563,7 +563,10 @@ fn convert_ty_inner<'tcx>(
     // extraction finish fast; the compiler's post-extraction checkpoint then
     // reports the overrun as a hard error. Fail-closed: never a proof.
     if ctx.remaining_nodes % 256 == 0 && trust_types::verify_budget::budget_exhausted() {
-        return unsupported_ty("TyKind", "type lowering exceeded the per-function verification budget");
+        return unsupported_ty(
+            "TyKind",
+            "type lowering exceeded the per-function verification budget",
+        );
     }
 
     ctx.remaining_nodes -= 1;
@@ -1651,7 +1654,16 @@ fn lower_enum_adt<'tcx>(
     // called after the `!is_struct() && !is_union()` guard), so stamp `Enum`. The
     // setter recognizer declines it (an enum is outside the single-anonymous-
     // constructor setter fragment).
-    TrustTy::Adt { name: name.to_string(), fields, variants, disc_index_safe, faithful_enum_repr, layout: None, enum_layout, adt_kind: Some(trust_types::AdtKind::Enum) }
+    TrustTy::Adt {
+        name: name.to_string(),
+        fields,
+        variants,
+        disc_index_safe,
+        faithful_enum_repr,
+        layout: None,
+        enum_layout,
+        adt_kind: Some(trust_types::AdtKind::Enum),
+    }
 }
 
 /// Trust (B3-3): map a rustc enum layout onto the trust-ir-free
@@ -1709,9 +1721,7 @@ fn extractor_enum_layout_info<'tcx>(
         // the variant has fields (uninhabited / degenerate variants); an
         // IndexVec index would panic. Decline the whole descriptor.
         let offs: Option<Vec<u64>> = (0..variant.fields.len())
-            .map(|i| {
-                vl.field_offsets.get(rustc_abi::FieldIdx::from_usize(i)).map(|o| o.bytes())
-            })
+            .map(|i| vl.field_offsets.get(rustc_abi::FieldIdx::from_usize(i)).map(|o| o.bytes()))
             .collect();
         variant_field_offsets.push(offs?);
     }

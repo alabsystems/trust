@@ -3589,4 +3589,342 @@ mod tests {
             rep.notes
         );
     }
+
+    // ------------------------------------------------------------------
+    // Trust (plan 2026-07-29 T1): the RECURSIVE POINTER-PAYLOAD enum shape
+    // class — clean-kernel's `Level` (first-party/clean
+    // crates/clean-kernel/src/level/mod.rs).
+    //
+    // `Level`'s recursive edges ride a newtype struct (`LevelArc`) wrapping
+    // `Option<Arc<Level>>`; its `Param` variant carries `Name`, a struct
+    // holding the nested recursive enum `NameInner` (`Arc<Name>` / `Arc<str>`
+    // payloads). `map_ty`'s registration walk spells that DAG with NO cycle:
+    // every recursive edge bottoms out at `NonNull`'s raw pointer, and the
+    // RawPtr arm does not recurse into pointees, so `Arc<Level>` registers as
+    // a struct whose deep field is `Ty::Ptr` and `Level` itself never
+    // re-enters the walk (the `adt_visit_stack` guard can only fire on
+    // by-value ADT cycles, which Rust's sized-ness rules already forbid).
+    //
+    // These tests pin the trust-ir-level machinery over the EXACT def DAG that
+    // `register_enum` + `register_struct` commit for `Level` at HEAD (post
+    // #174 struct-payload admission + wave-EP thin-pointer payloads): the
+    // canonical tag resolves, the binary codec round-trips the defs
+    // byte-stably, and the differential comparator accepts the shape
+    // structurally across independently-numbered modules while still
+    // detecting deep-leaf and discriminant divergences. The registration
+    // WALK itself needs a TyCtxt and is exercised by the ui fixture
+    // `tests/ui/trust/trust_ir_lower_recursive_pointer_payload_enum.rs`
+    // (compile-terminates today; measured end-to-end after the next trustc
+    // stage rebuild).
+    // ------------------------------------------------------------------
+
+    /// The `Level` def DAG, with every table id shifted by `offset` dummy
+    /// defs so cross-module comparisons prove STRUCTURAL agreement (raw id
+    /// equality would be a lie: the producer and oracle number their tables
+    /// independently).
+    fn level_shape_module(name: &str, offset: u32) -> (Module, EnumId) {
+        use trust_ir::{
+            EnumLayoutDescriptor, EnumTagEncoding, FieldDef, StructDef, StructId, StructRepr,
+        };
+
+        let mut module = Module::new(name);
+        for i in 0..offset {
+            module.add_struct(StructDef {
+                id: StructId::new(i),
+                name: format!("DummyS{i}"),
+                fields: Vec::new(),
+                size: Some(0),
+                align: Some(1),
+                repr: StructRepr::Rust,
+            });
+            module.add_enum(EnumDef::new(
+                EnumId::new(i),
+                format!("DummyE{i}"),
+                vec![EnumVariant {
+                    name: "Only".into(),
+                    fields: Vec::new(),
+                    field_names: Vec::new(),
+                }],
+            ));
+        }
+        let sid = |i: u32| StructId::new(offset + i);
+        let eid = |i: u32| EnumId::new(offset + i);
+        let field = |name: &str, ty: Ty, off: u64| FieldDef {
+            name: name.to_string(),
+            ty,
+            offset: Some(off),
+        };
+        let ptr_struct = |id: StructId, name: &str, size: u64| StructDef {
+            id,
+            name: name.to_string(),
+            fields: vec![field("pointer", Ty::Ptr, 0)],
+            size: Some(size),
+            align: Some(8),
+            repr: StructRepr::Transparent,
+        };
+        let zst = |id: StructId, name: &str| StructDef {
+            id,
+            name: name.to_string(),
+            fields: Vec::new(),
+            size: Some(0),
+            align: Some(1),
+            repr: StructRepr::Rust,
+        };
+
+        // Struct table, nested-first (the producer's registration order):
+        // s0 NonNull<ArcInner<Level>>, s1 PhantomData<ArcInner<Level>>,
+        // s2 Global, s3 Arc<Level>, s4 LevelArc, s5 NonNull<ArcInner<Name>>,
+        // s6 PhantomData<ArcInner<Name>>, s7 Arc<Name>,
+        // s8 NonNull<ArcInner<str>>, s9 PhantomData<ArcInner<str>>,
+        // s10 Arc<str>, s11 Name.
+        module.add_struct(ptr_struct(sid(0), "NonNull<ArcInner<Level>>", 8));
+        module.add_struct(zst(sid(1), "PhantomData<ArcInner<Level>>"));
+        module.add_struct(zst(sid(2), "Global"));
+        module.add_struct(StructDef {
+            id: sid(3),
+            name: "Arc<Level>".into(),
+            fields: vec![
+                field("ptr", Ty::Struct(sid(0)), 0),
+                field("phantom", Ty::Struct(sid(1)), 8),
+                field("alloc", Ty::Struct(sid(2)), 8),
+            ],
+            size: Some(8),
+            align: Some(8),
+            repr: StructRepr::Rust,
+        });
+        // e0 Option<Arc<Level>> — niche-encoded over the non-null pointer.
+        module.add_enum(
+            EnumDef::new(
+                eid(0),
+                "Option<Arc<Level>>",
+                vec![
+                    EnumVariant {
+                        name: "None".into(),
+                        fields: Vec::new(),
+                        field_names: Vec::new(),
+                    },
+                    EnumVariant {
+                        name: "Some".into(),
+                        fields: vec![Ty::Struct(sid(3))],
+                        field_names: Vec::new(),
+                    },
+                ],
+            )
+            .with_discriminants(vec![Some(0), Some(1)]),
+        );
+        let option_def = module.enums.last_mut().expect("Option def just added");
+        option_def.layout = Some(EnumLayoutDescriptor {
+            encoding: EnumTagEncoding::Niche {
+                untagged_variant: 1,
+                niche_variants_start: 0,
+                niche_variants_end: 0,
+                niche_start: 0,
+                niche_offset: 0,
+                niche_ty: EnumTagRepr::U64,
+            },
+            size: 8,
+            align: 8,
+            variant_field_offsets: vec![vec![], vec![0]],
+        });
+        module.add_struct(StructDef {
+            id: sid(4),
+            name: "LevelArc".into(),
+            fields: vec![field("0", Ty::Enum(eid(0)), 0)],
+            size: Some(8),
+            align: Some(8),
+            repr: StructRepr::Rust,
+        });
+        module.add_struct(ptr_struct(sid(5), "NonNull<ArcInner<Name>>", 8));
+        module.add_struct(zst(sid(6), "PhantomData<ArcInner<Name>>"));
+        module.add_struct(StructDef {
+            id: sid(7),
+            name: "Arc<Name>".into(),
+            fields: vec![
+                field("ptr", Ty::Struct(sid(5)), 0),
+                field("phantom", Ty::Struct(sid(6)), 8),
+                field("alloc", Ty::Struct(sid(2)), 8),
+            ],
+            size: Some(8),
+            align: Some(8),
+            repr: StructRepr::Rust,
+        });
+        // `Arc<str>`: the recorded rustc size is 16 (a FAT pointer) while the
+        // producer's current spelling of the deep `*const ArcInner<str>` lane
+        // is the thin `Ty::Ptr` (map_ty's RawPtr catch-all does not model
+        // unsized-tail ADT pointees). Recorded here exactly as registered —
+        // the spelling caveat is called out in `register_enum`'s doc and is a
+        // named follow-up, not asserted away.
+        module.add_struct(ptr_struct(sid(8), "NonNull<ArcInner<str>>", 16));
+        module.add_struct(zst(sid(9), "PhantomData<ArcInner<str>>"));
+        module.add_struct(StructDef {
+            id: sid(10),
+            name: "Arc<str>".into(),
+            fields: vec![
+                field("ptr", Ty::Struct(sid(8)), 0),
+                field("phantom", Ty::Struct(sid(9)), 16),
+                field("alloc", Ty::Struct(sid(2)), 16),
+            ],
+            size: Some(16),
+            align: Some(8),
+            repr: StructRepr::Rust,
+        });
+        // e1 NameInner { Anon, Str(Arc<Name>, Arc<str>), Num(Arc<Name>, u64) }.
+        module.add_enum(
+            EnumDef::new(
+                eid(1),
+                "NameInner",
+                vec![
+                    EnumVariant {
+                        name: "Anon".into(),
+                        fields: Vec::new(),
+                        field_names: Vec::new(),
+                    },
+                    EnumVariant {
+                        name: "Str".into(),
+                        fields: vec![Ty::Struct(sid(7)), Ty::Struct(sid(10))],
+                        field_names: Vec::new(),
+                    },
+                    EnumVariant {
+                        name: "Num".into(),
+                        fields: vec![Ty::Struct(sid(7)), Ty::U64],
+                        field_names: Vec::new(),
+                    },
+                ],
+            )
+            .with_discriminants(vec![Some(0), Some(1), Some(2)]),
+        );
+        module.add_struct(StructDef {
+            id: sid(11),
+            name: "Name".into(),
+            fields: vec![field("inner", Ty::Enum(eid(1)), 0), field("cached_hash", Ty::U64, 24)],
+            size: Some(32),
+            align: Some(8),
+            repr: StructRepr::Rust,
+        });
+        // e2 Level { Zero, Succ(LevelArc), Max(LevelArc, LevelArc),
+        //            IMax(LevelArc, LevelArc), Param(Name) }.
+        let level = module.add_enum(
+            EnumDef::new(
+                eid(2),
+                "Level",
+                vec![
+                    EnumVariant {
+                        name: "Zero".into(),
+                        fields: Vec::new(),
+                        field_names: Vec::new(),
+                    },
+                    EnumVariant {
+                        name: "Succ".into(),
+                        fields: vec![Ty::Struct(sid(4))],
+                        field_names: Vec::new(),
+                    },
+                    EnumVariant {
+                        name: "Max".into(),
+                        fields: vec![Ty::Struct(sid(4)), Ty::Struct(sid(4))],
+                        field_names: Vec::new(),
+                    },
+                    EnumVariant {
+                        name: "IMax".into(),
+                        fields: vec![Ty::Struct(sid(4)), Ty::Struct(sid(4))],
+                        field_names: Vec::new(),
+                    },
+                    EnumVariant {
+                        name: "Param".into(),
+                        fields: vec![Ty::Struct(sid(11))],
+                        field_names: Vec::new(),
+                    },
+                ],
+            )
+            .with_discriminants(vec![Some(0), Some(1), Some(2), Some(3), Some(4)]),
+        );
+        (module, level)
+    }
+
+    #[test]
+    fn level_shape_canonical_tag_and_discriminants_resolve() {
+        let (module, level) = level_shape_module("level_tag", 0);
+        let def = module.enum_def(level).expect("Level def registered");
+        assert_eq!(
+            def.effective_discriminants().expect("Level discriminants resolve"),
+            vec![0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            def.canonical_tag_repr().expect("Level canonical tag resolves"),
+            EnumTagRepr::U8,
+            "5 non-negative discriminants, no repr hint -> smallest unsigned width"
+        );
+    }
+
+    #[test]
+    fn level_shape_binary_codec_round_trips_byte_stably() {
+        let (module, level) = level_shape_module("level_codec", 0);
+        let bytes = trust_ir::binary::serialize_module(&module);
+        let decoded =
+            trust_ir::binary::deserialize_module(&bytes).expect("Level module deserializes");
+        assert_eq!(decoded.enums, module.enums, "enum defs (incl. niche descriptor) round-trip");
+        assert_eq!(decoded.structs, module.structs, "struct defs round-trip");
+        assert_eq!(
+            trust_ir::binary::serialize_module(&decoded),
+            bytes,
+            "re-serialization is byte-stable"
+        );
+        assert!(decoded.enum_def(level).is_some());
+    }
+
+    #[test]
+    fn level_shape_signatures_agree_structurally_across_id_spaces() {
+        let (thir, thir_level) = level_shape_module("level_thir", 0);
+        let (oracle, oracle_level) = level_shape_module("level_oracle", 2);
+        assert_ne!(thir_level, oracle_level, "the two modules number their tables differently");
+        assert_eq!(
+            tys_agree(&thir, &oracle, &Ty::Enum(thir_level), &Ty::Enum(oracle_level), TY_CMP_DEPTH),
+            Ok(true),
+            "the Level DAG must compare structurally, never by raw id"
+        );
+        // A trivial body's signature over the shape: `fn(&Level) -> bool`
+        // (the borrow is the producer's thin `Ty::Ptr`) and the by-value
+        // `fn(Level) -> bool`.
+        let by_ref = FuncTy { params: vec![Ty::Ptr], returns: vec![Ty::Bool], is_vararg: false };
+        assert_eq!(sig_tys_agree(&thir, &oracle, &by_ref, &by_ref), Ok(true));
+        let by_value_thir = FuncTy {
+            params: vec![Ty::Enum(thir_level)],
+            returns: vec![Ty::Bool],
+            is_vararg: false,
+        };
+        let by_value_oracle = FuncTy {
+            params: vec![Ty::Enum(oracle_level)],
+            returns: vec![Ty::Bool],
+            is_vararg: false,
+        };
+        assert_eq!(sig_tys_agree(&thir, &oracle, &by_value_thir, &by_value_oracle), Ok(true));
+    }
+
+    #[test]
+    fn level_shape_deep_leaf_divergence_is_detected() {
+        let (thir, thir_level) = level_shape_module("level_deep_thir", 0);
+        let (mut oracle, oracle_level) = level_shape_module("level_deep_oracle", 1);
+        // Corrupt the DEEPEST leaf on the oracle side: NonNull<ArcInner<Level>>
+        // .pointer flips Ptr -> I64. Reaching it requires the comparator to
+        // descend Enum(Level) -> Struct(LevelArc) -> Enum(Option) ->
+        // Struct(Arc) -> Struct(NonNull) -> leaf.
+        oracle.structs[1].fields[0].ty = Ty::I64;
+        assert_eq!(
+            tys_agree(&thir, &oracle, &Ty::Enum(thir_level), &Ty::Enum(oracle_level), TY_CMP_DEPTH),
+            Ok(false),
+            "a deep pointer-leaf disagreement must be a detected divergence, not a pass"
+        );
+    }
+
+    #[test]
+    fn level_shape_discriminant_divergence_is_detected() {
+        let (thir, thir_level) = level_shape_module("level_disc_thir", 0);
+        let (mut oracle, oracle_level) = level_shape_module("level_disc_oracle", 0);
+        let od = oracle_level.as_usize();
+        oracle.enums[od].discriminants[4] = Some(9);
+        assert_eq!(
+            tys_agree(&thir, &oracle, &Ty::Enum(thir_level), &Ty::Enum(oracle_level), TY_CMP_DEPTH),
+            Ok(false),
+            "effective-discriminant disagreement must be a detected divergence"
+        );
+    }
 }

@@ -9,10 +9,10 @@
 
 use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::{
-    AssertMessage, BasicBlock, BinOp, BlockId, Contract, ContractKind, ContractMetadata, Formula,
-    LoopContractKind, LoopContractSpec, Operand, Projection, Rvalue, Sort, SourceSpan, Statement,
-    Symbol, Terminator, Ty, UnOp, VcKind, VerifiableFunction, VerificationCondition,
-    parse_spec_expr,
+    AssertMessage, BasicBlock, BinOp, BlockId, CompilerContractBundle, ConstValue, Contract,
+    ContractKind, ContractMetadata, Formula, LoopContractKind, LoopContractSpec, Operand,
+    Projection, Rvalue, Sort, SourceSpan, Statement, Symbol, Terminator, Ty, UnOp, VcKind,
+    VerifiableFunction, VerificationCondition, parse_spec_expr,
 };
 #[cfg(test)]
 use trust_types::{LocalDecl, VerifiableBody};
@@ -43,8 +43,8 @@ pub(crate) const SPEC_UNVERIFIABLE_KIND: &str = "SpecUnverifiable";
 pub(crate) const LOWERED_CONTRACT_PREFIX: &str = "__trust_lowered_compiler_contract__:";
 
 const LOOP_CONTRACT_UNSUPPORTED_KIND: &str = "UserLoopContractUnsupported";
-use trust_types::assumption::UNSUPPORTED_COMPILER_CONTRACT_PREFIX;
 pub(crate) use trust_types::UNPAIRED_LOOP_CONTRACT_PREFIX;
+use trust_types::assumption::UNSUPPORTED_COMPILER_CONTRACT_PREFIX;
 
 /// Pair compiler-owned E4/E5 clauses with the natural-loop headers recovered
 /// from the extracted MIR. Clauses are grouped by the compiler-minted source
@@ -59,6 +59,29 @@ pub(crate) use trust_types::UNPAIRED_LOOP_CONTRACT_PREFIX;
 pub fn bind_compiler_loop_contracts(
     func: &mut VerifiableFunction,
     specs: &[LoopContractSpec],
+) -> Vec<(usize, String)> {
+    bind_compiler_loop_contracts_inner(func, specs, None)
+}
+
+/// Bind compiler-owned loop clauses while requiring their unique, exact typed
+/// proposition catalog rows.
+///
+/// Production compiler callers must use this entry point. Unlike the portable
+/// compatibility helper above, it never treats reparsed source text as
+/// authority: [`CompilerContractBundle::typed_proposition`] reauthenticates the
+/// global source index, bound MIR header, kind, canonical body, formula class,
+/// and variable domains.
+pub fn bind_compiler_loop_contract_bundle(
+    func: &mut VerifiableFunction,
+    bundle: &CompilerContractBundle,
+) -> Vec<(usize, String)> {
+    bind_compiler_loop_contracts_inner(func, &bundle.loop_contracts, Some(bundle))
+}
+
+fn bind_compiler_loop_contracts_inner(
+    func: &mut VerifiableFunction,
+    specs: &[LoopContractSpec],
+    compiler_bundle: Option<&CompilerContractBundle>,
 ) -> Vec<(usize, String)> {
     let loops = crate::termination::detect_loops(&func.body);
     let mut failures = Vec::new();
@@ -77,16 +100,36 @@ pub fn bind_compiler_loop_contracts(
             .filter(|candidate| candidate.source_loop_id == spec.source_loop_id)
             .collect();
         let evidence_is_consistent = group.iter().all(|candidate| {
-            candidate.loop_head == spec.loop_head && candidate.header_span == spec.header_span
+            candidate.loop_head == spec.loop_head
+                && candidate.header_span == spec.header_span
+                && candidate.source_hir_local_id == spec.source_hir_local_id
+                && candidate.mir_header == spec.mir_header
         });
         let binding = if !evidence_is_consistent {
             Err(format!(
-                "source loop {} carries inconsistent loop/header span evidence across its clauses",
+                "e45.loop-source.inconsistent-group: source loop {} carries inconsistent HIR/MIR/span evidence across its clauses",
                 spec.source_loop_id
             ))
+        } else if let Some(header) = spec.mir_header {
+            let header = BlockId(header);
+            let is_real_header = func.body.blocks.get(header.0).is_some()
+                && loops.iter().any(|loop_info| loop_info.header == header);
+            if !is_real_header {
+                Err(format!(
+                    "e45.loop-source.stale-mir-header: source loop {} names bb{} but it is not a dominator-proved natural-loop header in this exact MIR body",
+                    spec.source_loop_id, header.0
+                ))
+            } else if spec.source_hir_local_id.is_none() {
+                Err(format!(
+                    "e45.loop-source.unauthenticated-mir-header: source loop {} carries a MIR header without its compiler-owned HIR identity",
+                    spec.source_loop_id
+                ))
+            } else {
+                Ok(header)
+            }
         } else if !source_span_contains(&spec.loop_head, &spec.header_span) {
             Err(format!(
-                "source loop {} carries a missing or out-of-loop header span",
+                "e45.loop-source.invalid-span: source loop {} carries a missing or out-of-loop header span",
                 spec.source_loop_id
             ))
         } else {
@@ -115,17 +158,6 @@ pub fn bind_compiler_loop_contracts(
     }
 
     for (index, spec) in specs.iter().enumerate() {
-        if spec.body.starts_with(UNSUPPORTED_COMPILER_CONTRACT_PREFIX)
-            || parse_spec_expr(&spec.body).is_none()
-        {
-            failures.push((
-                index,
-                format!(
-                    "authored loop clause `{}` is not in the supported typed spec fragment",
-                    spec.body
-                ),
-            ));
-        }
         let kind = match spec.kind {
             LoopContractKind::Invariant => ContractKind::LoopInvariant,
             LoopContractKind::Decreases => ContractKind::Decreases,
@@ -145,6 +177,26 @@ pub fn bind_compiler_loop_contracts(
             Ok(header) => *header,
             Err(reason) => {
                 failures.push((index, reason.clone()));
+                // The portable compatibility helper owns both pieces of
+                // validation independently: a bad source/header pairing must
+                // not hide that the authored clause is also outside the typed
+                // expression fragment.  Keeping both diagnostics matters to
+                // callers that repair all authored errors in one pass.  The
+                // production bundle path cannot perform its exact proposition
+                // lookup until a MIR header has been authenticated, so its
+                // binding failure remains the single fail-closed diagnostic.
+                if compiler_bundle.is_none()
+                    && (spec.body.starts_with(UNSUPPORTED_COMPILER_CONTRACT_PREFIX)
+                        || parse_spec_expr(&spec.body).is_none())
+                {
+                    failures.push((
+                        index,
+                        format!(
+                            "authored loop clause `{}` is not in the supported typed spec fragment",
+                            spec.body
+                        ),
+                    ));
+                }
                 func.contracts.push(Contract {
                     kind,
                     span: spec.span.clone(),
@@ -153,11 +205,33 @@ pub fn bind_compiler_loop_contracts(
                 continue;
             }
         };
-        func.contracts.push(Contract {
+        let contract = Contract {
             kind,
             span: spec.span.clone(),
             body: format!("bb{}: {}", header.0, spec.body),
-        });
+        };
+        let has_supported_typed_proposition = compiler_bundle.map_or_else(
+            || {
+                !spec.body.starts_with(UNSUPPORTED_COMPILER_CONTRACT_PREFIX)
+                    && parse_spec_expr(&spec.body).is_some()
+            },
+            |bundle| bundle.typed_proposition(bundle.contracts.len() + index, &contract).is_some(),
+        );
+        if !has_supported_typed_proposition {
+            let reason = if compiler_bundle.is_some() {
+                format!(
+                    "authored loop clause `{}` has no unique exact compiler-typed proposition",
+                    spec.body
+                )
+            } else {
+                format!(
+                    "authored loop clause `{}` is not in the supported typed spec fragment",
+                    spec.body
+                )
+            };
+            failures.push((index, reason));
+        }
+        func.contracts.push(contract);
     }
 
     failures
@@ -985,10 +1059,14 @@ fn generate_loop_invariant_vcs(
         return;
     };
     let Some(invariant) = type_and_validate_loop_formula(func, parsed, Sort::Bool) else {
+        let collection_blocker =
+            read_only_collection_blocker(func).map(|code| format!("{code}: ")).unwrap_or_default();
         vcs.push(loop_contract_unsupported_vc(
             func,
             contract,
-            format!("loop invariant `{expr}` references an unsupported or ambiguous MIR value"),
+            format!(
+                "{collection_blocker}loop invariant `{expr}` references an unsupported or ambiguous MIR value"
+            ),
         ));
         return;
     };
@@ -1005,24 +1083,26 @@ fn generate_loop_invariant_vcs(
         .map(|precondition| type_loop_formula(func, precondition, Sort::Bool))
         .collect::<Option<Vec<_>>>()
     else {
+        let collection_blocker =
+            read_only_collection_blocker(func).map(|code| format!("{code}: ")).unwrap_or_default();
         vcs.push(loop_contract_unsupported_vc(
             func,
             contract,
             format!(
-                "loop invariant `{expr}` depends on a function precondition that cannot be rebound to the exact MIR/source state"
+                "{collection_blocker}loop invariant `{expr}` depends on a function precondition that cannot be rebound to the exact MIR/source state"
             ),
         ));
         return;
     };
-    if typed_preconditions
-        .iter()
-        .any(|pre| formula_uses_unmodeled_machine_arithmetic_in_function(func, pre))
-    {
+    if typed_preconditions.iter().any(|pre| {
+        formula_uses_unmodeled_machine_arithmetic_in_function(func, pre)
+            && !machine_faithful_clause_admissible(func, pre)
+    }) {
         vcs.push(loop_contract_unsupported_vc(
             func,
             contract,
             format!(
-                "loop invariant `{expr}` depends on a function precondition with unmodeled machine arithmetic"
+                "e4.machine.precondition-outside-bv-fragment: loop invariant `{expr}` depends on a function precondition outside the exact declared-width machine fragment"
             ),
         ));
         return;
@@ -1038,28 +1118,82 @@ fn generate_loop_invariant_vcs(
         ));
         return;
     };
-    let Some((post_state, guard)) = symbolic_single_path_loop_transition(func, header) else {
-        vcs.push(loop_contract_unsupported_vc(
+    let transitions = match symbolic_loop_transitions(func, header) {
+        Ok(transitions) => transitions,
+        Err(reason) => {
+            vcs.push(loop_contract_unsupported_vc(
             func,
             contract,
             format!(
-                "loop invariant `{expr}` is outside the exact single-path loop-transition fragment at bb{header_block}"
+                    "{reason}: loop invariant `{expr}` has no complete exact transition model at bb{header_block}"
             ),
         ));
-        return;
+            return;
+        }
     };
 
     let invariant_at_entry = substitute_formula_state(&invariant, &entry_state);
     let mut initiation = typed_preconditions;
     initiation.push(Formula::Not(Box::new(invariant_at_entry)));
-    let initiation = conjunction(initiation);
+    let mut initiation = conjunction(initiation);
 
     // The post-state is independently symbolically executed through one full
     // successful iteration.  This is deliberately NOT `P && !P`: a wrong
     // invariant whose body falsifies P leaves a satisfiable violation formula.
-    let invariant_after = substitute_formula_state(&invariant, &post_state);
-    let preservation =
-        Formula::And(vec![invariant.clone(), guard, Formula::Not(Box::new(invariant_after))]);
+    let mut preservation = disjunction(
+        transitions
+            .iter()
+            .map(|transition| {
+                let invariant_after = substitute_formula_state(&invariant, &transition.post_state);
+                Formula::And(vec![
+                    invariant.clone(),
+                    transition.guard.clone(),
+                    Formula::Not(Box::new(invariant_after)),
+                ])
+            })
+            .collect(),
+    );
+    let machine_required = formula_uses_unmodeled_machine_arithmetic(&invariant)
+        || formula_contains_machine_encoding(&preservation);
+    if machine_required {
+        let combined = Formula::And(vec![initiation.clone(), preservation.clone()]);
+        let Some((width, signed)) = uniform_machine_domain(func, &combined) else {
+            vcs.push(loop_contract_unsupported_vc(
+                func,
+                contract,
+                format!(
+                    "e4.machine.mixed-domain: loop invariant `{expr}` does not have one exact declared-width machine domain at bb{header_block}"
+                ),
+            ));
+            return;
+        };
+        let Some(machine_initiation) =
+            machine_faithful_translate(func, &initiation, width, signed, true, Polarity::Prop)
+        else {
+            vcs.push(loop_contract_unsupported_vc(
+                func,
+                contract,
+                format!(
+                    "e4.machine.initiation-translation: loop invariant `{expr}` initiation is outside the exact declared-width machine fragment"
+                ),
+            ));
+            return;
+        };
+        let Some(machine_preservation) =
+            machine_faithful_translate(func, &preservation, width, signed, true, Polarity::Prop)
+        else {
+            vcs.push(loop_contract_unsupported_vc(
+                func,
+                contract,
+                format!(
+                    "e4.machine.consecution-translation: loop invariant `{expr}` transition is outside the exact declared-width machine fragment"
+                ),
+            ));
+            return;
+        };
+        initiation = machine_initiation;
+        preservation = machine_preservation;
+    }
     if !formula_has_sort(&initiation, Sort::Bool) || !formula_has_sort(&preservation, Sort::Bool) {
         vcs.push(loop_contract_unsupported_vc(
             func,
@@ -1105,33 +1239,43 @@ fn generate_loop_decreases_vc(
         return;
     };
     let Some(measure) = type_loop_formula(func, parsed, Sort::Int) else {
-        vcs.push(loop_contract_unsupported_vc(
-            func,
-            contract,
-            format!("loop decreases measure `{expr}` references an unsupported MIR value"),
-        ));
-        return;
-    };
-    let header = BlockId(header_block);
-    let Some((post_state, guard)) = symbolic_single_path_loop_transition(func, header) else {
+        let collection_blocker =
+            read_only_collection_blocker(func).map(|code| format!("{code}: ")).unwrap_or_default();
         vcs.push(loop_contract_unsupported_vc(
             func,
             contract,
             format!(
-                "loop decreases measure `{expr}` is outside the exact single-path loop-transition fragment at bb{header_block}"
+                "{collection_blocker}loop decreases measure `{expr}` references an unsupported MIR value"
             ),
         ));
         return;
     };
-    let after = substitute_formula_state(&measure, &post_state);
+    let header = BlockId(header_block);
+    let transitions = match symbolic_loop_transitions(func, header) {
+        Ok(transitions) => transitions,
+        Err(reason) => {
+            vcs.push(loop_contract_unsupported_vc(
+            func,
+            contract,
+            format!(
+                    "{reason}: loop decreases measure `{expr}` has no complete exact transition model at bb{header_block}"
+            ),
+        ));
+            return;
+        }
+    };
     if formula_uses_unmodeled_machine_arithmetic(&measure)
-        && !guarded_unsigned_difference_is_exact(func, &measure, &after, &guard)
+        && !machine_faithful_value_admissible(func, &measure)
+        && !transitions.iter().all(|transition| {
+            let after = substitute_formula_state(&measure, &transition.post_state);
+            guarded_unsigned_difference_is_exact(func, &measure, &after, &transition.guard)
+        })
     {
         vcs.push(loop_contract_unsupported_vc(
             func,
             contract,
             format!(
-                "loop decreases measure `{expr}` uses machine arithmetic not justified by the taken-edge guard"
+                "e5.machine.measure-outside-bv-fragment: loop decreases measure `{expr}` uses machine arithmetic outside the exact declared-width fragment"
             ),
         ));
         return;
@@ -1163,12 +1307,44 @@ fn generate_loop_decreases_vc(
             assumptions.push(invariant.predicate.clone());
         }
     }
-    assumptions.push(guard);
-    assumptions.push(Formula::Or(vec![
-        Formula::Lt(Box::new(measure.clone()), Box::new(Formula::Int(0))),
-        Formula::Ge(Box::new(after), Box::new(measure)),
-    ]));
-    let violation = conjunction(assumptions);
+    let machine_domain = uniform_machine_domain(func, &measure);
+    let mut violation = disjunction(
+        transitions
+            .iter()
+            .map(|transition| {
+                let after = substitute_formula_state(&measure, &transition.post_state);
+                let progress_violation = Formula::Ge(Box::new(after), Box::new(measure.clone()));
+                let mut path_assumptions = assumptions.clone();
+                path_assumptions.push(transition.guard.clone());
+                path_assumptions.push(match machine_domain {
+                    // Unsigned Machine{w} values are intrinsically natural
+                    // numbers. An Int-style negative premise would invent
+                    // states outside the source domain.
+                    Some((_, false)) => progress_violation,
+                    Some((_, true)) | None => Formula::Or(vec![
+                        Formula::Lt(Box::new(measure.clone()), Box::new(Formula::Int(0))),
+                        progress_violation,
+                    ]),
+                });
+                conjunction(path_assumptions)
+            })
+            .collect(),
+    );
+    if let Some((width, signed)) = machine_domain {
+        let Some(machine_violation) =
+            machine_faithful_translate(func, &violation, width, signed, true, Polarity::Prop)
+        else {
+            vcs.push(loop_contract_unsupported_vc(
+                func,
+                contract,
+                format!(
+                    "e5.machine.transition-translation: loop decreases measure `{expr}` cannot be translated with its exact declared-width transition at bb{header_block}"
+                ),
+            ));
+            return;
+        };
+        violation = machine_violation;
+    }
     if !formula_has_sort(&violation, Sort::Bool) {
         vcs.push(loop_contract_unsupported_vc(
             func,
@@ -1202,37 +1378,44 @@ fn type_and_validate_loop_formula(
     expected_sort: Sort,
 ) -> Option<Formula> {
     let typed = type_loop_formula(func, formula, expected_sort)?;
-    // E4 currently represents integer locals as mathematical Ints. Raw
-    // comparisons over a machine value preserve their meaning, but authored
-    // Int arithmetic does not preserve fixed-width overflow/wrap semantics.
-    // Reject such clauses until this lane carries an exact BV encoding: e.g.
-    // `x + 1 > x` is false for `u8::MAX` and must never become an E4 theorem.
-    (!formula_uses_unmodeled_machine_arithmetic(&typed)).then_some(typed)
+    (!formula_uses_unmodeled_machine_arithmetic(&typed)
+        || machine_faithful_clause_admissible(func, &typed))
+    .then_some(typed)
 }
 
 /// The deliberately narrow E4 collection model.
 ///
-/// Only immutable shared-reference arguments to slices or fixed arrays of
-/// scalar, Freeze elements enter this lane.  The one `base` Formula is used by
+/// Shared references, read-only uses of mutable-reference arguments, and one
+/// exact exclusive-mutation fragment over slices or fixed arrays of scalar,
+/// Freeze elements enter this lane. The one `base` Formula is used by
 /// source `xs[i]`, symbolic MIR element reads, initiation, and consecution; the
 /// one `length` Formula likewise joins source `xs.len()` to exact MIR `Len` (and
-/// the exact slice `PtrMetadata` shape).  This is not the general array-theory
-/// lane: mutable collections, local aliases/reseats, projected writes, and
-/// collection-bearing calls remain an explicit `UserLoopContractUnsupported`
-/// frontier.  Multi-path loops such as the full binary-search example remain
-/// outside `symbolic_single_path_loop_transition` as well.
+/// the exact slice `PtrMetadata` shape). This is not a general array-theory
+/// lane: immutable sources may have a finite set of independently exact,
+/// non-escaping shared aliases, while an exclusive source admits only guarded
+/// element stores and has no alias/reborrow/call/intrinsic/reseat/escape lane.
 #[derive(Clone)]
 struct ReadOnlyCollectionModel {
+    /// Local through which this particular access is performed.
     local: usize,
+    /// Original function argument supplying the canonical snapshot identity.
+    source_local: usize,
     name: String,
     elem_sort: Sort,
     length: ReadOnlyCollectionLength,
+    access: CollectionAccess,
 }
 
 #[derive(Clone)]
 enum ReadOnlyCollectionLength {
     Slice,
     Fixed(u64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CollectionAccess {
+    SharedReadOnly,
+    ExclusiveMutable,
 }
 
 impl ReadOnlyCollectionModel {
@@ -1255,8 +1438,8 @@ impl ReadOnlyCollectionModel {
         }
     }
 
-    fn is_slice(&self) -> bool {
-        matches!(self.length, ReadOnlyCollectionLength::Slice)
+    fn is_exclusive_mutable(&self) -> bool {
+        self.access == CollectionAccess::ExclusiveMutable
     }
 }
 
@@ -1290,7 +1473,7 @@ fn read_only_collection_shape_for_local(
         return None;
     }
     let decl = func.body.locals.get(local)?;
-    let Ty::Ref { mutable: false, inner } = &decl.ty else {
+    let Ty::Ref { mutable, inner } = &decl.ty else {
         return None;
     };
     let (elem, length) = match inner.as_ref() {
@@ -1300,7 +1483,12 @@ fn read_only_collection_shape_for_local(
     };
     let elem_sort = read_only_collection_element_sort(elem)?;
     let name = crate::place_to_var_name(func, &trust_types::Place::local(local));
-    Some(ReadOnlyCollectionModel { local, name, elem_sort, length })
+    let access = if *mutable {
+        CollectionAccess::ExclusiveMutable
+    } else {
+        CollectionAccess::SharedReadOnly
+    };
+    Some(ReadOnlyCollectionModel { local, source_local: local, name, elem_sort, length, access })
 }
 
 fn operand_place(operand: &Operand) -> Option<&trust_types::Place> {
@@ -1331,6 +1519,20 @@ fn read_only_collection_index_projection<'a>(
     }
 }
 
+/// The two canonical Trust model spellings of rustc `usize`.
+///
+/// Default verifier extraction historically normalizes `usize` to the target
+/// pointer-width unsigned `Int` (`Ty::usize()` in this 64-bit model). Faithful
+/// extraction retains `PtrSizedInt(false)`. TrustIr does not preserve enough
+/// identity to distinguish a same-width source `u64` after legacy
+/// normalization, so authority additionally comes from rustc's typed MIR
+/// `Projection::Index` and the exact same local in its BoundsCheck predicate.
+/// No other integer width/sign (and no untyped integer-shaped formula) enters
+/// this lane.
+fn is_normalized_usize_ty(ty: &Ty) -> bool {
+    *ty == Ty::usize() || matches!(ty, Ty::PtrSizedInt { signed: false, .. })
+}
+
 fn operand_uses_collection_only_as_element_read(
     func: &VerifiableFunction,
     operand: &Operand,
@@ -1344,12 +1546,11 @@ fn operand_uses_collection_only_as_element_read(
     // semantics at the public TrustIr boundary.
     let Operand::Copy(place) = operand else { return false };
     match read_only_collection_index_projection(place, local) {
-        Some(Projection::Index(index_local)) => {
-            func.body.locals.get(*index_local).is_some_and(|decl| {
-                decl.index == *index_local
-                    && matches!(decl.ty, Ty::Int { .. } | Ty::PtrSizedInt { .. })
-            })
-        }
+        Some(Projection::Index(index_local)) => func
+            .body
+            .locals
+            .get(*index_local)
+            .is_some_and(|decl| decl.index == *index_local && is_normalized_usize_ty(&decl.ty)),
         Some(Projection::ConstantIndex { from_end: false, .. }) => true,
         _ => false,
     }
@@ -1364,10 +1565,9 @@ fn exact_read_only_collection_metadata_operand(
     operand: &Operand,
     local: usize,
 ) -> bool {
-    let Some(model) = read_only_collection_shape_for_local(func, local) else {
-        return false;
-    };
-    model.is_slice()
+    let Some(decl) = func.body.locals.get(local) else { return false };
+    let Ty::Ref { inner, .. } = &decl.ty else { return false };
+    matches!(inner.as_ref(), Ty::Slice { elem } if read_only_collection_element_sort(elem).is_some())
         && matches!(operand, Operand::Copy(place) if place.local == local && place.projections.is_empty())
 }
 
@@ -1600,6 +1800,503 @@ fn rvalue_preserves_read_only_collection(
     }
 }
 
+fn exact_shared_collection_alias_definition(
+    func: &VerifiableFunction,
+    statement: &Statement,
+    source_local: usize,
+) -> Option<usize> {
+    let Statement::Assign { place, rvalue: Rvalue::Use(Operand::Copy(source)), .. } = statement
+    else {
+        return None;
+    };
+    if !place.projections.is_empty()
+        || place.local == source_local
+        || source.local != source_local
+        || !source.projections.is_empty()
+        || place.local <= func.body.arg_count
+    {
+        return None;
+    }
+    let source_decl = func.body.locals.get(source_local)?;
+    let alias_decl = func.body.locals.get(place.local)?;
+    if source_decl.ty != alias_decl.ty {
+        return None;
+    }
+    let Ty::Ref { mutable: false, inner } = &source_decl.ty else { return None };
+    matches!(inner.as_ref(), Ty::Slice { .. } | Ty::Array { .. }).then_some(place.local)
+}
+
+/// Validate one shared local alias as a pure, non-escaping view of its source
+/// argument. Exactly one `alias = Copy(source)` definition is admitted for this
+/// alias; other independently exact aliases of the same source are allowed.
+/// Reseat, chained alias, call, projected write, address/reborrow, or unknown
+/// effect rejects the complete collection model.
+fn read_only_collection_alias_is_stable(
+    func: &VerifiableFunction,
+    alias_local: usize,
+    source_local: usize,
+) -> bool {
+    let definitions = func
+        .body
+        .blocks
+        .iter()
+        .flat_map(|block| block.stmts.iter())
+        .filter(|statement| {
+            exact_shared_collection_alias_definition(func, statement, source_local)
+                == Some(alias_local)
+        })
+        .count();
+    if definitions != 1 {
+        return false;
+    }
+
+    for block in &func.body.blocks {
+        for statement in &block.stmts {
+            if exact_shared_collection_alias_definition(func, statement, source_local)
+                == Some(alias_local)
+            {
+                continue;
+            }
+            match statement {
+                Statement::Assign { place, rvalue, .. } => {
+                    if place.local == alias_local
+                        || !rvalue_preserves_read_only_collection(func, rvalue, alias_local)
+                    {
+                        return false;
+                    }
+                }
+                Statement::SetDiscriminant { place, .. } | Statement::Deinit { place }
+                    if place.local == alias_local =>
+                {
+                    return false;
+                }
+                Statement::Intrinsic { args, .. }
+                    if args
+                        .iter()
+                        .any(|operand| operand_mentions_local_anywhere(operand, alias_local)) =>
+                {
+                    return false;
+                }
+                Statement::Unsupported { .. } => return false,
+                Statement::StorageLive(_)
+                | Statement::StorageDead(_)
+                | Statement::Retag { .. }
+                | Statement::PlaceMention(_)
+                | Statement::Intrinsic { .. }
+                | Statement::SetDiscriminant { .. }
+                | Statement::Deinit { .. }
+                | Statement::Coverage
+                | Statement::ConstEvalCounter
+                | Statement::Nop => {}
+                _ => return false,
+            }
+        }
+        match &block.terminator {
+            Terminator::Call { args, dest, .. } => {
+                if dest.local == alias_local
+                    || args
+                        .iter()
+                        .any(|operand| operand_mentions_local_anywhere(operand, alias_local))
+                {
+                    return false;
+                }
+            }
+            Terminator::SwitchInt { discr, .. }
+                if !operand_uses_collection_only_as_element_read(func, discr, alias_local) =>
+            {
+                return false;
+            }
+            Terminator::Assert { cond, .. }
+                if !operand_uses_collection_only_as_element_read(func, cond, alias_local) =>
+            {
+                return false;
+            }
+            Terminator::Drop { place, .. } if place.local == alias_local => return false,
+            Terminator::Opaque { .. } => return false,
+            Terminator::Goto(_)
+            | Terminator::SwitchInt { .. }
+            | Terminator::Return
+            | Terminator::Assert { .. }
+            | Terminator::Drop { .. }
+            | Terminator::Unreachable
+            | Terminator::Resume => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn exact_exclusive_mutable_store_projection<'a>(
+    func: &VerifiableFunction,
+    place: &'a trust_types::Place,
+    model: &ReadOnlyCollectionModel,
+) -> Option<&'a Projection> {
+    if !model.is_exclusive_mutable()
+        || model.local != model.source_local
+        || place.local != model.source_local
+    {
+        return None;
+    }
+    let projection = read_only_collection_index_projection(place, model.source_local)?;
+    match projection {
+        Projection::Index(index_local) => {
+            let index_decl = func.body.locals.get(*index_local)?;
+            if index_decl.index != *index_local || !is_normalized_usize_ty(&index_decl.ty) {
+                return None;
+            }
+        }
+        Projection::ConstantIndex { offset, min_length, from_end: false } => {
+            if offset.checked_add(1) != Some(*min_length) {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    let place_sort =
+        crate::place_ty_cow(func, place).as_deref().and_then(read_only_collection_element_sort)?;
+    (place_sort == model.elem_sort).then_some(projection)
+}
+
+fn exact_exclusive_mutable_store_value_is_typed(
+    func: &VerifiableFunction,
+    place: &trust_types::Place,
+    rvalue: &Rvalue,
+) -> bool {
+    let Rvalue::Use(value) = rvalue else {
+        return false;
+    };
+    let Some(place_ty) = crate::place_ty_cow(func, place) else {
+        return false;
+    };
+    crate::operand_ty_cow(func, value).is_some_and(|value_ty| value_ty == place_ty)
+}
+
+fn constant_operand_nonnegative_index(operand: &Operand) -> Option<u128> {
+    match operand {
+        Operand::Constant(ConstValue::Uint(value, width)) if *width == usize::BITS => Some(*value),
+        _ => None,
+    }
+}
+
+fn operand_matches_collection_index_projection(operand: &Operand, projection: &Projection) -> bool {
+    match projection {
+        Projection::Index(index_local) => matches!(
+            operand,
+            Operand::Copy(place) | Operand::Move(place)
+                if place.local == *index_local && place.projections.is_empty()
+        ),
+        Projection::ConstantIndex { offset, from_end: false, .. } => u128::try_from(*offset)
+            .ok()
+            .is_some_and(|offset| constant_operand_nonnegative_index(operand) == Some(offset)),
+        _ => false,
+    }
+}
+
+fn unique_plain_local_binary_definition<'a>(
+    block: &'a BasicBlock,
+    operand: &Operand,
+) -> Option<(usize, BinOp, &'a Operand, &'a Operand)> {
+    let local = match operand {
+        Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => place.local,
+        _ => return None,
+    };
+    let mut definitions = block.stmts.iter().enumerate().filter_map(|(index, statement)| {
+        let Statement::Assign { place, rvalue, .. } = statement else {
+            return None;
+        };
+        if place.local != local || !place.projections.is_empty() {
+            return None;
+        }
+        Some((index, rvalue))
+    });
+    let (index, definition) = definitions.next()?;
+    if definitions.next().is_some() {
+        return None;
+    }
+    let Rvalue::BinaryOp(op, lhs, rhs) = definition else {
+        return None;
+    };
+    Some((index, *op, lhs, rhs))
+}
+
+fn exact_collection_length_definition_before(
+    func: &VerifiableFunction,
+    block: &BasicBlock,
+    before_statement: usize,
+    operand: &Operand,
+    model: &ReadOnlyCollectionModel,
+) -> bool {
+    if let ReadOnlyCollectionLength::Fixed(length) = model.length
+        && constant_operand_nonnegative_index(operand) == Some(u128::from(length))
+    {
+        return true;
+    }
+
+    let len_local = match operand {
+        Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => place.local,
+        _ => return false,
+    };
+    if func
+        .body
+        .locals
+        .get(len_local)
+        .is_none_or(|decl| decl.index != len_local || !is_normalized_usize_ty(&decl.ty))
+    {
+        return false;
+    }
+    let mut definitions = block.stmts.iter().take(before_statement).filter_map(|statement| {
+        let Statement::Assign { place, rvalue, .. } = statement else {
+            return None;
+        };
+        (place.local == len_local && place.projections.is_empty()).then_some(rvalue)
+    });
+    let Some(definition) = definitions.next() else {
+        return false;
+    };
+    if definitions.next().is_some() {
+        return false;
+    }
+    match definition {
+        Rvalue::Len(place) => exact_read_only_collection_len_place(place, model.source_local),
+        Rvalue::UnaryOp(UnOp::PtrMetadata, metadata) => {
+            matches!(&model.length, ReadOnlyCollectionLength::Slice)
+                && matches!(
+                    metadata,
+                    Operand::Copy(place) | Operand::Move(place)
+                        if place.local == model.source_local && place.projections.is_empty()
+                )
+        }
+        _ => false,
+    }
+}
+
+fn terminator_edges_to(terminator: &Terminator, target: BlockId) -> usize {
+    let mut edges = match terminator {
+        Terminator::Goto(candidate) | Terminator::Drop { target: candidate, .. } => {
+            usize::from(*candidate == target)
+        }
+        Terminator::SwitchInt { targets, otherwise, .. } => {
+            targets.iter().filter(|(_, candidate)| *candidate == target).count()
+                + usize::from(*otherwise == target)
+        }
+        Terminator::Call { target: candidate, .. } => {
+            usize::from(candidate.as_ref() == Some(&target))
+        }
+        Terminator::Assert { target: candidate, .. } => usize::from(*candidate == target),
+        Terminator::Opaque { targets, .. } => {
+            targets.iter().filter(|candidate| **candidate == target).count()
+        }
+        Terminator::Return | Terminator::Unreachable | Terminator::Resume => 0,
+        _ => return usize::MAX,
+    };
+    if terminator.unwind_cleanup_target() == Some(target) {
+        edges = edges.saturating_add(1);
+    }
+    edges
+}
+
+fn mutable_collection_store_bounds_authenticated(
+    func: &VerifiableFunction,
+    store_block: BlockId,
+    store_statement: usize,
+    projection: &Projection,
+    model: &ReadOnlyCollectionModel,
+) -> bool {
+    if let (
+        ReadOnlyCollectionLength::Fixed(length),
+        Projection::ConstantIndex { offset, min_length, from_end: false },
+    ) = (&model.length, projection)
+    {
+        let Some(canonical_min_length) = offset.checked_add(1) else {
+            return false;
+        };
+        return *min_length == canonical_min_length
+            && u64::try_from(*offset).is_ok_and(|offset| offset < *length);
+    }
+
+    let mut incoming_edges = 0usize;
+    let mut guard = None;
+    for block in &func.body.blocks {
+        let edges = terminator_edges_to(&block.terminator, store_block);
+        if edges == usize::MAX {
+            return false;
+        }
+        incoming_edges = incoming_edges.saturating_add(edges);
+        if edges != 0 {
+            if edges != 1 || guard.is_some() {
+                return false;
+            }
+            guard = Some(block);
+        }
+    }
+    if incoming_edges != 1 {
+        return false;
+    }
+    if let Projection::Index(index_local) = projection {
+        let Some(block) = func.body.blocks.get(store_block.0) else {
+            return false;
+        };
+        if block.stmts.iter().take(store_statement).any(|statement| {
+            matches!(
+                statement,
+                Statement::Assign { place, .. } if place.local == *index_local
+            ) || matches!(
+                statement,
+                Statement::StorageDead(local) if local == index_local
+            ) || matches!(
+                statement,
+                Statement::SetDiscriminant { place, .. } | Statement::Deinit { place }
+                    if place.local == *index_local
+            )
+        }) {
+            return false;
+        }
+    }
+    let Some(guard) = guard else { return false };
+    let Terminator::Assert {
+        cond,
+        expected: true,
+        msg: AssertMessage::BoundsCheck,
+        target,
+        unwind,
+        ..
+    } = &guard.terminator
+    else {
+        return false;
+    };
+    if *target != store_block || unwind.cleanup_target() == Some(store_block) {
+        return false;
+    }
+    let Some((condition_statement, BinOp::Lt, checked_index, checked_length)) =
+        unique_plain_local_binary_definition(guard, cond)
+    else {
+        return false;
+    };
+    let cond_local = match cond {
+        Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => place.local,
+        _ => return false,
+    };
+    if func
+        .body
+        .locals
+        .get(cond_local)
+        .is_none_or(|decl| decl.index != cond_local || decl.ty != Ty::Bool)
+    {
+        return false;
+    }
+    // The asserted boolean must be the last semantic definition in this exact
+    // guard block. In particular, changing the index after computing `i < len`
+    // would authenticate a different projected store.
+    if guard.stmts.iter().skip(condition_statement + 1).any(|statement| {
+        !matches!(statement, Statement::Coverage | Statement::ConstEvalCounter | Statement::Nop)
+    }) {
+        return false;
+    }
+    operand_matches_collection_index_projection(checked_index, projection)
+        && exact_collection_length_definition_before(
+            func,
+            guard,
+            condition_statement,
+            checked_length,
+            model,
+        )
+}
+
+fn exclusive_mutable_collection_arg_is_stable(func: &VerifiableFunction, local: usize) -> bool {
+    let Some(model) = read_only_collection_shape_for_local(func, local) else {
+        return false;
+    };
+    if !model.is_exclusive_mutable() {
+        return false;
+    }
+
+    for block in &func.body.blocks {
+        for (statement_index, statement) in block.stmts.iter().enumerate() {
+            match statement {
+                Statement::Assign { place, rvalue, .. } => {
+                    if place.local == local {
+                        let Some(projection) =
+                            exact_exclusive_mutable_store_projection(func, place, &model)
+                        else {
+                            return false;
+                        };
+                        if !exact_exclusive_mutable_store_value_is_typed(func, place, rvalue)
+                            || !mutable_collection_store_bounds_authenticated(
+                                func,
+                                block.id,
+                                statement_index,
+                                projection,
+                                &model,
+                            )
+                            || !rvalue_preserves_read_only_collection(func, rvalue, local)
+                        {
+                            return false;
+                        }
+                        continue;
+                    }
+                    if !rvalue_preserves_read_only_collection(func, rvalue, local) {
+                        return false;
+                    }
+                }
+                Statement::SetDiscriminant { place, .. } | Statement::Deinit { place }
+                    if place.local == local =>
+                {
+                    return false;
+                }
+                Statement::Intrinsic { args, .. }
+                    if args
+                        .iter()
+                        .any(|operand| operand_mentions_local_anywhere(operand, local)) =>
+                {
+                    return false;
+                }
+                Statement::Unsupported { .. } => return false,
+                Statement::StorageLive(_)
+                | Statement::StorageDead(_)
+                | Statement::Retag { .. }
+                | Statement::PlaceMention(_)
+                | Statement::Intrinsic { .. }
+                | Statement::SetDiscriminant { .. }
+                | Statement::Deinit { .. }
+                | Statement::Coverage
+                | Statement::ConstEvalCounter
+                | Statement::Nop => {}
+                _ => return false,
+            }
+        }
+        match &block.terminator {
+            Terminator::Call { args, dest, .. } => {
+                if dest.local == local
+                    || args.iter().any(|operand| operand_mentions_local_anywhere(operand, local))
+                {
+                    return false;
+                }
+            }
+            Terminator::SwitchInt { discr, .. }
+                if !operand_uses_collection_only_as_element_read(func, discr, local) =>
+            {
+                return false;
+            }
+            Terminator::Assert { cond, .. }
+                if !operand_uses_collection_only_as_element_read(func, cond, local) =>
+            {
+                return false;
+            }
+            Terminator::Drop { place, .. } if place.local == local => return false,
+            Terminator::Opaque { .. } => return false,
+            Terminator::Goto(_)
+            | Terminator::SwitchInt { .. }
+            | Terminator::Return
+            | Terminator::Assert { .. }
+            | Terminator::Drop { .. }
+            | Terminator::Unreachable
+            | Terminator::Resume => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn read_only_collection_arg_is_stable(func: &VerifiableFunction, local: usize) -> bool {
     for (block_index, block) in func.body.blocks.iter().enumerate() {
         for (statement_index, statement) in block.stmts.iter().enumerate() {
@@ -1621,6 +2318,14 @@ fn read_only_collection_arg_is_stable(func: &VerifiableFunction, local: usize) -
                         statement_index,
                     ) {
                         continue;
+                    }
+                    if let Some(alias_local) =
+                        exact_shared_collection_alias_definition(func, statement, local)
+                    {
+                        if read_only_collection_alias_is_stable(func, alias_local, local) {
+                            continue;
+                        }
+                        return false;
                     }
                     if !rvalue_preserves_read_only_collection(func, rvalue, local) {
                         return false;
@@ -1687,24 +2392,119 @@ fn read_only_collection_arg_is_stable(func: &VerifiableFunction, local: usize) -
     true
 }
 
+/// Stable machine-readable reason why a collection-shaped argument could not
+/// enter the bounded E4/E5 model. This classifier never authorizes a model; it
+/// runs only after exact shared-read or exclusive-mutation admission failed and
+/// keeps the remaining frontier visible to tools without asking them to scrape
+/// prose.
+fn read_only_collection_blocker(func: &VerifiableFunction) -> Option<&'static str> {
+    for local in 1..=func.body.arg_count {
+        if read_only_collection_shape_for_local(func, local).is_none()
+            || exact_collection_model_for_local(func, local).is_some()
+        {
+            continue;
+        }
+        for block in &func.body.blocks {
+            for statement in &block.stmts {
+                match statement {
+                    Statement::Assign { place, .. } if place.local == local => {
+                        return Some("e45.collection.mutation-or-reseat");
+                    }
+                    Statement::Assign {
+                        rvalue: Rvalue::Ref { place, .. } | Rvalue::AddressOf(_, place),
+                        ..
+                    } if place_mentions_local_anywhere(place, local) => {
+                        return Some("e45.collection.alias-or-reborrow");
+                    }
+                    Statement::Assign { .. }
+                        if exact_shared_collection_alias_definition(func, statement, local)
+                            .is_some_and(|alias| {
+                                !read_only_collection_alias_is_stable(func, alias, local)
+                            }) =>
+                    {
+                        return Some("e45.collection.alias-escape");
+                    }
+                    Statement::Unsupported { .. } => {
+                        return Some("e45.collection.unknown-effect");
+                    }
+                    _ => {}
+                }
+            }
+            match &block.terminator {
+                Terminator::Call { args, dest, .. }
+                    if dest.local == local
+                        || args
+                            .iter()
+                            .any(|operand| operand_mentions_local_anywhere(operand, local)) =>
+                {
+                    return Some("e45.collection.call-escape");
+                }
+                Terminator::Opaque { .. } => return Some("e45.collection.unknown-effect"),
+                _ => {}
+            }
+        }
+        return Some("e45.collection.unstable-or-unsupported-use");
+    }
+    None
+}
+
 fn read_only_collection_model_for_local(
     func: &VerifiableFunction,
     local: usize,
 ) -> Option<ReadOnlyCollectionModel> {
-    let model = read_only_collection_shape_for_local(func, local)?;
-    read_only_collection_arg_is_stable(func, local).then_some(model)
+    if let Some(model) = read_only_collection_shape_for_local(func, local) {
+        return read_only_collection_arg_is_stable(func, local).then_some(model);
+    }
+
+    let mut sources = (1..=func.body.arg_count).filter(|source_local| {
+        func.body.blocks.iter().any(|block| {
+            block.stmts.iter().any(|statement| {
+                exact_shared_collection_alias_definition(func, statement, *source_local)
+                    == Some(local)
+            })
+        })
+    });
+    let source_local = sources.next()?;
+    if sources.next().is_some()
+        || !read_only_collection_arg_is_stable(func, source_local)
+        || !read_only_collection_alias_is_stable(func, local, source_local)
+    {
+        return None;
+    }
+    let mut model = read_only_collection_shape_for_local(func, source_local)?;
+    model.local = local;
+    Some(model)
+}
+
+fn exact_collection_model_for_local(
+    func: &VerifiableFunction,
+    local: usize,
+) -> Option<ReadOnlyCollectionModel> {
+    if let Some(model) = read_only_collection_shape_for_local(func, local)
+        && model.is_exclusive_mutable()
+    {
+        return exclusive_mutable_collection_arg_is_stable(func, local).then_some(model);
+    }
+    read_only_collection_model_for_local(func, local)
 }
 
 fn read_only_collection_model_for_name(
     func: &VerifiableFunction,
     name: &str,
 ) -> Option<ReadOnlyCollectionModel> {
-    let mut matches = func.body.locals.iter().filter_map(|decl| {
-        let model = read_only_collection_model_for_local(func, decl.index)?;
-        (model.name == name).then_some(model)
+    // Name uniqueness is checked over every MIR local before unsupported
+    // collection shapes are filtered out. Otherwise an unsupported loop-local
+    // `xs` can shadow a stable argument `xs`, disappear from
+    // `exact_collection_model_for_local`, and let the source predicate borrow
+    // the outer argument's array identity.
+    let mut named = func.body.locals.iter().filter(|decl| {
+        crate::place_to_var_name(func, &trust_types::Place::local(decl.index)) == name
     });
-    let model = matches.next()?;
-    matches.next().is_none().then_some(model)
+    let local = named.next()?.index;
+    if named.next().is_some() {
+        return None;
+    }
+    exact_collection_model_for_local(func, local)
 }
 
 /// Rebind the executable spec parser's canonical literal-index place spelling
@@ -1734,7 +2534,21 @@ fn read_only_collection_literal_index_for_name(
         return None;
     }
     let model = read_only_collection_model_for_name(func, base)?;
+    if let ReadOnlyCollectionLength::Fixed(length) = &model.length {
+        let index = u64::try_from(index).ok()?;
+        if index >= *length {
+            return None;
+        }
+    }
     Some(Formula::Select(Box::new(model.base_formula()), Box::new(Formula::Int(index))))
+}
+
+fn body_has_formula_local_name(func: &VerifiableFunction, name: &str) -> bool {
+    func.body.locals.iter().any(|decl| {
+        decl.name.as_deref() == Some(name)
+            || crate::place_to_var_name(func, &trust_types::Place::local(decl.index)) == name
+            || format!("_{}", decl.index) == name
+    })
 }
 
 fn type_loop_formula(
@@ -1766,12 +2580,26 @@ fn type_loop_formula(
         if let Some(base) = name.strip_suffix("__slice_len")
             && let Some(model) = read_only_collection_model_for_name(func, base)
         {
+            // A real local with the synthetic spelling makes the source leaf
+            // ambiguous. The compiler query rejects the same collision before
+            // transport; repeat the check at this public reconstruction
+            // boundary so a forged formula cannot borrow collection identity.
+            if body_has_formula_local_name(func, &name)
+                || body_has_formula_local_name(func, &model.length_name())
+            {
+                return None;
+            }
             replacements.insert(name, model.length_formula());
             continue;
         }
         if let Some(base) = name.strip_suffix("_len")
             && let Some(model) = read_only_collection_model_for_name(func, base)
         {
+            if body_has_formula_local_name(func, &name)
+                || body_has_formula_local_name(func, &model.length_name())
+            {
+                return None;
+            }
             replacements.insert(name, model.length_formula());
             continue;
         }
@@ -1943,6 +2771,20 @@ fn machine_int_ty_for_var(func: &VerifiableFunction, name: &str) -> Option<(u32,
         Some((local_part, field)) => (local_part, Some(field.parse::<usize>().ok()?)),
         None => (base, None),
     };
+    // A source `xs.len()` is compiler-lowered to the synthetic `xs_len` leaf
+    // and rebound by `type_loop_formula` to the exact stable slice model.
+    // Preserve its source `usize` domain here: otherwise an ordinary
+    // `i <= xs.len()` invariant combines a 64-bit `i` with an untyped Int
+    // length and is spuriously rejected as mixed-domain. Fixed-array lengths
+    // are constants and never need this synthetic-variable case.
+    if field.is_none()
+        && !body_has_formula_local_name(func, local_part)
+        && let Some(collection_name) = local_part.strip_suffix("_len")
+        && let Some(model) = read_only_collection_model_for_name(func, collection_name)
+        && matches!(model.length, ReadOnlyCollectionLength::Slice)
+    {
+        return Some((64, false));
+    }
     let mut matches = func.body.locals.iter().filter(|decl| {
         decl.name.as_deref() == Some(local_part)
             || crate::place_to_var_name(func, &trust_types::Place::local(decl.index)) == local_part
@@ -1993,15 +2835,18 @@ fn var_is_bool_local(func: &VerifiableFunction, name: &str) -> bool {
 }
 
 /// Whether an authored arithmetic-bearing clause is eligible for the
-/// Machine{w} lane: every integer variable resolves to ONE shared
+/// Machine{w} lane: every clause integer variable resolves to ONE shared
 /// `(width, signed)` machine domain, every literal fits that domain, and the
 /// clause stays inside the wrap-exact fragment (`+`/`-`/`*`/unary `-`,
-/// comparisons, equality, boolean connectives). Spec-level `/`/`%` are
-/// refused: SMT's total bvudiv/bvsdiv assign a zero divisor a value where the
-/// authored Rust expression traps, so such a clause keeps its visible
+/// comparisons, equality, boolean connectives). Body-generated shifts retain
+/// that principal LHS domain but may carry Rust's independently typed integer
+/// RHS; [`machine_faithful_shift_amount`] authenticates its exact masked
+/// encoding and translates that count at its own declared domain. Spec-level
+/// `/`/`%` are refused: SMT's total bvudiv/bvsdiv assign a zero divisor a value
+/// where the authored Rust expression traps, so such a clause keeps its visible
 /// `unsupported_machine_arithmetic` row until a definedness premise lane
-/// lands. This predicate gates ADMISSION only; it grants nothing — the final
-/// VC still has to translate (`machine_faithful_vc_formula`) and prove.
+/// lands. This predicate gates ADMISSION only; it grants nothing — the final VC
+/// still has to translate (`machine_faithful_vc_formula`) and prove.
 pub(crate) fn machine_faithful_clause_admissible(
     func: &VerifiableFunction,
     formula: &Formula,
@@ -2012,37 +2857,57 @@ pub(crate) fn machine_faithful_clause_admissible(
     clause_in_machine_fragment(func, formula, width, signed, /* allow_div_rem */ false)
 }
 
-/// The single `(width, signed)` machine domain shared by every integer
-/// variable in the formula, `None` when any integer variable is unresolvable
-/// or two variables disagree. Bool-typed variables and literals do not
-/// constrain the domain.
+/// The single `(width, signed)` principal machine domain shared by every
+/// integer variable in the formula, `None` when any ordinary integer variable
+/// is unresolvable or two ordinary variables disagree. Bool-typed variables,
+/// literals, and the independently typed RHS below an authenticated
+/// body-generated shift do not constrain the principal domain; the shift
+/// translator validates that RHS separately and fails closed on any malformed
+/// wrapper.
 fn uniform_machine_domain(func: &VerifiableFunction, formula: &Formula) -> Option<(u32, bool)> {
     let mut domain: Option<(u32, bool)> = None;
     let mut consistent = true;
-    formula.visit(&mut |node| {
-        let name = match node {
-            Formula::Var(name, sort) => match sort {
-                Sort::Bool => return,
-                _ => name.as_str(),
-            },
-            Formula::SymVar(sym, sort) => match sort {
-                Sort::Bool => return,
-                _ => sym.as_str(),
-            },
-            _ => return,
-        };
-        if var_is_bool_local(func, name) {
+    fn collect(
+        func: &VerifiableFunction,
+        node: &Formula,
+        domain: &mut Option<(u32, bool)>,
+        consistent: &mut bool,
+    ) {
+        // Rust permits the RHS of a shift to have a different integer width
+        // and signedness from the shifted value.  The exact body encoding
+        // normalizes that count inside the shift node; it therefore must not
+        // select (or conflict with) the principal Machine{w} domain.  The
+        // shift translator independently authenticates and translates the
+        // skipped count at its own declared domain.
+        if let Formula::BvShl(value, _, _)
+        | Formula::BvLShr(value, _, _)
+        | Formula::BvAShr(value, _, _) = node
+        {
+            collect(func, value, domain, consistent);
             return;
         }
-        match machine_int_ty_for_var(func, name) {
-            Some(var_domain) => match domain {
-                None => domain = Some(var_domain),
-                Some(existing) if existing == var_domain => {}
-                Some(_) => consistent = false,
-            },
-            None => consistent = false,
+        let name = match node {
+            Formula::Var(name, sort) if !matches!(sort, Sort::Bool) => Some(name.as_str()),
+            Formula::SymVar(sym, sort) if !matches!(sort, Sort::Bool) => Some(sym.as_str()),
+            _ => None,
+        };
+        if let Some(name) = name
+            && !var_is_bool_local(func, name)
+        {
+            match machine_int_ty_for_var(func, name) {
+                Some(var_domain) => match *domain {
+                    None => *domain = Some(var_domain),
+                    Some(existing) if existing == var_domain => {}
+                    Some(_) => *consistent = false,
+                },
+                None => *consistent = false,
+            }
         }
-    });
+        for child in node.children() {
+            collect(func, child, domain, consistent);
+        }
+    }
+    collect(func, formula, &mut domain, &mut consistent);
     if !consistent {
         return None;
     }
@@ -2065,6 +2930,13 @@ fn clause_in_machine_fragment(
         .is_some()
 }
 
+fn machine_faithful_value_admissible(func: &VerifiableFunction, formula: &Formula) -> bool {
+    let Some((width, signed)) = uniform_machine_domain(func, formula) else {
+        return false;
+    };
+    machine_faithful_translate(func, formula, width, signed, false, Polarity::Value).is_some()
+}
+
 /// Expected sort of a node during machine translation.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Polarity {
@@ -2075,8 +2947,10 @@ enum Polarity {
 }
 
 /// The literal's `width`-bit two's-complement pattern, `None` when the value
-/// does not fit the declared domain. The pattern is stored non-negative so the
-/// downstream bridges (`Expr::bitvec_const`, `to_smtlib`) never see a sign.
+/// does not fit the declared domain. `Formula::BitVec` carries a complete
+/// 128-bit pattern by reinterpreting it as `i128`; a set high bit is therefore
+/// intentionally represented by a negative carrier value and masked back by
+/// the solver bridge.
 fn machine_literal_pattern(value: i128, width: u32, signed: bool) -> Option<i128> {
     if width == 0 || width > 128 {
         return None;
@@ -2095,15 +2969,121 @@ fn machine_literal_pattern(value: i128, width: u32, signed: bool) -> Option<i128
             return None;
         }
     }
-    if value >= 0 {
-        return Some(value);
-    }
-    // Two's complement of a negative in-range value; width < 128 here because
-    // an i128::MIN pattern would not fit the non-negative i128 carrier.
-    if width == 128 {
+    let mask = if width == 128 { u128::MAX } else { (1_u128 << width) - 1 };
+    Some(((value as u128) & mask) as i128)
+}
+
+fn machine_unsigned_literal_pattern(value: u128, width: u32, signed: bool) -> Option<i128> {
+    if width == 0 || width > 128 {
         return None;
     }
-    Some(value + (1_i128 << width))
+    let max = if signed {
+        (1_u128 << (width - 1)) - 1
+    } else if width == 128 {
+        u128::MAX
+    } else {
+        (1_u128 << width) - 1
+    };
+    (value <= max).then_some(value as i128)
+}
+
+fn rust_shift_width_supported(width: u32) -> bool {
+    matches!(width, 8 | 16 | 32 | 64 | 128)
+}
+
+/// Encode the low `width` bits of an integer carrier without imposing the
+/// shifted value's signed range on the shift count.  Rust permits a shift RHS
+/// of any integer type; only its low `log2(width)` bits select the operation.
+fn rust_shift_literal_pattern(value: u128, width: u32) -> Option<i128> {
+    if !rust_shift_width_supported(width) {
+        return None;
+    }
+    let mask = if width == 128 { u128::MAX } else { (1_u128 << width) - 1 };
+    Some((value & mask) as i128)
+}
+
+fn rust_shift_amount_formula(amount: &Formula, width: u32) -> Option<Box<Formula>> {
+    if !rust_shift_width_supported(width) {
+        return None;
+    }
+    Some(Box::new(Formula::BvAnd(
+        Box::new(Formula::IntToBv(Box::new(amount.clone()), width)),
+        Box::new(Formula::BitVec { value: i128::from(width - 1), width }),
+        width,
+    )))
+}
+
+fn resize_shift_amount(amount: Formula, source_width: u32, target_width: u32) -> Option<Formula> {
+    if !rust_shift_width_supported(source_width) || !rust_shift_width_supported(target_width) {
+        return None;
+    }
+    Some(match source_width.cmp(&target_width) {
+        std::cmp::Ordering::Less => {
+            Formula::BvZeroExt(Box::new(amount), target_width - source_width)
+        }
+        std::cmp::Ordering::Greater => {
+            Formula::BvExtract { inner: Box::new(amount), high: target_width - 1, low: 0 }
+        }
+        std::cmp::Ordering::Equal => amount,
+    })
+}
+
+/// Translate the exact Rust shift-count wrapper emitted by
+/// [`symbolic_binop`].  Unlike other binary operations, a shift RHS may have a
+/// different width and signedness.  rustc first masks the source bit pattern by
+/// `lhs_width - 1`, then truncates or zero-extends it to the LHS width
+/// (`rustc_codegen_ssa::base::build_shift_expr_rhs`).  Masking after the resize
+/// is equivalent because every supported Rust integer width is a power of two,
+/// and keeps both operands of the SMT shift at one sort.
+fn machine_faithful_shift_amount(
+    func: &VerifiableFunction,
+    amount: &Formula,
+    width: u32,
+    allow_div_rem: bool,
+) -> Option<Formula> {
+    if !rust_shift_width_supported(width) {
+        return None;
+    }
+    let Formula::BvAnd(raw_amount, mask, node_width) = amount else {
+        return None;
+    };
+    if *node_width != width
+        || mask.as_ref() != &(Formula::BitVec { value: i128::from(width - 1), width })
+    {
+        return None;
+    }
+    let Formula::IntToBv(source, conversion_width) = raw_amount.as_ref() else {
+        return None;
+    };
+    if *conversion_width != width {
+        return None;
+    }
+
+    let resized = match source.as_ref() {
+        Formula::Int(value) => {
+            Formula::BitVec { value: rust_shift_literal_pattern(*value as u128, width)?, width }
+        }
+        Formula::UInt(value) => {
+            Formula::BitVec { value: rust_shift_literal_pattern(*value, width)?, width }
+        }
+        source => {
+            let (source_width, source_signed) = uniform_machine_domain(func, source)?;
+            let source = machine_faithful_translate(
+                func,
+                source,
+                source_width,
+                source_signed,
+                allow_div_rem,
+                Polarity::Value,
+            )?;
+            resize_shift_amount(source, source_width, width)?
+        }
+    };
+    Some(Formula::BvAnd(
+        Box::new(resized),
+        Box::new(Formula::BitVec { value: i128::from(width - 1), width }),
+        width,
+    ))
 }
 
 /// Translate a formula into pure declared-width QF_BV, `None` on any node
@@ -2120,10 +3100,12 @@ fn machine_faithful_translate(
     allow_div_rem: bool,
     polarity: Polarity,
 ) -> Option<Formula> {
-    let value =
-        |f: &Formula| machine_faithful_translate(func, f, width, signed, allow_div_rem, Polarity::Value);
-    let prop =
-        |f: &Formula| machine_faithful_translate(func, f, width, signed, allow_div_rem, Polarity::Prop);
+    let value = |f: &Formula| {
+        machine_faithful_translate(func, f, width, signed, allow_div_rem, Polarity::Value)
+    };
+    let prop = |f: &Formula| {
+        machine_faithful_translate(func, f, width, signed, allow_div_rem, Polarity::Prop)
+    };
     let value_pair = |a: &Formula, b: &Formula| -> Option<(Box<Formula>, Box<Formula>)> {
         Some((Box::new(value(a)?), Box::new(value(b)?)))
     };
@@ -2141,9 +3123,7 @@ fn machine_faithful_translate(
             | Formula::Le(..)
             | Formula::Gt(..)
             | Formula::Ge(..) => true,
-            Formula::Var(name, sort) => {
-                matches!(sort, Sort::Bool) || var_is_bool_local(func, name)
-            }
+            Formula::Var(name, sort) => matches!(sort, Sort::Bool) || var_is_bool_local(func, name),
             Formula::SymVar(sym, sort) => {
                 matches!(sort, Sort::Bool) || var_is_bool_local(func, sym.as_str())
             }
@@ -2166,9 +3146,7 @@ fn machine_faithful_translate(
                 Formula::Var(sym.as_str().to_string(), Sort::Bool)
             }
             Formula::Not(a) => Formula::Not(Box::new(prop(a)?)),
-            Formula::And(xs) => {
-                Formula::And(xs.iter().map(prop).collect::<Option<Vec<_>>>()?)
-            }
+            Formula::And(xs) => Formula::And(xs.iter().map(prop).collect::<Option<Vec<_>>>()?),
             Formula::Or(xs) => Formula::Or(xs.iter().map(prop).collect::<Option<Vec<_>>>()?),
             Formula::Implies(a, b) => Formula::Implies(Box::new(prop(a)?), Box::new(prop(b)?)),
             Formula::Eq(a, b) => {
@@ -2219,6 +3197,43 @@ fn machine_faithful_translate(
             Formula::BvMul(a, b, w) if *w == width => {
                 Formula::BvMul(Box::new(value(a)?), Box::new(value(b)?), width)
             }
+            Formula::BvUDiv(a, b, w) if *w == width && !signed => {
+                Formula::BvUDiv(Box::new(value(a)?), Box::new(value(b)?), width)
+            }
+            Formula::BvSDiv(a, b, w) if *w == width && signed => {
+                Formula::BvSDiv(Box::new(value(a)?), Box::new(value(b)?), width)
+            }
+            Formula::BvURem(a, b, w) if *w == width && !signed => {
+                Formula::BvURem(Box::new(value(a)?), Box::new(value(b)?), width)
+            }
+            Formula::BvSRem(a, b, w) if *w == width && signed => {
+                Formula::BvSRem(Box::new(value(a)?), Box::new(value(b)?), width)
+            }
+            Formula::BvAnd(a, b, w) if *w == width => {
+                Formula::BvAnd(Box::new(value(a)?), Box::new(value(b)?), width)
+            }
+            Formula::BvOr(a, b, w) if *w == width => {
+                Formula::BvOr(Box::new(value(a)?), Box::new(value(b)?), width)
+            }
+            Formula::BvXor(a, b, w) if *w == width => {
+                Formula::BvXor(Box::new(value(a)?), Box::new(value(b)?), width)
+            }
+            Formula::BvNot(a, w) if *w == width => Formula::BvNot(Box::new(value(a)?), width),
+            Formula::BvShl(a, b, w) if *w == width => Formula::BvShl(
+                Box::new(value(a)?),
+                Box::new(machine_faithful_shift_amount(func, b, width, allow_div_rem)?),
+                width,
+            ),
+            Formula::BvLShr(a, b, w) if *w == width && !signed => Formula::BvLShr(
+                Box::new(value(a)?),
+                Box::new(machine_faithful_shift_amount(func, b, width, allow_div_rem)?),
+                width,
+            ),
+            Formula::BvAShr(a, b, w) if *w == width && signed => Formula::BvAShr(
+                Box::new(value(a)?),
+                Box::new(machine_faithful_shift_amount(func, b, width, allow_div_rem)?),
+                width,
+            ),
             Formula::BitVec { value, width: w } if *w == width => {
                 Formula::BitVec { value: *value, width }
             }
@@ -2234,12 +3249,11 @@ fn machine_faithful_translate(
                 machine_int_ty_for_var(func, sym.as_str()).filter(|d| *d == (width, signed))?;
                 Formula::Var(sym.as_str().to_string(), Sort::BitVec(width))
             }
-            Formula::Int(n) => Formula::BitVec {
-                value: machine_literal_pattern(*n, width, signed)?,
-                width,
-            },
+            Formula::Int(n) => {
+                Formula::BitVec { value: machine_literal_pattern(*n, width, signed)?, width }
+            }
             Formula::UInt(n) => Formula::BitVec {
-                value: machine_literal_pattern(i128::try_from(*n).ok()?, width, signed)?,
+                value: machine_unsigned_literal_pattern(*n, width, signed)?,
                 width,
             },
             Formula::Add(a, b) => {
@@ -2288,6 +3302,37 @@ pub(crate) fn machine_faithful_vc_formula(
     machine_faithful_translate(func, formula, width, signed, true, Polarity::Prop)
 }
 
+fn formula_contains_machine_encoding(formula: &Formula) -> bool {
+    let mut found = false;
+    formula.visit(&mut |node| {
+        found |= matches!(
+            node,
+            Formula::BitVec { .. }
+                | Formula::BvAdd(..)
+                | Formula::BvSub(..)
+                | Formula::BvMul(..)
+                | Formula::BvUDiv(..)
+                | Formula::BvSDiv(..)
+                | Formula::BvURem(..)
+                | Formula::BvSRem(..)
+                | Formula::BvAnd(..)
+                | Formula::BvOr(..)
+                | Formula::BvXor(..)
+                | Formula::BvNot(..)
+                | Formula::BvShl(..)
+                | Formula::BvLShr(..)
+                | Formula::BvAShr(..)
+                | Formula::BvULt(..)
+                | Formula::BvULe(..)
+                | Formula::BvSLt(..)
+                | Formula::BvSLe(..)
+                | Formula::BvToInt(..)
+                | Formula::IntToBv(..)
+        );
+    });
+    found
+}
+
 fn formula_establishes_above(formula: &Formula, name: &str, minimum: i128) -> bool {
     let is_name =
         |formula: &Formula| matches!(formula, Formula::Var(candidate, _) if candidate == name);
@@ -2318,9 +3363,17 @@ fn initial_symbolic_state(func: &VerifiableFunction) -> FxHashMap<String, Formul
     let mut state = FxHashMap::default();
     for decl in &func.body.locals {
         let name = crate::place_to_var_name(func, &trust_types::Place::local(decl.index));
-        if let Some(model) = read_only_collection_model_for_local(func, decl.index) {
-            state.insert(model.name.clone(), model.base_formula());
-            state.insert(model.length_name(), model.length_formula());
+        if let Some(model) = exact_collection_model_for_local(func, decl.index) {
+            if model.local == model.source_local {
+                state.insert(model.name.clone(), model.base_formula());
+                state.insert(model.length_name(), model.length_formula());
+            } else {
+                // The alias acquires the canonical base only when its unique
+                // definition is symbolically executed. Before that, retain a
+                // distinct placeholder so a malformed use-before-definition
+                // cannot gain source identity.
+                state.insert(name.clone(), Formula::Var(name, model.array_sort()));
+            }
         } else {
             state.insert(name.clone(), Formula::Var(name, crate::sort_for_ty(&decl.ty)));
         }
@@ -2521,81 +3574,205 @@ fn symbolic_state_at_loop_entry(
     Some(state)
 }
 
-fn symbolic_single_path_loop_transition(
+#[derive(Clone)]
+struct SymbolicLoopTransition {
+    post_state: FxHashMap<String, Formula>,
+    guard: Formula,
+    latch: BlockId,
+}
+
+#[derive(Clone)]
+struct PendingLoopPath {
+    current: BlockId,
+    state: FxHashMap<String, Formula>,
+    guard: Formula,
+    blocks: Vec<BlockId>,
+    seen: FxHashSet<BlockId>,
+}
+
+/// Symbolically execute every bounded, acyclic path from the loop header to
+/// every dominator-proved backedge.
+///
+/// One E4/E5 row contains the disjunction of the per-path violation formulas,
+/// so proving that row UNSAT establishes the clause on every modeled
+/// backedge. Exiting paths need no consecution obligation. Calls, drops,
+/// irreducible/nested cycles, path explosion, and any unmodeled terminator fail
+/// the whole loop closed; no subset of latches can mint authority.
+fn symbolic_loop_transitions(
     func: &VerifiableFunction,
     header: BlockId,
-) -> Option<(FxHashMap<String, Formula>, Formula)> {
-    let loop_info: Vec<_> = crate::termination::detect_loops(&func.body)
+) -> Result<Vec<SymbolicLoopTransition>, String> {
+    const MAX_EXACT_LOOP_PATHS: usize = 64;
+
+    let loop_infos = crate::termination::detect_loops(&func.body)
         .into_iter()
         .filter(|info| info.header == header)
-        .collect();
-    let [loop_info] = loop_info.as_slice() else { return None };
-    let in_loop: FxHashSet<_> = loop_info.body_blocks.iter().copied().collect();
-    let header_block = func.body.blocks.get(header.0)?;
-    let mut state = initial_symbolic_state(func);
-    apply_symbolic_statements(func, &header_block.stmts, &mut state, None)?;
+        .collect::<Vec<_>>();
+    if loop_infos.is_empty() {
+        return Err("e45.transition.no-natural-loop".to_string());
+    }
+    let in_loop: FxHashSet<_> =
+        loop_infos.iter().flat_map(|info| info.body_blocks.iter().copied()).collect();
+    let latches: FxHashSet<_> = loop_infos.iter().map(|info| info._latch).collect();
+    let header_block = func
+        .body
+        .blocks
+        .get(header.0)
+        .ok_or_else(|| "e45.transition.invalid-header".to_string())?;
+
+    let mut header_state = initial_symbolic_state(func);
+    apply_symbolic_statements(func, &header_block.stmts, &mut header_state, None)
+        .ok_or_else(|| "e45.transition.header-statements".to_string())?;
     let Terminator::SwitchInt { discr, targets, otherwise, .. } = &header_block.terminator else {
-        return None;
+        return Err("e45.transition.header-not-switch".to_string());
     };
-    let mut body_targets: Vec<BlockId> = targets
+
+    let mut body_targets = targets
         .iter()
         .map(|(_, target)| *target)
         .chain(std::iter::once(*otherwise))
         .filter(|target| *target != header && in_loop.contains(target))
-        .collect();
+        .collect::<Vec<_>>();
     body_targets.sort_by_key(|target| target.0);
     body_targets.dedup();
-    let [body_target] = body_targets.as_slice() else { return None };
-    let guard = switch_edge_formula(func, discr, targets, *otherwise, *body_target, &state)?;
-
-    let transition_blocks =
-        single_path_loop_transition_blocks(func, header, *body_target, &in_loop)?;
-    if !checked_update_shapes_are_authenticated(func, &transition_blocks) {
-        return None;
+    if body_targets.is_empty() {
+        return Err("e45.transition.no-taken-body-edge".to_string());
     }
-    for current in transition_blocks {
-        let block = func.body.blocks.get(current.0)?;
-        apply_symbolic_statements(func, &block.stmts, &mut state, Some(&guard))?;
-    }
-    Some((state, guard))
-}
 
-/// Collect the exact body path for one successful loop iteration before any
-/// symbolic state is mutated. Besides making the single-path premise explicit,
-/// this gives checked-arithmetic authentication the complete transition rather
-/// than only the block currently being interpreted.
-fn single_path_loop_transition_blocks(
-    func: &VerifiableFunction,
-    header: BlockId,
-    body_target: BlockId,
-    in_loop: &FxHashSet<BlockId>,
-) -> Option<Vec<BlockId>> {
-    let mut current = body_target;
-    let mut seen = FxHashSet::default();
-    let mut blocks = Vec::new();
-    loop {
-        // Fail closed on per-function budget overrun: bail the symbolic
-        // loop-transition walk to an Unsupported loop-invariant/decreases VC
-        // (drop-only, never a proof). Trip count is seen-bounded, but repeated
-        // symbolic substitution can grow each state formula exponentially, so
-        // poll the ambient deadline before every step.
+    let mut pending = Vec::new();
+    for target in body_targets {
+        let guard = switch_edge_formula(func, discr, targets, *otherwise, target, &header_state)
+            .ok_or_else(|| "e45.transition.header-guard".to_string())?;
+        pending.push(PendingLoopPath {
+            current: target,
+            state: header_state.clone(),
+            guard,
+            blocks: Vec::new(),
+            seen: FxHashSet::default(),
+        });
+    }
+
+    let mut transitions = Vec::new();
+    let mut covered_latches = FxHashSet::default();
+    while let Some(mut path) = pending.pop() {
         if trust_types::verify_budget::budget_exhausted() {
-            return None;
+            return Err("e45.transition.budget-exhausted".to_string());
         }
-        if current == header {
-            break;
+        if transitions.len().saturating_add(pending.len()) >= MAX_EXACT_LOOP_PATHS {
+            return Err(format!(
+                "e45.transition.path-limit: exact path count exceeds {MAX_EXACT_LOOP_PATHS}"
+            ));
         }
-        if !seen.insert(current) || !in_loop.contains(&current) {
-            return None;
+        if path.current == header {
+            let Some(latch) = path.blocks.last().copied() else {
+                return Err("e45.transition.empty-backedge-path".to_string());
+            };
+            if !latches.contains(&latch) {
+                return Err(format!(
+                    "e45.transition.unrecognized-backedge: bb{} -> bb{}",
+                    latch.0, header.0
+                ));
+            }
+            if !checked_update_shapes_are_authenticated(func, &path.blocks) {
+                return Err("e45.transition.checked-shape".to_string());
+            }
+            covered_latches.insert(latch);
+            transitions.push(SymbolicLoopTransition {
+                post_state: path.state,
+                guard: path.guard,
+                latch,
+            });
+            continue;
         }
-        let block = func.body.blocks.get(current.0)?;
-        blocks.push(current);
-        current = match &block.terminator {
-            Terminator::Goto(target) | Terminator::Assert { target, .. } => *target,
-            _ => return None,
-        };
+        if !in_loop.contains(&path.current) {
+            // A body edge leaving the natural-loop set is an exit, not a
+            // successful iteration and therefore has no E4/E5 step obligation.
+            continue;
+        }
+        if !path.seen.insert(path.current) {
+            return Err(format!(
+                "e45.transition.nested-or-cyclic-subpath: cycle at bb{} does not close bb{}",
+                path.current.0, header.0
+            ));
+        }
+
+        let block = func
+            .body
+            .blocks
+            .get(path.current.0)
+            .ok_or_else(|| "e45.transition.invalid-block".to_string())?;
+        path.blocks.push(path.current);
+        apply_symbolic_statements(func, &block.stmts, &mut path.state, Some(&path.guard))
+            .ok_or_else(|| format!("e45.transition.statement-shape: bb{}", block.id.0))?;
+
+        let push_edge =
+            |target: BlockId, edge_guard: Formula, pending: &mut Vec<PendingLoopPath>| {
+                let mut next = path.clone();
+                next.current = target;
+                next.guard = conjunction(vec![next.guard, edge_guard]);
+                pending.push(next);
+            };
+        match &block.terminator {
+            Terminator::Goto(target) => {
+                push_edge(*target, Formula::Bool(true), &mut pending);
+            }
+            Terminator::Assert { cond, expected, target, .. } => {
+                let cond = symbolic_operand(func, cond, &path.state)
+                    .ok_or_else(|| format!("e45.transition.assert-condition: bb{}", block.id.0))?;
+                let success = if *expected { cond } else { Formula::Not(Box::new(cond)) };
+                push_edge(*target, success, &mut pending);
+            }
+            Terminator::SwitchInt { discr, targets, otherwise, .. } => {
+                let mut successors = targets
+                    .iter()
+                    .map(|(_, target)| *target)
+                    .chain(std::iter::once(*otherwise))
+                    .collect::<Vec<_>>();
+                successors.sort_by_key(|target| target.0);
+                successors.dedup();
+                for target in successors {
+                    if target != header && !in_loop.contains(&target) {
+                        continue;
+                    }
+                    let edge_guard =
+                        switch_edge_formula(func, discr, targets, *otherwise, target, &path.state)
+                            .ok_or_else(|| {
+                                format!("e45.transition.branch-guard: bb{}", block.id.0)
+                            })?;
+                    push_edge(target, edge_guard, &mut pending);
+                }
+            }
+            Terminator::Return | Terminator::Unreachable | Terminator::Resume => {
+                // Function exit/divergence does not complete an iteration.
+            }
+            Terminator::Call { .. } => {
+                return Err(format!("e45.transition.call-effect: bb{}", block.id.0));
+            }
+            Terminator::Drop { .. } => {
+                return Err(format!("e45.transition.drop-effect: bb{}", block.id.0));
+            }
+            Terminator::Opaque { .. } => {
+                return Err(format!("e45.transition.opaque-terminator: bb{}", block.id.0));
+            }
+            _ => {
+                return Err(format!("e45.transition.future-terminator: bb{}", block.id.0));
+            }
+        }
     }
-    Some(blocks)
+
+    if transitions.is_empty() {
+        return Err("e45.transition.no-complete-iteration".to_string());
+    }
+    if covered_latches != latches {
+        let mut missing =
+            latches.difference(&covered_latches).map(|latch| latch.0).collect::<Vec<_>>();
+        missing.sort_unstable();
+        return Err(format!(
+            "e45.transition.uncovered-backedges: missing latch blocks {missing:?}"
+        ));
+    }
+    transitions.sort_by_key(|transition| transition.latch.0);
+    Ok(transitions)
 }
 
 fn switch_edge_formula(
@@ -2608,17 +3785,28 @@ fn switch_edge_formula(
 ) -> Option<Formula> {
     let discr_formula = symbolic_operand(func, discr, state)?;
     let discr_ty = crate::operand_ty_cow(func, discr)?;
-    if machine_integer_ty(discr_ty.as_ref()) && discr_ty.is_signed() {
-        // SwitchInt targets are raw u128 bit patterns. Until this lane decodes
-        // them through the discriminant's signed width, comparing them as Int
-        // would turn negative cases into huge positive constants.
-        return None;
-    }
     let constant = |value: u128| -> Option<Formula> {
         if matches!(discr_ty.as_ref(), Ty::Bool) {
-            Some(Formula::Bool(value != 0))
+            return (value <= 1).then_some(Formula::Bool(value != 0));
+        }
+        let width = discr_ty.int_width().unwrap_or(128);
+        if width == 0 || width > 128 {
+            return None;
+        }
+        let mask = if width == 128 { u128::MAX } else { (1_u128 << width) - 1 };
+        if value & !mask != 0 {
+            return None;
+        }
+        if discr_ty.is_signed() {
+            let sign = 1_u128 << (width - 1);
+            let signed = if value & sign == 0 {
+                i128::try_from(value).ok()?
+            } else {
+                (value | !mask) as i128
+            };
+            Some(Formula::Int(signed))
         } else {
-            Some(Formula::Int(i128::try_from(value).ok()?))
+            Some(Formula::UInt(value))
         }
     };
     let explicit: Vec<Formula> = targets
@@ -2649,17 +3837,14 @@ fn disjunction(mut formulas: Vec<Formula>) -> Formula {
     }
 }
 
-/// Authenticate the only checked-machine-arithmetic shape admitted by the
-/// E4/E5 symbolic transition lane.
+/// Authenticate checked-machine-arithmetic shapes admitted by the E4/E5
+/// declared-width transition lane.
 ///
-/// `symbolic_binop` independently proves that an unsigned unit update is exact
-/// under the taken loop guard.  That arithmetic fact is not permission to
-/// treat an arbitrary `CheckedBinaryOp` tuple as a scalar definition, however:
-/// the public MIR carrier must also preserve rustc's typed checked tuple, its
-/// matching no-overflow assertion, and the exact value copy-back.  Requiring
-/// the complete local shape keeps malformed or stale serialized MIR out of the
-/// fresh-production lane.  Any miss returns `false`; the caller emits the
-/// ordinary visible `UserLoopContractUnsupported` row.
+/// Exact BV evaluation covers every arithmetic operator modeled by
+/// `symbolic_binop`, but that semantic fact is not permission to treat an
+/// arbitrary public `CheckedBinaryOp` tuple as a scalar definition. The
+/// carrier must preserve rustc's typed `(value, overflow)` tuple, matching
+/// overflow assertion, and unique value copy-back. Any miss fails closed.
 fn checked_update_shapes_are_authenticated(
     func: &VerifiableFunction,
     transition_blocks: &[BlockId],
@@ -2718,7 +3903,15 @@ fn checked_update_shape_is_authenticated(
     let Some(rhs_ty) = crate::operand_ty_cow(func, rhs).map(|ty| ty.into_owned()) else {
         return false;
     };
-    if lhs_ty != rhs_ty {
+    let operand_types_match = if matches!(op, BinOp::Shl | BinOp::Shr) {
+        // MIR shifts alone permit an independently typed integer RHS.  The
+        // tuple value still has the LHS type; symbolic_binop authenticates and
+        // normalizes the count at its own exact portable type.
+        machine_integer_ty(&lhs_ty) && machine_integer_ty(&rhs_ty)
+    } else {
+        lhs_ty == rhs_ty
+    };
+    if !operand_types_match {
         return false;
     }
     let Some(tuple_decl) = func.body.locals.iter().find(|decl| decl.index == tuple_local) else {
@@ -2731,29 +3924,9 @@ fn checked_update_shape_is_authenticated(
         return false;
     }
 
-    let unit_constant = |operand: &Operand| {
-        matches!(
-            operand,
-            Operand::Constant(
-                trust_types::ConstValue::Int(1) | trust_types::ConstValue::Uint(1, _)
-            )
-        )
-    };
-    let bare_local = |operand: &Operand| match operand {
-        Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => {
-            Some(place.local)
-        }
-        _ => None,
-    };
-    let subject_local = match op {
-        BinOp::Sub if unit_constant(rhs) => bare_local(lhs),
-        BinOp::Add if unit_constant(rhs) => bare_local(lhs),
-        BinOp::Add if unit_constant(lhs) => bare_local(rhs),
-        _ => None,
-    };
-    let Some(subject_local) = subject_local else {
+    if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Shl | BinOp::Shr) {
         return false;
-    };
+    }
 
     let Terminator::Assert { cond, expected: false, msg, target, .. } = &block.terminator else {
         return false;
@@ -2781,30 +3954,41 @@ fn checked_update_shape_is_authenticated(
     let Some(target_block) = func.body.blocks.get(target.0) else {
         return false;
     };
-    let subject_writes = transition_blocks
+    let copy_backs = transition_blocks
+        .iter()
+        .filter_map(|block_id| func.body.blocks.get(block_id.0))
+        .flat_map(|transition_block| transition_block.stmts.iter())
+        .filter_map(|statement| {
+            let Statement::Assign { place, rvalue, .. } = statement else { return None };
+            if !place.projections.is_empty()
+                || !matches!(
+                    rvalue,
+                    Rvalue::Use(Operand::Copy(source) | Operand::Move(source))
+                        if source.local == tuple_local
+                            && source.projections.as_slice()
+                                == [trust_types::Projection::Field(0)]
+                )
+            {
+                return None;
+            }
+            Some((statement, place.local))
+        })
+        .collect::<Vec<_>>();
+    let [(copy_back, subject_local)] = copy_backs.as_slice() else {
+        return false;
+    };
+    if !target_block.stmts.iter().any(|statement| std::ptr::eq(statement, *copy_back)) {
+        return false;
+    }
+    transition_blocks
         .iter()
         .filter_map(|block_id| func.body.blocks.get(block_id.0))
         .flat_map(|transition_block| transition_block.stmts.iter())
         .filter(|statement| {
-            matches!(statement, Statement::Assign { place, .. } if place.local == subject_local)
+            matches!(statement, Statement::Assign { place, .. } if place.local == *subject_local)
         })
-        .collect::<Vec<_>>();
-    let [subject_write] = subject_writes.as_slice() else {
-        return false;
-    };
-    if !target_block.stmts.iter().any(|statement| std::ptr::eq(statement, *subject_write)) {
-        return false;
-    }
-    let Statement::Assign { place, rvalue, .. } = *subject_write else {
-        return false;
-    };
-    place.projections.is_empty()
-        && matches!(
-            rvalue,
-            Rvalue::Use(Operand::Copy(source) | Operand::Move(source))
-                if source.local == tuple_local
-                    && source.projections.as_slice() == [trust_types::Projection::Field(0)]
-        )
+        .count()
+        == 1
 }
 
 fn symbolic_state_key_belongs_to_local(key: &str, base: &str) -> bool {
@@ -2826,6 +4010,41 @@ fn invalidate_symbolic_local(
 ) {
     let base = crate::place_to_var_name(func, &trust_types::Place::local(local));
     state.retain(|key, _| !symbolic_state_key_belongs_to_local(key, &base));
+}
+
+fn apply_symbolic_exclusive_mutable_store(
+    func: &VerifiableFunction,
+    place: &trust_types::Place,
+    rvalue: &Rvalue,
+    state: &mut FxHashMap<String, Formula>,
+    machine_arithmetic_guard: Option<&Formula>,
+) -> Option<()> {
+    let model = exact_collection_model_for_local(func, place.local)?;
+    let projection = exact_exclusive_mutable_store_projection(func, place, &model)?;
+    let index = match projection {
+        Projection::Index(index_local) => {
+            let index_name =
+                crate::place_to_var_name(func, &trust_types::Place::local(*index_local));
+            state.get(&index_name).cloned().unwrap_or_else(|| Formula::Var(index_name, Sort::Int))
+        }
+        Projection::ConstantIndex { offset, from_end: false, .. } => {
+            Formula::Int(i128::try_from(*offset).ok()?)
+        }
+        _ => return None,
+    };
+    if !formula_has_sort(&index, Sort::Int) {
+        return None;
+    }
+    let value = symbolic_rvalue(func, rvalue, state, machine_arithmetic_guard)?;
+    if !formula_has_sort(&value, model.elem_sort.clone()) {
+        return None;
+    }
+    let current = current_collection_base(func, &model, state)?;
+    state.insert(
+        model.name.clone(),
+        Formula::Store(Box::new(current), Box::new(index), Box::new(value)),
+    );
+    Some(())
 }
 
 fn apply_symbolic_statements(
@@ -2854,7 +4073,18 @@ fn apply_symbolic_statements(
                     state.insert(dest, value);
                 }
             }
-            Statement::Assign { place, .. } => {
+            Statement::Assign { place, rvalue, .. } => {
+                if apply_symbolic_exclusive_mutable_store(
+                    func,
+                    place,
+                    rvalue,
+                    state,
+                    machine_arithmetic_guard,
+                )
+                .is_some()
+                {
+                    continue;
+                }
                 invalidate_symbolic_local(func, place.local, state);
                 return None;
             }
@@ -2873,21 +4103,31 @@ fn apply_symbolic_statements(
     Some(())
 }
 
+fn current_collection_base(
+    func: &VerifiableFunction,
+    model: &ReadOnlyCollectionModel,
+    state: &FxHashMap<String, Formula>,
+) -> Option<Formula> {
+    let access_name = crate::place_to_var_name(func, &trust_types::Place::local(model.local));
+    let current = state.get(&access_name)?.clone();
+    if !formula_has_sort(&current, model.array_sort()) {
+        return None;
+    }
+    (model.is_exclusive_mutable() || current == model.base_formula()).then_some(current)
+}
+
 fn symbolic_read_only_collection_select(
     func: &VerifiableFunction,
     operand: &Operand,
     state: &FxHashMap<String, Formula>,
 ) -> Option<Formula> {
     let Operand::Copy(place) = operand else { return None };
-    let model = read_only_collection_model_for_local(func, place.local)?;
-    let index_projection = read_only_collection_index_projection(place, model.local)?;
+    let model = exact_collection_model_for_local(func, place.local)?;
+    let index_projection = read_only_collection_index_projection(place, place.local)?;
     let index = match index_projection {
         Projection::Index(local) => {
             let decl = func.body.locals.get(*local)?;
-            if decl.index != *local {
-                return None;
-            }
-            if !matches!(decl.ty, Ty::Int { .. } | Ty::PtrSizedInt { .. }) {
+            if decl.index != *local || !is_normalized_usize_ty(&decl.ty) {
                 return None;
             }
             let name = crate::place_to_var_name(func, &trust_types::Place::local(*local));
@@ -2901,11 +4141,7 @@ fn symbolic_read_only_collection_select(
     if !formula_has_sort(&index, Sort::Int) {
         return None;
     }
-    let expected_base = model.base_formula();
-    let base = state.get(&model.name)?.clone();
-    if base != expected_base {
-        return None;
-    }
+    let base = current_collection_base(func, &model, state)?;
     Some(Formula::Select(Box::new(base), Box::new(index)))
 }
 
@@ -2914,10 +4150,11 @@ fn symbolic_read_only_collection_len(
     place: &trust_types::Place,
     state: &FxHashMap<String, Formula>,
 ) -> Option<Formula> {
-    let model = read_only_collection_model_for_local(func, place.local)?;
-    if !exact_read_only_collection_len_place(place, model.local) {
+    let model = exact_collection_model_for_local(func, place.local)?;
+    if !exact_read_only_collection_len_place(place, place.local) {
         return None;
     }
+    current_collection_base(func, &model, state)?;
     let expected = model.length_formula();
     let current = state.get(&model.length_name())?.clone();
     (current == expected).then_some(current)
@@ -2941,10 +4178,11 @@ fn symbolic_read_only_collection_metadata_len(
     state: &FxHashMap<String, Formula>,
 ) -> Option<Formula> {
     let place = operand_place(operand)?;
-    if let Some(model) = read_only_collection_model_for_local(func, place.local) {
-        if !exact_read_only_collection_metadata_operand(func, operand, model.local) {
+    if let Some(model) = exact_collection_model_for_local(func, place.local) {
+        if !exact_read_only_collection_metadata_operand(func, operand, place.local) {
             return None;
         }
+        current_collection_base(func, &model, state)?;
         let expected = model.length_formula();
         let current = state.get(&model.length_name())?.clone();
         return (current == expected).then_some(current);
@@ -2968,7 +4206,8 @@ fn symbolic_read_only_collection_metadata_len(
     let current_view = state.get(&view_name)?;
     let mut matches = func.body.locals.iter().filter_map(|decl| {
         let model = read_only_collection_model_for_local(func, decl.index)?;
-        if !matches!(&model.length, ReadOnlyCollectionLength::Fixed(_))
+        if model.source_local != decl.index
+            || !matches!(&model.length, ReadOnlyCollectionLength::Fixed(_))
             || model.base_formula() != *current_view
         {
             return None;
@@ -3009,17 +4248,35 @@ fn symbolic_rvalue(
         Rvalue::UnaryOp(UnOp::Neg, operand)
             if crate::operand_ty_cow(func, operand).as_deref().is_some_and(machine_integer_ty) =>
         {
-            // Mathematical negation does not model fixed-width MIN overflow or
-            // wrapping. Keep the entire loop contract fail-closed.
-            None
+            let ty = crate::operand_ty_cow(func, operand)?;
+            let width = ty.int_width()?;
+            let signed = ty.is_signed();
+            let operand = symbolic_operand(func, operand, state)?;
+            Some(Formula::BvToInt(
+                Box::new(Formula::BvSub(
+                    Box::new(Formula::BitVec { value: 0, width }),
+                    Box::new(Formula::IntToBv(Box::new(operand), width)),
+                    width,
+                )),
+                width,
+                signed,
+            ))
         }
         Rvalue::UnaryOp(UnOp::Not, operand)
             if crate::operand_ty_cow(func, operand).as_deref().is_some_and(machine_integer_ty) =>
         {
-            // Formula::Not is Boolean negation, not a fixed-width bitwise
-            // complement.  Mapping an integer `!x` to it is both ill-sorted and
-            // semantically wrong, so the exact transition lane rejects it.
-            None
+            let ty = crate::operand_ty_cow(func, operand)?;
+            let width = ty.int_width()?;
+            let signed = ty.is_signed();
+            let operand = symbolic_operand(func, operand, state)?;
+            Some(Formula::BvToInt(
+                Box::new(Formula::BvNot(
+                    Box::new(Formula::IntToBv(Box::new(operand), width)),
+                    width,
+                )),
+                width,
+                signed,
+            ))
         }
         Rvalue::UnaryOp(UnOp::Neg, operand) => {
             Some(Formula::Neg(Box::new(symbolic_operand(func, operand, state)?)))
@@ -3037,93 +4294,96 @@ fn symbolic_binop(
     lhs: &Operand,
     rhs: &Operand,
     state: &FxHashMap<String, Formula>,
-    machine_arithmetic_guard: Option<&Formula>,
+    _machine_arithmetic_guard: Option<&Formula>,
 ) -> Option<Formula> {
     let lhs_formula = symbolic_operand(func, lhs, state)?;
     let rhs_formula = symbolic_operand(func, rhs, state)?;
     let ty = crate::operand_ty_cow(func, lhs);
-    if ty.as_deref().is_some_and(machine_integer_ty)
-        && matches!(
-            op,
-            BinOp::Add
-                | BinOp::Sub
-                | BinOp::Mul
-                | BinOp::Div
-                | BinOp::Rem
-                | BinOp::Shl
-                | BinOp::Shr
-        )
-        && !machine_arithmetic_guard.is_some_and(|guard| {
-            guarded_unsigned_unit_update_is_exact(
-                func,
-                op,
-                lhs,
-                rhs,
-                &lhs_formula,
-                &rhs_formula,
-                guard,
-            )
-        })
-    {
-        // `try_binop_to_formula` lowers arithmetic to unbounded Int operations;
-        // shifts likewise do not preserve MIR's fixed-width/out-of-range shift
-        // behavior in this lane.  Neither is an exact transition for a Rust
-        // machine integer, so E4/E5 must wait for an exact BV encoding.
-        return None;
+    if ty.as_deref().is_some_and(machine_integer_ty) {
+        let ty = ty.as_deref()?;
+        let width = ty.int_width()?;
+        let signed = ty.is_signed();
+        let lhs_bv = Box::new(Formula::IntToBv(Box::new(lhs_formula.clone()), width));
+        let rhs_bv = Box::new(Formula::IntToBv(Box::new(rhs_formula.clone()), width));
+        let machine_value = match op {
+            BinOp::Add => Some(Formula::BvAdd(lhs_bv, rhs_bv, width)),
+            BinOp::Sub => Some(Formula::BvSub(lhs_bv, rhs_bv, width)),
+            BinOp::Mul => Some(Formula::BvMul(lhs_bv, rhs_bv, width)),
+            BinOp::Div if signed => Some(Formula::BvSDiv(lhs_bv, rhs_bv, width)),
+            BinOp::Div => Some(Formula::BvUDiv(lhs_bv, rhs_bv, width)),
+            BinOp::Rem if signed => Some(Formula::BvSRem(lhs_bv, rhs_bv, width)),
+            BinOp::Rem => Some(Formula::BvURem(lhs_bv, rhs_bv, width)),
+            BinOp::BitAnd => Some(Formula::BvAnd(lhs_bv, rhs_bv, width)),
+            BinOp::BitOr => Some(Formula::BvOr(lhs_bv, rhs_bv, width)),
+            BinOp::BitXor => Some(Formula::BvXor(lhs_bv, rhs_bv, width)),
+            BinOp::Shl => {
+                Some(Formula::BvShl(lhs_bv, rust_shift_amount_formula(&rhs_formula, width)?, width))
+            }
+            BinOp::Shr if signed => Some(Formula::BvAShr(
+                lhs_bv,
+                rust_shift_amount_formula(&rhs_formula, width)?,
+                width,
+            )),
+            BinOp::Shr => Some(Formula::BvLShr(
+                lhs_bv,
+                rust_shift_amount_formula(&rhs_formula, width)?,
+                width,
+            )),
+            _ => None,
+        };
+        if let Some(machine_value) = machine_value {
+            // MIR's integer literals are stored without their contextual Rust
+            // type in the portable VF. Accept such a literal only when its bit
+            // pattern fits the LHS's exact declared domain; every non-literal
+            // operand must retain identical width and signedness. Comparisons
+            // deliberately bypass this check because they produce no machine
+            // value and are translated with the whole formula's authenticated
+            // domain below.
+            let rhs_matches = if matches!(op, BinOp::Shl | BinOp::Shr) {
+                // MIR shifts deliberately permit every integer RHS width and
+                // signedness.  Its exact declared type is used by the pure-BV
+                // translator above; non-shift operations retain the strict
+                // homogeneous-domain rule below.
+                match rhs {
+                    // `Int` lacks contextual type metadata in the portable VF,
+                    // but every i128 carrier is a valid source bit pattern and
+                    // masking its low bits is independent of that lost type.
+                    Operand::Constant(ConstValue::Int(_)) => true,
+                    Operand::Constant(ConstValue::Uint(value, source_width)) => {
+                        rust_shift_width_supported(*source_width)
+                            && machine_unsigned_literal_pattern(
+                                *value,
+                                *source_width,
+                                /* signed */ false,
+                            )
+                            .is_some()
+                    }
+                    _ => {
+                        crate::operand_ty_cow(func, rhs).as_deref().is_some_and(machine_integer_ty)
+                    }
+                }
+            } else {
+                match rhs {
+                    Operand::Constant(ConstValue::Int(value)) => {
+                        machine_literal_pattern(*value, width, signed).is_some()
+                    }
+                    Operand::Constant(ConstValue::Uint(value, _)) => {
+                        machine_unsigned_literal_pattern(*value, width, signed).is_some()
+                    }
+                    _ => crate::operand_ty_cow(func, rhs).is_some_and(|rhs_ty| {
+                        rhs_ty.int_width() == Some(width) && rhs_ty.is_signed() == signed
+                    }),
+                }
+            };
+            if !rhs_matches {
+                return None;
+            }
+            return Some(Formula::BvToInt(Box::new(machine_value), width, signed));
+        }
     }
     let width = ty.as_deref().and_then(Ty::int_width);
     let signed = ty.as_deref().is_some_and(Ty::is_signed);
     crate::chc::try_binop_to_formula(op, lhs_formula, rhs_formula, width, signed).ok()
-}
-
-/// Admit the two unit updates whose taken-edge guard proves that the
-/// mathematical-Int transition is byte-for-byte equivalent to unsigned MIR:
-///
-/// * `i + 1` under `i < upper`, where `upper` is an in-range value of the same
-///   unsigned width. Since `upper <= MAX`, the addition cannot wrap.
-/// * `i - 1` under a taken guard proving `i > 0`. Since unsigned values are
-///   non-negative, the subtraction cannot underflow.
-///
-/// Both subjects must be bare unsigned locals. Wider steps, reversed
-/// subtraction, and guards that merely prove `i >= 0` remain fail-closed.
-fn guarded_unsigned_unit_update_is_exact(
-    func: &VerifiableFunction,
-    op: BinOp,
-    lhs: &Operand,
-    rhs: &Operand,
-    lhs_formula: &Formula,
-    rhs_formula: &Formula,
-    guard: &Formula,
-) -> bool {
-    match op {
-        BinOp::Add => {
-            let (subject_operand, subject_formula) =
-                if formula_integer_literal(rhs_formula) == Some(1) {
-                    (lhs, lhs_formula)
-                } else if formula_integer_literal(lhs_formula) == Some(1) {
-                    (rhs, rhs_formula)
-                } else {
-                    return false;
-                };
-            let Some(width) = bare_unsigned_operand_width(func, subject_operand) else {
-                return false;
-            };
-            if !matches!(subject_formula, Formula::Var(..)) {
-                return false;
-            }
-            let Some(upper) = strict_upper_bound_from_true_guard(guard, subject_formula) else {
-                return false;
-            };
-            unsigned_formula_is_in_range(func, upper, width)
-        }
-        BinOp::Sub => {
-            formula_integer_literal(rhs_formula) == Some(1)
-                && bare_unsigned_operand_width(func, lhs).is_some()
-                && matches!(lhs_formula, Formula::Var(..))
-                && unsigned_positive_from_true_guard(guard, lhs_formula)
-        }
-        _ => false,
-    }
 }
 
 /// The matching authored E5 measure is exact for the same reason: under
@@ -3158,18 +4418,6 @@ fn guarded_unit_increment(before: &Formula, after: &Formula) -> bool {
         || (rhs.as_ref() == before && formula_integer_literal(lhs) == Some(1))
 }
 
-fn bare_unsigned_operand_width(func: &VerifiableFunction, operand: &Operand) -> Option<u32> {
-    let place = match operand {
-        Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => place,
-        _ => return None,
-    };
-    let decl = func.body.locals.iter().find(|decl| decl.index == place.local)?;
-    match decl.ty {
-        Ty::Int { width, signed: false } => Some(width),
-        _ => None,
-    }
-}
-
 fn bare_unsigned_formula_width(func: &VerifiableFunction, formula: &Formula) -> Option<u32> {
     let Formula::Var(name, _) = formula else { return None };
     let mut matching = func.body.locals.iter().filter(|decl| {
@@ -3184,17 +4432,6 @@ fn bare_unsigned_formula_width(func: &VerifiableFunction, formula: &Formula) -> 
         Ty::Int { width, signed: false } => Some(width),
         _ => None,
     }
-}
-
-fn unsigned_formula_is_in_range(func: &VerifiableFunction, formula: &Formula, width: u32) -> bool {
-    if bare_unsigned_formula_width(func, formula) == Some(width) {
-        return true;
-    }
-    let Some(value) = formula_integer_literal(formula) else { return false };
-    if value < 0 || width == 0 || width > 128 {
-        return false;
-    }
-    width == 128 || (value as u128) <= ((1_u128 << width) - 1)
 }
 
 fn strict_upper_bound_from_true_guard<'a>(
@@ -3226,28 +4463,6 @@ fn predicate_asserted_by_true_guard(guard: &Formula) -> &Formula {
             _ => guard,
         },
         _ => guard,
-    }
-}
-
-fn unsigned_positive_from_true_guard(guard: &Formula, subject: &Formula) -> bool {
-    let predicate = predicate_asserted_by_true_guard(guard);
-    match predicate {
-        Formula::Gt(lhs, lower) if lhs.as_ref() == subject => {
-            formula_integer_literal(lower).is_some_and(|bound| bound >= 0)
-        }
-        Formula::Lt(lower, rhs) if rhs.as_ref() == subject => {
-            formula_integer_literal(lower).is_some_and(|bound| bound >= 0)
-        }
-        Formula::Ge(lhs, lower) if lhs.as_ref() == subject => {
-            formula_integer_literal(lower).is_some_and(|bound| bound >= 1)
-        }
-        Formula::Le(lower, rhs) if rhs.as_ref() == subject => {
-            formula_integer_literal(lower).is_some_and(|bound| bound >= 1)
-        }
-        Formula::And(parts) => {
-            parts.iter().any(|part| unsigned_positive_from_true_guard(part, subject))
-        }
-        _ => false,
     }
 }
 
@@ -3288,7 +4503,9 @@ pub(crate) fn loop_contract_body(body: &str) -> Option<(usize, String)> {
         && let Ok(block) = block_str.trim().parse::<usize>()
         && !expr.trim().is_empty()
     {
-        return Some((block, expr.trim().to_string()));
+        let expr = expr.trim();
+        let expr = expr.strip_prefix(LOWERED_CONTRACT_PREFIX).unwrap_or(expr);
+        return Some((block, expr.to_string()));
     }
     None
 }
@@ -3575,6 +4792,122 @@ mod tests {
         }
     }
 
+    fn exclusive_mutable_collection_loop_function(inner: Ty) -> VerifiableFunction {
+        let xs_ty = Ty::Ref { mutable: true, inner: Box::new(inner) };
+        let indexed_xs =
+            Place { local: 1, projections: vec![Projection::Deref, Projection::Index(3)] };
+        VerifiableFunction {
+            name: "exclusive_mutable_collection_loop".to_string(),
+            def_path: "test::exclusive_mutable_collection_loop".to_string(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Unit, name: Some("_0".into()) },
+                    LocalDecl { index: 1, ty: xs_ty, name: Some("xs".into()) },
+                    LocalDecl { index: 2, ty: Ty::Bool, name: Some("keep".into()) },
+                    LocalDecl { index: 3, ty: Ty::usize(), name: Some("index".into()) },
+                    LocalDecl { index: 4, ty: Ty::usize(), name: Some("length".into()) },
+                    LocalDecl { index: 5, ty: Ty::Bool, name: Some("in_bounds".into()) },
+                    LocalDecl { index: 6, ty: Ty::u32(), name: Some("observed".into()) },
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![],
+                        terminator: Terminator::Goto(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        stmts: vec![],
+                        terminator: Terminator::SwitchInt {
+                            discr: Operand::Copy(Place::local(2)),
+                            targets: vec![(1, BlockId(2))],
+                            otherwise: BlockId(4),
+                            exhaustive_enum_unreachable: false,
+                            span: SourceSpan::default(),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        stmts: vec![
+                            Statement::Assign {
+                                place: Place::local(4),
+                                rvalue: Rvalue::Len(Place {
+                                    local: 1,
+                                    projections: vec![Projection::Deref],
+                                }),
+                                span: SourceSpan::default(),
+                            },
+                            Statement::Assign {
+                                place: Place::local(5),
+                                rvalue: Rvalue::BinaryOp(
+                                    BinOp::Lt,
+                                    Operand::Copy(Place::local(3)),
+                                    Operand::Copy(Place::local(4)),
+                                ),
+                                span: SourceSpan::default(),
+                            },
+                        ],
+                        terminator: Terminator::Assert {
+                            unwind: trust_types::UnwindEdge::Unreachable,
+                            cond: Operand::Move(Place::local(5)),
+                            expected: true,
+                            msg: AssertMessage::BoundsCheck,
+                            target: BlockId(3),
+                            span: SourceSpan::default(),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        stmts: vec![
+                            Statement::Assign {
+                                place: indexed_xs.clone(),
+                                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(7, 32))),
+                                span: SourceSpan::default(),
+                            },
+                            Statement::Assign {
+                                place: Place::local(6),
+                                rvalue: Rvalue::Use(Operand::Copy(indexed_xs)),
+                                span: SourceSpan::default(),
+                            },
+                        ],
+                        terminator: Terminator::Goto(BlockId(1)),
+                    },
+                    BasicBlock { id: BlockId(4), stmts: vec![], terminator: Terminator::Return },
+                ],
+                arg_count: 3,
+                return_ty: Ty::Unit,
+            },
+            contracts: vec![Contract {
+                kind: ContractKind::LoopInvariant,
+                span: SourceSpan::default(),
+                body: "bb1: xs[0] == xs[0]".to_string(),
+            }],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        }
+    }
+
+    fn set_mutable_collection_fixture_projection(
+        func: &mut VerifiableFunction,
+        projection: Projection,
+    ) {
+        for statement in &mut func.body.blocks[3].stmts {
+            match statement {
+                Statement::Assign { place, .. } if place.local == 1 => {
+                    place.projections = vec![Projection::Deref, projection.clone()];
+                }
+                Statement::Assign { rvalue: Rvalue::Use(Operand::Copy(place)), .. }
+                    if place.local == 1 =>
+                {
+                    place.projections = vec![Projection::Deref, projection.clone()];
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn use_rustc_fixed_array_len_lowering(func: &mut VerifiableFunction) -> usize {
         let Ty::Ref { mutable: false, inner } = &func.body.locals[1].ty else {
             panic!("fixture source must be an immutable fixed-array reference")
@@ -3626,6 +4959,30 @@ mod tests {
             )),
             "an unsupported collection must not mint E4 rows: {vcs:#?}",
         );
+    }
+
+    fn assert_collection_loop_is_supported(func: &VerifiableFunction) {
+        let mut vcs = Vec::new();
+        check_contracts(func, &mut vcs);
+        assert_eq!(vcs.len(), 2, "the supported collection emits exactly one E4 pair: {vcs:#?}");
+        assert!(
+            vcs.iter().all(|vc| matches!(
+                vc.kind,
+                VcKind::LoopInvariantInitiation { .. } | VcKind::LoopInvariantConsecution { .. }
+            )),
+            "the bounded collection fragment must not degrade: {vcs:#?}",
+        );
+    }
+
+    fn collection_blocker(func: &VerifiableFunction) -> String {
+        let mut vcs = Vec::new();
+        check_contracts(func, &mut vcs);
+        vcs.iter()
+            .find_map(|vc| match &vc.kind {
+                VcKind::UnsupportedMir { detail, .. } => Some(detail.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected a visible collection blocker: {vcs:#?}"))
     }
 
     #[test]
@@ -3709,6 +5066,77 @@ mod tests {
     }
 
     #[test]
+    fn slice_length_retains_its_exact_usize_domain_in_e4_and_e5() {
+        let mut func = read_only_collection_loop_function(Ty::Slice { elem: Box::new(Ty::u32()) });
+        func.preconditions.clear();
+        func.contracts = vec![
+            Contract {
+                kind: ContractKind::LoopInvariant,
+                span: SourceSpan::default(),
+                body: "bb1: n <= xs.len()".to_string(),
+            },
+            Contract {
+                kind: ContractKind::Decreases,
+                span: SourceSpan::default(),
+                body: "bb1: xs.len() - n".to_string(),
+            },
+        ];
+
+        let invariant = type_loop_formula(
+            &func,
+            parse_spec_expr("n <= xs.len()").expect("slice-bound invariant parses"),
+            Sort::Bool,
+        )
+        .expect("the exact slice length rebinds");
+        let measure = type_loop_formula(
+            &func,
+            parse_spec_expr("xs.len() - n").expect("slice-distance measure parses"),
+            Sort::Int,
+        )
+        .expect("the exact slice length rebinds in a measure");
+        assert_eq!(uniform_machine_domain(&func, &invariant), Some((64, false)));
+        assert_eq!(uniform_machine_domain(&func, &measure), Some((64, false)));
+        assert!(machine_faithful_value_admissible(&func, &measure));
+
+        let mut vcs = Vec::new();
+        check_contracts(&func, &mut vcs);
+        assert_eq!(vcs.len(), 3, "one E4 pair and one E5 row must survive: {vcs:#?}");
+        assert!(
+            vcs.iter().all(|vc| !matches!(vc.kind, VcKind::UnsupportedMir { .. })),
+            "an authenticated `usize` index and its slice length share one machine domain: {vcs:#?}",
+        );
+
+        let mut collision = func;
+        let collision_local = collision.body.locals.len();
+        collision.body.locals.push(LocalDecl {
+            index: collision_local,
+            ty: Ty::usize(),
+            name: Some("xs_len".into()),
+        });
+        assert!(
+            type_loop_formula(
+                &collision,
+                parse_spec_expr("n <= xs.len()").expect("collision formula parses"),
+                Sort::Bool,
+            )
+            .is_none(),
+            "a real `xs_len` local must not borrow the collection projection's machine domain",
+        );
+        assert!(
+            type_loop_formula(
+                &collision,
+                Formula::Le(
+                    Box::new(Formula::Var("n".into(), Sort::Int)),
+                    Box::new(Formula::Var("xs__slice_len".into(), Sort::Int)),
+                ),
+                Sort::Bool,
+            )
+            .is_none(),
+            "the canonical extracted length leaf must not rebind through a colliding output name",
+        );
+    }
+
+    #[test]
     fn read_only_fixed_array_length_is_the_exact_type_constant() {
         let mut func =
             read_only_collection_loop_function(Ty::Array { elem: Box::new(Ty::u32()), len: 4 });
@@ -3778,7 +5206,32 @@ mod tests {
             );
         }
 
-        let func = read_only_collection_loop_function(Ty::Slice { elem: Box::new(Ty::u32()) });
+        let slice = read_only_collection_loop_function(Ty::Slice { elem: Box::new(Ty::u32()) });
+        assert!(
+            read_only_collection_literal_index_for_name(&slice, "xs[4]").is_some(),
+            "a slice has no type-level upper bound; runtime length hypotheses govern its read",
+        );
+
+        let fixed =
+            read_only_collection_loop_function(Ty::Array { elem: Box::new(Ty::u32()), len: 4 });
+        assert!(
+            read_only_collection_literal_index_for_name(&fixed, "xs[3]").is_some(),
+            "the last fixed-array element is an exact projected identity",
+        );
+        assert!(
+            read_only_collection_literal_index_for_name(&fixed, "xs[4]").is_none(),
+            "an index equal to the fixed-array length must fail closed",
+        );
+        let out_of_bounds = Formula::Eq(
+            Box::new(Formula::Var("xs[4]".to_string(), Sort::Int)),
+            Box::new(Formula::Int(0)),
+        );
+        assert!(
+            type_loop_formula(&fixed, out_of_bounds, Sort::Bool).is_none(),
+            "a forged out-of-range fixed-array leaf must not acquire E4 authority",
+        );
+
+        let func = slice;
         for name in ["ghost[0]", "xs[00]", "xs[0][1]", "xs[]", "xs[-1]", "[0]"] {
             assert!(
                 read_only_collection_literal_index_for_name(&func, name).is_none(),
@@ -3793,10 +5246,31 @@ mod tests {
                 "a forged literal projection must not acquire collection authority: {name}",
             );
         }
+
+        let mut shadowed =
+            read_only_collection_loop_function(Ty::Array { elem: Box::new(Ty::u32()), len: 4 });
+        shadowed.body.locals.push(LocalDecl {
+            index: 5,
+            ty: Ty::Array { elem: Box::new(Ty::u32()), len: 4 },
+            name: Some("xs".into()),
+        });
+        assert!(
+            read_only_collection_model_for_name(&shadowed, "xs").is_none(),
+            "an unsupported loop-local `xs` must not disappear before name uniqueness is checked",
+        );
+        for formula in [
+            parse_spec_expr("xs[0] == xs[0]").expect("projected shadow formula"),
+            parse_spec_expr("xs.len() == 4").expect("length shadow formula"),
+        ] {
+            assert!(
+                type_loop_formula(&shadowed, formula, Sort::Bool).is_none(),
+                "a same-named unsupported local must prevent the stable outer collection from lending its identity",
+            );
+        }
     }
 
     #[test]
-    fn read_only_collection_lane_rejects_mutation_alias_and_untyped_index_shapes() {
+    fn read_only_collection_lane_supports_stable_mut_borrow_and_exact_shared_aliases() {
         let base = || read_only_collection_loop_function(Ty::Slice { elem: Box::new(Ty::u32()) });
 
         let mut mutable = base();
@@ -3804,7 +5278,74 @@ mod tests {
             unreachable!()
         };
         *is_mutable = true;
-        assert_collection_loop_is_explicitly_unsupported(&mutable);
+        assert_collection_loop_is_supported(&mutable);
+
+        // Independently exact immutable aliases, defined on the entry path and
+        // used only for scalar reads, all denote the same canonical sequence
+        // term as the source argument.
+        let mut aliased = base();
+        let alias_ty = aliased.body.locals[1].ty.clone();
+        aliased.body.locals[4].ty = alias_ty.clone();
+        aliased.body.locals[4].name = Some("view".into());
+        aliased.body.locals.push(LocalDecl { index: 5, ty: Ty::u32(), name: Some("value".into()) });
+        aliased.body.locals.push(LocalDecl {
+            index: 6,
+            ty: alias_ty,
+            name: Some("second_view".into()),
+        });
+        aliased.body.locals.push(LocalDecl {
+            index: 7,
+            ty: Ty::u32(),
+            name: Some("second_value".into()),
+        });
+        aliased.body.blocks[0].stmts.insert(
+            0,
+            Statement::Assign {
+                place: Place::local(4),
+                rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+                span: SourceSpan::default(),
+            },
+        );
+        aliased.body.blocks[0].stmts.insert(
+            1,
+            Statement::Assign {
+                place: Place::local(6),
+                rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+                span: SourceSpan::default(),
+            },
+        );
+        let Statement::Assign { place: dest, rvalue, .. } = &mut aliased.body.blocks[2].stmts[0]
+        else {
+            unreachable!()
+        };
+        *dest = Place::local(5);
+        let Rvalue::Use(Operand::Copy(element)) = rvalue else { unreachable!() };
+        element.local = 4;
+        aliased.body.blocks[2].stmts.push(Statement::Assign {
+            place: Place::local(7),
+            rvalue: Rvalue::Use(Operand::Copy(Place {
+                local: 6,
+                projections: vec![
+                    Projection::Deref,
+                    Projection::ConstantIndex { offset: 0, min_length: 1, from_end: false },
+                ],
+            })),
+            span: SourceSpan::default(),
+        });
+        assert_collection_loop_is_supported(&aliased);
+        for alias in [4, 6] {
+            assert_eq!(
+                read_only_collection_model_for_local(&aliased, alias)
+                    .expect("independently exact alias model")
+                    .source_local,
+                1,
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_collection_lane_rejects_mutation_escape_and_untyped_index_shapes() {
+        let base = || read_only_collection_loop_function(Ty::Slice { elem: Box::new(Ty::u32()) });
 
         let mut reseated = base();
         reseated.body.blocks[2].stmts.insert(
@@ -3816,15 +5357,10 @@ mod tests {
             },
         );
         assert_collection_loop_is_explicitly_unsupported(&reseated);
-
-        let mut aliased = base();
-        aliased.body.locals[4].ty = aliased.body.locals[1].ty.clone();
-        aliased.body.blocks[2].stmts[0] = Statement::Assign {
-            place: Place::local(4),
-            rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
-            span: SourceSpan::default(),
-        };
-        assert_collection_loop_is_explicitly_unsupported(&aliased);
+        assert!(
+            collection_blocker(&reseated).contains("e45.collection.mutation-or-reseat"),
+            "reseating must expose its machine-readable blocker",
+        );
 
         let mut projected_write = base();
         projected_write.body.blocks[2].stmts.insert(
@@ -3842,6 +5378,10 @@ mod tests {
             },
         );
         assert_collection_loop_is_explicitly_unsupported(&projected_write);
+        assert!(
+            collection_blocker(&projected_write).contains("e45.collection.mutation-or-reseat"),
+            "projected mutation must expose its machine-readable blocker",
+        );
 
         let mut collection_call = base();
         collection_call.body.blocks[2].terminator = Terminator::Call {
@@ -3856,6 +5396,73 @@ mod tests {
             is_unsafe_sig: false,
         };
         assert_collection_loop_is_explicitly_unsupported(&collection_call);
+        assert!(
+            collection_blocker(&collection_call).contains("e45.collection.call-escape"),
+            "call escape must expose its machine-readable blocker",
+        );
+
+        let mut escaping_alias = base();
+        escaping_alias.body.locals[4].ty = escaping_alias.body.locals[1].ty.clone();
+        escaping_alias.body.blocks[2].stmts[0] = Statement::Assign {
+            place: Place::local(4),
+            rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+            span: SourceSpan::default(),
+        };
+        escaping_alias.body.blocks[2].terminator = Terminator::Call {
+            unwind: trust_types::UnwindEdge::Unreachable,
+            func: "escape".into(),
+            args: vec![Operand::Copy(Place::local(4))],
+            dest: Place::local(0),
+            target: Some(BlockId(1)),
+            span: SourceSpan::default(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+        };
+        assert_collection_loop_is_explicitly_unsupported(&escaping_alias);
+        assert!(
+            collection_blocker(&escaping_alias).contains("e45.collection.alias-escape"),
+            "an escaping alias must expose its machine-readable blocker",
+        );
+
+        let mut chained_alias = base();
+        let alias_ty = chained_alias.body.locals[1].ty.clone();
+        chained_alias.body.locals.push(LocalDecl {
+            index: 5,
+            ty: alias_ty.clone(),
+            name: Some("view".into()),
+        });
+        chained_alias.body.locals.push(LocalDecl {
+            index: 6,
+            ty: alias_ty,
+            name: Some("chained_view".into()),
+        });
+        chained_alias.body.blocks[0].stmts.splice(
+            0..0,
+            [
+                Statement::Assign {
+                    place: Place::local(5),
+                    rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+                    span: SourceSpan::default(),
+                },
+                Statement::Assign {
+                    place: Place::local(6),
+                    rvalue: Rvalue::Use(Operand::Copy(Place::local(5))),
+                    span: SourceSpan::default(),
+                },
+            ],
+        );
+        let Statement::Assign { rvalue: Rvalue::Use(Operand::Copy(element)), .. } =
+            &mut chained_alias.body.blocks[2].stmts[0]
+        else {
+            unreachable!()
+        };
+        element.local = 6;
+        assert_collection_loop_is_explicitly_unsupported(&chained_alias);
+        assert!(
+            collection_blocker(&chained_alias).contains("e45.collection.alias-escape"),
+            "a chained alias must expose the alias frontier",
+        );
 
         let mut wrong_len = base();
         let Statement::Assign { rvalue, .. } = &mut wrong_len.body.blocks[0].stmts[0] else {
@@ -3892,6 +5499,284 @@ mod tests {
             elem: Box::new(Ty::Tuple(vec![Ty::u32()])),
         });
         assert_collection_loop_is_explicitly_unsupported(&nonscalar);
+    }
+
+    #[test]
+    fn exclusive_mutable_collection_lane_models_exact_store_and_read_after_write() {
+        let mut slice =
+            exclusive_mutable_collection_loop_function(Ty::Slice { elem: Box::new(Ty::u32()) });
+        let model =
+            read_only_collection_shape_for_local(&slice, 1).expect("mutable collection shape");
+        let Statement::Assign { place: store_place, rvalue: store_value, .. } =
+            &slice.body.blocks[3].stmts[0]
+        else {
+            unreachable!()
+        };
+        let projection = exact_exclusive_mutable_store_projection(&slice, store_place, &model)
+            .expect("exact mutable store projection");
+        assert!(exact_exclusive_mutable_store_value_is_typed(&slice, store_place, store_value,));
+        assert!(mutable_collection_store_bounds_authenticated(
+            &slice,
+            BlockId(3),
+            0,
+            projection,
+            &model,
+        ));
+        assert!(
+            exclusive_mutable_collection_arg_is_stable(&slice, 1),
+            "the exact unique BoundsCheck -> store shape must enter the mutable lane",
+        );
+        assert_collection_loop_is_supported(&slice);
+
+        let transitions =
+            symbolic_loop_transitions(&slice, BlockId(1)).expect("exact mutable transition");
+        assert_eq!(transitions.len(), 1);
+        let stored = transitions[0].post_state.get("xs").expect("mutable array post-state");
+        assert!(
+            matches!(stored, Formula::Store(..)),
+            "projected assignment must update the canonical array with Store: {stored:?}",
+        );
+        assert_eq!(
+            transitions[0].post_state.get("observed"),
+            Some(&Formula::Select(
+                Box::new(stored.clone()),
+                Box::new(Formula::Var("index".into(), Sort::Int)),
+            )),
+            "a later element read must observe the exact Store chain",
+        );
+
+        let mut vcs = Vec::new();
+        check_contracts(&slice, &mut vcs);
+        let (_, consecution) = e4_pair(&vcs);
+        let mut contains_store = false;
+        consecution.formula.visit(&mut |formula| {
+            contains_store |= matches!(formula, Formula::Store(..));
+        });
+        assert!(contains_store, "E4 consecution must carry the mutable Store: {consecution:#?}");
+
+        // A separately invalid clause must not make the diagnostic-only
+        // classifier misdescribe this already-authenticated Store as an
+        // unsupported mutation. Admission, not the first raw assignment shape,
+        // is the authority boundary.
+        slice.contracts.push(Contract {
+            kind: ContractKind::LoopInvariant,
+            span: SourceSpan::default(),
+            body: "bb1: unknown_scalar == 0".to_string(),
+        });
+        assert_eq!(read_only_collection_blocker(&slice), None);
+        let mut mixed_vcs = Vec::new();
+        check_contracts(&slice, &mut mixed_vcs);
+        let unrelated = mixed_vcs
+            .iter()
+            .find_map(|vc| match &vc.kind {
+                VcKind::UnsupportedMir { detail, .. } if detail.contains("unknown_scalar") => {
+                    Some(detail)
+                }
+                _ => None,
+            })
+            .expect("the unrelated invalid clause must remain visible");
+        assert!(
+            !unrelated.contains("e45.collection."),
+            "a supported exclusive Store must not contaminate another clause's blocker: \
+             {unrelated}",
+        );
+
+        let fixed_dynamic = exclusive_mutable_collection_loop_function(Ty::Array {
+            elem: Box::new(Ty::u32()),
+            len: 4,
+        });
+        assert_collection_loop_is_supported(&fixed_dynamic);
+
+        let mut fixed_constant = fixed_dynamic;
+        set_mutable_collection_fixture_projection(
+            &mut fixed_constant,
+            Projection::ConstantIndex { offset: 0, min_length: 1, from_end: false },
+        );
+        fixed_constant.body.blocks[2].stmts.clear();
+        fixed_constant.body.blocks[2].terminator = Terminator::Goto(BlockId(3));
+        assert!(
+            exclusive_mutable_collection_arg_is_stable(&fixed_constant, 1),
+            "a fixed-array constant index proven `< N` needs no dynamic assert",
+        );
+        assert_collection_loop_is_supported(&fixed_constant);
+    }
+
+    #[test]
+    fn exclusive_mutable_collection_lane_rejects_unbound_or_unstable_stores() {
+        let base =
+            || exclusive_mutable_collection_loop_function(Ty::Slice { elem: Box::new(Ty::u32()) });
+
+        let mut missing_guard = base();
+        missing_guard.body.blocks[2].terminator = Terminator::Goto(BlockId(3));
+        assert!(!exclusive_mutable_collection_arg_is_stable(&missing_guard, 1));
+        assert_collection_loop_is_explicitly_unsupported(&missing_guard);
+
+        // Merely having the same normalized machine type gives no authority:
+        // the bounds predicate must use the exact local projected by the store.
+        let mut mismatched_index = base();
+        let Statement::Assign { rvalue: Rvalue::BinaryOp(BinOp::Lt, checked_index, _), .. } =
+            &mut mismatched_index.body.blocks[2].stmts[1]
+        else {
+            unreachable!()
+        };
+        *checked_index = Operand::Copy(Place::local(4));
+        assert!(!exclusive_mutable_collection_arg_is_stable(&mismatched_index, 1));
+        assert_collection_loop_is_explicitly_unsupported(&mismatched_index);
+
+        for wrong_index_ty in [Ty::Int { width: usize::BITS, signed: true }, Ty::u32(), Ty::Bool] {
+            let mut wrong_index_type = base();
+            wrong_index_type.body.locals[3].ty = wrong_index_ty;
+            assert!(!exclusive_mutable_collection_arg_is_stable(&wrong_index_type, 1,));
+            assert_collection_loop_is_explicitly_unsupported(&wrong_index_type);
+        }
+
+        let mut mismatched_length = base();
+        let Statement::Assign { rvalue, .. } = &mut mismatched_length.body.blocks[2].stmts[0]
+        else {
+            unreachable!()
+        };
+        *rvalue = Rvalue::Use(Operand::Constant(ConstValue::Uint(99, 64)));
+        assert!(!exclusive_mutable_collection_arg_is_stable(&mismatched_length, 1));
+        assert_collection_loop_is_explicitly_unsupported(&mismatched_length);
+
+        let mut wrong_assert_kind = base();
+        let Terminator::Assert { msg, .. } = &mut wrong_assert_kind.body.blocks[2].terminator
+        else {
+            unreachable!()
+        };
+        *msg = AssertMessage::Overflow(BinOp::Add);
+        assert!(!exclusive_mutable_collection_arg_is_stable(&wrong_assert_kind, 1));
+        assert_collection_loop_is_explicitly_unsupported(&wrong_assert_kind);
+
+        let mut reassigned_index = base();
+        reassigned_index.body.blocks[3].stmts.insert(
+            0,
+            Statement::Assign {
+                place: Place::local(3),
+                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, usize::BITS))),
+                span: SourceSpan::default(),
+            },
+        );
+        assert!(!exclusive_mutable_collection_arg_is_stable(&reassigned_index, 1));
+        assert_collection_loop_is_explicitly_unsupported(&reassigned_index);
+
+        let mut reassigned_after_comparison = base();
+        reassigned_after_comparison.body.blocks[2].stmts.push(Statement::Assign {
+            place: Place::local(3),
+            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, usize::BITS))),
+            span: SourceSpan::default(),
+        });
+        assert!(!exclusive_mutable_collection_arg_is_stable(&reassigned_after_comparison, 1,));
+        assert_collection_loop_is_explicitly_unsupported(&reassigned_after_comparison);
+
+        let mut bypassed_guard = base();
+        let Terminator::SwitchInt { targets, .. } = &mut bypassed_guard.body.blocks[1].terminator
+        else {
+            unreachable!()
+        };
+        targets.push((0, BlockId(3)));
+        assert!(!exclusive_mutable_collection_arg_is_stable(&bypassed_guard, 1));
+        assert_collection_loop_is_explicitly_unsupported(&bypassed_guard);
+
+        let mut wrong_value_type = base();
+        let Statement::Assign { rvalue, .. } = &mut wrong_value_type.body.blocks[3].stmts[0] else {
+            unreachable!()
+        };
+        *rvalue = Rvalue::Use(Operand::Constant(ConstValue::Bool(true)));
+        assert!(!exclusive_mutable_collection_arg_is_stable(&wrong_value_type, 1));
+        assert_collection_loop_is_explicitly_unsupported(&wrong_value_type);
+
+        let mut reborrow = base();
+        let alias_local = reborrow.body.locals.len();
+        reborrow.body.locals.push(LocalDecl {
+            index: alias_local,
+            ty: reborrow.body.locals[1].ty.clone(),
+            name: Some("reborrow".into()),
+        });
+        reborrow.body.blocks[3].stmts.insert(
+            0,
+            Statement::Assign {
+                place: Place::local(alias_local),
+                rvalue: Rvalue::Ref { mutable: true, place: Place::local(1) },
+                span: SourceSpan::default(),
+            },
+        );
+        assert!(!exclusive_mutable_collection_arg_is_stable(&reborrow, 1));
+        assert_collection_loop_is_explicitly_unsupported(&reborrow);
+
+        let mut call_escape = base();
+        call_escape.body.blocks[3].terminator = Terminator::Call {
+            unwind: trust_types::UnwindEdge::Unreachable,
+            func: "escape".into(),
+            args: vec![Operand::Move(Place::local(1))],
+            dest: Place::local(0),
+            target: Some(BlockId(1)),
+            span: SourceSpan::default(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+        };
+        assert!(!exclusive_mutable_collection_arg_is_stable(&call_escape, 1));
+        assert_collection_loop_is_explicitly_unsupported(&call_escape);
+
+        let mut intrinsic_escape = base();
+        intrinsic_escape.body.blocks[3].stmts.insert(
+            0,
+            Statement::Intrinsic {
+                name: "opaque_mutation".into(),
+                args: vec![Operand::Move(Place::local(1))],
+            },
+        );
+        assert!(!exclusive_mutable_collection_arg_is_stable(&intrinsic_escape, 1));
+        assert_collection_loop_is_explicitly_unsupported(&intrinsic_escape);
+
+        let mut reseated = base();
+        reseated.body.blocks[3].stmts.insert(
+            0,
+            Statement::Assign {
+                place: Place::local(1),
+                rvalue: Rvalue::Use(Operand::Move(Place::local(1))),
+                span: SourceSpan::default(),
+            },
+        );
+        assert!(!exclusive_mutable_collection_arg_is_stable(&reseated, 1));
+        assert_collection_loop_is_explicitly_unsupported(&reseated);
+
+        let mut slice_constant_without_guard = base();
+        set_mutable_collection_fixture_projection(
+            &mut slice_constant_without_guard,
+            Projection::ConstantIndex { offset: 0, min_length: 1, from_end: false },
+        );
+        slice_constant_without_guard.body.blocks[2].stmts.clear();
+        slice_constant_without_guard.body.blocks[2].terminator = Terminator::Goto(BlockId(3));
+        assert!(!exclusive_mutable_collection_arg_is_stable(&slice_constant_without_guard, 1,));
+        assert_collection_loop_is_explicitly_unsupported(&slice_constant_without_guard);
+
+        let mut fixed_oob = exclusive_mutable_collection_loop_function(Ty::Array {
+            elem: Box::new(Ty::u32()),
+            len: 4,
+        });
+        set_mutable_collection_fixture_projection(
+            &mut fixed_oob,
+            Projection::ConstantIndex { offset: 4, min_length: 5, from_end: false },
+        );
+        fixed_oob.body.blocks[2].stmts.clear();
+        fixed_oob.body.blocks[2].terminator = Terminator::Goto(BlockId(3));
+        assert!(!exclusive_mutable_collection_arg_is_stable(&fixed_oob, 1));
+        assert_collection_loop_is_explicitly_unsupported(&fixed_oob);
+
+        let mut fixed_forged_projection = exclusive_mutable_collection_loop_function(Ty::Array {
+            elem: Box::new(Ty::u32()),
+            len: 4,
+        });
+        set_mutable_collection_fixture_projection(
+            &mut fixed_forged_projection,
+            Projection::ConstantIndex { offset: 0, min_length: 2, from_end: false },
+        );
+        fixed_forged_projection.body.blocks[2].stmts.clear();
+        fixed_forged_projection.body.blocks[2].terminator = Terminator::Goto(BlockId(3));
+        assert!(!exclusive_mutable_collection_arg_is_stable(&fixed_forged_projection, 1,));
+        assert_collection_loop_is_explicitly_unsupported(&fixed_forged_projection);
     }
 
     #[test]
@@ -3934,12 +5819,12 @@ mod tests {
         let initiation = vcs
             .iter()
             .find(|vc| matches!(vc.kind, VcKind::LoopInvariantInitiation { .. }))
-            .expect("E4 initiation")
+            .unwrap_or_else(|| panic!("E4 initiation missing from {vcs:#?}"))
             .clone();
         let consecution = vcs
             .iter()
             .find(|vc| matches!(vc.kind, VcKind::LoopInvariantConsecution { .. }))
-            .expect("E4 consecution")
+            .unwrap_or_else(|| panic!("E4 consecution missing from {vcs:#?}"))
             .clone();
         (initiation, consecution)
     }
@@ -4518,12 +6403,15 @@ mod tests {
             Sort::Bool,
         )
         .expect("predicate types");
+        let machine_predicate =
+            machine_faithful_translate(&func, &predicate, 32, false, true, Polarity::Prop)
+                .expect("feedback predicate has the exact u32 machine reading");
         assert!(
             !formula_contains(&e5_formula(&first_pass), &predicate),
             "the first-pass E5 VC must not assume an authored invariant"
         );
         assert!(
-            formula_contains(&e5_formula(&replacement), &predicate),
+            formula_contains(&e5_formula(&replacement), &machine_predicate),
             "the explicit second-pass E5 VC must assume the same-header invariant"
         );
         assert_eq!(e5_formula(&replacement), e5_formula(&second_pass));
@@ -4662,12 +6550,21 @@ mod tests {
             Sort::Bool,
         )
         .expect("predicate types");
-        assert!(formula_contains(&e5_formula(&feedback_raw), &predicate));
-        assert!(formula_contains(&e5_formula(&feedback_augmented), &predicate));
+        let machine_predicate = machine_faithful_translate(
+            &arithmetic_poisoned,
+            &predicate,
+            32,
+            false,
+            true,
+            Polarity::Prop,
+        )
+        .expect("feedback predicate has the exact u32 machine reading");
+        assert!(formula_contains(&e5_formula(&feedback_raw), &machine_predicate));
+        assert!(formula_contains(&e5_formula(&feedback_augmented), &machine_predicate));
     }
 
     #[test]
-    fn u8_wraparound_arithmetic_cannot_enter_e4_or_feedback() {
+    fn exact_machine_e4_covers_wrap_shift_not_and_signed_switch_fail_closed_elsewhere() {
         fn assert_no_e4(func: &VerifiableFunction, context: &str) {
             let mut vcs = Vec::new();
             check_contracts(func, &mut vcs);
@@ -4687,12 +6584,52 @@ mod tests {
                 "{context}: rejection must remain an explicit fail-closed row"
             );
         }
+        fn assert_machine_e4(
+            func: &VerifiableFunction,
+            width: u32,
+            expected_node: impl Fn(&Formula) -> bool,
+            context: &str,
+        ) {
+            let mut vcs = Vec::new();
+            check_contracts(func, &mut vcs);
+            let (initiation, consecution) = e4_pair(&vcs);
+            assert!(
+                !vcs.iter().any(|vc| matches!(vc.kind, VcKind::UnsupportedMir { .. })),
+                "{context}: exact machine semantics must not degrade: {vcs:#?}",
+            );
+            let mut exact_nodes = 0;
+            let mut int_arithmetic = 0;
+            for row in [&initiation, &consecution] {
+                row.formula.visit(&mut |formula| {
+                    exact_nodes += usize::from(expected_node(formula));
+                    int_arithmetic += usize::from(matches!(
+                        formula,
+                        Formula::Add(..)
+                            | Formula::Sub(..)
+                            | Formula::Mul(..)
+                            | Formula::Div(..)
+                            | Formula::Rem(..)
+                            | Formula::Neg(..)
+                    ));
+                });
+            }
+            assert!(exact_nodes > 0, "{context}: expected a width-{width} BV node: {vcs:#?}");
+            assert_eq!(
+                int_arithmetic, 0,
+                "{context}: mathematical-Int arithmetic must not survive: {vcs:#?}",
+            );
+        }
 
         let mut authored = feedback_loop_function();
         authored.body.locals[1].ty = Ty::u8();
         authored.body.locals[2].ty = Ty::u8();
         authored.contracts[0].body = "bb1: i + 1 > i".to_string();
-        assert_no_e4(&authored, "the mathematical claim `i + 1 > i` is false at u8::MAX");
+        assert_machine_e4(
+            &authored,
+            8,
+            |formula| matches!(formula, Formula::BvAdd(_, _, 8)),
+            "`i + 1 > i` must keep its refutable wrapping-u8 reading",
+        );
 
         let mut transition = feedback_loop_function();
         transition.body.locals[1].ty = Ty::u8();
@@ -4706,9 +6643,11 @@ mod tests {
             ),
             span: SourceSpan::default(),
         }];
-        assert_no_e4(
+        assert_machine_e4(
             &transition,
-            "a wrapping u8 loop transition cannot be modeled as unbounded addition",
+            8,
+            |formula| matches!(formula, Formula::BvAdd(_, _, 8)),
+            "a wrapping u8 transition",
         );
 
         let mut precondition = feedback_loop_function();
@@ -4766,11 +6705,17 @@ mod tests {
             exhaustive_enum_unreachable: false,
             span: SourceSpan::default(),
         };
-        assert_no_e4(&signed_switch, "signed SwitchInt targets require width-aware decoding");
+        let mut signed_switch_vcs = Vec::new();
+        check_contracts(&signed_switch, &mut signed_switch_vcs);
+        let (_, signed_consecution) = e4_pair(&signed_switch_vcs);
+        assert!(
+            formula_contains(&signed_consecution.formula, &Formula::Int(-1)),
+            "the raw i8 SwitchInt target 0xff must decode to -1: {signed_switch_vcs:#?}",
+        );
 
-        for (ty, op, context) in [
-            (Ty::u8(), BinOp::Shl, "a u8 shift is not an exact Int transition"),
-            (Ty::usize(), BinOp::Shr, "a pointer-width shift is not an exact Int transition"),
+        for (ty, width, op, context) in [
+            (Ty::u8(), 8, BinOp::Shl, "a u8 wrapping shift"),
+            (Ty::usize(), usize::BITS, BinOp::Shr, "a pointer-width logical shift"),
         ] {
             let mut shift = feedback_loop_function();
             shift.body.locals[1].ty = ty.clone();
@@ -4784,12 +6729,25 @@ mod tests {
                 ),
                 span: SourceSpan::default(),
             }];
-            assert_no_e4(&shift, context);
+            assert_machine_e4(
+                &shift,
+                width,
+                |formula| match op {
+                    BinOp::Shl => {
+                        matches!(formula, Formula::BvShl(_, _, node_width) if *node_width == width)
+                    }
+                    BinOp::Shr => {
+                        matches!(formula, Formula::BvLShr(_, _, node_width) if *node_width == width)
+                    }
+                    _ => false,
+                },
+                context,
+            );
         }
 
-        for (ty, context) in [
-            (Ty::u8(), "u8 bitwise Not must not become Boolean Not"),
-            (Ty::isize(), "pointer-width integer Not must fail closed"),
+        for (ty, width, context) in [
+            (Ty::u8(), 8, "u8 bitwise Not"),
+            (Ty::isize(), usize::BITS, "pointer-width integer Not"),
         ] {
             let mut bit_not = feedback_loop_function();
             bit_not.body.locals[1].ty = ty.clone();
@@ -4799,7 +6757,12 @@ mod tests {
                 rvalue: Rvalue::UnaryOp(UnOp::Not, Operand::Copy(Place::local(2))),
                 span: SourceSpan::default(),
             }];
-            assert_no_e4(&bit_not, context);
+            assert_machine_e4(
+                &bit_not,
+                width,
+                |formula| matches!(formula, Formula::BvNot(_, node_width) if *node_width == width),
+                context,
+            );
         }
 
         let bool_not = feedback_loop_function();
@@ -4813,6 +6776,94 @@ mod tests {
             ),
             Some(Formula::Not(Box::new(Formula::Var("cond".to_string(), Sort::Bool)))),
             "Boolean Not remains in the exact transition fragment",
+        );
+    }
+
+    #[test]
+    fn rust_shift_counts_are_masked_and_keep_their_independent_integer_domain() {
+        let mut heterogeneous = feedback_loop_function();
+        heterogeneous.body.locals[1].ty = Ty::i16();
+        heterogeneous.body.locals[2].ty = Ty::u8();
+        let state = initial_symbolic_state(&heterogeneous);
+        let encoded = symbolic_binop(
+            &heterogeneous,
+            BinOp::Shl,
+            &Operand::Copy(Place::local(2)),
+            &Operand::Copy(Place::local(1)),
+            &state,
+            None,
+        )
+        .expect("MIR permits a u8 LHS with an i16 shift count");
+        let translated =
+            machine_faithful_translate(&heterogeneous, &encoded, 8, false, true, Polarity::Value)
+                .expect("the independently typed shift count has an exact pure-BV translation");
+        assert_eq!(
+            translated,
+            Formula::BvShl(
+                Box::new(Formula::Var("i".into(), Sort::BitVec(8))),
+                Box::new(Formula::BvAnd(
+                    Box::new(Formula::BvExtract {
+                        inner: Box::new(Formula::Var("n".into(), Sort::BitVec(16))),
+                        high: 7,
+                        low: 0,
+                    }),
+                    Box::new(Formula::BitVec { value: 7, width: 8 }),
+                    8,
+                )),
+                8,
+            ),
+            "the i16 count must truncate to the u8 operation width and then mask to 0..=7",
+        );
+
+        let mut signed = feedback_loop_function();
+        signed.body.locals[1].ty = Ty::i8();
+        signed.body.locals[2].ty = Ty::i8();
+        let state = initial_symbolic_state(&signed);
+        let encoded = symbolic_binop(
+            &signed,
+            BinOp::Shr,
+            &Operand::Copy(Place::local(2)),
+            &Operand::Constant(ConstValue::Int(8)),
+            &state,
+            None,
+        )
+        .expect("an untyped portable integer literal remains a valid shift count");
+        let translated =
+            machine_faithful_translate(&signed, &encoded, 8, true, true, Polarity::Value)
+                .expect("signed wrapping shift has an exact pure-BV translation");
+        assert!(
+            matches!(
+                &translated,
+                Formula::BvAShr(_, amount, 8)
+                    if matches!(
+                        amount.as_ref(),
+                        Formula::BvAnd(raw, mask, 8)
+                            if matches!(raw.as_ref(), Formula::BitVec { value: 8, width: 8 })
+                                && matches!(
+                                    mask.as_ref(),
+                                    Formula::BitVec { value: 7, width: 8 }
+                                )
+                    )
+            ),
+            "signed right shift must stay arithmetic while masking count 8 to zero: {translated:?}",
+        );
+
+        for count in [0, 1, 7, 8, 9, 15, 16, 31, 255] {
+            let masked = count & 7;
+            assert_eq!(
+                0x81_u8.wrapping_shl(count),
+                0x81_u8 << masked,
+                "the encoded u8 shift-count mask must equal Rust for count {count}",
+            );
+            assert_eq!(
+                (-64_i8).wrapping_shr(count),
+                -64_i8 >> masked,
+                "the encoded arithmetic-right-shift mask must equal Rust for count {count}",
+            );
+        }
+        assert!(
+            rust_shift_amount_formula(&Formula::Int(1), 4).is_none(),
+            "non-Rust integer widths must fail closed instead of gaining a shift encoding",
         );
     }
 
@@ -4912,6 +6963,16 @@ mod tests {
             formula_uses_unmodeled_machine_arithmetic(&symbolic),
             "symbolic negation remains fixed-width machine arithmetic",
         );
+        assert_eq!(
+            machine_literal_pattern(i128::MIN, 128, true),
+            Some(i128::MIN),
+            "the complete signed-128 minimum pattern is representable",
+        );
+        assert_eq!(
+            machine_unsigned_literal_pattern(u128::MAX, 128, false),
+            Some(-1),
+            "the unsigned-128 high half uses the signed carrier without losing bits",
+        );
     }
 
     #[test]
@@ -4979,10 +7040,8 @@ mod tests {
         // invariant is unchanged and pinned structurally: the row must carry
         // NO mathematical-integer arithmetic (the `Int` tautology reading that
         // would have PROVED the false clause) and must wrap at width 8.
-        let post_rows: Vec<_> = post_vcs
-            .iter()
-            .filter(|vc| matches!(vc.kind, VcKind::Postcondition))
-            .collect();
+        let post_rows: Vec<_> =
+            post_vcs.iter().filter(|vc| matches!(vc.kind, VcKind::Postcondition)).collect();
         assert_eq!(
             post_rows.len(),
             1,

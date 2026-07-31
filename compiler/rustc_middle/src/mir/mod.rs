@@ -48,10 +48,10 @@ mod query;
 mod statement;
 mod syntax;
 mod terminator;
+pub mod traversal;
 pub mod trust_contract;
 pub mod trust_proof;
 pub mod trust_proof_item;
-pub mod traversal;
 pub mod visit;
 
 pub use consts::*;
@@ -900,6 +900,13 @@ pub enum LocalKind {
 
 #[derive(Clone, Debug, TyEncodable, TyDecodable, StableHash)]
 pub struct VarBindingForm<'tcx> {
+    /// Compiler-owned HIR-local identity for this source binding.
+    ///
+    /// Trust retains this identity in a compact runtime-MIR carrier for
+    /// functions with first-class loop contracts. It is independent of
+    /// optional `var_debug_info`, so certified monitor placement remains exact
+    /// under `-Cdebuginfo=0` and source-name shadowing.
+    pub binding_hir_local_id: hir::ItemLocalId,
     /// Is variable bound via `x`, `mut x`, `ref x`, `ref mut x`, `mut ref x`, or `mut ref mut x`?
     pub binding_mode: BindingMode,
     /// If an explicit type was provided for this variable binding,
@@ -1081,6 +1088,11 @@ pub enum LocalInfo<'tcx> {
     /// warnings/errors when compiling the current crate, and therefore it need
     /// not be visible across crates.
     User(BindingForm<'tcx>),
+    /// Compact source-binding provenance retained in optimized MIR only for a
+    /// body with first-class Trust loop contracts. Runtime cleanup replaces a
+    /// `User(Var(..))` row with this carrier before discarding diagnostic-only
+    /// binding data. It never crosses crate boundaries.
+    TrustSourceBinding { hir_local_id: u32 },
     /// A temporary created that references the static with the given `DefId`.
     StaticRef { def_id: DefId, is_thread_local: bool },
     /// A temporary created that references the const with the given `DefId`
@@ -1169,12 +1181,17 @@ impl<'tcx> LocalDecl<'tcx> {
         }
     }
 
-    /// Returns `true` if this is a DerefTemp
+    /// Returns `true` if this is a `DerefTemp`.
+    ///
+    /// Runtime and cross-crate MIR may have cleared `local_info`. The required
+    /// `EraseDerefTemps` pass runs before runtime cleanup clears that metadata,
+    /// so `Clear` cannot denote a surviving deref temp and must return `false`
+    /// rather than using the crate-local-only accessor and ICEing.
     pub fn is_deref_temp(&self) -> bool {
-        match self.local_info() {
-            LocalInfo::DerefTemp => true,
-            _ => false,
-        }
+        matches!(
+            &self.local_info,
+            ClearCrossCrate::Set(info) if matches!(&**info, LocalInfo::DerefTemp)
+        )
     }
 
     /// Returns `true` is the local is from a compiler desugaring, e.g.,
@@ -1501,6 +1518,13 @@ pub struct SourceScopeData<'tcx> {
 pub struct SourceScopeLocalData {
     /// An `HirId` with lint levels equivalent to this scope's lint levels.
     pub lint_root: HirId,
+    /// Nearest source loop expression whose MIR is being built in this scope.
+    ///
+    /// Trust uses this crate-local identity to bind first-class E4/E5 clauses
+    /// to dominator-proved MIR headers. Unlike `lint_root`, this is populated
+    /// even without `-Zmaximal-hir-to-mir-coverage`; nested loops override it
+    /// and ordinary descendant scopes inherit it.
+    pub trust_loop_hir_local_id: Option<hir::ItemLocalId>,
 }
 
 /// A collection of projections into user types.
@@ -1735,7 +1759,7 @@ mod size_asserts {
     // tidy-alphabetical-start
     static_assert_size!(BasicBlockData<'_>, 160);
     static_assert_size!(LocalDecl<'_>, 40);
-    static_assert_size!(SourceScopeData<'_>, 64);
+    static_assert_size!(SourceScopeData<'_>, 72);
     static_assert_size!(Statement<'_>, 56);
     static_assert_size!(Terminator<'_>, 104);
     static_assert_size!(VarDebugInfo<'_>, 88);

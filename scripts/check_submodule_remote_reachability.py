@@ -2,10 +2,17 @@
 """Fail-closed check for parent-pinned submodule commit reachability.
 
 This release gate verifies that each commit recorded by the parent checkout's
-submodule gitlinks is contained in at least one fetched remote-tracking ref in
-the corresponding submodule. It does not fetch or push. If a parent points at a
-local-only submodule commit, a fresh recursive clone may fail to reproduce that
-pin; this script reports that condition and exits non-zero.
+submodule gitlinks is contained in at least one fetched remote-tracking branch
+or durable ``refs/pins/<sha>`` archival ref in the corresponding submodule. It
+does not fetch or push. If a parent points at a local-only submodule commit, a
+fresh recursive clone may fail to reproduce that pin; this script reports that
+condition and exits non-zero.
+
+``refs/pins/*`` is the repository's branch-free retention namespace. The
+historical-pin audit fetches that namespace explicitly and anchors orphaned
+commits there, so a server-side garbage collection cannot destroy a published
+superproject pin. Suggesting that an old detached commit be pushed to ``main``
+would overwrite the release branch and is never an acceptable repair.
 """
 
 from __future__ import annotations
@@ -172,20 +179,17 @@ def remote_url(path: Path, remote: str) -> str:
     return result.stdout.strip()
 
 
-def default_remote_branch(path: Path, remote: str) -> str:
-    result = run_git(path, ["symbolic-ref", "--quiet", f"refs/remotes/{remote}/HEAD"], check=False)
-    if result.returncode == 0:
-        ref = result.stdout.strip()
-        prefix = f"refs/remotes/{remote}/"
-        if ref.startswith(prefix):
-            return ref[len(prefix) :]
-    return "main"
-
-
-def remote_refs_containing(path: Path, sha: str) -> tuple[str, ...]:
+def durable_refs_containing(path: Path, sha: str) -> tuple[str, ...]:
     result = run_git(
         path,
-        ["for-each-ref", "--contains", sha, "--format=%(refname:short)", "refs/remotes"],
+        [
+            "for-each-ref",
+            "--contains",
+            sha,
+            "--format=%(refname:short)",
+            "refs/remotes",
+            "refs/pins",
+        ],
         check=False,
     )
     if result.returncode != 0:
@@ -197,16 +201,20 @@ def shell_join(parts: Iterable[str]) -> str:
     return " ".join(shlex.quote(part) for part in parts)
 
 
-def publish_command(path: str, remote: str, sha: str, branch: str) -> str:
-    return shell_join(["git", "-C", path, "push", remote, f"{sha}:refs/heads/{branch}"])
+def pin_ref(sha: str) -> str:
+    return f"refs/pins/{sha}"
+
+
+def publish_command(path: str, remote: str, sha: str) -> str:
+    return shell_join(["git", "-C", path, "push", remote, f"{sha}:{pin_ref(sha)}"])
 
 
 def check_pin(repo_root: Path, pin: SubmodulePin) -> PinCheck:
     submodule_path = repo_root / pin.path
     remote = preferred_remote(submodule_path) if submodule_path.exists() else DEFAULT_REMOTE
     url = remote_url(submodule_path, remote) if submodule_path.exists() else ""
-    branch = default_remote_branch(submodule_path, remote) if submodule_path.exists() else "main"
-    command = publish_command(pin.path, remote, pin.sha, branch)
+    publish_ref = pin_ref(pin.sha)
+    command = publish_command(pin.path, remote, pin.sha)
 
     if not submodule_path.exists():
         return PinCheck(
@@ -215,7 +223,7 @@ def check_pin(repo_root: Path, pin: SubmodulePin) -> PinCheck:
             status="missing-submodule-worktree",
             remote=remote,
             remote_url=url,
-            publish_ref=f"refs/heads/{branch}",
+            publish_ref=publish_ref,
             suggested_command=shell_join(
                 [
                     "python3",
@@ -234,7 +242,7 @@ def check_pin(repo_root: Path, pin: SubmodulePin) -> PinCheck:
             status="uninitialized-submodule",
             remote=remote,
             remote_url=url,
-            publish_ref=f"refs/heads/{branch}",
+            publish_ref=publish_ref,
             suggested_command=shell_join(
                 [
                     "python3",
@@ -258,13 +266,13 @@ def check_pin(repo_root: Path, pin: SubmodulePin) -> PinCheck:
             status="missing-commit-object",
             remote=remote,
             remote_url=url,
-            publish_ref=f"refs/heads/{branch}",
+            publish_ref=publish_ref,
             suggested_command=shell_join(["git", "-C", pin.path, "fetch", "--all", "--tags", "--prune"]),
             detail="pinned commit object is not present in the initialized submodule",
         )
 
     try:
-        refs = remote_refs_containing(submodule_path, pin.sha)
+        refs = durable_refs_containing(submodule_path, pin.sha)
     except GitError as error:
         return PinCheck(
             path=pin.path,
@@ -272,7 +280,7 @@ def check_pin(repo_root: Path, pin: SubmodulePin) -> PinCheck:
             status="remote-reachability-error",
             remote=remote,
             remote_url=url,
-            publish_ref=f"refs/heads/{branch}",
+            publish_ref=publish_ref,
             suggested_command=command,
             detail=str(error),
         )
@@ -293,9 +301,9 @@ def check_pin(repo_root: Path, pin: SubmodulePin) -> PinCheck:
         status="not-reachable-from-fetched-remotes",
         remote=remote,
         remote_url=url,
-        publish_ref=f"refs/heads/{branch}",
+        publish_ref=publish_ref,
         suggested_command=command,
-        detail="pinned commit is present locally but not contained in refs/remotes/*",
+        detail="pinned commit is present locally but not contained in refs/remotes/* or refs/pins/*",
     )
 
 
@@ -322,11 +330,15 @@ def render_text(result: AuditResult) -> str:
     )
 
     if result.ok:
-        lines.append("PASS: every parent-pinned submodule commit is reachable from fetched remote refs")
+        lines.append(
+            "PASS: every parent-pinned submodule commit is reachable from fetched "
+            "remote branches or durable pin refs"
+        )
         return "\n".join(lines)
 
     lines.append(
-        "FAIL: parent-pinned submodule commit(s) are not reproducible from fetched remote refs"
+        "FAIL: parent-pinned submodule commit(s) are not reproducible from fetched "
+        "remote branches or durable pin refs"
     )
     for check in result.failed:
         lines.append("")
@@ -384,20 +396,40 @@ def assert_self_check_case(
     result: AuditResult,
     expected_status: str,
     expected_ok: bool,
+    expected_publish_ref: str | None = None,
+    expected_ref_prefix: str | None = None,
 ) -> None:
     observed_statuses = [pin.status for pin in result.pins]
+    only_pin = result.pins[0] if len(result.pins) == 1 else None
+    publish_ref_matches = (
+        expected_publish_ref is None
+        or (only_pin is not None and only_pin.publish_ref == expected_publish_ref)
+    )
+    containing_ref_matches = (
+        expected_ref_prefix is None
+        or (
+            only_pin is not None
+            and any(ref.startswith(expected_ref_prefix) for ref in only_pin.remote_refs)
+        )
+    )
     passed = (
         len(result.pins) == 1
         and observed_statuses == [expected_status]
         and result.ok is expected_ok
+        and publish_ref_matches
+        and containing_ref_matches
     )
     cases.append(
         {
             "name": name,
             "expected_status": expected_status,
             "expected_ok": expected_ok,
+            "expected_publish_ref": expected_publish_ref,
+            "expected_ref_prefix": expected_ref_prefix,
             "observed_statuses": observed_statuses,
             "observed_ok": result.ok,
+            "observed_publish_ref": only_pin.publish_ref if only_pin is not None else None,
+            "observed_remote_refs": list(only_pin.remote_refs) if only_pin is not None else [],
             "passed": passed,
             "pins": [pin.as_dict() for pin in result.pins],
         }
@@ -455,6 +487,22 @@ def self_check(*, json_output: bool = False) -> int:
             result=unreachable,
             expected_status="not-reachable-from-fetched-remotes",
             expected_ok=False,
+            expected_publish_ref=pin_ref(
+                run_git(submodule, ["rev-parse", "HEAD"]).stdout.strip()
+            ),
+        )
+
+        pinned_sha = run_git(submodule, ["rev-parse", "HEAD"]).stdout.strip()
+        self_git(submodule, ["push", "origin", f"{pinned_sha}:{pin_ref(pinned_sha)}"])
+        self_git(submodule, ["fetch", "origin", f"+{pin_ref(pinned_sha)}:{pin_ref(pinned_sha)}"])
+        pinned = audit(super_repo)
+        assert_self_check_case(
+            cases=cases,
+            name="branch-free durable pin ref",
+            result=pinned,
+            expected_status="reachable",
+            expected_ok=True,
+            expected_ref_prefix="pins/",
         )
 
         missing_object_sha = "1" * 40
@@ -501,7 +549,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         prog="targo trust repo submodule-reachability",
         description=(
             "Fail closed when parent-pinned submodule commits are not contained "
-            "in fetched refs/remotes/*."
+            "in fetched refs/remotes/* or durable refs/pins/*."
         )
     )
     parser.add_argument(

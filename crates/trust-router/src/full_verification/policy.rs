@@ -10,7 +10,10 @@ pub const TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY: &str = "trust.trust_ir.
 pub const TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY: &str =
     "trust.trust_ir.native.verifier_suite";
 
-pub(crate) const TRUST_VC_HARDENED_NAMESPACE: &str = "trust.vc.hardened";
+// The privileged namespace is ALIASED from the crate that owns the vocabulary,
+// never re-declared: a local spelling could drift from the admitted list and
+// silently split the hardened lane in two.
+pub(crate) use trust_verifier_api::TRUST_VC_HARDENED_OBLIGATION_NAMESPACE as TRUST_VC_HARDENED_NAMESPACE;
 pub(crate) const TRUST_VC_HARDENED_WILDCARD: &str = "*";
 
 /// Full-verification execution policy.

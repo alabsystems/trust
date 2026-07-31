@@ -4323,6 +4323,7 @@ mod aggregate_projection_tests {
                         name: "UnionLike".into(),
                         variant: 0,
                         active_field: Some(1),
+                        args: None,
                     },
                     vec![Operand::Constant(ConstValue::Int(7))],
                 ),
@@ -4494,7 +4495,12 @@ mod aggregate_projection_tests {
             vec![Statement::Assign {
                 place: Place::local(1),
                 rvalue: Rvalue::Aggregate(
-                    AggregateKind::Adt { name: "OptionI32".into(), variant: 0, active_field: None },
+                    AggregateKind::Adt {
+                        name: "OptionI32".into(),
+                        variant: 0,
+                        active_field: None,
+                        args: None,
+                    },
                     vec![],
                 ),
                 span: SourceSpan::default(),

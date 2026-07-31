@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+#[path = "support/fake_trustd.rs"]
+mod fake_trustd;
 #[path = "support/publication_transport.rs"]
 mod publication_transport;
 
@@ -172,6 +174,7 @@ fn run_focused_check_inner(
     let targo_trust = install_targo_trust_binary(&bin_dir);
     write_executable(&bin_dir.join("trustc"), fake_trustc_script());
     write_executable(&bin_dir.join("targo"), &fake_targo_script(target_outcome, !block_report_dir));
+    let _trustd = fake_trustd::install(&bin_dir);
     let report_dir = temp.path().join("focused-report");
     if block_report_dir {
         fs::write(&report_dir, "not a directory").expect("block report-dir with a file");

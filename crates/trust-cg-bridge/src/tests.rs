@@ -2243,7 +2243,7 @@ fn test_lower_aggregate_adt() {
                 stmts: vec![Statement::Assign {
                     place: Place::local(3),
                     rvalue: Rvalue::Aggregate(
-                        AggregateKind::Adt { name: "Point".into(), variant: 0, active_field: None },
+                        AggregateKind::Adt { name: "Point".into(), variant: 0, active_field: None, args: None },
                         vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
                     ),
                     span: SourceSpan::default(),
@@ -2305,6 +2305,7 @@ fn test_lower_aggregate_adt_enum_variant_writes_discriminant() {
                             name: "Option".into(),
                             variant: 1, // Some
                             active_field: None,
+                            args: None,
                         },
                         vec![Operand::Copy(Place::local(1))],
                     ),
@@ -2377,6 +2378,7 @@ fn test_lower_aggregate_adt_none_variant_no_data() {
                             name: "Option".into(),
                             variant: 0, // None
                             active_field: None,
+                            args: None,
                         },
                         vec![], // no data fields
                     ),
@@ -2434,6 +2436,7 @@ fn test_lower_fieldless_option_some_fails_closed() {
                             name: "core::option::Option".into(),
                             variant: 1,
                             active_field: None,
+                            args: None,
                         },
                         vec![Operand::Copy(Place::local(1))],
                     ),
@@ -2493,6 +2496,7 @@ fn test_lower_checked_div_like_fieldless_option_fails_closed() {
                                 name: "core::option::Option".into(),
                                 variant: 0,
                                 active_field: None,
+                                args: None,
                             },
                             vec![],
                         ),
@@ -2509,6 +2513,7 @@ fn test_lower_checked_div_like_fieldless_option_fails_closed() {
                                 name: "core::option::Option".into(),
                                 variant: 1,
                                 active_field: None,
+                                args: None,
                             },
                             vec![Operand::Copy(Place::local(1))],
                         ),
@@ -2553,7 +2558,7 @@ fn test_emit_object_struct_return_after_aggregate_construction() {
                 stmts: vec![Statement::Assign {
                     place: Place::local(0),
                     rvalue: Rvalue::Aggregate(
-                        AggregateKind::Adt { name: "Pair".into(), variant: 0, active_field: None },
+                        AggregateKind::Adt { name: "Pair".into(), variant: 0, active_field: None, args: None },
                         vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
                     ),
                     span: SourceSpan::default(),
@@ -4749,6 +4754,7 @@ fn test_lower_nested_aggregate_struct_containing_tuple() {
                             name: "Wrapper".to_string(),
                             variant: 0,
                             active_field: None,
+                            args: None,
                         },
                         vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
                     ),
@@ -7043,6 +7049,7 @@ fn test_edge_case_aggregate_construction_adt() {
                             name: "MyStruct".to_string(),
                             variant: 0,
                             active_field: None,
+                            args: None,
                         },
                         vec![
                             Operand::Constant(ConstValue::Int(10)),

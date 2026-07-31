@@ -26,8 +26,9 @@ use arg_file_command::ArgFileCommand;
 use shared_helpers::{
     activate_cargo_test_shim_environment, cargo_test_no_verify_requested,
     compile_uses_trust_bootstrap_no_verify, dylib_path, dylib_path_var, exe, expand_rustc_argfiles,
-    finalize_trust_no_verify, maybe_dump, parse_rustc_stage, parse_rustc_verbose,
-    parse_value_from_args, strip_trust_no_verify, trust_bootstrap_shim_marker_enabled,
+    finalize_trust_no_verify, finalize_trust_no_verify_snapshot, maybe_dump, parse_rustc_stage,
+    parse_rustc_verbose, parse_value_from_args, strip_trust_no_verify,
+    trust_bootstrap_shim_marker_enabled,
 };
 
 #[path = "../utils/shared_helpers.rs"]
@@ -146,6 +147,8 @@ fn main() {
         rustc_driver_supports_trust_no_verify(&rustc_driver);
     let targeted_rustc_supports_trust_no_verify =
         targeted_rustc_supports_trust_no_verify(&rustc_driver);
+    // Computed here, before `rustc_driver` moves into the command builder.
+    let targeted_rustc_is_snapshot = targeted_rustc_is_stage0_snapshot(&rustc_driver);
 
     // Trust: enforce the driver-capability invariant before forwarding args — a
     // driver that cannot parse `-Ztrust-verify=off` must never receive it. See
@@ -326,12 +329,27 @@ fn main() {
     // Keep the fixture/build environment byte-for-byte intact (notably
     // `TRUST_NO_VERIFY` itself), but enforce capability and canonical
     // last-value-wins semantics after every argv- and environment-derived
-    // option has been assembled.
-    finalize_trust_no_verify(
-        cmd.args_mut(),
-        targeted_rustc_supports_trust_no_verify,
-        bootstrap_no_verify_applies,
-    );
+    // option has been assembled. A stage0 SNAPSHOT is the exception: its
+    // vintage is the seed pin's, not this source tree's, so it is addressed
+    // through the version-invariant env transport rather than an argv
+    // spelling it may not parse — the pinned seed predates the
+    // `-Ztrust-verify=off` rename, and handing it the new spelling aborted
+    // every fresh-machine build at the first build script.
+    if targeted_rustc_is_snapshot {
+        if finalize_trust_no_verify_snapshot(
+            cmd.args_mut(),
+            targeted_rustc_supports_trust_no_verify,
+            bootstrap_no_verify_applies,
+        ) {
+            cmd.env("TRUST_NO_VERIFY", "1");
+        }
+    } else {
+        finalize_trust_no_verify(
+            cmd.args_mut(),
+            targeted_rustc_supports_trust_no_verify,
+            bootstrap_no_verify_applies,
+        );
+    }
 
     let is_test = args.iter().any(|a| a == "--test");
     if verbose > 2 {
@@ -514,11 +532,28 @@ fn rustc_driver_supports_trust_no_verify(rustc_driver: &OsString) -> bool {
         })
 }
 
+// Trust: a SNAPSHOT driver is anything under a `stage0` directory — that
+// directory is definitionally the SEED, whose vintage is the seed pin's, not
+// this source tree's. The seed ships its driver under BOTH names (`rustc` is
+// a launcher for its `trustc`), so the stem carries no vintage information
+// here: an earlier stem-based exemption classified the seed's `trustc` as
+// in-tree and handed it the current argv spelling, which the pre-rename seed
+// rejected at the first build script. In-tree drivers live in stage1+ (or
+// outside the build dir entirely) and their vintage matches this shim's own
+// source by construction; see `finalize_trust_no_verify_snapshot` for why a
+// snapshot gets the env transport instead of an argv flag.
+fn targeted_rustc_is_stage0_snapshot(rustc_driver: &OsString) -> bool {
+    Path::new(rustc_driver)
+        .components()
+        .any(|component| component.as_os_str().to_str() == Some("stage0"))
+}
+
 // Trust: targeted compiles may run on the stage0 snapshot (e.g. stage0 -> stage1
 // compiler artifacts). A bootstrap-managed snapshot (under `build/<triple>/stage0/`)
-// or a `trustc`-named driver is Trust-native and understands the flag; a
-// bring-your-own stage0 (e.g. `/opt/homebrew/bin/rustc`) is stock upstream and
-// does not.
+// or a `trustc`-named driver is Trust-native and understands the off-switch
+// CONCEPT; whether it parses the current argv SPELLING is a vintage question —
+// see `targeted_rustc_is_stage0_snapshot`. A bring-your-own stage0
+// (e.g. `/opt/homebrew/bin/rustc`) is stock upstream and has neither.
 fn targeted_rustc_supports_trust_no_verify(rustc_driver: &OsString) -> bool {
     let path = Path::new(rustc_driver);
     path.file_stem().and_then(|stem| stem.to_str()) == Some("trustc")

@@ -6591,6 +6591,7 @@ fn fieldless_enum_reassignment_function(faithful: bool) -> VerifiableFunction {
                 name: "test::FieldlessReassignment".into(),
                 variant: index,
                 active_field: None,
+                args: None,
             },
             vec![],
         ),
@@ -8652,6 +8653,7 @@ fn test_lower_tagged_option_none_aggregate_sets_false_tag() {
                             name: "std::option::Option".into(),
                             variant: 0,
                             active_field: None,
+                            args: None,
                         },
                         vec![],
                     ),
@@ -8709,6 +8711,7 @@ fn test_lower_tagged_option_some_aggregate_sets_payload_and_true_tag() {
                             name: "std::option::Option".into(),
                             variant: 1,
                             active_field: None,
+                            args: None,
                         },
                         vec![Operand::Constant(ConstValue::Int(7))],
                     ),
@@ -8770,6 +8773,7 @@ fn test_lower_tagged_option_some_symbolic_payload_sets_tag() {
                             name: "std::option::Option".into(),
                             variant: 1,
                             active_field: None,
+                            args: None,
                         },
                         vec![Operand::Symbolic(Formula::Var("payload".into(), Sort::BitVec(32)))],
                     ),
@@ -9776,6 +9780,7 @@ fn test_lower_enum_aggregate_with_datatype_payload_field() {
                             name: "std::result::Result".into(),
                             variant: 1,
                             active_field: None,
+                            args: None,
                         },
                         vec![Operand::Move(Place::local(1))],
                     ),
@@ -9811,6 +9816,26 @@ fn test_lower_enum_aggregate_with_datatype_payload_field() {
 // ---------------------------------------------------------------------------
 
 fn typed_absent_call(func: &str, arg_tys: Vec<Ty>, dest_ty: Ty) -> VerifiableFunction {
+    typed_absent_call_with_metadata(
+        func,
+        arg_tys,
+        dest_ty,
+        false,
+        false,
+        Some(BlockId(1)),
+        None,
+    )
+}
+
+fn typed_absent_call_with_metadata(
+    func: &str,
+    arg_tys: Vec<Ty>,
+    dest_ty: Ty,
+    is_unsafe_sig: bool,
+    is_foreign: bool,
+    target: Option<BlockId>,
+    atomic: Option<AtomicOperation>,
+) -> VerifiableFunction {
     let mut locals = vec![LocalDecl { index: 0, ty: dest_ty.clone(), name: None }];
     let mut args = Vec::with_capacity(arg_tys.len());
     for (offset, ty) in arg_tys.into_iter().enumerate() {
@@ -9831,14 +9856,14 @@ fn typed_absent_call(func: &str, arg_tys: Vec<Ty>, dest_ty: Ty) -> VerifiableFun
                     stmts: vec![],
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
-                        is_unsafe_sig: false,
-                        is_foreign: false,
+                        is_unsafe_sig,
+                        is_foreign,
                         func: func.into(),
                         args,
                         dest: Place::local(0),
-                        target: Some(BlockId(1)),
+                        target,
                         span: SourceSpan::default(),
-                        atomic: None,
+                        atomic,
                     },
                 },
                 TrustBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
@@ -9959,7 +9984,11 @@ fn test_string_markers_and_capacity_growth_never_grant_totality() {
 fn test_primitive_num_gates_require_exact_library_paths() {
     for (callee, args, dest) in [
         ("core::num::<impl u64>::count_ones", vec![Ty::u64()], Ty::u32()),
-        ("core::num::<impl u64>::wrapping_add", vec![Ty::u64(), Ty::u64()], Ty::u64()),
+        (
+            "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add",
+            vec![Ty::u64(), Ty::u64()],
+            Ty::u64(),
+        ),
     ] {
         let module = lower_to_trust_ir(&typed_absent_call(callee, args, dest))
             .unwrap_or_else(|error| panic!("exact primitive method must lower: {error:?}"));
@@ -9972,7 +10001,18 @@ fn test_primitive_num_gates_require_exact_library_paths() {
     for (callee, args, dest) in [
         ("my_crate::core::num::count_ones", vec![Ty::u64()], Ty::u32()),
         ("core::hostile::num::count_ones", vec![Ty::u64()], Ty::u32()),
+        ("core::num::<impl u64>::wrapping_add", vec![Ty::u64(), Ty::u64()], Ty::u64()),
         ("core::hostile::num::wrapping_add", vec![Ty::u64(), Ty::u64()], Ty::u64()),
+        (
+            "@trust-rustc-total-primitive-method::core::num::<impl u32>::wrapping_add",
+            vec![Ty::u64(), Ty::u64()],
+            Ty::u64(),
+        ),
+        (
+            "@trust-rustc-total-primitive-method::core::num::<impl u128>::wrapping_add",
+            vec![Ty::u128(), Ty::u128()],
+            Ty::u128(),
+        ),
     ] {
         let module =
             lower_to_trust_ir(&typed_absent_call(callee, args, dest)).unwrap_or_else(|error| {
@@ -9983,6 +10023,217 @@ fn test_primitive_num_gates_require_exact_library_paths() {
             "same-tail path must not gain primitive summary authority: {callee}"
         );
     }
+}
+
+fn assert_single_wrapping_binop(
+    module: &trust_ir::Module,
+    expected_op: TrustIrBinOp,
+    expected_ty: TrustIrTy,
+) {
+    assert_valid_module(module);
+    let wrapping: Vec<_> = module
+        .functions
+        .iter()
+        .flat_map(|function| function.blocks.iter())
+        .flat_map(|block| block.body.iter())
+        .filter(|node| node.proofs.contains(&trust_ir::ProofAnnotation::Wrapping))
+        .collect();
+    assert_eq!(wrapping.len(), 1, "expected exactly one wrapping-certified instruction");
+    assert!(
+        matches!(
+            &wrapping[0].inst,
+            Inst::BinOp { op, ty, .. } if op == &expected_op && ty == &expected_ty
+        ),
+        "wrapping certificate must decorate the expected modular BinOp: {:?}",
+        wrapping[0]
+    );
+    assert!(
+        !has_absent_callee_panic_obligation(module),
+        "an authenticated wrapping call must not retain an absent-callee panic obligation"
+    );
+}
+
+fn wrapping_call_with_int_rhs(callee: &str, ty: Ty, rhs: i128) -> VerifiableFunction {
+    let mut function = typed_absent_call(callee, vec![ty.clone()], ty);
+    let Terminator::Call { args, .. } = &mut function.body.blocks[0].terminator else {
+        unreachable!("typed_absent_call always constructs a call terminator");
+    };
+    args.push(Operand::Constant(ConstValue::Int(rhs)));
+    function
+}
+
+fn wrapping_call_with_uint_rhs(
+    callee: &str,
+    ty: Ty,
+    rhs: u128,
+    encoded_width: u32,
+) -> VerifiableFunction {
+    let mut function = typed_absent_call(callee, vec![ty.clone()], ty);
+    let Terminator::Call { args, .. } = &mut function.body.blocks[0].terminator else {
+        unreachable!("typed_absent_call always constructs a call terminator");
+    };
+    args.push(Operand::Constant(ConstValue::Uint(rhs, encoded_width)));
+    function
+}
+
+#[test]
+fn test_wrapping_refutation_markers_lower_signed_and_pointer_sized_binops() {
+    let signed = lower_to_trust_ir(&typed_absent_call(
+        "@trust-rustc-wrapping-refutation-method::core::num::<impl i32>::wrapping_sub",
+        vec![Ty::i32(), Ty::i32()],
+        Ty::i32(),
+    ))
+    .expect("authenticated i32 wrapping_sub must lower");
+    assert_single_wrapping_binop(&signed, TrustIrBinOp::Sub, TrustIrTy::I32);
+
+    let signed_literal = lower_to_trust_ir(&wrapping_call_with_int_rhs(
+        "@trust-rustc-wrapping-refutation-method::core::num::<impl i32>::wrapping_add",
+        Ty::i32(),
+        1,
+    ))
+    .expect("authenticated i32 wrapping_add with a representable literal must lower");
+    assert_single_wrapping_binop(&signed_literal, TrustIrBinOp::Add, TrustIrTy::I32);
+
+    let faithful_usize = Ty::PtrSizedInt { signed: false };
+    let pointer_sized = lower_to_trust_ir(&typed_absent_call(
+        "@trust-rustc-wrapping-refutation-method::core::num::<impl usize>::wrapping_add",
+        vec![faithful_usize.clone(), faithful_usize.clone()],
+        faithful_usize,
+    ))
+    .expect("authenticated faithful usize wrapping_add must lower");
+    assert_single_wrapping_binop(&pointer_sized, TrustIrBinOp::Add, TrustIrTy::Usize);
+
+    let legacy_pointer_sized = lower_to_trust_ir(&typed_absent_call(
+        "@trust-rustc-wrapping-refutation-method::core::num::<impl usize>::wrapping_add",
+        vec![Ty::usize(), Ty::usize()],
+        Ty::usize(),
+    ))
+    .expect("authenticated legacy usize wrapping_add must lower");
+    assert_single_wrapping_binop(&legacy_pointer_sized, TrustIrBinOp::Add, TrustIrTy::U64);
+}
+
+fn assert_wrapping_call_fails_closed(function: VerifiableFunction, label: &str) {
+    match lower_to_trust_ir(&function) {
+        Ok(module) => {
+            assert!(
+                module
+                    .functions
+                    .iter()
+                    .flat_map(|function| function.blocks.iter())
+                    .flat_map(|block| block.body.iter())
+                    .all(|node| {
+                        !matches!(&node.inst, Inst::BinOp { .. })
+                            && !node.proofs.contains(&trust_ir::ProofAnnotation::Wrapping)
+                    }),
+                "{label} must not inherit modular BinOp authority"
+            );
+            assert!(
+                has_absent_callee_panic_obligation(&module),
+                "{label} must retain the fail-closed absent-callee panic obligation"
+            );
+        }
+        Err(_) => {
+            // A hard lowering refusal is also fail-closed. Atomic metadata uses
+            // this lane because its source-string reconstruction is quarantined.
+        }
+    }
+}
+
+#[test]
+fn test_wrapping_refutation_marker_metadata_and_shape_fail_closed() {
+    const I32_ADD: &str =
+        "@trust-rustc-wrapping-refutation-method::core::num::<impl i32>::wrapping_add";
+    const U64_ADD: &str =
+        "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add";
+    let i32_args = || vec![Ty::i32(), Ty::i32()];
+
+    assert_wrapping_call_fails_closed(
+        typed_absent_call(
+            "@trust-rustc-wrapping-refutation-method::core::num::<impl i32>::wrapping_add::suffix",
+            i32_args(),
+            Ty::i32(),
+        ),
+        "malformed marker",
+    );
+    assert_wrapping_call_fails_closed(
+        typed_absent_call(I32_ADD, vec![Ty::u32(), Ty::u32()], Ty::u32()),
+        "carrier-mismatched marker",
+    );
+    assert_wrapping_call_fails_closed(
+        wrapping_call_with_int_rhs(
+            "@trust-rustc-wrapping-refutation-method::core::num::<impl i8>::wrapping_add",
+            Ty::i8(),
+            128,
+        ),
+        "unrepresentable narrow literal",
+    );
+    assert_wrapping_call_fails_closed(
+        wrapping_call_with_uint_rhs(U64_ADD, Ty::u64(), 1, 32),
+        "unsigned literal whose encoded width disagrees with the marker",
+    );
+    assert_wrapping_call_fails_closed(
+        wrapping_call_with_int_rhs(U64_ADD, Ty::u64(), 1),
+        "signed literal spelling under an unsigned marker",
+    );
+    assert_wrapping_call_fails_closed(
+        wrapping_call_with_uint_rhs(I32_ADD, Ty::i32(), 1, 32),
+        "unsigned literal spelling under a signed marker",
+    );
+    assert_wrapping_call_fails_closed(
+        typed_absent_call_with_metadata(
+            I32_ADD,
+            i32_args(),
+            Ty::i32(),
+            true,
+            false,
+            Some(BlockId(1)),
+            None,
+        ),
+        "unsafe call metadata",
+    );
+    assert_wrapping_call_fails_closed(
+        typed_absent_call_with_metadata(
+            I32_ADD,
+            i32_args(),
+            Ty::i32(),
+            false,
+            true,
+            Some(BlockId(1)),
+            None,
+        ),
+        "foreign call metadata",
+    );
+    assert_wrapping_call_fails_closed(
+        typed_absent_call_with_metadata(
+            I32_ADD,
+            i32_args(),
+            Ty::i32(),
+            false,
+            false,
+            None,
+            None,
+        ),
+        "missing normal-return target",
+    );
+    assert_wrapping_call_fails_closed(
+        typed_absent_call_with_metadata(
+            I32_ADD,
+            i32_args(),
+            Ty::i32(),
+            false,
+            false,
+            Some(BlockId(1)),
+            Some(AtomicOperation {
+                place: Place::local(1),
+                dest: Some(Place::local(0)),
+                op_kind: AtomicOpKind::FetchAdd,
+                ordering: AtomicOrdering::SeqCst,
+                failure_ordering: None,
+                span: SourceSpan::default(),
+            }),
+        ),
+        "atomic call metadata",
+    );
 }
 
 /// `u32::try_from(u64)` via the type-erased trait spelling: the TYPED gate
@@ -10689,6 +10940,7 @@ fn test_marked_str_range_index_keeps_gap3_recognition() {
                                 name: "std::ops::RangeFrom".to_string(),
                                 variant: 0,
                                 active_field: None,
+                                args: None,
                             },
                             vec![Operand::Copy(Place::local(2))],
                         ),
@@ -11850,6 +12102,7 @@ fn test_f8_ratio_new_iszero_guard_real_mir_shape_keeps_blanket_fail_closed() {
                                 name: "core::option::Option".into(),
                                 variant: 0,
                                 active_field: None,
+                                args: None,
                             },
                             vec![],
                         ),
@@ -11897,6 +12150,7 @@ fn test_f8_ratio_new_iszero_guard_real_mir_shape_keeps_blanket_fail_closed() {
                                 name: "core::option::Option".into(),
                                 variant: 1,
                                 active_field: None,
+                                args: None,
                             },
                             vec![Operand::Move(Place::local(5))],
                         ),

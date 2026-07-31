@@ -4,20 +4,23 @@
 
 """E6/E9 fragment probe — what the two-language surface actually admits.
 
-Each probe is a four-to-eight line program pairing a Rust function with a Clean
-island definition, written so that exactly one thing about it is interesting.
+Each probe is a focused program pairing a Rust function with a Clean island
+definition, written so that exactly one thing about it is interesting.
 The runner compiles each under `-Ztrust-verify=on` with the E6/E9 debug channels
 on, and records:
 
   * whether each function was ADMITTED into the kernel (E6), and as which shape;
-  * whether the uncited `ensures` DISCHARGED by definitional equality (E9).
+  * whether an `ensures` DISCHARGED by uncited definitional equality or a cited
+    theorem (E9).
 
-Why this exists: the E6 fragment is much narrower than the prose around it
-suggests, and the boundary is not where a reader would guess. Two of the five
-recognized body shapes are unreachable in practice, every constant-shaped probe
-fails, and `Select` discharges only when the island is written in the kernel's
-internal encoding rather than the way a person would write it. A prose
-description of that boundary goes stale silently; this matrix does not.
+Why this exists: the E6 fragment is narrower than the prose around it suggests,
+and the boundary is not where a reader would guess. Natural unsigned `Select`
+and the closed compiler-authenticated S3/S4 wrapping lane now discharge;
+exact certified-callee closure is live; a citation to a theorem in a DEFERRED
+island (one naming the `trust_import_*` namespace) discharges after the
+whole-crate mint; while every constant-shaped probe remains outside the working
+lane. A prose description of that boundary goes stale silently; this matrix does
+not.
 
 Usage:
     python3 tests/e6-fragment-probe/run.py
@@ -35,22 +38,49 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+
+def _trustc_cmd() -> list[str]:
+    """The trustc to measure.
+
+    Defaults to the rustup `trust` toolchain. `TRUST_PROBE_TRUSTC` overrides it
+    with an explicit binary, which is how an isolated worktree build gets
+    measured without repointing the toolchain a shared tree depends on.
+    """
+    explicit = os.environ.get("TRUST_PROBE_TRUSTC")
+    if explicit:
+        return [explicit]
+    rustup = Path.home() / ".cargo" / "bin" / "rustup"
+    return [str(rustup) if rustup.is_file() else "rustup", "run", "trust", "trustc"]
+
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent.parent
 PROBES = HERE / "probes"
 
-DIRECTIVE_RE = re.compile(r"^//@\s*(probe-[a-z-]+)\s*:\s*(.*?)\s*$", re.MULTILINE)
+# Horizontal whitespace only. `\s*` also consumes newlines, which made an empty
+# `probe-note:` absorb the next directive and corrupted the recorded matrix.
+DIRECTIVE_RE = re.compile(
+    r"^//@[ \t]*(probe-[a-z-]+)[ \t]*:[ \t]*(.*?)[ \t]*$", re.MULTILINE
+)
 E6_RE = re.compile(
     r"TRUST_E6_DEBUG fn=(?P<fn>\S+) admissible=(?P<adm>true|false).*?"
     r"recognize=(?P<shape>Some\([A-Za-z]+|None)"
 )
-E9_OK_RE = re.compile(r"TRUST_E9_DEBUG DEFEQ-DISCHARGED fn=(?P<fn>\S+)")
+# Three lanes discharge, and each prints its own marker: the uncited
+# definitional-equality lane prints `DEFEQ-DISCHARGED`, the in-walk cited lane
+# prints plain `DISCHARGED`, and the item-10 post-walk lane (a citation to a
+# theorem in a DEFERRED island) prints `POST-WALK-DISCHARGED`. Matching only some
+# of them silently UNDERSTATES the measured surface — which is how `d13`/`d14`
+# first read as `island-only` while the compiler was in fact publishing
+# `3 proved`. An understating instrument is less dangerous than a flattering one
+# and still wrong.
+E9_OK_RE = re.compile(r"TRUST_E9_DEBUG (?:DEFEQ-|POST-WALK-)?DISCHARGED fn=(?P<fn>\S+)")
 # The rejection line always carries fn=, but the verdict payload varies — some
 # arms have `detail: "..."`, others do not. Requiring `detail:` silently
 # reclassified genuine defeq rejections as "unproved", which is the flattering
@@ -72,7 +102,7 @@ def parse_directives(text: str) -> dict:
 def toolchain_stamp() -> dict:
     try:
         p = subprocess.run(
-            ["rustup", "run", "trust", "rustc", "-vV"],
+            [*_trustc_cmd(), "-vV"],
             capture_output=True, text=True, timeout=60, cwd=REPO_ROOT,
         )
         m = re.search(r"commit-hash:\s*([0-9a-f]+)", p.stdout)
@@ -100,6 +130,12 @@ def classify(stdout: str, stderr: str) -> tuple[str, str]:
     if "unexpectedly panicked" in out or "internal compiler error" in out:
         loc = re.search(r"panicked at ([^\n]+)", out)
         return "ice", loc.group(1) if loc else "compiler panic"
+    # A probe with no clause to discharge: what is under test is whether the
+    # ISLAND itself typechecks. Compiles clean and the kernel registered the
+    # declarations => the property holds.
+    if "Clean island kernel-checked" in out and not re.search(r"^error", out, re.MULTILINE):
+        if not E9_OK_RE.search(out) and not E9_NO_RE.search(out):
+            return "island-only", ""
     if E9_OK_RE.search(out):
         return "discharged", ""
     m = E9_NO_RE.search(out)
@@ -130,6 +166,12 @@ def classify(stdout: str, stderr: str) -> tuple[str, str]:
 def run_probe(path: Path, timeout: int) -> dict:
     text = path.read_text(encoding="utf-8")
     d = parse_directives(text)
+    extra_flags = shlex.split(d.get("probe-flags", ""))
+    if extra_flags not in ([], ["-O"]):
+        raise ValueError(
+            f"{path.name}: unsupported probe-flags {extra_flags!r}; "
+            "the closed harness currently permits only `-O`"
+        )
     env = dict(os.environ)
     env["TRUST_E6_DEBUG"] = "1"
     env["TRUST_E9_DEBUG"] = "1"
@@ -137,9 +179,9 @@ def run_probe(path: Path, timeout: int) -> dict:
 
     with tempfile.TemporaryDirectory(prefix="e6-probe-") as td:
         cmd = [
-            "rustup", "run", "trust", "trustc", str(path),
+            *_trustc_cmd(), str(path),
             "--crate-type=lib", "--edition", "2021", "--crate-name", "probe",
-            "-Ztrust-verify=on", "--out-dir", td,
+            "-Ztrust-verify=on", *extra_flags, "--out-dir", td,
         ]
         try:
             p = subprocess.run(
@@ -168,6 +210,7 @@ def run_probe(path: Path, timeout: int) -> dict:
         "verdict": verdict,
         "ok": verdict == expect,
         "declared_shape": d.get("probe-shape"),
+        "flags": extra_flags,
         "observed_shapes": shapes,
         "admissible": admissible,
         "reason": reason,

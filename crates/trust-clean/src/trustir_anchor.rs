@@ -753,6 +753,112 @@ fn stmt_ty() -> Expr {
 /// The closed `Int` literal `Expr` for `n`, BYTE-IDENTICAL to
 /// `clean_ground::int_lit_to_expr` (so a `Const c` operand denotes the exact term the
 /// live grounder emits for `Formula::Int(c)`).
+/// Trust: W-CAST-ARG (2026-07-29) — `2^width` as a closed kernel `Int`.
+///
+/// Moved here from `trustir_adt.rs` so the trust-ir cast recipe and the MirSem one are
+/// literally the SAME code rather than two copies that can drift (the drift hazard is
+/// not hypothetical: this session found nine byte-identical-by-comment literal encoders
+/// that had silently diverged).
+pub(crate) fn int_pow2_expr(width: u32) -> Expr {
+    match width {
+        0..=126 => int_lit(1_i128 << width),
+        127 => Expr::apps(cst("Int.mul"), [int_lit(1_i128 << 63), int_lit(1_i128 << 64)]),
+        128 => Expr::apps(cst("Int.mul"), [int_lit(1_i128 << 64), int_lit(1_i128 << 64)]),
+        _ => unreachable!("integer cast width is validated before power construction"),
+    }
+}
+
+/// Trust: W-CAST-ARG (2026-07-29) — a VALIDATED integer cast destination.
+///
+/// The only way to name a cast destination in the trust-ir operand lane. Construction
+/// is fallible and the whitelist is `{8, 16, 32, 64}` — **128 is deliberately EXCLUDED**.
+///
+/// WHY 128 IS OUT (G1). It is not a soundness hole, it is COMPUTATIONALLY INERT: at
+/// width 128 `int_pow2_expr` yields `Int.mul (2^64) (2^64)` rather than a literal, and
+/// the native `reduce_int_mod` reducer reads its arguments with `get_int_val`, which
+/// needs a *reduced* literal. The modulus never reduces, so the cast term would never
+/// compute and every 128-bit instance would decline at `check_type` anyway — but it
+/// would decline *late and confusingly* instead of at the gate. Excluding it up front
+/// keeps the failure legible. Admitting 128 requires a reducible 2^128 modulus first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IntCastDest {
+    width: u32,
+    signed: bool,
+}
+
+impl IntCastDest {
+    /// `None` (fail-closed) for any width outside the computable whitelist.
+    pub(crate) fn new(width: u32, signed: bool) -> Option<Self> {
+        matches!(width, 8 | 16 | 32 | 64).then_some(Self { width, signed })
+    }
+    pub(crate) fn width(self) -> u32 {
+        self.width
+    }
+    pub(crate) fn signed(self) -> bool {
+        self.signed
+    }
+}
+
+/// `e mod 2^width`, normalised into `[0, 2^width)`.
+///
+/// The anchor's `Int.mod` is TRUNCATED remainder, so a negative operand yields a
+/// negative remainder; the `Bool.rec` adds the modulus back on exactly that branch.
+/// This is the unsigned half of the Rust `as` semantics.
+fn wrap_unsigned_expr(source: Expr, width: u32) -> Expr {
+    let modulus = int_pow2_expr(width);
+    let remainder = Expr::apps(cst("Int.mod"), [source, modulus.clone()]);
+    let negative_remainder = Expr::apps(cst("decide"), [
+        Expr::apps(cst("Int.lt"), [remainder.clone(), int_lit(0)]),
+        Expr::apps(cst("Int.decLt"), [remainder.clone(), int_lit(0)]),
+    ]);
+    let int_motive = Expr::lam(bd_default(), cst("Bool"), cst("Int"));
+    let bool_rec = Expr::const_(Name::from_string("Bool.rec"), vec![Level::succ(Level::zero())]);
+    Expr::apps(bool_rec, [
+        int_motive,
+        remainder.clone(),
+        Expr::apps(cst("Int.add"), [remainder, modulus]),
+        negative_remainder,
+    ])
+}
+
+/// The signed reinterpretation on top of [`wrap_unsigned_expr`]: a residue at or above
+/// `2^(width-1)` denotes `residue - 2^width`.
+fn wrap_signed_expr(wrapped: Expr, width: u32) -> Expr {
+    let modulus = int_pow2_expr(width);
+    let half = int_pow2_expr(width - 1);
+    let upper_half = Expr::apps(cst("decide"), [
+        Expr::apps(cst("Int.le"), [half.clone(), wrapped.clone()]),
+        Expr::apps(cst("Int.decLe"), [half, wrapped.clone()]),
+    ]);
+    let int_motive = Expr::lam(bd_default(), cst("Bool"), cst("Int"));
+    let bool_rec = Expr::const_(Name::from_string("Bool.rec"), vec![Level::succ(Level::zero())]);
+    let negative = Expr::apps(cst("Int.sub"), [wrapped.clone(), modulus]);
+    Expr::apps(bool_rec, [int_motive, wrapped, negative, upper_half])
+}
+
+/// Trust: W-CAST-ARG (2026-07-29) — THE EXACT mathematical value of a Rust integer
+/// `as` cast, as a kernel term. The SINGLE dispatcher; nothing else builds a cast.
+///
+/// **This is the soundness crux of the whole increment, so it is exact and not an
+/// identity.** A Rust `as` conversion reduces modulo `2^width`, and a signed
+/// destination then reinterprets the upper half of that residue class as negative.
+/// Modelling `i32 -> u32 -> i32` as identity would be FALSE for any value with the top
+/// bit set — and `swap_bytes(i32)` is exactly that round trip.
+///
+/// Term-for-term the same recipe as `trustir_adt::int_cast_expr`, which is already
+/// kernel-checked and probe-pinned; the difference is only that this one takes an
+/// already-built `Expr` (so the trust-ir lane can feed it an operand denotation) and
+/// that its destination is a validated [`IntCastDest`] rather than a raw `(u32, bool)`
+/// pair, which is what keeps width 128 out by construction.
+pub(crate) fn exact_int_cast_expr(source: Expr, dest: IntCastDest) -> Expr {
+    let wrapped = wrap_unsigned_expr(source, dest.width());
+    if dest.signed() { wrap_signed_expr(wrapped, dest.width()) } else { wrapped }
+}
+
+fn bd_default() -> BinderData {
+    BinderData::from(BinderInfo::Default)
+}
+
 pub(crate) fn int_lit(n: i128) -> Expr {
     // Trust: EXACT ENCODING (2026-07-24) — `Expr::nat_lit_u128` covers the FULL
     // magnitude range. The former `as u64` was `n mod 2^64`, a SILENT TRUNCATION that
@@ -9813,6 +9919,90 @@ pub fn trustir_branch_refinement_fail_closed() -> bool {
         check_refinement_decl("Trust.TrustIr.Refinement.branch_wrong", statement, proof),
         RefinementVerdict::KernelRejected(_)
     )
+}
+
+#[cfg(test)]
+mod exact_cast_tests {
+    use clean_kernel::TypeChecker;
+
+    use super::{IntCastDest, exact_int_cast_expr, int_lit, trustir_env};
+
+    /// Trust: W-CAST-ARG (2026-07-29) — THE SEMANTICS PIN for the trust-ir cast.
+    ///
+    /// This is the soundness crux of the operand extension, so it is pinned BEFORE
+    /// anything consumes it. The lesson is fresh: earlier this session a live false
+    /// accept was traced to an unaudited term CONSTRUCTOR (`int_lit_to_expr` was
+    /// non-injective), not to any gate. So the constructor gets its own test.
+    ///
+    /// Each row is the mathematical value Rust's `as` produces. If any of these ever
+    /// reduce to something else, the cast is a fiction and every certificate built on
+    /// it is worthless.
+    #[test]
+    fn exact_int_cast_reduces_to_rust_as_semantics() {
+        let env = trustir_env().expect("anchor env");
+        let tc = TypeChecker::new(&env);
+        for (source, width, signed, expected) in [
+            // The wrapping cases: a negative source must NOT stay negative unsigned.
+            (-1_i128, 8_u32, false, 255_i128),
+            (256, 8, false, 0),
+            (i128::from(i64::MIN), 8, false, 0),
+            // The signed reinterpretation: upper half of the residue class is negative.
+            (255, 8, true, -1),
+            (-129, 8, true, 127),
+            (128, 8, true, -128),
+            // Identity inside range must stay identity.
+            (0, 8, false, 0),
+            (127, 8, true, 127),
+            (42, 32, true, 42),
+            // The round trip that `swap_bytes(iN)` actually performs: i32 -> u32 -> i32.
+            (-1, 32, false, 4_294_967_295),
+            (4_294_967_295, 32, true, -1),
+            // Wider widths still compute.
+            (-1, 16, false, 65_535),
+            (-1, 64, false, 18_446_744_073_709_551_615),
+        ] {
+            let dest = IntCastDest::new(width, signed).expect("whitelisted width");
+            let actual = exact_int_cast_expr(int_lit(source), dest);
+            assert!(
+                tc.is_def_eq(&actual, &int_lit(expected)),
+                "cast {source} -> {}{width} must reduce to {expected}",
+                if signed { 'i' } else { 'u' }
+            );
+        }
+    }
+
+    /// A cast is NOT an identity — the failure mode that would make the whole lane a
+    /// fiction. Pinned directly so a future "simplification" to identity is caught here.
+    #[test]
+    fn exact_int_cast_is_not_identity_on_out_of_range_values() {
+        let env = trustir_env().expect("anchor env");
+        let tc = TypeChecker::new(&env);
+        let dest = IntCastDest::new(8, false).expect("u8");
+        for source in [-1_i128, 256, 300, i128::from(i32::MIN)] {
+            let actual = exact_int_cast_expr(int_lit(source), dest);
+            assert!(
+                !tc.is_def_eq(&actual, &int_lit(source)),
+                "cast {source} -> u8 must NOT be the identity"
+            );
+        }
+    }
+
+    /// G1 — width 128 is refused AT CONSTRUCTION. It is computationally inert rather
+    /// than unsound: `int_pow2_expr(128)` is `Int.mul (2^64) (2^64)`, and the native
+    /// `reduce_int_mod` reads its operands with `get_int_val`, which needs a reduced
+    /// literal — so the modulus never reduces and the term never computes. Refusing at
+    /// the gate keeps that a legible decline instead of a confusing late failure.
+    #[test]
+    fn int_cast_dest_rejects_inert_and_nonsense_widths() {
+        for w in [8_u32, 16, 32, 64] {
+            assert!(IntCastDest::new(w, true).is_some(), "{w} is computable");
+            assert!(IntCastDest::new(w, false).is_some());
+        }
+        for w in [0_u32, 1, 7, 128, 256] {
+            assert!(IntCastDest::new(w, true).is_none(), "{w} must be refused");
+            assert!(IntCastDest::new(w, false).is_none());
+        }
+    }
 }
 
 #[cfg(test)]

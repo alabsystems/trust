@@ -115,6 +115,7 @@ fn and_then_extra_continuation_write_declines() {
                 name: "std::option::Option".into(),
                 variant: 1,
                 active_field: None,
+                args: None,
             },
             vec![Operand::Move(trust_types::Place { local: 4, projections: vec![] })],
         ),

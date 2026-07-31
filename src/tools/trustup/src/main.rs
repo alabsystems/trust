@@ -42,6 +42,31 @@ const INHERITED_PUBLIC_NAMES: &[&str] = &[
     "cargo-miri",
 ];
 
+/// The only inherited public names a Trust root may expose, and the canonical
+/// Trust binaries each one is permitted to be an alias *of*.
+///
+/// This mirrors `STOCK_ALIAS_TARGETS` in `scripts/off_stock_rust_audit.py` — the
+/// existing encoding of "a stock spelling is legitimate only when it is an alias
+/// of the corresponding Trust frontend in the same toolchain directory" — and is
+/// deliberately a strict *subset* of it on both axes, so nothing trustup admits
+/// could be rejected by that audit:
+///
+///  * Fewer names. The audit also maps `rustdoc`/`rustfmt`/`cargo-clippy`/
+///    `clippy-driver`, because it must grade arbitrary third-party trees. A
+///    Trust sysroot never materializes those: `tool::upstream_compat_bin_for_tool_source`
+///    emits `cargo` and nothing else, and `rustc` is materialized separately by
+///    `materialize_local_compiler_aliases`. Those two exist solely because
+///    rustup refuses to register a toolchain whose `bin/` lacks them. Any other
+///    inherited spelling in a Trust root is still an unconditional rejection.
+///  * A stricter identity test. The audit accepts same-inode **or** equal
+///    size-and-SHA-256, since it audits paths it did not produce and that may
+///    have been copied across filesystems. Here the aliases are produced by
+///    bootstrap in one directory, so same-device/same-inode is both sufficient
+///    and the fail-closed choice: it cannot admit a distinct executable that
+///    merely happens to hash the same as a sibling at audit time.
+const INHERITED_ALIAS_TARGETS: &[(&str, &[&str])] =
+    &[("rustc", &["trustc"]), ("cargo", &["targo", "tcargo"])];
+
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
         Ok(code) => code,
@@ -308,14 +333,64 @@ fn validate_toolchain_root(root: &Path) -> Result<(), String> {
     }
     for inherited in INHERITED_PUBLIC_NAMES {
         let path = bin.join(exe_name(inherited));
-        if path.exists() {
-            return Err(format!(
-                "Trust root exposes inherited public name `{inherited}` at {}; use a Trust-only root",
-                path.display()
-            ));
+        // `Path::exists` follows symlinks and so reports a *dangling* alias as
+        // absent, which would skip the check entirely for the one shape most
+        // likely to be a leftover pointing outside the root. Ask about the link
+        // itself; a dangling link then also fails the alias test below, because
+        // it has no resolvable inode to match a canonical sibling with.
+        if fs::symlink_metadata(&path).is_err() {
+            continue;
         }
+        if inherited_alias_is_authenticated(&bin, inherited, &path) {
+            continue;
+        }
+        return Err(format!(
+            "Trust root exposes inherited public name `{inherited}` at {}; use a Trust-only root",
+            path.display()
+        ));
     }
     Ok(())
+}
+
+/// True when `path` is one of the two rustup-required inherited spellings *and*
+/// is the very same on-disk artifact as a canonical Trust binary sitting beside
+/// it in `bin`. See `INHERITED_ALIAS_TARGETS`.
+fn inherited_alias_is_authenticated(bin: &Path, inherited: &str, path: &Path) -> bool {
+    let Some(targets) = INHERITED_ALIAS_TARGETS
+        .iter()
+        .find(|(name, _)| *name == inherited)
+        .map(|(_, targets)| *targets)
+    else {
+        return false;
+    };
+    targets.iter().any(|target| same_artifact(path, &bin.join(exe_name(target))))
+}
+
+/// Same regular file, reached by two names: a hardlink or a symlink within the
+/// same toolchain directory. Both metadata calls follow symlinks, so the
+/// `cargo -> targo` symlink form and the `cargo`/`targo` hardlink form (which is
+/// what this tree's bootstrap actually produces) are both recognised.
+#[cfg(unix)]
+fn same_artifact(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let (Ok(left), Ok(right)) = (fs::metadata(left), fs::metadata(right)) else {
+        return false;
+    };
+    left.is_file()
+        && right.is_file()
+        && left.dev() == right.dev()
+        && left.ino() == right.ino()
+}
+
+/// Non-Unix hosts have no stable-Rust inode identity (`MetadataExt::file_index`
+/// is behind `windows_by_handle`), so there is no way to *prove* two names are
+/// one artifact here. Fail closed: no inherited spelling is admitted, which is
+/// exactly the behaviour these platforms had before same-inode admission
+/// existed. A Windows Trust root must be Trust-only.
+#[cfg(not(unix))]
+fn same_artifact(_left: &Path, _right: &Path) -> bool {
+    false
 }
 
 fn print_capability_report(root: &Path) {

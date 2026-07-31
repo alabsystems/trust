@@ -552,6 +552,23 @@ fn resolve_callsite<'tcx, I: Inliner<'tcx>>(
     if let TerminatorKind::Call { ref func, fn_span, .. } = terminator.kind {
         let func_ty = func.ty(caller_body, tcx);
         if let ty::FnDef(def_id, args) = *func_ty.kind() {
+            // Trust (E6 S3/S4 release parity): verification consumes the exact
+            // compiler-authenticated identity of core integer `wrapping_*`
+            // calls. MIR inlining erases that identity and leaves an ordinary
+            // `Add`/`Sub`/`Mul`, which is indistinguishable from source
+            // arithmetic and therefore acquires a false no-overflow
+            // obligation. Preserve only exact TyCtxt-authenticated inherent
+            // core primitive methods through the final Trust pass. This grants
+            // no proof authority to excluded operations/carriers: they remain
+            // calls and fail closed downstream. LLVM may still inline them
+            // after verification.
+            if crate::trust_verify::verification_enabled(tcx.sess)
+                && trust_mir_extract::tcx_is_authenticated_core_integer_wrapping_method(tcx, def_id)
+            {
+                debug!("preserving authenticated core wrapping call for Trust verification");
+                return None;
+            }
+
             if !inliner.should_inline_for_callee(def_id) {
                 debug!("not enabled");
                 return None;

@@ -2,13 +2,14 @@ use std::ffi::OsString;
 use std::path::Path;
 
 use super::shared_helpers::{
-    canonicalize_trust_no_verify, finalize_trust_no_verify, strip_trust_no_verify,
+    canonicalize_trust_no_verify, finalize_trust_no_verify, finalize_trust_no_verify_snapshot,
+    strip_trust_no_verify,
 };
 use super::{
     ArgFileCommand, enforce_trust_no_verify_capability, is_lint_driver_arg,
     rustc_driver_supports_trust_no_verify, should_apply_compiler_lint_flags,
-    should_strip_cargo_rustc_arg, targeted_rustc_supports_trust_no_verify,
-    trust_bootstrap_no_verify_applies,
+    should_strip_cargo_rustc_arg, targeted_rustc_is_stage0_snapshot,
+    targeted_rustc_supports_trust_no_verify, trust_bootstrap_no_verify_applies,
 };
 
 fn rustc_args(args: &[&str]) -> Vec<OsString> {
@@ -371,6 +372,130 @@ fn detects_targeted_drivers_that_support_trust_no_verify() {
         OsString::from("/checkout/build/aarch64-unknown-linux-gnu/stage0/bin/trustc");
     assert!(targeted_rustc_supports_trust_no_verify(&trust_stage0));
     assert!(rustc_driver_supports_trust_no_verify(&trust_stage0));
+}
+
+#[test]
+fn stage0_snapshot_discrimination_and_env_transport() {
+    // The SEED snapshot: bootstrap-managed stage0, `rustc`-named. Its vintage
+    // is the seed pin's, not this source tree's — the pinned 2026-07-13 seed
+    // advertises only the retired `-Zno-trust-verify`, so handing it the
+    // current argv spelling aborts the compile with `unknown unstable option`
+    // (the fresh-machine wall this path exists to close).
+    let seed = OsString::from("/checkout/build/aarch64-apple-darwin/stage0/bin/rustc");
+    assert!(targeted_rustc_is_stage0_snapshot(&seed));
+    // The seed ships its driver under BOTH names (`rustc` is a launcher for
+    // its `trustc`), so the trustc-named seed driver is a snapshot too — the
+    // stem-based exemption of exactly this path is what handed the pre-rename
+    // seed the current argv spelling and walled the build.
+    assert!(targeted_rustc_is_stage0_snapshot(&OsString::from(
+        "/checkout/build/aarch64-apple-darwin/stage0/bin/trustc"
+    )));
+    // In-tree drivers are NEVER snapshots: their vintage matches this shim's
+    // source by construction, so the canonical argv spelling stays theirs.
+    for in_tree in [
+        "/checkout/build/aarch64-apple-darwin/stage1/bin/rustc",
+        "/checkout/build/host/stage2/bin/rustc",
+        "/checkout/build/host/stage2/bin/trustc",
+        "/usr/local/bin/trustc",
+    ] {
+        assert!(
+            !targeted_rustc_is_stage0_snapshot(&OsString::from(in_tree)),
+            "{in_tree} must not be classified a snapshot"
+        );
+    }
+
+    // Snapshot finalize: every argv spelling is stripped — the driver may not
+    // parse ANY spelling this tree knows — and the env transport is requested
+    // exactly when a supported driver has an applicable compile.
+    let mut args = vec![
+        OsString::from("-Ztrust-verify=off"),
+        OsString::from("--crate-name"),
+        OsString::from("build_script_build"),
+    ];
+    assert!(finalize_trust_no_verify_snapshot(&mut args, true, true));
+    assert!(
+        !args.iter().any(|arg| arg.to_string_lossy().contains("trust-verify")),
+        "no argv spelling may survive for a snapshot driver: {args:?}"
+    );
+
+    // THE HOSTFLAGS LANE — the build-script case that walled every fresh
+    // build. `trust_bootstrap_no_verify_applies` answers false for a seed on
+    // a host unit (its driver gate deliberately excludes stage0), but the
+    // builder already materialized the off-switch in the args via
+    // RUSTC_HOST_FLAGS. Stripping it without honoring it re-enables
+    // batteries-on verification of the dep tree (the memchr wall), so the
+    // stripped off-request must ride the env transport.
+    let mut args = vec![OsString::from("-Ztrust-verify=off")];
+    assert!(finalize_trust_no_verify_snapshot(&mut args, true, false));
+    assert!(args.is_empty());
+    // Same, in the split "-Z" "trust-verify=off" token shape.
+    let mut args = vec![OsString::from("-Z"), OsString::from("trust-verify=off")];
+    assert!(finalize_trust_no_verify_snapshot(&mut args, true, false));
+    assert!(args.is_empty());
+
+    // An `=on` request is NOT an off-request: stripped (unparseable by the
+    // seed either way), and no env transport — verification was asked FOR.
+    let mut args = vec![OsString::from("-Ztrust-verify=on")];
+    assert!(!finalize_trust_no_verify_snapshot(&mut args, true, false));
+    assert!(args.is_empty());
+
+    // No off-request anywhere and not applicable => no env transport.
+    let mut args = vec![OsString::from("--crate-name"), OsString::from("x")];
+    assert!(!finalize_trust_no_verify_snapshot(&mut args, true, false));
+
+    // Positional args after `--` are never options: an off-spelling there
+    // does not count as a request (mirrors strip/canonicalize's boundary).
+    let mut args = vec![OsString::from("--"), OsString::from("-Ztrust-verify=off")];
+    assert!(!finalize_trust_no_verify_snapshot(&mut args, true, false));
+
+    // Unsupported (stock upstream parked in a stage0-named dir) => stripped,
+    // no env transport. Stock ignores the env anyway; not setting it keeps
+    // the invariant clean.
+    let mut args = vec![OsString::from("-Ztrust-verify=off")];
+    assert!(!finalize_trust_no_verify_snapshot(&mut args, false, true));
+    assert!(args.is_empty());
+}
+
+#[test]
+fn retired_spelling_is_normalized_and_never_forwarded() {
+    // The seed's targo injects the retired `-Zno-trust-verify` into the rustc
+    // invocations it drives (its native lane predates the 576db732cd rename),
+    // and a CURRENT driver rejects that name outright — the exact
+    // seed-targo/stage1-rustc deadlock from the stage2 blocker diagnosis.
+    // For a current driver, canonicalize must NORMALIZE it: strip the retired
+    // spelling, insert the one spelling the driver parses.
+    let mut args = vec![
+        OsString::from("-Zno-trust-verify"),
+        OsString::from("--crate-name"),
+        OsString::from("core"),
+    ];
+    canonicalize_trust_no_verify(&mut args);
+    assert_eq!(args.iter().filter(|arg| **arg == "-Ztrust-verify=off").count(), 1);
+    assert!(
+        !args.iter().any(|arg| arg.to_string_lossy().contains("no-trust-verify")),
+        "the retired spelling must never survive normalization: {args:?}"
+    );
+
+    // For a SNAPSHOT driver, a retired off-request rides the env transport
+    // like any other off-request (bare and `=yes` forms are truthy)...
+    for retired in ["-Zno-trust-verify", "-Zno-trust-verify=yes"] {
+        let mut args = vec![OsString::from(retired)];
+        assert!(
+            finalize_trust_no_verify_snapshot(&mut args, true, false),
+            "{retired} must ride the transport"
+        );
+        assert!(args.is_empty());
+    }
+    // ...and the split token shape too.
+    let mut args = vec![OsString::from("-Z"), OsString::from("no-trust-verify")];
+    assert!(finalize_trust_no_verify_snapshot(&mut args, true, false));
+    assert!(args.is_empty());
+
+    // `=no` is not an off-request — but it IS still stripped, because no
+    // current-vintage driver parses the name at all.
+    let mut args = vec![OsString::from("-Zno-trust-verify=no")];
+    assert!(!finalize_trust_no_verify_snapshot(&mut args, true, false));
+    assert!(args.is_empty());
 }
 
 #[test]

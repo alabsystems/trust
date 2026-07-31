@@ -315,7 +315,9 @@ const TRUST_VC_FORMULA_SMTLIB_METADATA_KEY: &str = "trust.vc.formula.smtlib2";
 const TRUST_VC_FORMULA_SORT_METADATA_KEY: &str = "trust.vc.formula.sort";
 #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
 const TRUST_IR_OBLIGATION_SOURCE_FORMULA_SCHEMA: &str = "trust.trust_ir.obligation-source.v1";
-const TRUST_VC_HARDENED_NAMESPACE: &str = "trust.vc.hardened";
+// Aliased from the owning vocabulary crate, never re-declared: a local
+// spelling could drift from the admitted list and split the hardened lane.
+use trust_verifier_api::TRUST_VC_HARDENED_OBLIGATION_NAMESPACE as TRUST_VC_HARDENED_NAMESPACE;
 const TRUST_VC_HARDENED_WILDCARD: &str = "*";
 
 /// E4/E5 are trust-mc reachability obligations only when the compiler supplied
@@ -869,6 +871,7 @@ impl TrustMcVerifierApiAdapter {
             obligation_id: obligation.obligation_id.clone(),
             engine: self.manifest.clone(),
             status,
+            decline: None,
             proof_strength: None,
             artifacts: Vec::new(),
             counterexample: None,
@@ -996,6 +999,7 @@ impl TrustMcVerifierApiAdapter {
                     obligation_id: obligation.obligation_id.clone(),
                     engine: self.manifest.clone(),
                     status: EvidenceStatus::Proved,
+                    decline: None,
                     proof_strength: Some(proof_strength),
                     artifacts,
                     counterexample: None,

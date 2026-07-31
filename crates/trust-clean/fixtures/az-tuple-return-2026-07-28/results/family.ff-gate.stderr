@@ -1,0 +1,15 @@
+
+=== FF-gate cluster summary (6 functions) ===
+  SHAPE_GAP        6
+
+=== SHAPE_GAP functions (recognizer declines on both lanes) ===
+  az::int::<impl az::OverflowingCast<i16> for i32>::overflowing_cast  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, expr_fold_decline: None, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  az::int::<impl az::OverflowingCast<u8> for u16>::overflowing_cast  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, expr_fold_decline: None, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  az::overflowing_cast::<i32, i16>  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, expr_fold_decline: None, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  az::int::<impl az::WrappingCast<i16> for i32>::wrapping_cast  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, expr_fold_decline: None, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  az::overflowing_cast::<u16, u8>  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, expr_fold_decline: None, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+  az::int::<impl az::WrappingCast<u8> for u16>::wrapping_cast  FullyFaithfulDiagnosis { via_ir_shape: false, via_ir_safety: false, via_ir: false, expr_fold_decline: None, via_mirsem_straight_line_shape: false, via_mirsem_loop_shape: false, via_mirsem_shape: false, via_mirsem_straight_line_safety_discharged: false, via_mirsem_call_requires: false, via_mirsem_loop_full: false, via_mirsem: false, fully_faithful: false }
+
+=== SAFETY_GAP functions (shape recognized, safety/discharge open) ===
+
+=== iter_loop_projection: recognized (0 functions, CLASS-NEUTRAL — cluster_tag UNCHANGED) ===

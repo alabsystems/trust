@@ -68,7 +68,8 @@ pub mod facets;
 // Made pub for trust_wp contract IR builder access.
 pub(crate) mod contracts;
 pub use contracts::{
-    LoopInvariantFeedbackCandidate, LoopInvariantFeedbackContext, bind_compiler_loop_contracts,
+    LoopInvariantFeedbackCandidate, LoopInvariantFeedbackContext,
+    bind_compiler_loop_contract_bundle, bind_compiler_loop_contracts,
     loop_invariant_feedback_candidate, loop_invariant_feedback_candidate_with_context,
     prepare_loop_invariant_feedback_validation,
     regenerate_loop_decreases_with_invariant_feedback_vcs,
@@ -4269,6 +4270,16 @@ fn canonicalize_place(func: &VerifiableFunction, place: Place, fuel: u32) -> Pla
     p
 }
 
+/// The characters a projection segment emitted by `place_to_var_name` may begin
+/// with. `place_to_var_name` spells a place as `base ++ segments`, and this set is
+/// the only thing that makes that concatenation decodable: a segment starts with
+/// one of these, a base contains none of them, so the boundary is the first
+/// occurrence in the string. Both halves of that invariant are ENFORCED, not
+/// asserted — see the two uses in `place_to_var_name`. Adding a segment spelling
+/// that starts with something else does not silently break the split: the emitter
+/// prefixes `@` to any segment that would.
+const PROJECTION_SEGMENT_LEAD: &[char] = &['.', '[', '*', '@'];
+
 // Trust (leaf-assert-unhostage, 2026-07-11): `pub` (was `pub(crate)`) — the
 // SINGLE SOURCE OF TRUTH for the VC formula variable vocabulary. trust-clean's
 // guard-implied-assert augmentation (`prove.rs`, ordering-sentinel cmp facts)
@@ -4322,15 +4333,81 @@ pub fn place_to_var_name(func: &VerifiableFunction, place: &Place) -> String {
     // slice `s`, nor may `__trust_constparam_0_N` alias const generic `N`.
     // `trust-types` owns the conservative namespace classifier so extraction,
     // contract admission, vcgen, and the native bridge cannot drift.
+    // Trust #soundness (base/segment-boundary false proof, round 4): the residual
+    // leak neither demotion above covers. Both of them make the BASE token unique
+    // among bases; neither makes the CONCATENATION `base ++ segments` decodable. A
+    // local literally named `q.0` mints the base `q.0` — character-for-character
+    // what `Place { local: <the local named "q">, projections: [Field(0)] }` mints,
+    // a different place over different storage. That name is unique among source
+    // names and is not `_<digits>`-shaped, so it passes both prior filters.
+    // Consumers that recover an obligation's subject by NAME-STRING equality then
+    // accept a statement defining one of the two as the defining statement of the
+    // other. `docs/audits/2026-07-30-forgery-audit-r4-verdict.md` §1 records that
+    // mint against the `trust-clean` locators — `DivByZero` for a function
+    // containing no division, and `NegationOverflow(W32)`; that half was not
+    // re-executed here. What IS re-executed here is the collision itself:
+    // `place_name_boundary_tests` drives `generate_vcs` over two asserts about two
+    // different places and, without the demotion below, the whole function's
+    // emitted vocabulary is the single name `q.0`.
+    //
+    // Fixed at the boundary, not at the shape. This function returns
+    // `base ++ segments`, so make the split point recoverable from the string:
+    //   (i) every segment begins with a `PROJECTION_SEGMENT_LEAD` character —
+    //       enforced below where each segment is built, so it holds for the arms
+    //       written today AND for any arm added later, rather than being a property
+    //       someone must re-verify by reading the match; and
+    //   (ii) a base contains no such character — a source name that does is
+    //       ambiguous and demotes to the unique `_<local>` spelling, exactly as the
+    //       two demotions above do for their shapes.
+    // Therefore, for EVERY name this function returns, the base is the prefix up to
+    // the first `PROJECTION_SEGMENT_LEAD` character; no base can absorb a leading
+    // segment, and no `base ++ segments` can be read back as a bare base. That is a
+    // decomposition argument over the whole encoding rather than an enumeration of
+    // collision shapes — which is the respect in which it differs from the two
+    // comments above, each of which closed one shape and left this one open.
+    //
+    // What this does NOT claim is injectivity on places. `place_to_var_name` stays
+    // deliberately non-injective: `canonicalize_place` maps distinct places that denote the same
+    // storage onto one name (that is its purpose), and two segment spellings
+    // coincide by construction — a constant `Index` and the corresponding
+    // `ConstantIndex` both print `[c;min=len]` (`constant_array_index_segment`
+    // returns that format at :3383 and :3418, and the `ConstantIndex` arm below
+    // builds it too), which names element `c` of the same base place either way.
+    // The claim is only about the base/segment boundary.
+    //
+    // Cost, measured over crates/trust-clean/fixtures: 2326 functions, 16827
+    // locals, 4923 of them source-named; 0 names contain `.`, `[`, `*` or `@` —
+    // 0 contain any character outside `[A-Za-z0-9_]` at all — so this demotion
+    // fires nowhere in that corpus. Re-running `generate_vcs` over all 2326 with
+    // this conjunct removed hashes every VC list identically: 0 functions change,
+    // 0 certificates withdrawn (trust-clean's suite is unchanged at 2460 passing).
+    // Extraction has TWO local-name producers and neither applies a character
+    // filter: `build_debug_name_map` copies rustc's `var_debug_info` name
+    // (`trust-mir-extract/src/lib.rs:4014`) screening only for the synthetic
+    // namespace (`:4028`), and `recover_direct_parameter_names` /
+    // `merge_recovered_parameter_names` (`:3253-3337`, called at `:1426`) recovers
+    // HIR parameter idents under the same screen (`:3320`) plus duplicate/occupancy
+    // screens. So whether a rustc-produced `Symbol` can carry one of these
+    // characters is NOT settled here — only that none does across the corpus
+    // above. Nothing rests on that question, because the direction is fail-closed:
+    // this demotion only ever SEPARATES names, never merges them. The demoted
+    // spelling is `format!("_{}", place.local)` above, a function of the local index
+    // alone, so no other local's whole-place can mint it (a source name spelled
+    // `_<k>` is demoted by `name_is_fallback_shaped` to its OWN index), and no
+    // projected place can, since every projected name carries a
+    // `PROJECTION_SEGMENT_LEAD` character and `_<k>` carries none. The worst case is
+    // therefore a lost fact convergence — a false-fail, never a grant.
     let name_is_fallback_shaped = |name: &str| -> bool {
         name.strip_prefix('_').and_then(|s| s.parse::<usize>().ok()).is_some()
     };
+    let name_is_projection_shaped = |name: &str| -> bool { name.contains(PROJECTION_SEGMENT_LEAD) };
     let mut matching_decls = func.body.locals.iter().filter(|decl| decl.index == place.local);
     let matching_decl = matching_decls.next().filter(|_| matching_decls.next().is_none());
     let base = match matching_decl.and_then(|decl| decl.name.as_deref()) {
         Some(name)
             if func.body.locals.iter().filter(|d| d.name.as_deref() == Some(name)).count() <= 1
                 && !name_is_fallback_shaped(name)
+                && !name_is_projection_shaped(name)
                 && trust_types::source_contract_synthetic_name_collision(name).is_none() =>
         {
             name
@@ -4345,29 +4422,63 @@ pub fn place_to_var_name(func: &VerifiableFunction, place: &Place) -> String {
             .projections
             .iter()
             .enumerate()
-            .map(|(pos, p)| match p {
-                Projection::Field(i) => format!(".{i}"),
-                Projection::Index(i) => constant_array_index_segment(func, place, pos, *i)
-                    .unwrap_or_else(|| format!("[_{i}]")),
-                Projection::Deref => "*".to_string(),
-                Projection::Downcast(i) => format!("@{i}"),
-                Projection::OpaqueCast(_) => "@opaque_cast".to_string(),
-                Projection::UnwrapUnsafeBinder(_) => "@unwrap_unsafe_binder".to_string(),
-                Projection::ConstantIndex { offset, min_length, from_end } => {
-                    if *from_end {
-                        format!("[-{offset};min={min_length}]")
-                    } else {
-                        format!("[{offset};min={min_length}]")
+            .map(|(pos, p)| {
+                let segment = match p {
+                    Projection::Field(i) => format!(".{i}"),
+                    Projection::Index(i) => constant_array_index_segment(func, place, pos, *i)
+                        .unwrap_or_else(|| format!("[_{i}]")),
+                    Projection::Deref => "*".to_string(),
+                    Projection::Downcast(i) => format!("@{i}"),
+                    Projection::OpaqueCast(_) => "@opaque_cast".to_string(),
+                    Projection::UnwrapUnsafeBinder(_) => "@unwrap_unsafe_binder".to_string(),
+                    Projection::ConstantIndex { offset, min_length, from_end } => {
+                        if *from_end {
+                            format!("[-{offset};min={min_length}]")
+                        } else {
+                            format!("[{offset};min={min_length}]")
+                        }
                     }
-                }
-                Projection::Subslice { from, to, from_end } => {
-                    if *from_end {
-                        format!("[{from}..-{to}]")
-                    } else {
-                        format!("[{from}..{to}]")
+                    Projection::Subslice { from, to, from_end } => {
+                        if *from_end {
+                            format!("[{from}..-{to}]")
+                        } else {
+                            format!("[{from}..{to}]")
+                        }
                     }
+                    // `Projection` is `#[non_exhaustive]`
+                    // (`trust-types/src/model.rs:5720`), so this arm exists for
+                    // variants that do not exist yet; the eight above are every
+                    // variant declared today. Its `unknown` spelling has no lead
+                    // character, which is exactly the hazard the wrapper below
+                    // catches — a future variant would otherwise mint a segment
+                    // that reads back as part of a base name.
+                    _ => "unknown".to_string(),
+                };
+                // Half (i) of the base/segment-boundary invariant, enforced rather
+                // than assumed: a segment that would not announce itself gets an
+                // `@` so the decode point stays unambiguous. No-op today — every arm
+                // above already starts with `.`, `[`, `*` or `@`, including all
+                // three `Some` returns of `constant_array_index_segment`
+                // (`[c;min=len]` at :3383 and :3418, `[c;slice]` at :3419).
+                // `place_name_boundary_tests::every_projection_segment_leads` pins
+                // ten spellings — one per `Projection` variant plus the `from_end`
+                // twins of `ConstantIndex`/`Subslice` — and
+                // `tests::arr_literal_const_index_read_name_matches_aggregate_write_name`
+                // (:6706) pins `[c;min=N]`, and
+                // `tests::deref_shared_slice_ref_const_index_converges` (tests.rs:7176)
+                // pins `[c;slice]` as the golden string `s*[0;slice]` (:7204-7205).
+                // Exactly ONE constructible spelling is pinned by no test: this wildcard
+                // arm's `@unknown`. (An earlier draft said "two", missing the slice
+                // golden because it grepped for the literal `c;slice` rather than for an
+                // instantiated const — a coverage gap asserted, not measured.) Over
+                // crates/trust-clean/fixtures the prefix fires 0 times: re-running
+                // `generate_vcs` over all 2326 fixture functions with this branch
+                // removed hashes every VC list identically.
+                if segment.starts_with(PROJECTION_SEGMENT_LEAD) {
+                    segment
+                } else {
+                    format!("@{segment}")
                 }
-                _ => "unknown".to_string(),
             })
             .collect();
         format!("{base}{}", projs.join(""))
@@ -4380,6 +4491,10 @@ mod formula_proptest;
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+// The base/segment-boundary invariant `place_to_var_name` now enforces.
+#[cfg(test)]
+mod place_name_boundary_tests;
 
 #[cfg(test)]
 mod f5_e2e_repro {

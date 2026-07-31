@@ -40,7 +40,7 @@ use ay::{
     panic_payload_to_string,
 };
 use ay_bindings::execute_direct::{self, ExecuteCounterexample, ExecuteTypedResult, ModelValue};
-use ay_bindings::{AYProgram, Constraint, Sort as AYSort};
+use ay_bindings::{AYProgram, Constraint, Sort as AYSort, SortInner as AYSortInner};
 use sha2::{Digest, Sha256};
 use trust_types::ay_bridge::{formula_to_expr, sort_to_ay};
 use trust_types::{
@@ -255,9 +255,22 @@ impl InProcessAyBackend {
         // same detection the subprocess SMT export uses.
         program.set_logic(smt2_export::detect_logic(formula));
 
+        // Lever A: register any algebraic-datatype sorts BEFORE declaring consts
+        // of those sorts, so ay applies the datatype theory (constructor/selector/
+        // tester axioms). A by-name back-edge reference (empty constructors)
+        // carries no definition and ay maps it to an unconstrained uninterpreted
+        // sort — SOUND (a fresh datatype/uninterpreted const can never make the
+        // context vacuously UNSAT). `declare_datatype` is idempotent (deduped by
+        // name) and `upgrade_logic_for_datatypes` keeps the logic datatype-capable.
+        let free_vars = smt2_export::collect_free_vars(formula);
+        for (_, sort) in &free_vars {
+            Self::declare_datatype_sorts(&mut program, sort);
+        }
+        program.upgrade_logic_for_datatypes();
+
         // Declare each free (non-quantifier-bound) variable exactly once before
         // the assertion, mirroring how smt2_export emits declarations.
-        for (name, sort) in smt2_export::collect_free_vars(formula) {
+        for (name, sort) in free_vars {
             let _ = program.declare_const(name, sort_to_ay(&sort));
         }
 
@@ -274,6 +287,40 @@ impl InProcessAyBackend {
         program.check_sat();
 
         program
+    }
+
+    /// Recursively register every FULL algebraic-datatype definition reachable
+    /// from `sort` with `program` (deduped by name; nested datatypes declared
+    /// before the datatypes that use them). A by-name back-edge reference (empty
+    /// constructors) carries no definition and is skipped — ay handles it as an
+    /// unconstrained uninterpreted sort. Mirrors the text path's
+    /// `Sort::datatype_declarations` so both backends register the same datatypes.
+    fn declare_datatype_sorts(program: &mut AYProgram, sort: &Sort) {
+        match sort {
+            Sort::Array(idx, elem) => {
+                Self::declare_datatype_sorts(program, idx);
+                Self::declare_datatype_sorts(program, elem);
+            }
+            Sort::Datatype { name, constructors } => {
+                // A by-name reference has nothing to declare.
+                if constructors.is_empty() || program.is_datatype_declared(name) {
+                    return;
+                }
+                // Declare nested datatype field definitions first.
+                for (_, fields) in constructors {
+                    for (_, fsort) in fields {
+                        Self::declare_datatype_sorts(program, fsort);
+                    }
+                }
+                // Build and register THIS datatype. `sort_to_ay` of a full
+                // `Sort::Datatype` yields an ay datatype sort whose inner
+                // `DatatypeSort` carries the constructors/fields.
+                if let AYSortInner::Datatype(dt) = sort_to_ay(sort).inner() {
+                    let _ = program.declare_datatype(dt.clone());
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Map an UNSAT outcome's proof artifact to `Proved` only when it is
@@ -312,15 +359,16 @@ impl InProcessAyBackend {
                             native_proof_envelope: None,
                         };
 
-                        // Certification transport gate.  Clean can reconstruct
-                        // candidate kernel terms for a few fragments, but
-                        // `VerificationResult` does not yet carry the resulting
-                        // `CertifiedPayload`, bind it to the exact VC digest, or
-                        // replay it at the authority consumer.  Reusing ay's LRAT
-                        // bytes while changing only the assurance label would mint
-                        // an unreplayable `Certified` verdict.  Therefore this is
-                        // deliberately an identity on every build: the honest
-                        // strict-checked SmtBacked result survives.
+                        // Certification transport gate (D.9).  On an `ay-certify`
+                        // build this promotes to `Certified` for the fragments
+                        // Clean can reconstruct — but only after the kernel has
+                        // certified the refutation from this VC alone AND the
+                        // packaged envelope has been replayed back to the same
+                        // verdict.  ay's LRAT bytes are carried through unchanged;
+                        // the kernel payload rides in the typed
+                        // `native_proof_envelope` slot beside them.  Every other
+                        // build, and every declining step, keeps the honest
+                        // strict-checked SmtBacked result.
                         let proved = Self::promote_to_certified(proved, formula, time_ms);
 
                         // Track D increment 2: N-version cross-check. ay accepted
@@ -392,24 +440,72 @@ impl InProcessAyBackend {
     }
 
     /// Fail-closed certification transport gate for builds with experimental
-    /// Clean reconstruction enabled.
+    /// Clean reconstruction enabled (D.9).
     ///
-    /// The reconstruction helpers can produce a kernel-checked
-    /// `CertifiedPayload`, but the live result carrier currently has only one
-    /// opaque `proof_certificate` byte vector.  The bytes already stored there
-    /// are ay's LRAT certificate; replacing only `strength` used to discard the
-    /// Clean payload and falsely advertise replayable kernel evidence.  Until a
-    /// typed envelope binds the exact VC digest, kernel goal/context, and Clean
-    /// payload and every `Certified` consumer replays that envelope, this gate
-    /// MUST remain an identity.  This also avoids doing expensive reconstruction
-    /// whose result cannot safely cross the boundary.
+    /// This gate was an identity for as long as the result carrier had only the
+    /// single opaque `proof_certificate` byte vector — already occupied by ay's
+    /// LRAT bytes. Changing `strength` alone would have dropped the Clean
+    /// payload on the floor and advertised replayable kernel evidence that no
+    /// consumer could replay. `Proved` now carries a second, typed slot
+    /// (`native_proof_envelope`), so the payload has somewhere honest to go and
+    /// the LRAT bytes are preserved rather than displaced.
+    ///
+    /// Promotion requires ALL of:
+    ///
+    /// 1. the VC is the recognized fragment and the Clean kernel certifies its
+    ///    refutation from the VC ALONE (`certify_lia_violation_formula` rebuilds
+    ///    the context from the recognized bounds — nothing is taken on trust);
+    /// 2. the payload packages into a structurally accepted envelope;
+    /// 3. **the envelope replays** — we re-derive the context from the formula a
+    ///    second time and watch the kernel re-accept the very bytes we are about
+    ///    to ship. We refuse to stamp `Certified` on evidence that does not
+    ///    reproduce the verdict, so an envelope that would fail at a downstream
+    ///    consumer never leaves here labelled as proof.
+    ///
+    /// Any step declining returns the honest strict-checked `SmtBacked` verdict
+    /// unchanged. Non-fragment formulas exit at the cheap syntactic recognizer,
+    /// so the kernel work is confined to the class that can actually certify.
     #[cfg(feature = "ay-certify")]
     fn promote_to_certified(
         proved: VerificationResult,
-        _formula: &Formula,
+        formula: &Formula,
         _time_ms: u64,
     ) -> VerificationResult {
-        proved
+        if !matches!(proved, VerificationResult::Proved { .. }) {
+            return proved;
+        }
+        // (1) Certify from the VC itself.
+        let Ok(Some(crate::ay_certify::CertifyOutcome::Certified(payload))) =
+            crate::ay_certify::certify_lia_violation_formula(formula)
+        else {
+            return proved;
+        };
+        // (2) Package into the typed, zero-authority carrier.
+        let Some(envelope) = crate::ay_certify::certified_envelope_for(formula, &payload) else {
+            return proved;
+        };
+        // (3) Independently replay what we are about to ship.
+        if !crate::ay_certify::replay_certified_envelope(formula, &envelope).is_replayed() {
+            return proved;
+        }
+        // (4) Promote, PRESERVING ay's LRAT certificate and every other field.
+        match proved {
+            VerificationResult::Proved {
+                solver,
+                time_ms,
+                proof_certificate,
+                solver_warnings,
+                ..
+            } => VerificationResult::Proved {
+                solver,
+                time_ms,
+                strength: ProofStrength::smt_unsat_certified(),
+                proof_certificate,
+                solver_warnings,
+                native_proof_envelope: Some(envelope),
+            },
+            other => other,
+        }
     }
 
     /// Carcara N-version cross-check dispatcher (Track D increment 2).
@@ -1370,6 +1466,19 @@ mod tests {
         Formula::Var(name.into(), Sort::Int)
     }
 
+    // Lever A: a recursive `Expr`-shaped datatype sort with a `Const(c: bv32)`
+    // leaf and a binary `App(f: Expr, x: Expr)` node (children are by-name refs).
+    fn expr_dt_sort() -> Sort {
+        let r = Sort::Datatype { name: "Expr".into(), constructors: Vec::new() };
+        Sort::Datatype {
+            name: "Expr".into(),
+            constructors: vec![
+                ("Const".into(), vec![("c".into(), Sort::BitVec(32))]),
+                ("App".into(), vec![("f".into(), r.clone()), ("x".into(), r)]),
+            ],
+        }
+    }
+
     fn bool_var(name: &str) -> Formula {
         Formula::Var(name.into(), Sort::Bool)
     }
@@ -1634,13 +1743,36 @@ mod tests {
                     assert_eq!(*strength, ProofStrength::smt_unsat_strict_checked());
                     assert_eq!(strength.assurance, trust_types::AssuranceLevel::SmtBacked);
                 }
-                // With `ay-certify`, reconstruction is still experimental and
-                // cannot upgrade the live verdict until its Clean payload is
-                // digest-bound and replayed by every authority consumer.
+                // With `ay-certify` (D.9), this fragment reconstructs and the
+                // verdict IS upgraded — but only because the row now carries a
+                // typed envelope that binds to this VC and replays. Assert the
+                // evidence, not merely the label: a `Certified` we cannot replay
+                // is exactly what the old identity gate existed to prevent.
                 #[cfg(feature = "ay-certify")]
                 {
-                    assert_eq!(*strength, ProofStrength::smt_unsat_strict_checked());
-                    assert_eq!(strength.assurance, trust_types::AssuranceLevel::SmtBacked);
+                    assert_eq!(*strength, ProofStrength::smt_unsat_certified());
+                    assert_eq!(strength.assurance, trust_types::AssuranceLevel::Certified);
+                    let VerificationResult::Proved {
+                        native_proof_envelope: Some(envelope), ..
+                    } = &result
+                    else {
+                        panic!("a Certified row must carry replayable evidence");
+                    };
+                    assert_eq!(
+                        crate::ay_certify::replay_certified_envelope(
+                            &safety_vc(Formula::And(vec![
+                                Formula::Gt(
+                                    Box::new(int_var("x")),
+                                    Box::new(Formula::Int(10))
+                                ),
+                                Formula::Lt(Box::new(int_var("x")), Box::new(Formula::Int(5))),
+                            ]))
+                            .formula,
+                            envelope
+                        ),
+                        crate::ay_certify::ReplayOutcome::Replayed,
+                        "the end-to-end Certified row's evidence must replay against its VC"
+                    );
                 }
                 assert!(
                     proof_certificate.as_ref().is_some_and(|bytes| !bytes.is_empty()),
@@ -1657,6 +1789,82 @@ mod tests {
             other => {
                 panic!("UNSAT violation must be Proved or fail-closed Unknown, got: {other:?}")
             }
+        }
+    }
+
+    /// The mutable-collection E4 lane lowers `xs[i] = value` to the array
+    /// post-state `store(xs, i, value)`. Exercise AY's proof checker on the
+    /// corresponding read-after-write theorem itself: a backend verdict is not
+    /// enough for this regression; the exact solve must carry an artifact whose
+    /// strict checker verdict is `Verified`.
+    #[test]
+    fn array_store_select_uses_a_strict_verified_ay_proof_and_tampering_refutes() {
+        let backend = InProcessAyBackend::new();
+        let array_sort = Sort::Array(Box::new(Sort::Int), Box::new(Sort::Int));
+        let array = Formula::Var("xs".into(), array_sort);
+        let index = int_var("index");
+        let value = int_var("value");
+        let store =
+            Formula::Store(boxed(array.clone()), boxed(index.clone()), boxed(value.clone()));
+        let violation = Formula::Not(boxed(Formula::Eq(
+            boxed(Formula::Select(boxed(store), boxed(index.clone()))),
+            boxed(value.clone()),
+        )));
+
+        let program = backend.build_program(&violation);
+        let _ay_guard = AY_EXEC_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let outcomes = execute_direct::execute_incremental(&program)
+            .expect("the exact array read-after-write query must execute in-process");
+        let outcome = outcomes.last().expect("the program contains one check-sat");
+        assert!(
+            matches!(outcome.result, ExecuteTypedResult::Verified),
+            "read(store(xs, index, value), index) == value must be UNSAT as a violation: \
+             {outcome:?}",
+        );
+        let artifact =
+            outcome.unsat_proof.as_ref().expect("UNSAT must carry AY's checked proof artifact");
+        assert!(
+            matches!(&artifact.strict_verdict, StrictProofVerdict::Verified(_)),
+            "the array-theory proof must pass AY's strict proof checker: {artifact:?}",
+        );
+        artifact
+            .accept_for_consumer(ProofAcceptanceMode::Strict)
+            .expect("the strict consumer gate must accept the same checked artifact");
+        drop(_ay_guard);
+
+        // Same-sorted but different locals are not interchangeable. Changing
+        // either the store index or value makes the violation satisfiable, so
+        // neither tampered query may retain proof authority.
+        let other_index = int_var("other_index");
+        let wrong_index = Formula::Not(boxed(Formula::Eq(
+            boxed(Formula::Select(
+                boxed(Formula::Store(
+                    boxed(array.clone()),
+                    boxed(other_index),
+                    boxed(value.clone()),
+                )),
+                boxed(index.clone()),
+            )),
+            boxed(value.clone()),
+        )));
+        let wrong_value = Formula::Not(boxed(Formula::Eq(
+            boxed(Formula::Select(
+                boxed(Formula::Store(
+                    boxed(array),
+                    boxed(index.clone()),
+                    boxed(int_var("other_value")),
+                )),
+                boxed(index),
+            )),
+            boxed(value),
+        )));
+        for tampered in [wrong_index, wrong_value] {
+            let result = backend.run_strict(&tampered);
+            assert!(
+                result.is_failed(),
+                "a satisfiable tampered Store/Select query must be refuted, never proved: \
+                 {result:?}",
+            );
         }
     }
 
@@ -2116,14 +2324,116 @@ mod tests {
             ),
         }
     }
+
+    // -- Lever A: recursive-datatype encoding soundness (the load-bearing gate) --
+    //
+    // The CARDINAL risk of datatype modeling is a false-PROVE: an encoding that
+    // makes the solver context vacuously UNSAT would "prove" every obligation.
+    // These tests assert through the REAL ay solver that (1) declaring a
+    // datatype-sorted variable does NOT vacuously prove a satisfiable violation,
+    // and (2) the program still builds well-formed (the datatype is declared
+    // before the const that uses it).
+
+    /// A program with a datatype-sorted free variable plus a SATISFIABLE integer
+    /// violation (`x > 0`) must be refuted (Failed), NOT proved. If declaring the
+    /// recursive `Expr` datatype poisoned the context to UNSAT, this would falsely
+    /// return Proved — the exact false-PROVE the guard must prevent.
+    #[test]
+    fn datatype_var_does_not_vacuously_prove_a_sat_violation() {
+        let backend = InProcessAyBackend::new();
+        // The datatype var is unused by the violation, but it IS declared (it
+        // appears as a free Var), so the preamble must declare `Expr` and a
+        // const of that sort without making the context UNSAT.
+        let formula = Formula::And(vec![
+            // touch the datatype var so it is a free var that gets declared
+            Formula::Eq(
+                Box::new(Formula::Var("e".into(), expr_dt_sort())),
+                Box::new(Formula::Var("e".into(), expr_dt_sort())),
+            ),
+            Formula::Gt(Box::new(int_var("x")), Box::new(Formula::Int(0))),
+        ]);
+        let result = backend.verify(&safety_vc(formula));
+        assert!(
+            !matches!(result, VerificationResult::Proved { .. }),
+            "declaring a recursive datatype var must not vacuously prove a SAT violation \
+             (x>0 is satisfiable); a Proved here is the false-PROVE we guard against; got {result:?}"
+        );
+    }
+
+    /// `build_program` over a datatype-sorted var must select a datatype-capable
+    /// logic and register the datatype before declaring the const. We check the
+    /// logic was upgraded to a `*DT*`/`ALL` family (never a non-datatype logic
+    /// that would reject the declaration).
+    #[test]
+    fn datatype_var_program_uses_datatype_capable_logic() {
+        let formula = Formula::Eq(
+            Box::new(Formula::Var("e".into(), expr_dt_sort())),
+            Box::new(Formula::Var("e".into(), expr_dt_sort())),
+        );
+        let program = InProcessAyBackend::new().build_program(&formula);
+        let logic = program.get_logic().expect("a logic must be set");
+        assert!(
+            logic == "ALL" || logic.contains("DT"),
+            "a datatype-bearing VC must use a datatype-capable logic, got: {logic}"
+        );
+        assert!(
+            program.is_datatype_declared("Expr"),
+            "the Expr datatype must be registered before any const of that sort"
+        );
+    }
+
+    /// A BY-NAME datatype back-edge (empty constructors) carries no definition:
+    /// it must NOT be registered as a datatype, and the logic must still be
+    /// datatype-capable — `detect_logic` (not `upgrade_logic_for_datatypes`,
+    /// which only fires once a datatype has actually been declared) is what
+    /// carries that case.
+    #[test]
+    fn by_name_datatype_ref_is_uninterpreted_but_keeps_a_capable_logic() {
+        let by_name = Sort::Datatype { name: "Expr".into(), constructors: Vec::new() };
+        let formula = Formula::Eq(
+            Box::new(Formula::Var("e".into(), by_name.clone())),
+            Box::new(Formula::Var("e".into(), by_name)),
+        );
+        let program = InProcessAyBackend::new().build_program(&formula);
+        assert_eq!(program.get_logic(), Some("ALL"), "a datatype-bearing VC must use ALL");
+        assert!(
+            !program.is_datatype_declared("Expr"),
+            "a by-name back-edge has no definition to declare; it is an uninterpreted sort"
+        );
+    }
+
+    /// A satisfiable datatype formula must never come back Proved. `e == e` is a
+    /// TAUTOLOGY, so as a *violation* formula it is trivially SAT — the honest
+    /// verdict is Failed/Unknown. Gated behind `is_available` so it is skipped
+    /// where the direct ay lane is absent.
+    #[test]
+    fn satisfiable_datatype_formula_is_never_proved() {
+        if !execute_direct::is_available() {
+            return;
+        }
+        let backend = InProcessAyBackend::new();
+        let formula = Formula::Eq(
+            Box::new(Formula::Var("e".into(), expr_dt_sort())),
+            Box::new(Formula::Var("e".into(), expr_dt_sort())),
+        );
+        let result = backend.verify(&safety_vc(formula));
+        assert!(
+            !matches!(result, VerificationResult::Proved { .. }),
+            "a satisfiable datatype formula must not be Proved; got {result:?}"
+        );
+    }
 }
 
 /// Fail-closed authority tests for the router certification transport seam
 /// [`InProcessAyBackend::promote_to_certified`].
 ///
-/// No live solver is required.  Recognized LIA, BV-multiply, and BV-shift
-/// candidates all MUST retain the exact SmtBacked verdict and ay certificate
-/// until the Clean payload has a typed, digest-bound, replayable carrier.
+/// No live solver is required.  BV-multiply and BV-shift candidates, satisfiable
+/// formulas, and out-of-fragment formulas MUST all retain the exact SmtBacked
+/// verdict and ay certificate: the Clean kernel cannot certify them from the VC
+/// alone, so there is nothing replayable to promote on.  Since D.9 the
+/// recognized LIA candidate IS promoted on an `ay-certify` build, and the
+/// batteries below pin that the promotion carries evidence which replays
+/// against its own VC and is refused against any other.
 // This module intentionally runs in the base `ay-backend` build as well as
 // `ay-certify`: S1 is an AY replay gate, and feature placement must not hide its
 // falsification battery from the configuration that exports it.
@@ -2175,11 +2485,67 @@ mod certification_transport_gate_tests {
         }
     }
 
-    /// Even a locally reconstructed LIA candidate stays SmtBacked because the
-    /// live result cannot carry or replay the Clean payload.
+    /// Without the Clean reconstruction feature there is no kernel to certify
+    /// with, so even a recognized LIA candidate keeps the honest SmtBacked
+    /// verdict.
+    #[cfg(not(feature = "ay-certify"))]
     #[test]
     fn recognized_lia_stays_smtbacked_without_clean_payload_transport() {
         assert_unchanged_smtbacked(&x_gt10_lt5());
+    }
+
+    /// D.9: on an `ay-certify` build the recognized LIA candidate IS promoted —
+    /// and the promotion carries replayable evidence rather than a bare label.
+    ///
+    /// This pins the three things the old identity gate existed to prevent:
+    /// ay's LRAT bytes are not displaced, the kernel payload is present in its
+    /// own typed slot, and that payload independently replays against this VC.
+    #[cfg(feature = "ay-certify")]
+    #[test]
+    fn recognized_lia_is_promoted_with_replayable_evidence() {
+        let formula = x_gt10_lt5();
+        let out = InProcessAyBackend::promote_to_certified(strict_proved(), &formula, 99);
+        let VerificationResult::Proved {
+            strength, proof_certificate, native_proof_envelope, time_ms, ..
+        } = out
+        else {
+            panic!("promotion must stay Proved");
+        };
+        assert_eq!(strength, ProofStrength::smt_unsat_certified());
+        assert_eq!(strength.assurance, trust_types::AssuranceLevel::Certified);
+        assert_eq!(
+            proof_certificate.as_deref(),
+            Some(&[9, 9, 9][..]),
+            "ay's LRAT certificate must be PRESERVED, not displaced by the kernel payload"
+        );
+        assert_eq!(time_ms, 3, "the gate must preserve the original timing evidence");
+        let envelope = native_proof_envelope.expect("a Certified row must carry its evidence");
+        assert!(envelope.accepted());
+        assert_eq!(
+            crate::ay_certify::replay_certified_envelope(&formula, &envelope),
+            crate::ay_certify::ReplayOutcome::Replayed,
+            "the shipped envelope must independently replay against this VC"
+        );
+    }
+
+    /// D.9: the promotion is BOUND. The envelope minted for one VC does not
+    /// replay against another, so a `Certified` row cannot be laundered onto a
+    /// different obligation by copying its evidence across.
+    #[cfg(feature = "ay-certify")]
+    #[test]
+    fn promoted_evidence_does_not_replay_against_another_vc() {
+        let out = InProcessAyBackend::promote_to_certified(strict_proved(), &x_gt10_lt5(), 99);
+        let VerificationResult::Proved { native_proof_envelope: Some(envelope), .. } = out else {
+            panic!("expected a promoted row carrying an envelope");
+        };
+        let other = Formula::And(vec![
+            Formula::Gt(Box::new(Formula::Var("x".into(), Sort::Int)), Box::new(Formula::Int(20))),
+            Formula::Lt(Box::new(Formula::Var("x".into(), Sort::Int)), Box::new(Formula::Int(7))),
+        ]);
+        assert_eq!(
+            crate::ay_certify::replay_certified_envelope(&other, &envelope),
+            crate::ay_certify::ReplayOutcome::KernelRejected
+        );
     }
 
     /// The same hard block applies to the recognized BV-multiply candidate.

@@ -43,10 +43,42 @@ also can never license an optimization, because erasure requires
 `KernelCertified`, so every one of them is a proof that was paid for and thrown
 away.
 
+## `policy_directions.py` — the ruling's three directions
+
+Pins all three dispositions the completeness-gap ruling requires
+(`docs/design/2026-07-25-completeness-gap-policy-ruling.md`, §"What must be true
+before any code lands", item 3), over `directions/`:
+
+| fixture | direction | default | certify |
+|---|---|---|---|
+| `gap_with_fallback.rs` | gap WITH a runtime fallback | builds | rejected |
+| `refutation.rs` | genuine refutation | rejected | rejected |
+| `nofallback.rs` | unproved row with NO fallback | rejected | rejected |
+
+The third is the load-bearing one — it is the only thing separating policy B from
+"accept anything unproved" — and it is the one C.7 never measured.
+
+**This battery is the exception to the rule below, which is why it is the most
+carefully guarded file here.** For the other instruments the exit code is noise;
+here it *is* the measurement, because "does the build succeed?" is the entire
+question. So it screens every run for the compiler refusing its *flags* and for
+an ICE before reading any exit code as a verdict.
+
+It also guards against passing for the wrong reason. `nofallback.rs` must produce
+an actual `postcond` row, and that row's outcome must NOT be a refutation — a
+false postcondition would be refuted, which already fails under `refutation.rs`,
+so the case would silently become a duplicate that pins nothing. Both guards were
+falsified before being trusted: inverting either expectation makes the battery
+exit 1.
+
+Measured at stage2 `2d87b63cc`: all three hold.
+
 ## Why exit codes are never the verdict
 
-Both scripts refuse to infer a verdict from a process exit code, and report a
+The scripts refuse to infer a verdict from a process exit code, and report a
 `HARNESS` error instead when the compiler rejects their own flags.
+(`policy_directions.py` must read exit codes — see its own section above for how
+it screens them first.)
 
 This is not hypothetical. A sibling battery in this repo once reported
 **all-green while the defect it existed to catch was wide open**: a flag rename

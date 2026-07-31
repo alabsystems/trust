@@ -1534,8 +1534,90 @@ fn canonical_default_admission_metadata() -> Vec<MetadataEntry> {
     ]
 }
 
+/// Compiler-derived boundary-hardening lane (OS/path, byte/text, error, panic,
+/// compatibility, process semantics, unsafe/FFI, trust domain).
+///
+/// This is the ONE privileged `ObligationKind::Custom` namespace. Consumers
+/// treat it as a capability, not a label: carrying it grants a full-verifier
+/// route (`trust-router` `obligation_route_for_kind`), trust-mc ownership plus a
+/// `MirObligationKind::Assertion` lowering (`trust-bmc`), trust-mc
+/// formula-obligation status (`trust-mir-extract`), and native TrustIr
+/// routability (`rustc_mir_transform::trust_verify`). Every other `Custom`
+/// namespace is deliberately un-routable, and that exclusion is load-bearing:
+/// see [`TRUST_VC_UNBOUNDED_ALLOCATION_OBLIGATION_NAMESPACE`].
+pub const TRUST_VC_HARDENED_OBLIGATION_NAMESPACE: &str = "trust.vc.hardened";
+
+/// Compiler verification conditions with no nominal [`ObligationKind`].
+pub const TRUST_VC_OBLIGATION_NAMESPACE: &str = "trust.vc";
+
+/// Allocation-capacity obligations (`count >= ceiling`).
+///
+/// This namespace exists so the obligation is NOT natively routable. A
+/// `VcKind::UnboundedAllocation` is not a panic-freedom / arithmetic-overflow
+/// property, and the native whole-function CHC proof does not model it; mapping
+/// it into a routable kind false-proved unbounded allocations. Widening the
+/// privileged-namespace test to cover this namespace reopens that P0.
+pub const TRUST_VC_UNBOUNDED_ALLOCATION_OBLIGATION_NAMESPACE: &str =
+    "trust.vc.unbounded_allocation";
+
+/// Source-level contract clauses the compiler could not lower (`name` is
+/// `"unsupported"`), used to bind a public marker row to its clause monitor.
+pub const TRUST_CONTRACT_OBLIGATION_NAMESPACE: &str = "trust.contract";
+
+/// Proof items (lemmas, specification functions, proof blocks, logic laws).
+pub const TRUST_PROOF_ITEM_OBLIGATION_NAMESPACE: &str = "trust.proof_item";
+
+/// trust-vc's TrustIr adapter request lane.
+pub const TRUST_VC_TRUST_IR_OBLIGATION_NAMESPACE: &str = "trust_vc.trust_ir";
+
+/// The closed set of namespaces an [`ObligationKind::Custom`] may carry.
+///
+/// `namespace` is authority-bearing (see
+/// [`TRUST_VC_HARDENED_OBLIGATION_NAMESPACE`]), so it is admitted from this
+/// pinned list rather than accepted as free text: an obligation cannot mint a
+/// producer identity that no Trust component defines, and a new privileged lane
+/// cannot appear without an edit here, in the crate that owns the vocabulary.
+/// Enforced by `validate_obligation_kind`, which runs on every obligation in a
+/// bundle, a request batch, a run result, a skipped row, and on the canonical
+/// semantic digest — and at the serde boundary itself: every `ObligationKind`
+/// deserialization funnels through `ObligationKindWire`'s `TryFrom`, which runs
+/// the same admission. The boundary check is load-bearing, not belt-and-braces:
+/// obligation kinds are deserialized in production (`targo-trust`'s three-suite
+/// artifact gate parses `verification-run-manifest.json` from disk), and bare
+/// [`TrustObligation`]/[`SkippedObligation`]/[`EngineManifest`] values have no
+/// validating `Deserialize` impls of their own.
+///
+/// `name` is deliberately NOT sealed: within an admitted namespace it is a
+/// label, never an authority test — the hardened lane forwards unrecognized
+/// names as `HardenedVcCategory::Unknown`, and the two name-sensitive consumers
+/// (`trust.contract`/`"unsupported"`, `trust.vc`/`"translation_validation"`)
+/// use exact equality to NARROW, so an unknown name fails closed.
+pub const ADMITTED_OBLIGATION_NAMESPACES: &[&str] = &[
+    TRUST_CONTRACT_OBLIGATION_NAMESPACE,
+    TRUST_PROOF_ITEM_OBLIGATION_NAMESPACE,
+    TRUST_VC_OBLIGATION_NAMESPACE,
+    TRUST_VC_HARDENED_OBLIGATION_NAMESPACE,
+    TRUST_VC_UNBOUNDED_ALLOCATION_OBLIGATION_NAMESPACE,
+    TRUST_VC_TRUST_IR_OBLIGATION_NAMESPACE,
+];
+
+/// True when `namespace` is a Trust-defined [`ObligationKind::Custom`]
+/// namespace. Exact match against [`ADMITTED_OBLIGATION_NAMESPACES`]: never a
+/// prefix or `starts_with` test, which would let `trust.vc.hardened.evil` — or
+/// the unbounded-allocation lane under a `trust.vc` prefix — inherit authority.
+#[must_use]
+pub fn is_admitted_obligation_namespace(namespace: &str) -> bool {
+    ADMITTED_OBLIGATION_NAMESPACES.contains(&namespace)
+}
+
 /// Obligation role.
+///
+/// `Custom` is an open-ended shape but not an open-ended vocabulary: its
+/// `namespace` must be one of [`ADMITTED_OBLIGATION_NAMESPACES`], and
+/// deserialization enforces that admission itself (the `try_from` funnel
+/// below), so an unpinned namespace cannot enter through any serde boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "ObligationKindWire")]
 #[non_exhaustive]
 pub enum ObligationKind {
     Precondition,
@@ -1553,6 +1635,62 @@ pub enum ObligationKind {
     Liveness,
     Protocol,
     Custom { namespace: String, name: String },
+}
+
+/// Deserialization funnel for [`ObligationKind`]: identical wire shape (same
+/// variant names, order, and `Custom` fields, so self-describing and
+/// index-based encodings are both unchanged), with `TryFrom` running
+/// `validate_obligation_kind` on the way in. A forged or unpinned `Custom`
+/// namespace is refused AT the serde boundary itself, not only by the envelope
+/// validators a deserializer happens to call. This matters because obligation
+/// kinds ARE deserialized in production — `targo-trust`'s
+/// `run_three_suite_artifact_gate` (pipeline_v2) parses an on-disk
+/// `verification-run-manifest.json` outside `cfg(test)` — and a bare
+/// [`TrustObligation`], [`SkippedObligation`], or [`EngineManifest`] has no
+/// validating `Deserialize` impl of its own.
+#[derive(Deserialize)]
+enum ObligationKindWire {
+    Precondition,
+    Postcondition,
+    Assertion,
+    Invariant,
+    LoopInvariant,
+    ArithmeticSafety,
+    MemorySafety,
+    BoundsCheck,
+    Ownership,
+    Refinement,
+    Termination,
+    TemporalSafety,
+    Liveness,
+    Protocol,
+    Custom { namespace: String, name: String },
+}
+
+impl TryFrom<ObligationKindWire> for ObligationKind {
+    type Error = String;
+
+    fn try_from(wire: ObligationKindWire) -> Result<Self, Self::Error> {
+        let kind = match wire {
+            ObligationKindWire::Precondition => Self::Precondition,
+            ObligationKindWire::Postcondition => Self::Postcondition,
+            ObligationKindWire::Assertion => Self::Assertion,
+            ObligationKindWire::Invariant => Self::Invariant,
+            ObligationKindWire::LoopInvariant => Self::LoopInvariant,
+            ObligationKindWire::ArithmeticSafety => Self::ArithmeticSafety,
+            ObligationKindWire::MemorySafety => Self::MemorySafety,
+            ObligationKindWire::BoundsCheck => Self::BoundsCheck,
+            ObligationKindWire::Ownership => Self::Ownership,
+            ObligationKindWire::Refinement => Self::Refinement,
+            ObligationKindWire::Termination => Self::Termination,
+            ObligationKindWire::TemporalSafety => Self::TemporalSafety,
+            ObligationKindWire::Liveness => Self::Liveness,
+            ObligationKindWire::Protocol => Self::Protocol,
+            ObligationKindWire::Custom { namespace, name } => Self::Custom { namespace, name },
+        };
+        validate_obligation_kind(&kind)?;
+        Ok(kind)
+    }
 }
 
 /// Typed origin and compiler context for one public obligation.
@@ -1674,6 +1812,16 @@ pub struct ObligationEvidence {
     pub obligation_id: String,
     pub engine: EngineManifest,
     pub status: EvidenceStatus,
+    /// Why this obligation was declined, when the producing engine classified
+    /// it. Set only by a producing engine, only on a decline, and only when the
+    /// decline is a pure capability gap.
+    ///
+    /// `None` is TERMINAL and is the correct default: an absent class means
+    /// nobody asserted that a retry is safe. Old wire payloads and engines that
+    /// have not been taught the distinction both land here, fail-closed by
+    /// construction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decline: Option<DeclineClass>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof_strength: Option<ProofStrength>,
     #[serde(
@@ -2154,6 +2302,53 @@ impl EvidenceStatus {
             Self::Canceled => trust_types::Outcome::Canceled,
             Self::Unsupported => trust_types::Outcome::Unsupported,
         }
+    }
+}
+
+/// Why an engine declined a specific obligation INSTANCE.
+///
+/// This exists so a future multi-engine fallback can tell "I have no lowering
+/// for this kind" apart from "I lowered this instance and refused it". Only the
+/// first is ever eligible for a second engine's attempt; retrying the second
+/// would launder a rejection into a green.
+///
+/// It is deliberately NOT derivable from [`SupportLevel`], which is a function
+/// of [`ObligationKind`] alone — a per-kind constant cannot classify an
+/// instance, so any discriminator built on it is a static whitelist wearing a
+/// classifier's clothes.
+///
+/// **A single variant is deliberate.** `Soundness` is not a variant, because
+/// "not `Capability`" is the safe default and naming the unsafe class invites
+/// someone to populate it. The absence of a class is TERMINAL: engines that have
+/// not been taught this distinction, older wire payloads, and every decline the
+/// router itself mints all land on `None` and are never retried. If a second
+/// retryable class is ever justified it is added here, on its own review;
+/// `#[non_exhaustive]` keeps that additive.
+///
+/// Eligibility MUST be tested with a positive match —
+/// `matches!(decline, Some(DeclineClass::Capability))` — never a negative one.
+/// [`SupportLevel::is_supported`] is written negatively over a
+/// `#[non_exhaustive]` enum, so every future variant there silently defaults to
+/// *attemptable*. Do not copy that shape here, where the default must be
+/// *terminal*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum DeclineClass {
+    /// The engine owns this obligation kind but has no lowering or encoding for
+    /// it. Nothing about this instance was decided: no solver budget was spent,
+    /// no admission policy ran, and no proof obligation was evaluated. Another
+    /// engine may therefore attempt it without re-litigating anything.
+    Capability,
+}
+
+impl DeclineClass {
+    /// True only for a decline another engine may retry.
+    ///
+    /// Takes the `Option` so the terminal default is expressed once, here,
+    /// rather than at each call site where a `None` could be mishandled.
+    #[must_use]
+    pub fn is_retryable(decline: Option<Self>) -> bool {
+        matches!(decline, Some(Self::Capability))
     }
 }
 
@@ -2908,6 +3103,24 @@ impl VerificationRunResult {
 
         for skipped in &self.skipped {
             validate_envelope_identifier("skipped obligation_id", &skipped.obligation_id)?;
+            // A skipped row's kind is copied verbatim into the release/audit
+            // manifest (`manifest_obligations`) and into release-blocking
+            // diagnostics, so it gets the same kind admission as a requested
+            // obligation. Since the serde funnel (`deserialize_obligation_
+            // namespace`) now rejects unpinned Custom namespaces at parse time,
+            // `from_json_slice` can no longer deliver a forged kind here — this
+            // check's remaining unique value is the IN-MEMORY lane: a row built
+            // by pub-field construction never crosses serde, and this is the
+            // only admission it meets.
+            //
+            // `validate_derived_state` would also catch a forged kind here, but
+            // only indirectly, via the `self.skipped != derived.skipped`
+            // recompute. Checking the field itself keeps "every public
+            // ObligationKind is admitted" a local invariant of the record
+            // rather than an emergent property of one comparison, and it holds
+            // in `validate_input_state` alone, which `try_reconcile_derived_
+            // state` runs before it rewrites derived fields.
+            validate_obligation_kind(&skipped.kind)?;
         }
         Ok(())
     }
@@ -3581,6 +3794,14 @@ fn validate_obligation_kind(kind: &ObligationKind) -> Result<(), String> {
             MAX_ENGINE_PROVENANCE_FIELD_BYTES,
         )?;
         validate_canonical_text("custom obligation name", name, MAX_ENGINE_PROVENANCE_FIELD_BYTES)?;
+        // The namespace is authority-bearing, so it is admitted from the pinned
+        // vocabulary this crate owns rather than accepted as producer free text.
+        if !is_admitted_obligation_namespace(namespace) {
+            return Err(format!(
+                "verifier custom obligation namespace `{namespace}` is not an admitted Trust \
+                 obligation namespace"
+            ));
+        }
     }
     Ok(())
 }
@@ -4161,15 +4382,33 @@ impl VerificationRunStatus {
         if summary.failed > 0 {
             return Self::Failed;
         }
+        // SOUNDNESS: this list must name every counter that can absorb an
+        // obligation WITHOUT contributing to `proved`. It is enumerated
+        // negatively, so a counter added later and forgotten here silently
+        // becomes non-blocking — which is exactly how `bounded_proved` came to be
+        // missing. Its own field doc says "bounded proofs ... do not make the run
+        // proved", and the gate did not enforce that: a bounded row incremented
+        // only `bounded_proved`, touching nothing here, so an obligation could be
+        // absorbed with no proof and no blocker. Paired with a `proved` count that
+        // did not deduplicate by obligation, two proved rows on one obligation
+        // could pay for a bounded-only row on another and still satisfy the
+        // equality below.
+        //
+        // If you add a counter to `VerificationRunSummary`, add it here unless it
+        // is provably non-absorbing.
         if summary.unknown > 0
             || summary.unsupported > 0
             || summary.skipped > 0
+            || summary.bounded_proved > 0
             || summary.insufficient_strength > 0
             || summary.missing_proof_artifacts > 0
             || summary.publication_conflicts > 0
         {
             return Self::Inconclusive;
         }
+        // `proved` counts DISTINCT obligations (see `VerificationRunSummary::new`),
+        // so this equality means "every requested obligation has a
+        // publication-grade proof", not "we accumulated enough rows".
         if summary.proved == summary.requested_obligations {
             return Self::Proved;
         }
@@ -4254,6 +4493,14 @@ impl VerificationRunSummary {
             ..Self::default()
         };
 
+        // SOUNDNESS: `proved` must count DISTINCT obligations, never evidence
+        // rows. `from_summary` accepts a run when `proved == requested_obligations`,
+        // so if one obligation contributed two publication-grade rows it could pay
+        // for a second obligation that was never proved at all. Nothing emits two
+        // rows per obligation today — a multi-engine fallback would be the first
+        // mechanism that does — so this is a guard placed before the mechanism
+        // that needs it, not a fix to an observed miscount.
+        let mut counted_proved: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for item in evidence {
             if is_admission(&item.obligation_id) {
                 continue;
@@ -4269,7 +4516,7 @@ impl VerificationRunSummary {
                         summary.insufficient_strength += 1;
                     } else if !item.satisfies_proof_artifact_policy() {
                         summary.missing_proof_artifacts += 1;
-                    } else {
+                    } else if counted_proved.insert(item.obligation_id.as_str()) {
                         summary.proved += 1;
                     }
                 }
@@ -5691,6 +5938,7 @@ impl VerificationRunManifest {
                 obligation_id: decision.obligation_id.clone(),
                 engine: decision.engine.clone(),
                 status: decision.status,
+                decline: None,
                 proof_strength: decision.proof_strength.clone(),
                 artifacts: decision.artifacts.clone(),
                 counterexample: decision.counterexample.clone(),
@@ -6099,6 +6347,7 @@ mod tests {
                     obligation_id: obligation.obligation_id.clone(),
                     engine: self.manifest.clone(),
                     status: EvidenceStatus::Proved,
+                    decline: None,
                     proof_strength: Some(ProofStrength::deductive()),
                     artifacts: vec![certificate_artifact(
                         &obligation.obligation_id,
@@ -6360,6 +6609,7 @@ mod tests {
             obligation_id: obligation_id.to_string(),
             engine: engine.clone(),
             status,
+            decline: None,
             proof_strength,
             artifacts,
             counterexample: None,
@@ -8030,6 +8280,7 @@ mod tests {
             obligation_id: "obl-1".to_string(),
             engine: EngineManifest::new("trust-mc", "0.1.0", EngineKind::Reachability),
             status: EvidenceStatus::Proved,
+            decline: None,
             proof_strength: Some(ProofStrength::bounded(16)),
             artifacts: Vec::new(),
             counterexample: None,
@@ -8051,6 +8302,107 @@ mod tests {
         assert!(!result.is_fully_proved());
     }
 
+    /// SOUNDNESS: the decline taxonomy's default must be TERMINAL.
+    ///
+    /// `DeclineClass` exists so a future fallback can retry a pure capability
+    /// gap without re-litigating a decline that was actually a refusal. The
+    /// whole design rests on the default being non-retryable: every engine that
+    /// has not been taught the distinction, every older wire payload, and every
+    /// decline the router itself mints arrive as `None`.
+    ///
+    /// Written as a positive match on purpose. `SupportLevel::is_supported` is
+    /// `!matches!(self, Self::Unsupported { .. })` over a `#[non_exhaustive]`
+    /// enum, so a variant added there silently becomes *attemptable*. Here a
+    /// variant added without updating `is_retryable` stays *terminal*, which is
+    /// the safe direction.
+    #[test]
+    fn decline_class_default_is_terminal_and_only_capability_retries() {
+        assert!(!DeclineClass::is_retryable(None), "an unclassified decline must never be retried");
+        assert!(DeclineClass::is_retryable(Some(DeclineClass::Capability)));
+    }
+
+    /// An older payload with no `decline` field must deserialize to the terminal
+    /// default, and a row carrying no class must serialize without the key so
+    /// today's bytes are unchanged.
+    #[test]
+    fn decline_is_wire_additive_and_absent_means_terminal() {
+        let legacy = serde_json::json!({
+            "evidence_id": "ev-legacy",
+            "obligation_id": "obl-1",
+            "engine": {
+                "name": "unit-engine",
+                "version": "0.1.0",
+                "kind": "Deductive",
+                "api_version": API_VERSION,
+            },
+            "status": "Unsupported",
+            "publication": {},
+        });
+        let restored: ObligationEvidence =
+            serde_json::from_value(legacy).expect("legacy payload without `decline` deserializes");
+        assert_eq!(restored.decline, None, "absent means terminal");
+        assert!(!DeclineClass::is_retryable(restored.decline));
+
+        let json = serde_json::to_value(&restored).expect("serialize");
+        assert!(
+            json.get("decline").is_none(),
+            "a row with no decline class must not emit the key, so existing bytes are unchanged"
+        );
+    }
+
+    /// SOUNDNESS WITNESS: duplicate proved rows on one obligation must not pay
+    /// for another obligation that was never proved.
+    ///
+    /// `from_summary` accepts a run when `proved == requested_obligations`. If
+    /// `proved` counted evidence ROWS, two publication-grade rows for the same
+    /// obligation would satisfy that equality for a two-obligation bundle while
+    /// the second obligation held only a bounded row — and a bounded row
+    /// increments neither `proved` nor, formerly, any blocking counter. The run
+    /// would report `Proved` with the second obligation proved by nobody.
+    ///
+    /// Two independent guards must both hold: `proved` deduplicates by
+    /// obligation, and `bounded_proved` blocks. Nothing emits two rows per
+    /// obligation today; a multi-engine fallback would be the first mechanism
+    /// that does, which is why this guard precedes it.
+    #[test]
+    fn duplicate_proved_rows_cannot_pay_for_an_unproved_obligation() {
+        let base = fully_proved_result(VerifierInvocation::NativeTrustPipeline);
+        assert_eq!(base.status, VerificationRunStatus::Proved, "baseline is a real proof");
+
+        let mut forged = base.clone();
+        // A SECOND, distinct obligation that only ever gets a bounded row.
+        let second = obligation_with_id("obl-bounded", ObligationKind::Postcondition);
+        forged.requested_obligations.push(second.clone());
+        let mut bounded = forged.evidence[0].clone();
+        bounded.evidence_id = "ev-bounded".to_string();
+        bounded.obligation_id = second.obligation_id.clone();
+        bounded.proof_strength = Some(ProofStrength::bounded(16));
+        forged.evidence.push(bounded);
+        // A duplicate publication-grade row for the FIRST obligation, which under
+        // row-counting would supply the missing `proved`.
+        let mut duplicate = forged.evidence[0].clone();
+        duplicate.evidence_id = "ev-duplicate".to_string();
+        forged.evidence.push(duplicate);
+
+        let forged = forged.canonicalized_derived_state();
+
+        assert_eq!(
+            forged.summary.requested_obligations, 2,
+            "two distinct obligations were requested"
+        );
+        assert_eq!(
+            forged.summary.proved, 1,
+            "proved must count distinct obligations, not evidence rows"
+        );
+        assert_eq!(forged.summary.bounded_proved, 1);
+        assert_eq!(
+            forged.status,
+            VerificationRunStatus::Inconclusive,
+            "an obligation with only a bounded row must never be absorbed into a Proved run"
+        );
+        assert!(!forged.is_fully_proved());
+    }
+
     #[test]
     fn weak_assurance_does_not_make_run_fully_proved() {
         let mut bundle = TrustContractBundle::empty(
@@ -8064,6 +8416,7 @@ mod tests {
             obligation_id: "obl-1".to_string(),
             engine: EngineManifest::new("heuristic", "0.1.0", EngineKind::Composite),
             status: EvidenceStatus::Proved,
+            decline: None,
             proof_strength: Some(ProofStrength {
                 reasoning: ReasoningKind::AbstractInterpretation,
                 assurance: AssuranceLevel::Heuristic,
@@ -8102,6 +8455,7 @@ mod tests {
             obligation_id: "obl-1".to_string(),
             engine: EngineManifest::new("trust-wp", "0.1.0", EngineKind::Deductive),
             status: EvidenceStatus::Proved,
+            decline: None,
             proof_strength: Some(ProofStrength::deductive()),
             artifacts: Vec::new(),
             counterexample: None,
@@ -8137,6 +8491,7 @@ mod tests {
             obligation_id: "obl-1".to_string(),
             engine: EngineManifest::new("ay", "0.1.0", EngineKind::SolverKernel),
             status: EvidenceStatus::Proved,
+            decline: None,
             proof_strength: Some(ProofStrength::certified(ReasoningKind::Smt)),
             artifacts: Vec::new(),
             counterexample: None,
@@ -8171,6 +8526,7 @@ mod tests {
             obligation_id: "obl-1".to_string(),
             engine: EngineManifest::new("trust-wp", "0.1.0", EngineKind::Deductive),
             status: EvidenceStatus::Proved,
+            decline: None,
             proof_strength: Some(ProofStrength::deductive()),
             artifacts: vec![certificate_artifact("obl-1", "conflict-proof")],
             counterexample: None,
@@ -8255,6 +8611,7 @@ mod tests {
             obligation_id: "obl-1".to_string(),
             engine: EngineManifest::new("engine-b", "0.1.0", EngineKind::Deductive),
             status: EvidenceStatus::Proved,
+            decline: None,
             proof_strength: Some(ProofStrength::deductive()),
             artifacts: Vec::new(),
             counterexample: None,
@@ -8296,6 +8653,7 @@ mod tests {
                 obligation_id: "obl-proved".to_string(),
                 engine: engine.clone(),
                 status: EvidenceStatus::Proved,
+                decline: None,
                 proof_strength: Some(ProofStrength {
                     reasoning: ReasoningKind::Chc,
                     assurance: AssuranceLevel::SmtBacked,
@@ -8310,6 +8668,7 @@ mod tests {
                 obligation_id: "obl-bounded".to_string(),
                 engine: engine.clone(),
                 status: EvidenceStatus::Proved,
+                decline: None,
                 proof_strength: Some(ProofStrength::bounded(32)),
                 artifacts: Vec::new(),
                 counterexample: None,
@@ -8506,6 +8865,7 @@ mod tests {
             obligation_id: "obl-1".to_string(),
             engine: EngineManifest::new("trust-wp", "0.1.0", EngineKind::Deductive),
             status: EvidenceStatus::Proved,
+            decline: None,
             proof_strength: Some(ProofStrength::deductive()),
             artifacts: Vec::new(),
             counterexample: None,
@@ -8533,6 +8893,7 @@ mod tests {
             obligation_id: "obl-1".to_string(),
             engine: EngineManifest::new("trust-mc", "1.2.3", EngineKind::Reachability),
             status: EvidenceStatus::Proved,
+            decline: None,
             proof_strength: Some(ProofStrength::bounded(8)),
             artifacts: vec![EvidenceArtifact {
                 kind: EvidenceArtifactKind::SolverQuery,
@@ -8855,9 +9216,22 @@ mod tests {
         duplicated.requested_obligations.push(duplicated.requested_obligations[0].clone());
         duplicated.evidence.push(duplicated.evidence[0].clone());
         duplicated = duplicated.canonicalized_derived_state();
-        assert_eq!(duplicated.status, VerificationRunStatus::Proved);
+        // The forgery is now caught by TWO independent layers. It used to pass the
+        // summary arithmetic (`status == Proved`, `proved == 2`) and be caught only
+        // by `validate_derived_state` below. `proved` now counts DISTINCT
+        // obligations, so a duplicated row no longer supplies a second proof and
+        // the run is already Inconclusive before validation runs. Defence in depth:
+        // both assertions below must hold.
         assert_eq!(duplicated.summary.requested_obligations, 2);
-        assert_eq!(duplicated.summary.proved, 2);
+        assert_eq!(
+            duplicated.summary.proved, 1,
+            "a duplicated evidence row must not count as a second proof"
+        );
+        assert_eq!(
+            duplicated.status,
+            VerificationRunStatus::Inconclusive,
+            "the summary layer must refuse a run whose obligations are not each proved"
+        );
         let duplicate_error = duplicated
             .validate_derived_state()
             .expect_err("duplicate request/evidence identities must fail closed");
@@ -9008,6 +9382,394 @@ mod tests {
             .expect_err("proved evidence cannot simultaneously claim a counterexample");
         assert!(error.contains("non-failed status"), "{error}");
         assert!(!forged.to_manifest().is_release_actionable());
+    }
+
+    /// `ObligationKind::Custom.namespace` is authority-bearing, not decorative:
+    /// `trust.vc.hardened` alone buys a full-verifier route, trust-mc ownership
+    /// plus an `Assertion` MIR lowering, and native TrustIr routability, while
+    /// every other namespace is deliberately unroutable (the
+    /// `trust.vc.unbounded_allocation` P0). It is therefore admitted from a
+    /// pinned list instead of accepted as producer free text.
+    #[test]
+    fn custom_obligation_namespace_is_sealed_to_the_pinned_vocabulary() {
+        for namespace in ADMITTED_OBLIGATION_NAMESPACES {
+            assert!(is_admitted_obligation_namespace(namespace), "{namespace}");
+            validate_obligation_kind(&ObligationKind::Custom {
+                namespace: (*namespace).to_string(),
+                // Names stay free inside an admitted namespace: the hardened
+                // lane forwards unrecognized names as `Unknown`.
+                name: "a_name_no_consumer_knows".to_string(),
+            })
+            .unwrap_or_else(|error| panic!("`{namespace}` must stay admitted: {error}"));
+        }
+
+        // Admission is exact match. A prefix, suffix, case, or homoglyph
+        // near-miss on the privileged namespace must not inherit its authority,
+        // and no producer may mint an identity Trust does not define.
+        for forged in [
+            "trust.vc.hardened.evil",
+            "trust.vc.hardened2",
+            "trust.vc.hardene",
+            "TRUST.VC.HARDENED",
+            "trust.vc.hardened\u{200b}",
+            "trust\u{2024}vc\u{2024}hardened",
+            "trust.vc.unbounded_allocation.routable",
+            "trust.vc.test",
+            "attacker.ns",
+        ] {
+            assert!(!is_admitted_obligation_namespace(forged), "{forged}");
+            let error = validate_obligation_kind(&ObligationKind::Custom {
+                namespace: forged.to_string(),
+                name: "raw_path_api".to_string(),
+            })
+            .expect_err("an unadmitted obligation namespace must be refused");
+            assert!(error.contains("not an admitted Trust"), "{error}");
+        }
+
+        // Untrimmed / control-character spellings stay refused by the canonical
+        // text gate that runs first.
+        for malformed in ["trust.vc.hardened ", " trust.vc.hardened", "trust.vc.\thardened", ""] {
+            assert!(
+                validate_obligation_kind(&ObligationKind::Custom {
+                    namespace: malformed.to_string(),
+                    name: "raw_path_api".to_string(),
+                })
+                .is_err(),
+                "{malformed:?}"
+            );
+        }
+    }
+
+    /// The exact wire spellings serialized artifacts, digests, and match arms
+    /// compare against. In-tree consumers do not re-state them: `trust-router`,
+    /// `trust-bmc`, and `trust-mir-extract` alias these constants by `use`, and
+    /// `rustc_mir_transform::trust_verify` compares against them directly, so
+    /// in-process agreement is structural, not tested. What this pin protects
+    /// is the WIRE meaning: an edit to the owning spelling would silently
+    /// re-key every already-serialized artifact and digest.
+    #[test]
+    fn admitted_obligation_namespace_wire_values_are_pinned() {
+        assert_eq!(TRUST_VC_HARDENED_OBLIGATION_NAMESPACE, "trust.vc.hardened");
+        assert_eq!(TRUST_VC_OBLIGATION_NAMESPACE, "trust.vc");
+        assert_eq!(
+            TRUST_VC_UNBOUNDED_ALLOCATION_OBLIGATION_NAMESPACE,
+            "trust.vc.unbounded_allocation"
+        );
+        assert_eq!(TRUST_CONTRACT_OBLIGATION_NAMESPACE, "trust.contract");
+        assert_eq!(TRUST_PROOF_ITEM_OBLIGATION_NAMESPACE, "trust.proof_item");
+        assert_eq!(TRUST_VC_TRUST_IR_OBLIGATION_NAMESPACE, "trust_vc.trust_ir");
+
+        // Exactly one privileged namespace.
+        assert_ne!(
+            TRUST_VC_UNBOUNDED_ALLOCATION_OBLIGATION_NAMESPACE,
+            TRUST_VC_HARDENED_OBLIGATION_NAMESPACE
+        );
+        // The prefix hazard is REAL, in the direction a guard would test it: an
+        // authority check of the form `candidate.starts_with(prefix)` cannot
+        // separate these lanes, because the shared `trust.vc` spelling is a
+        // proper prefix of BOTH the privileged lane and the deliberately
+        // unroutable allocation lane, and the privileged spelling is itself a
+        // proper prefix of forgeable extensions. (A previous revision asserted
+        // the vacuous opposite direction — that the unbounded spelling does not
+        // start with the hardened one — which no guard tests and which no edit
+        // to non-nested spellings could ever make fail.) Exact-match admission
+        // is therefore load-bearing: pin that it separates exactly the pairs
+        // `starts_with` cannot.
+        assert!(TRUST_VC_HARDENED_OBLIGATION_NAMESPACE.starts_with(TRUST_VC_OBLIGATION_NAMESPACE));
+        assert!(
+            TRUST_VC_UNBOUNDED_ALLOCATION_OBLIGATION_NAMESPACE
+                .starts_with(TRUST_VC_OBLIGATION_NAMESPACE)
+        );
+        let forged_extension = format!("{TRUST_VC_HARDENED_OBLIGATION_NAMESPACE}.evil");
+        assert!(forged_extension.starts_with(TRUST_VC_HARDENED_OBLIGATION_NAMESPACE));
+        assert!(forged_extension.starts_with(TRUST_VC_OBLIGATION_NAMESPACE));
+        assert!(!is_admitted_obligation_namespace(&forged_extension));
+
+        let mut sorted = ADMITTED_OBLIGATION_NAMESPACES.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            ADMITTED_OBLIGATION_NAMESPACES.len(),
+            "the admitted namespace list must not contain duplicates"
+        );
+    }
+
+    #[test]
+    fn an_unadmitted_custom_namespace_is_refused_at_every_obligation_entry_point() {
+        let admitted = ObligationKind::Custom {
+            namespace: TRUST_VC_HARDENED_OBLIGATION_NAMESPACE.to_string(),
+            name: "raw_path_api".to_string(),
+        };
+        let forged = ObligationKind::Custom {
+            namespace: "trust.vc.hardened.evil".to_string(),
+            name: "raw_path_api".to_string(),
+        };
+
+        // 1. Bundle inventory.
+        let mut bundle = TrustContractBundle::empty(
+            "bundle-sealed-namespace",
+            BundleSubject::Function {
+                crate_name: "demo".to_string(),
+                path: "demo::sealed_namespace".to_string(),
+            },
+        );
+        bundle.obligations.push(obligation_with_id("obl-forged", forged.clone()));
+        let error = bundle.validate().expect_err("a forged namespace cannot enter a bundle");
+        assert!(error.contains("not an admitted Trust"), "{error}");
+
+        // 2. The cross-boundary semantic digest refuses to bind it at all.
+        let digest_error = bundle.obligations[0]
+            .canonical_semantic_digest_sha256()
+            .expect_err("a forged namespace has no canonical public semantics");
+        assert!(digest_error.contains("not an admitted Trust"), "{digest_error}");
+
+        // 3. Request batches (the ID-retention guard is not the only check).
+        bundle.obligations[0].kind = admitted.clone();
+        bundle.validate().expect("the admitted hardened namespace still validates");
+        let mut requested = bundle.obligations.clone();
+        requested[0].kind = forged.clone();
+        assert!(bundle.validate_requested_obligations(&requested).is_err());
+
+        // 4. Engine capability inventory: an engine cannot declare authority in
+        //    a namespace Trust does not define.
+        let mut engine = EngineManifest::new("forged-engine", "0.1.0", EngineKind::Reachability);
+        engine.capabilities =
+            vec![EngineCapability { obligation_kind: forged, support: SupportLevel::Preferred }];
+        let engine_error =
+            engine.validate().expect_err("a forged capability namespace must be refused");
+        assert!(engine_error.contains("not an admitted Trust"), "{engine_error}");
+        engine.capabilities[0].obligation_kind = admitted;
+        engine.validate().expect("the admitted hardened capability still validates");
+    }
+
+    /// `from_json_slice` is documented as parsing an UNTRUSTED result, and a
+    /// skipped row's kind is copied verbatim into the release/audit manifest and
+    /// into release-blocking diagnostics. It gets the same admission as a
+    /// requested obligation, so the rejection is attributable to the forged
+    /// namespace rather than to a downstream derived-state recompute.
+    #[test]
+    fn skipped_obligation_kinds_are_admitted_across_the_untrusted_json_boundary() {
+        let engine = EngineManifest::new("unit-engine", "0.1.0", EngineKind::Deductive);
+        let mut bundle = TrustContractBundle::empty(
+            "bundle-skipped-kind",
+            BundleSubject::Function {
+                crate_name: "demo".to_string(),
+                path: "demo::skipped_kind".to_string(),
+            },
+        );
+        let proved = obligation_with_id("obl-proved", ObligationKind::Postcondition);
+        let unevidenced = obligation_with_id(
+            "obl-skipped",
+            ObligationKind::Custom {
+                namespace: TRUST_VC_HARDENED_OBLIGATION_NAMESPACE.to_string(),
+                name: "raw_path_api".to_string(),
+            },
+        );
+        bundle.obligations.push(proved.clone());
+        bundle.obligations.push(unevidenced);
+        let proof = evidence(
+            &engine,
+            "ev-proved",
+            &proved.obligation_id,
+            EvidenceStatus::Proved,
+            Some(ProofStrength::deductive()),
+            vec![certificate_artifact(&proved.obligation_id, "skipped-kind-proof")],
+        );
+        let result = VerificationRunResult::from_evidence(
+            VerifierExecutionContext::new("run-skipped-kind").snapshot(),
+            &bundle,
+            engine,
+            &bundle.obligations,
+            vec![proof],
+        );
+        assert_eq!(result.skipped.len(), 1, "fixture must carry exactly one skipped row");
+        result.validate_derived_state().expect("an admitted skipped kind is canonical");
+
+        // Forge ONLY the skipped row, leaving every requested obligation
+        // admitted, so the rejection is attributable to the skipped lane.
+        let mut forged = serde_json::to_value(&result).expect("serialize skipped-row result");
+        forged["skipped"][0]["kind"]["Custom"]["namespace"] =
+            serde_json::Value::String("trust.vc.hardened.evil".to_string());
+        let bytes = serde_json::to_vec(&forged).expect("encode forged skipped row");
+        let error = VerificationRunResult::from_json_slice(&bytes)
+            .expect_err("an unadmitted skipped-row namespace must not cross the JSON boundary");
+        assert!(error.contains("not an admitted Trust"), "{error}");
+    }
+
+    /// Serde `Deserialize` DOES have a production caller — `targo-trust`'s
+    /// `run_three_suite_artifact_gate` (pipeline_v2, not under `cfg(test)`)
+    /// parses a `VerificationRunManifest` from an on-disk
+    /// `verification-run-manifest.json` — so admission cannot rely on every
+    /// deserializer remembering to validate. It is enforced at the serde
+    /// boundary of `ObligationKind` itself: a bare kind, and a bare
+    /// `TrustObligation` (which has no validating `Deserialize` impl), both
+    /// refuse an unpinned namespace before any envelope validator runs.
+    #[test]
+    fn an_unadmitted_namespace_is_refused_at_the_serde_boundary_itself() {
+        let forged_kind_json =
+            r#"{"Custom":{"namespace":"trust.vc.hardened.evil","name":"raw_path_api"}}"#;
+        let error = serde_json::from_str::<ObligationKind>(forged_kind_json)
+            .expect_err("a bare ObligationKind deserialization must enforce admission");
+        assert!(error.to_string().contains("not an admitted Trust"), "{error}");
+
+        // Positive controls: every admitted namespace (with a free name) and a
+        // nominal variant still cross the same boundary.
+        for namespace in ADMITTED_OBLIGATION_NAMESPACES {
+            let admitted_json = format!(
+                r#"{{"Custom":{{"namespace":"{namespace}","name":"a_name_no_consumer_knows"}}}}"#
+            );
+            let kind: ObligationKind = serde_json::from_str(&admitted_json)
+                .unwrap_or_else(|error| panic!("`{namespace}` must deserialize: {error}"));
+            assert_eq!(
+                kind,
+                ObligationKind::Custom {
+                    namespace: (*namespace).to_string(),
+                    name: "a_name_no_consumer_knows".to_string(),
+                }
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<ObligationKind>("\"Assertion\"")
+                .expect("nominal variants still deserialize"),
+            ObligationKind::Assertion
+        );
+
+        // A bare TrustObligation rides the same funnel.
+        let mut obligation = serde_json::to_value(obligation_with_id(
+            "obl-bare-boundary",
+            ObligationKind::Custom {
+                namespace: TRUST_VC_HARDENED_OBLIGATION_NAMESPACE.to_string(),
+                name: "raw_path_api".to_string(),
+            },
+        ))
+        .expect("serialize bare obligation");
+        serde_json::from_value::<TrustObligation>(obligation.clone())
+            .expect("the admitted bare obligation deserializes");
+        obligation["kind"]["Custom"]["namespace"] =
+            serde_json::Value::String("attacker.ns".to_string());
+        let error = serde_json::from_value::<TrustObligation>(obligation)
+            .expect_err("a bare TrustObligation deserialization must enforce admission");
+        assert!(error.to_string().contains("not an admitted Trust"), "{error}");
+    }
+
+    /// The exact production boundary of the release-manifest gate: a manifest
+    /// whose privileged namespace is forged CONSISTENTLY — every occurrence
+    /// rewritten, so every derived-state recompute still matches — must still
+    /// be refused, attributably to namespace admission. When the namespace was
+    /// producer free text, exactly this forgery deserialized and validated
+    /// clean.
+    #[test]
+    fn a_consistently_forged_namespace_is_refused_at_the_release_manifest_boundary() {
+        let engine = EngineManifest::new("unit-engine", "0.1.0", EngineKind::Deductive);
+        let mut bundle = TrustContractBundle::empty(
+            "bundle-manifest-boundary",
+            BundleSubject::Function {
+                crate_name: "demo".to_string(),
+                path: "demo::manifest_boundary".to_string(),
+            },
+        );
+        let proved = obligation_with_id("obl-proved", ObligationKind::Postcondition);
+        let unevidenced = obligation_with_id(
+            "obl-skipped",
+            ObligationKind::Custom {
+                namespace: TRUST_VC_HARDENED_OBLIGATION_NAMESPACE.to_string(),
+                name: "raw_path_api".to_string(),
+            },
+        );
+        bundle.obligations.push(proved.clone());
+        bundle.obligations.push(unevidenced);
+        let proof = evidence(
+            &engine,
+            "ev-proved",
+            &proved.obligation_id,
+            EvidenceStatus::Proved,
+            Some(ProofStrength::deductive()),
+            vec![certificate_artifact(&proved.obligation_id, "manifest-boundary-proof")],
+        );
+        let result = VerificationRunResult::from_evidence(
+            VerifierExecutionContext::new("run-manifest-boundary").snapshot(),
+            &bundle,
+            engine,
+            &bundle.obligations,
+            vec![proof],
+        );
+        let manifest = result.try_to_manifest().expect("canonical manifest");
+        let text = serde_json::to_string(&manifest).expect("serialize manifest");
+        VerificationRunManifest::from_json_slice(text.as_bytes())
+            .expect("the admitted manifest crosses the JSON boundary");
+
+        // Rewrite EVERY occurrence (requested-obligation row AND skipped row at
+        // minimum), so nothing but admission can tell the forgery apart.
+        assert!(
+            text.matches(TRUST_VC_HARDENED_OBLIGATION_NAMESPACE).count() >= 2,
+            "fixture must exercise the namespace in more than one manifest field"
+        );
+        let forged_text = text.replace(TRUST_VC_HARDENED_OBLIGATION_NAMESPACE, "trust.vc.hardenex");
+        assert_ne!(forged_text, text);
+        let error = VerificationRunManifest::from_json_slice(forged_text.as_bytes())
+            .expect_err("a forged manifest namespace must not cross the JSON boundary");
+        assert!(error.contains("not an admitted Trust"), "{error}");
+    }
+
+    /// The defect report framed `Custom` as a collision surface. It is not:
+    /// obligation identity is `obligation_id` plus the canonical semantic
+    /// digest, and the externally-tagged encoding of `Custom` is injective.
+    /// Pinned here so a future `#[serde(untagged)]`/`rename_all`/flatten change
+    /// cannot quietly make two different claims hash alike.
+    #[test]
+    fn custom_obligation_kind_encoding_is_injective() {
+        let encode = |kind: &ObligationKind| {
+            serde_json::to_string(kind).expect("obligation kinds serialize")
+        };
+
+        // A nominal variant is a bare string; `Custom` is always a tagged
+        // object, so no `Custom` can ever spell a nominal role.
+        assert_eq!(encode(&ObligationKind::Assertion), "\"Assertion\"");
+        assert_eq!(
+            encode(&ObligationKind::Custom {
+                namespace: TRUST_VC_OBLIGATION_NAMESPACE.to_string(),
+                name: "Assertion".to_string(),
+            }),
+            "{\"Custom\":{\"namespace\":\"trust.vc\",\"name\":\"Assertion\"}}"
+        );
+
+        // The namespace/name split is not collapsible: no pair of distinct
+        // (namespace, name) values shares an encoding, so the obligation digest
+        // separates them.
+        let pairs = [
+            (TRUST_VC_OBLIGATION_NAMESPACE, "a.b"),
+            (TRUST_VC_OBLIGATION_NAMESPACE, "a"),
+            (TRUST_VC_HARDENED_OBLIGATION_NAMESPACE, "a"),
+            (TRUST_VC_HARDENED_OBLIGATION_NAMESPACE, "a.b"),
+            (TRUST_VC_UNBOUNDED_ALLOCATION_OBLIGATION_NAMESPACE, "a"),
+        ];
+        let mut encodings = FxHashSet::default();
+        let mut digests = FxHashSet::default();
+        for (namespace, name) in pairs {
+            let kind =
+                ObligationKind::Custom { namespace: namespace.to_string(), name: name.to_string() };
+            assert!(encodings.insert(encode(&kind)), "{namespace}/{name} collided on the wire");
+            let obligation = obligation_with_id("obl-digest", kind);
+            let digest = obligation
+                .canonical_semantic_digest_sha256()
+                .expect("an admitted namespace digests");
+            assert!(digests.insert(digest), "{namespace}/{name} collided in the semantic digest");
+        }
+
+        // Two claims that share a kind are still separated by the rest of the
+        // canonical semantics, so the kind was never the identity.
+        let shared = ObligationKind::Custom {
+            namespace: TRUST_VC_HARDENED_OBLIGATION_NAMESPACE.to_string(),
+            name: "raw_path_api".to_string(),
+        };
+        let left = obligation_with_id("obl-left", shared.clone());
+        let mut right = obligation_with_id("obl-right", shared);
+        right.description = "a different claim".to_string();
+        assert_ne!(
+            left.canonical_semantic_digest_sha256().expect("left digests"),
+            right.canonical_semantic_digest_sha256().expect("right digests")
+        );
     }
 
     #[test]

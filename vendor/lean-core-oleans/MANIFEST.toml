@@ -5,7 +5,7 @@ lean_toolchain = "leanprover/lean4:v4.8.0"
 lean_version = "Lean (version 4.8.0, aarch64-unknown-linux-gnu, commit df668f00e6c0, Release)"
 origin = "elan-installed leanprover/lean4:v4.8.0 release toolchain, lib/lean"
 root_module = "TrustIr.Semantics.Arith"
-built_on = "2026-07-26"
+built_on = "2026-07-29"
 # FOREIGN vendored artifacts (Lean 4 core Init .oleans) — the transitive
 # Lean-core import closure of the trust-ir arithmetic-semantics root module.
 # Consumed by crates/trust-clean/src/trustir_bridge.rs. Regenerate + audit

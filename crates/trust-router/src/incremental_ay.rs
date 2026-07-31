@@ -2566,6 +2566,32 @@ pub fn violation_is_forced(formula: &Formula) -> bool {
     eval_bool_formula(formula, &env) == Some(true)
 }
 
+/// Trust: `true` iff `formula` is a bare `true` LITERAL — a vcgen MODELING-GAP
+/// FAIL-CLOSE marker, NOT a violation forced by the program's own modeled values.
+///
+/// SOUNDNESS RATIONALE (the discriminator that keeps the guaranteed-violation
+/// hard error honest): several vcgen paths emit a literal `Formula::Bool(true)`
+/// as a deliberately fail-closed obligation when they CANNOT MODEL the relevant
+/// fact — e.g. the `Index<Range>` body when the receiver's length is unresolved
+/// or its range aggregate is untraceable (`generate::panic_calls`, "Untraceable
+/// range — already the `Bool(true)` fail-close"), an FFI boundary with no
+/// summary, or a memory-provenance gap. Keeping such an obligation FAILED (so the
+/// warning / coverage lane and the strict full-verification abort still surface
+/// it) is correct. But a bare `Bool(true)` carries ZERO information about the
+/// program's actual values: the indexed code may be provably in-bounds
+/// (`bytes[52..56]` on a `[u8; 64]` whose `&[T; N]` length the model did not
+/// recover), so reporting it as a GUARANTEED, every-execution Level-0 VIOLATION
+/// is a FALSE REFUTATION of correct code. A genuine value-forced violation always
+/// folds through REAL modeled atoms (`Ge(1<<28, 1<<28)`, `Ge(100, 64)`) — never a
+/// bare literal — so excluding the bare-literal case from that escalation removes
+/// only false refutations. Fail-closed: the obligation stays FAILED, never PROVED
+/// (`violation_is_modeling_gap_failclose` is only ever consulted to WITHHOLD an
+/// escalation, never to grant a proof).
+#[must_use]
+pub fn violation_is_modeling_gap_failclose(formula: &Formula) -> bool {
+    matches!(formula, Formula::Bool(true))
+}
+
 /// Trust: an `UnboundedAllocation` is a GUARANTEED over-budget violation iff its
 /// COUNT folds to a compile-time constant at or above the budget ceiling — i.e.
 /// the violation atom `Ge(count, CEILING)` / `Gt(count, CEILING)` holds with
@@ -2991,6 +3017,58 @@ mod tests {
             !violation_is_forced(&Formula::And(vec![count_def, bound, viol])),
             "a symbolically-bounded allocation must NOT be treated as guaranteed"
         );
+    }
+
+    #[test]
+    fn modeling_gap_failclose_flags_bare_true_literal() {
+        // A bare `Bool(true)` is the vcgen modeling-gap fail-close marker (the
+        // `Index<Range>` body with an unresolved receiver length / an untraceable
+        // range aggregate). It IS `violation_is_forced` (it folds to true), which is
+        // exactly why the guaranteed-violation escalation needs a second
+        // discriminator to keep it out.
+        assert!(violation_is_forced(&Formula::Bool(true)));
+        assert!(
+            violation_is_modeling_gap_failclose(&Formula::Bool(true)),
+            "a bare `true` literal is a modeling-gap fail-close, not a program-forced violation"
+        );
+    }
+
+    #[test]
+    fn modeling_gap_failclose_rejects_genuine_ground_violation() {
+        // A genuine guaranteed violation folds through REAL atoms (`Ge(100, 64)` —
+        // a constant out-of-bounds index). It must NOT be classified as a
+        // modeling-gap fail-close, so it still escalates.
+        let ground_oob = Formula::Ge(Box::new(Formula::Int(100)), Box::new(Formula::Int(64)));
+        assert!(violation_is_forced(&ground_oob));
+        assert!(
+            !violation_is_modeling_gap_failclose(&ground_oob),
+            "a real ground constant-OOB violation must stay escalatable (not a modeling gap)"
+        );
+        // The constant-allocation ground violation likewise stays escalatable.
+        let ground_alloc = Formula::Ge(
+            Box::new(Formula::Int(ALLOC_CEILING)),
+            Box::new(Formula::Int(ALLOC_CEILING)),
+        );
+        assert!(!violation_is_modeling_gap_failclose(&ground_alloc));
+        // And so does the real constant-alloc VC shape (`count == 1<<28` pinned by a
+        // block-def, violation `count >= CEILING`): it is a conjunction over modeled
+        // atoms, not a bare literal.
+        let count = int_var("count");
+        let count_def = Formula::Eq(Box::new(count.clone()), Box::new(Formula::Int(ALLOC_CEILING)));
+        let viol = Formula::Ge(Box::new(count), Box::new(Formula::Int(ALLOC_CEILING)));
+        let real_vc = Formula::And(vec![count_def, viol]);
+        assert!(violation_is_forced(&real_vc));
+        assert!(
+            !violation_is_modeling_gap_failclose(&real_vc),
+            "a modeled conjunction that folds to true is not a bare-literal modeling gap"
+        );
+    }
+
+    #[test]
+    fn modeling_gap_failclose_rejects_bool_false() {
+        // `Bool(false)` (a provably-safe / vacuously-UNSAT obligation) is not a
+        // fail-close marker — the classifier must not fire on it.
+        assert!(!violation_is_modeling_gap_failclose(&Formula::Bool(false)));
     }
 
     fn u32_mul_overflow_vc(formula: Formula) -> VerificationCondition {

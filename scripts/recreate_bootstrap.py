@@ -2272,6 +2272,48 @@ tools = [
     "targo-tippy",
     "tippy-driver",
     "trust-analyzer-proc-macro-srv",
+    # Trust: THE PROOF BACKENDS ARE PART OF THE TOOLCHAIN (2026-07-31). `clean`
+    # and `ty` were absent from this list while the stage tool provenance audit
+    # required them, so every seed-mode build ended with
+    #   ERROR: missing public stage tools: clean, ty
+    # for binaries no build could ever install. The name->source mapping below
+    # already carried both entries; only the request was missing.
+    #
+    # This is not cosmetic. `clean` is the CIC kernel, and per docs/TCB.md only a
+    # Clean kernel re-check earns `Certified` — with it absent from the sysroot,
+    # solver discovery falls through to `solver_detect.rs`'s `/opt/homebrew/bin`
+    # and `/usr/local/bin` search, i.e. it looks for the proof root in a package
+    # manager's directory. That is a wrong-verdict-source hazard, not a crash.
+    # `ty` owns concurrency (DataRace, InsufficientOrdering) per v6/D2.
+    #
+    # COST, stated plainly because it cuts against slimming the build: these are
+    # the two largest tools in the set — 134 MB and 192 MB as last built — and
+    # they are now built on every bootstrap. That trade was made deliberately:
+    # a toolchain that cannot reach its own trust root is not smaller, it is
+    # incomplete. Remove `solver_detect.rs`'s brew fallback only AFTER this
+    # lands and both binaries are present, never before.
+    "clean",
+    # Trust: `ty` RESTORED (2026-07-31). It was briefly gated out because building
+    # it broke the bootstrap with
+    #     error: cannot update the lock file first-party/ty/Cargo.lock
+    #            because --locked was passed to prevent this
+    # — a coherence failure between two sibling submodules, not a defect in ty's
+    # own manifest. first-party/ty path-depends into first-party/clean, whose
+    # clean-auto inherits ay 0.4.0 pinned at rev 286c85566; ty's lock recorded
+    # that edge at the stale 04539379. Fixed at the source with `cargo update -p
+    # ay` in the ty repo (only the ay 0.4.0 set moved; tla-ay's own ay 0.3.0 at
+    # 035e84f2 is untouched), landed as fix/ty-lock-ay-286c8556 and the
+    # first-party/ty gitlink moved to it. `cargo metadata --locked` now exits 0.
+    "ty",
+    # Trust: THE TRUST-NATIVE TOOLCHAIN REGISTRY (2026-07-31). trustup is a
+    # workspace member with tests, and until now had ZERO references in
+    # src/bootstrap and was absent from stage2/bin — so the only way to select
+    # the Trust toolchain was a PATH prepend, and aterm's rust-toolchain.toml
+    # (`channel = "trust"`) was inert because rustup is not installed. It is the
+    # Trust-native answer to that, and it was sitting unwired.
+    # Its bootstrap steps are gated on this list naming it, so removing this
+    # entry disables the wiring rather than breaking the build.
+    "trustup",
 ]
 {stage0_block}
 [llvm]
@@ -2466,6 +2508,11 @@ def install_ay_solver(root: Path, host: str, stage: int) -> bool:
 STAGE_TOOL_PRODUCERS = {
     "cargo": "cargo",
     "targo": "cargo",
+    # Trust: NOT OPTIONAL (2026-07-31). A public tool named in `tools = [...]`
+    # must also name the bootstrap artifact that produced it, or the post-build
+    # installer cannot place it and the stage tool provenance audit reports it
+    # missing — exactly the failure `clean` and `ty` hit in fef5414c1fa.
+    "trustup": "trustup",
     "targo-trust": "targo-trust",
     "trustd": "trustd",
     "ay": "ay",
@@ -6683,8 +6730,70 @@ def add_homebrew_library_path(env: dict[str, str]) -> None:
             )
 
 
+def _advertises_z_option(help_text: str, name: str) -> bool:
+    """Whether `-Z help` lists exactly this unstable option.
+
+    Mirrors the matching bootstrap.py performs (`^\\s*-Z\\s+<name>(?:=|\\s|$)`)
+    without taking a regex dependency: the name must be followed by `=`,
+    whitespace, or end of line, so `trust-verify` does not match
+    `trust-verify-survey` and `no-trust-verify` does not match `trust-verify`.
+    """
+    for line in help_text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("-Z"):
+            continue
+        rest = stripped[2:].lstrip()
+        if rest == name:
+            return True
+        if rest.startswith(name) and rest[len(name) : len(name) + 1] in ("=", " ", "\t"):
+            return True
+    return False
+
+
+def seed_verification_off_switch(root: Path, host: str, env: dict) -> str | None:
+    """Which verification off-switch the MATERIALIZED seed actually speaks.
+
+    The checksum-pinned seed can predate the wave-2 flag-surface consolidation
+    (576db732cd) that renamed the off-switch to `-Ztrust-verify=off`. Such a
+    seed advertises only the retired `-Zno-trust-verify` and aborts the very
+    first bootstrap Cargo invocation with `unknown unstable option:
+    trust-verify` when handed the current spelling — which is exactly what a
+    hardcoded flag did here, defeating the pre-rename bridge bootstrap.py
+    already carries (2149dc74774). Probe the concrete driver instead of
+    assuming a vintage.
+
+    Returns "flag" for a post-rename seed, "env" for a pre-rename one, and
+    None when the driver advertises neither spelling (a stock/genesis
+    compiler has no Trust machinery to disable and must never receive the
+    Trust-specific unstable flag).
+    """
+    trustc = root / "build" / host / "stage0" / "bin" / "trustc"
+    if not trustc.is_file():
+        return None
+    try:
+        result = subprocess.run(
+            [str(trustc), "-Z", "help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    help_text = result.stdout.decode("utf-8", "replace")
+    if _advertises_z_option(help_text, "trust-verify"):
+        return "flag"
+    if _advertises_z_option(help_text, "no-trust-verify"):
+        return "env"
+    return None
+
+
 def run_xpy_build(
     root: Path,
+    host: str,
     stage: int,
     jobs: int | None,
     extra: list[str],
@@ -6708,7 +6817,18 @@ def run_xpy_build(
     # has been scrubbed and only for the checksum/admission-bound Trust seed.  A
     # stock/genesis compiler must never receive this Trust-specific unstable flag.
     if seed_mode:
-        env["RUSTFLAGS_BOOTSTRAP"] = BOOTSTRAP_COMPILER_VERIFICATION["flag"]
+        off_switch = seed_verification_off_switch(root, host, env)
+        if off_switch == "flag":
+            env["RUSTFLAGS_BOOTSTRAP"] = BOOTSTRAP_COMPILER_VERIFICATION["flag"]
+        elif off_switch == "env":
+            # A PRE-RENAME seed gets the version-invariant nested-process
+            # transport instead of a flag it cannot parse. Every Trust vintage
+            # translates TRUST_NO_VERIFY before option parsing, so the recorded
+            # policy is identical — only the spelling differs. Setting the flag
+            # here would abort the build before a single bootstrap crate
+            # compiles; see bootstrap.py's apply_trust_bootstrap_compiler_policy,
+            # which reaches the same conclusion from the same probe.
+            env["TRUST_NO_VERIFY"] = "1"
     add_homebrew_library_path(env)
     print(f"\n$ {' '.join(cmd)}\n")
     return subprocess.run(cmd, env=env, cwd=str(root)).returncode
@@ -7010,7 +7130,7 @@ def main(argv: list[str] | None = None) -> int:
             recover_seed_stage0_quarantine(root, host, seed_stage0_quarantine)
             return 1
     print("\nBuilding stage", args.stage, "(this is the long part)...")
-    rc = run_xpy_build(root, args.stage, args.jobs, extra, seed_mode=seed_mode)
+    rc = run_xpy_build(root, host, args.stage, args.jobs, extra, seed_mode=seed_mode)
     if rc != 0:
         print(f"\n`./x.py build` failed (exit {rc}).")
         recover_seed_stage0_quarantine(root, host, seed_stage0_quarantine)

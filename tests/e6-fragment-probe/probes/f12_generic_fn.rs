@@ -1,6 +1,8 @@
 //@ probe-shape: none
-//@ probe-expect: ice
-//@ probe-note: REGRESSION, 2026-07-25: this now ICEs the compiler. It used to report
+//@ probe-expect: clause-outside-fragment
+//@ probe-note: The ICE recorded on 2026-07-25 is FIXED as of 2026-07-26; this is a
+//@ probe-note: fragment boundary again, not a crash. Kept because it was the probe that
+//@ probe-note: caught the crash. Formerly:
 //@ probe-note: clause-outside-fragment (generics are outside the domain map — the W16
 //@ probe-note: extraction-timing wall reaches this lane too). It is NOT an E6 problem:
 //@ probe-note: `pub fn idg<T>(x: T) -> T { x }` alone panics under -Ztrust-verify=on,

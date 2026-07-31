@@ -9,8 +9,8 @@ use arg_file_command::ArgFileCommand;
 use shared_helpers::{
     activate_cargo_test_shim_environment, cargo_test_no_verify_requested,
     compile_uses_trust_bootstrap_no_verify, dylib_path, dylib_path_var, expand_rustc_argfiles,
-    finalize_trust_no_verify, maybe_dump, parse_rustc_stage, parse_rustc_verbose,
-    parse_value_from_args, trust_bootstrap_shim_marker_enabled,
+    finalize_trust_no_verify, finalize_trust_no_verify_snapshot, maybe_dump, parse_rustc_stage,
+    parse_rustc_verbose, parse_value_from_args, trust_bootstrap_shim_marker_enabled,
 };
 
 #[path = "../utils/shared_helpers.rs"]
@@ -77,6 +77,16 @@ fn main() {
         parse_value_from_args(&args, "--crate-name"),
     );
 
+    // A SNAPSHOT rustdoc is anything under a `stage0` directory — that
+    // directory is definitionally the seed's, whose vintage is the seed pin's,
+    // not this source tree's, so it may not parse the current off-switch
+    // spelling. The stem carries no vintage information (the seed ships its
+    // tools under trust names too). Computed here, before `rustdoc` moves
+    // into the command builder.
+    let rustdoc_is_stage0_snapshot = Path::new(&rustdoc)
+        .components()
+        .any(|component| component.as_os_str().to_str() == Some("stage0"));
+
     let mut cmd = ArgFileCommand::new(rustdoc);
     cmd.force_argfile(had_inbound_argfile);
 
@@ -129,12 +139,25 @@ fn main() {
     }
 
     // Rustdoc parses its own rustc-style options, so enforce the Trust driver
-    // capability and canonical value at its final process boundary too.
-    finalize_trust_no_verify(
-        cmd.args_mut(),
-        rustdoc_supports_trust_no_verify,
-        rustdoc_bootstrap_no_verify_applies,
-    );
+    // capability and canonical value at its final process boundary too. Same
+    // snapshot exception as the rustc shim: the stage0 seed's trustdoc may
+    // predate the current spelling, so it gets the version-invariant env
+    // transport instead of an argv flag it may not parse.
+    if rustdoc_is_stage0_snapshot {
+        if finalize_trust_no_verify_snapshot(
+            cmd.args_mut(),
+            rustdoc_supports_trust_no_verify,
+            rustdoc_bootstrap_no_verify_applies,
+        ) {
+            cmd.env("TRUST_NO_VERIFY", "1");
+        }
+    } else {
+        finalize_trust_no_verify(
+            cmd.args_mut(),
+            rustdoc_supports_trust_no_verify,
+            rustdoc_bootstrap_no_verify_applies,
+        );
+    }
 
     let (mut cmd, arg_file) = cmd.build().unwrap();
     maybe_dump(format!("stage{}-rustdoc", stage + 1), &cmd);

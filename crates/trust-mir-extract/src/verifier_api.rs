@@ -13,7 +13,8 @@ use trust_types::{
     HighLevelSpecAttr, Operand, Place, Projection, Rvalue, Sort, SourceSpan, SpecBinOp, SpecExpr,
     SpecUnaryOp, Statement, TRUST_SYMBOLIC_FORMULA_SCHEMA, Terminator, TrustProofEngineHint,
     TrustProofExecutionMode, TrustProofItem, TrustProofItemKind, TrustProofItemSource, Ty, VcKind,
-    VerifiableFunction, VerificationCondition, infer_sort, parse_spec_attr, stable_sha256_hex,
+    VerifiableFunction, VerificationCondition, check_formula_sort, infer_sort, parse_spec_attr,
+    stable_sha256_hex,
 };
 use trust_verifier_api::{
     BundleSubject, ContractKind, ContractPredicate, FunctionContext, MetadataEntry,
@@ -30,22 +31,24 @@ const TRUST_VC_HARDENED_CATEGORY_METADATA_KEY: &str = "trust.vc.hardened.categor
 const TRUST_VC_HARDENED_FAMILY_METADATA_KEY: &str = "trust.vc.hardened.family";
 const TRUST_VC_HARDENED_CALLEE_METADATA_KEY: &str = "trust.vc.hardened.callee";
 const TRUST_VC_HARDENED_DETAIL_METADATA_KEY: &str = "trust.vc.hardened.detail";
-const TRUST_VC_HARDENED_NAMESPACE: &str = "trust.vc.hardened";
+// Both namespaces are ALIASED from the owning vocabulary crate, never
+// re-declared: a local spelling could drift from the admitted list and
+// silently split a lane in two.
+use trust_verifier_api::TRUST_VC_HARDENED_OBLIGATION_NAMESPACE as TRUST_VC_HARDENED_NAMESPACE;
 // Trust (P0 false-proof fix): namespace for the `UnboundedAllocation` (#nia-oom)
 // capacity obligation. Deliberately NOT `trust.vc.hardened`, so
 // `native_trust_ir_route_for_api_obligation` returns `None` (non-routable) and the
 // capacity check stays on the per-VC ay/interval lane that actually solves
 // `count >= ceiling`, rather than inheriting a native whole-function CHC "safe"
 // verdict that never modeled the allocation budget.
-const TRUST_VC_UNBOUNDED_ALLOCATION_NAMESPACE: &str = "trust.vc.unbounded_allocation";
+use trust_verifier_api::TRUST_VC_UNBOUNDED_ALLOCATION_OBLIGATION_NAMESPACE as TRUST_VC_UNBOUNDED_ALLOCATION_NAMESPACE;
 const TRUST_SOURCE_DIGEST_METADATA_KEY: &str = "trust.mir-extract.source.digest.sha256";
 /// Compiler-owned crate disambiguator carried by authority-bearing bundles.
 ///
 /// The value is exactly sixteen lowercase hexadecimal digits. It is paired
 /// with a stable-ID-bearing bundle ID: metadata alone is not present in a
 /// verifier run envelope and therefore cannot prevent cross-crate replay.
-pub const TRUST_COMPILER_STABLE_CRATE_ID_METADATA_KEY: &str =
-    "trust.compiler.stable_crate_id.v1";
+pub const TRUST_COMPILER_STABLE_CRATE_ID_METADATA_KEY: &str = "trust.compiler.stable_crate_id.v1";
 const UNRESOLVED_COMPATIBILITY_CRATE_NAME: &str = "@trust-unresolved-crate";
 const TRUST_VC_DIGEST_METADATA_KEY: &str = "trust.vc.digest.sha256";
 const TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY: &str = "trust.vc.formula.payload";
@@ -116,13 +119,18 @@ fn bound_loop_contract_matches_spec(
         return false;
     }
     contract.body.strip_prefix(UNPAIRED_LOOP_CONTRACT_PREFIX).is_some_and(|body| body == spec.body)
-        || parsed_loop_contract_body(&contract.body)
-            .is_some_and(|(_, body)| body.trim() == spec.body.trim())
+        || parsed_loop_contract_body(&contract.body).is_some_and(|(header, body)| {
+            spec.mir_header == Some(header) && body.trim() == spec.body.trim()
+        })
 }
 
 fn parsed_loop_contract_body(body: &str) -> Option<(usize, &str)> {
     let (header, body) = body.strip_prefix("bb")?.split_once(':')?;
     Some((header.parse::<usize>().ok()?, body))
+}
+
+fn normalized_compiler_contract_body(body: &str) -> &str {
+    body.trim().strip_prefix(LOWERED_COMPILER_CONTRACT_PREFIX).unwrap_or(body.trim()).trim()
 }
 
 fn canonical_source_contract<'a>(
@@ -168,7 +176,7 @@ fn vc_source_contract_role(
             if context == "loop-decreases" =>
         {
             parsed_loop_contract_body(&contract.body)
-                .is_some_and(|(_, body)| body.trim() == measure.trim())
+                .is_some_and(|(_, body)| normalized_compiler_contract_body(body) == measure.trim())
                 .then_some("loop_decreases")
         }
         (VcKind::NonTermination { context, measure }, TrustTypesContractKind::Decreases)
@@ -176,7 +184,7 @@ fn vc_source_contract_role(
         {
             (!contract.body.starts_with(UNPAIRED_LOOP_CONTRACT_PREFIX)
                 && parsed_loop_contract_body(&contract.body).is_none()
-                && contract.body.trim() == measure.trim())
+                && normalized_compiler_contract_body(&contract.body) == measure.trim())
             .then_some("recursion_decreases")
         }
         _ => None,
@@ -1130,14 +1138,13 @@ pub fn function_to_verifier_api_bundle_with_loop_feedback_candidates_and_compile
     crate_name: &str,
     stable_crate_id: u64,
 ) -> TrustContractBundle {
-    let mut bundle =
-        function_to_verifier_api_bundle_with_loop_feedback_candidates_and_crate_name(
-            function,
-            compiler_contracts,
-            vcs,
-            feedback,
-            crate_name,
-        );
+    let mut bundle = function_to_verifier_api_bundle_with_loop_feedback_candidates_and_crate_name(
+        function,
+        compiler_contracts,
+        vcs,
+        feedback,
+        crate_name,
+    );
     bind_compiler_crate_identity(&mut bundle, function, stable_crate_id);
     bundle
 }
@@ -1397,10 +1404,9 @@ fn machine_width_translate_value(
         Formula::SymVar(sym, _) if !bools.contains(sym.as_str()) => {
             Formula::Var(sym.as_str().to_string(), Sort::BitVec(width))
         }
-        Formula::Int(n) => Formula::BitVec {
-            value: machine_width_literal_pattern(*n, width, signed)?,
-            width,
-        },
+        Formula::Int(n) => {
+            Formula::BitVec { value: machine_width_literal_pattern(*n, width, signed)?, width }
+        }
         Formula::UInt(n) => Formula::BitVec {
             value: machine_width_literal_pattern(i128::try_from(*n).ok()?, width, signed)?,
             width,
@@ -2571,7 +2577,99 @@ fn try_widen_unsigned_relational_vc_to_bv(formula: &Formula) -> Option<Formula> 
     bv_widen_translate(formula, width)
 }
 
+/// Normalize the decidable fragment of SMT array read-over-write before the
+/// public typed-predicate boundary.
+///
+/// The public predicate IR deliberately carries scalar `Select` but not an
+/// arbitrary array-valued `Store`.  Native E4/E5 collection VCs nevertheless
+/// produce `Select(Store(a, i, v), j)` after an exact exclusive write.  The two
+/// cases below are exact SMT array identities:
+///
+/// - `i` and `j` are structurally identical: the read is `v`;
+/// - `i` and `j` are provably distinct integer literals: the read is
+///   `Select(a, j)`.
+///
+/// A symbolic or otherwise undecidable index relation is left untouched.  In
+/// particular, this pass never guesses aliasing and never manufactures the
+/// conditional (`ite`) required by the general read-over-write axiom.  Such a
+/// formula therefore continues to fail closed at typed lowering.
+fn normalize_decidable_array_read_over_write(formula: &Formula) -> Formula {
+    // Rewriting an ill-sorted `Select(Store(..))` could erase the very node
+    // that demonstrates the sort error. Validate the original tree first so
+    // malformed producer input remains malformed and cannot splice into the
+    // scalar typed lane.
+    if check_formula_sort(formula).is_err() {
+        return formula.clone();
+    }
+    formula.clone().map(&mut |node| {
+        let Formula::Select(array, read_index) = node else {
+            return node;
+        };
+        let Formula::Store(previous, stored_index, value) = *array else {
+            return Formula::Select(array, read_index);
+        };
+        let supported_array = matches!(
+            check_formula_sort(&previous),
+            Ok(Sort::Array(index, element))
+                if index.as_ref() == &Sort::Int
+                    && formula_sort_to_spec_scalar_sort(element.as_ref()).is_some()
+        );
+        if !supported_array {
+            return Formula::Select(
+                Box::new(Formula::Store(previous, stored_index, value)),
+                read_index,
+            );
+        }
+        if stored_index == read_index || provably_equal_integer_literals(&stored_index, &read_index)
+        {
+            return *value;
+        }
+        if provably_distinct_integer_literals(&stored_index, &read_index) {
+            return Formula::Select(previous, read_index);
+        }
+        Formula::Select(Box::new(Formula::Store(previous, stored_index, value)), read_index)
+    })
+}
+
+fn provably_equal_integer_literals(lhs: &Formula, rhs: &Formula) -> bool {
+    match (lhs, rhs) {
+        (Formula::Int(lhs), Formula::Int(rhs)) => lhs == rhs,
+        (Formula::UInt(lhs), Formula::UInt(rhs)) => lhs == rhs,
+        (Formula::Int(lhs), Formula::UInt(rhs)) => {
+            u128::try_from(*lhs).is_ok_and(|lhs| lhs == *rhs)
+        }
+        (Formula::UInt(lhs), Formula::Int(rhs)) => {
+            u128::try_from(*rhs).is_ok_and(|rhs| *lhs == rhs)
+        }
+        _ => false,
+    }
+}
+
+/// Whether two mathematical-integer literals are certainly unequal.
+///
+/// `UInt` is an alternate non-negative literal spelling in `Formula`, not a
+/// distinct SMT sort, so cross-spelling comparisons are safe here as well.
+fn provably_distinct_integer_literals(lhs: &Formula, rhs: &Formula) -> bool {
+    match (lhs, rhs) {
+        (Formula::Int(lhs), Formula::Int(rhs)) => lhs != rhs,
+        (Formula::UInt(lhs), Formula::UInt(rhs)) => lhs != rhs,
+        (Formula::Int(lhs), Formula::UInt(rhs)) => {
+            *lhs < 0 || u128::try_from(*lhs).is_ok_and(|lhs| lhs != *rhs)
+        }
+        (Formula::UInt(lhs), Formula::Int(rhs)) => {
+            *rhs < 0 || u128::try_from(*rhs).is_ok_and(|rhs| *lhs != rhs)
+        }
+        _ => false,
+    }
+}
+
 fn vc_formula_payload(kind: &VcKind, formula: &Formula) -> VcFormulaPayload {
+    // Exact native collection writes reach this boundary as array
+    // read-over-write terms.  Normalize only the two decidable identities
+    // above; unresolved index aliasing remains an unsupported Store and thus
+    // has no typed payload.
+    let normalized = normalize_decidable_array_read_over_write(formula);
+    let formula = &normalized;
     // Wide UNSIGNED (u64/usize) add/sub overflow VCs are LIA-encoded, and their
     // type-range literal (`u64::MAX`) exceeds the native solver's i64 Int boundary
     // -> `unknown` (gap-log #19). This is the final lowering boundary, where the
@@ -4745,6 +4843,8 @@ mod tests {
             trust_types::LoopContractSpec {
                 kind: trust_types::LoopContractKind::Invariant,
                 source_loop_id: 0,
+                source_hir_local_id: Some(1),
+                mir_header: Some(1),
                 loop_head: SourceSpan::default(),
                 header_span: SourceSpan::default(),
                 span: invariant.span.clone(),
@@ -4753,6 +4853,8 @@ mod tests {
             trust_types::LoopContractSpec {
                 kind: trust_types::LoopContractKind::Decreases,
                 source_loop_id: 0,
+                source_hir_local_id: Some(1),
+                mir_header: Some(1),
                 loop_head: SourceSpan::default(),
                 header_span: SourceSpan::default(),
                 span: decreases.span.clone(),
@@ -5102,17 +5204,11 @@ mod tests {
             },
         );
 
-        let exact = contract_bundle_to_verifier_api_with_crate_name(
-            &function,
-            &compiler_contracts,
-            "demo",
-        );
+        let exact =
+            contract_bundle_to_verifier_api_with_crate_name(&function, &compiler_contracts, "demo");
         assert_eq!(
             exact.subject,
-            BundleSubject::Function {
-                crate_name: "demo".to_string(),
-                path: function.def_path,
-            },
+            BundleSubject::Function { crate_name: "demo".to_string(), path: function.def_path },
         );
     }
 
@@ -5159,10 +5255,8 @@ mod tests {
                 .expect("second compiler identity digest"),
         );
 
-        for (stable_crate_id, expected) in [
-            (0, "0000000000000000"),
-            (u64::MAX, "ffffffffffffffff"),
-        ] {
+        for (stable_crate_id, expected) in [(0, "0000000000000000"), (u64::MAX, "ffffffffffffffff")]
+        {
             let bundle = contract_bundle_to_verifier_api_with_compiler_identity(
                 &function,
                 &compiler_contracts,
@@ -5170,10 +5264,7 @@ mod tests {
                 stable_crate_id,
             );
             assert_eq!(
-                metadata_value(
-                    &bundle.metadata,
-                    TRUST_COMPILER_STABLE_CRATE_ID_METADATA_KEY,
-                ),
+                metadata_value(&bundle.metadata, TRUST_COMPILER_STABLE_CRATE_ID_METADATA_KEY,),
                 Some(expected),
             );
         }
@@ -5733,11 +5824,7 @@ mod tests {
         assert!(matches!(&ge_lhs.kind, TrustSpecExprKind::Variable { name } if name == "x"));
         assert_eq!(
             ge_rhs.kind,
-            TrustSpecExprKind::FloatLiteral {
-                bits: (-1.0e30_f64).to_bits(),
-                eb: 11,
-                sb: 53
-            },
+            TrustSpecExprKind::FloatLiteral { bits: (-1.0e30_f64).to_bits(), eb: 11, sb: 53 },
         );
         let TrustSpecExprKind::Binary { op: TrustSpecBinaryOp::Le, rhs: le_rhs, .. } = &rhs.kind
         else {
@@ -5905,6 +5992,85 @@ mod tests {
         let production_bundle =
             function_to_verifier_api_bundle(&function, &compiler_contracts, &production);
         assert!(loop_contract_marker_indices(&production_bundle).is_empty());
+    }
+
+    #[test]
+    fn loop_typed_proposition_digest_requires_exact_unique_bound_source() {
+        let mut function = feedback_loop_function();
+        let invariant_body = format!("{LOWERED_COMPILER_CONTRACT_PREFIX}n <= 10 && i <= 10");
+        let decreases_body = format!("{LOWERED_COMPILER_CONTRACT_PREFIX}i");
+        function.contracts[0].body = format!("bb1: {invariant_body}");
+        function.contracts[1].body = format!("bb1: {decreases_body}");
+
+        let mut compiler_contracts = feedback_loop_contracts(&function);
+        compiler_contracts.loop_contracts[0].body = invariant_body.clone();
+        compiler_contracts.loop_contracts[1].body = decreases_body.clone();
+        let u32_domain = |name: &str| trust_types::CompilerContractVariableDomain {
+            name: name.to_string(),
+            domain: trust_types::CompilerContractValueDomain::MachineInt {
+                width: 32,
+                signed: false,
+            },
+        };
+        let invariant_proposition = trust_types::CompilerContractProposition {
+            source_contract_index: 0,
+            kind: TrustTypesContractKind::LoopInvariant,
+            body: invariant_body,
+            formula: trust_types::parse_spec_expr("n <= 10 && i <= 10").expect("typed invariant"),
+            variable_domains: vec![u32_domain("i"), u32_domain("n")],
+        };
+        let decreases_proposition = trust_types::CompilerContractProposition {
+            source_contract_index: 1,
+            kind: TrustTypesContractKind::Decreases,
+            body: decreases_body,
+            formula: trust_types::parse_spec_expr("i").expect("typed measure"),
+            variable_domains: vec![u32_domain("i")],
+        };
+        compiler_contracts.typed_propositions =
+            vec![invariant_proposition.clone(), decreases_proposition];
+
+        let vcs = trust_vcgen::generate_vcs(&function);
+        assert_eq!(
+            vcs.iter()
+                .filter(|vc| matches!(
+                    vc.kind,
+                    VcKind::LoopInvariantInitiation { .. }
+                        | VcKind::LoopInvariantConsecution { .. }
+                ))
+                .count(),
+            2,
+            "the compiler canonical prefix must not make E4 unparseable",
+        );
+        let exact = function_to_verifier_api_bundle(&function, &compiler_contracts, &vcs);
+        assert!(
+            exact.contracts[0]
+                .metadata
+                .iter()
+                .any(|entry| { entry.key == TRUST_CONTRACT_TYPED_PROPOSITION_DIGEST_METADATA_KEY }),
+            "an exact bound loop proposition must carry its structural digest",
+        );
+
+        let mut tampered = compiler_contracts.clone();
+        tampered.typed_propositions[0].body.push_str(" && true");
+        let tampered_bundle = function_to_verifier_api_bundle(&function, &tampered, &vcs);
+        assert!(matches!(
+            &tampered_bundle.contracts[0].predicate,
+            ContractPredicate::Unsupported { .. }
+        ));
+        assert!(
+            !tampered_bundle.contracts[0]
+                .metadata
+                .iter()
+                .any(|entry| { entry.key == TRUST_CONTRACT_TYPED_PROPOSITION_DIGEST_METADATA_KEY })
+        );
+
+        let mut duplicate = compiler_contracts;
+        duplicate.typed_propositions.push(invariant_proposition);
+        let duplicate_bundle = function_to_verifier_api_bundle(&function, &duplicate, &vcs);
+        assert!(matches!(
+            &duplicate_bundle.contracts[0].predicate,
+            ContractPredicate::Unsupported { .. }
+        ));
     }
 
     #[test]
@@ -6756,6 +6922,165 @@ mod tests {
                 if matches!(&base.kind, TrustSpecExprKind::Variable { name } if name == "xs")
                     && matches!(&index.kind, TrustSpecExprKind::IntLiteral { value } if value == "0")
         ));
+    }
+
+    #[test]
+    fn exact_array_read_after_write_gets_a_typed_loop_vc_payload() {
+        let array_sort = Sort::Array(Box::new(Sort::Int), Box::new(Sort::Int));
+        let formula = Formula::Not(Box::new(Formula::Eq(
+            Box::new(Formula::Select(
+                Box::new(Formula::Store(
+                    Box::new(Formula::Var("xs".to_string(), array_sort)),
+                    Box::new(Formula::Int(0)),
+                    Box::new(Formula::Int(7)),
+                )),
+                Box::new(Formula::Int(0)),
+            )),
+            Box::new(Formula::Int(7)),
+        )));
+
+        let payload = vc_formula_payload(
+            &VcKind::LoopInvariantInitiation {
+                invariant: "xs[0] == 7".to_string(),
+                header_block: 1,
+            },
+            &formula,
+        );
+
+        let expected = Formula::Not(Box::new(Formula::Eq(
+            Box::new(Formula::Int(7)),
+            Box::new(Formula::Int(7)),
+        )));
+        assert_eq!(payload.selected_formula.as_ref(), Some(&expected));
+        assert!(payload.typed_payload.is_some());
+        assert!(!payload.pruned);
+        assert!(!payload.smtlib.contains("store"));
+    }
+
+    #[test]
+    fn array_read_over_distinct_literal_write_keeps_the_prior_array() {
+        let array_sort = Sort::Array(Box::new(Sort::Int), Box::new(Sort::Int));
+        let prior_read = Formula::Select(
+            Box::new(Formula::Var("xs".to_string(), array_sort.clone())),
+            Box::new(Formula::Int(1)),
+        );
+        let formula = Formula::Eq(
+            Box::new(Formula::Select(
+                Box::new(Formula::Store(
+                    Box::new(Formula::Var("xs".to_string(), array_sort)),
+                    Box::new(Formula::Int(0)),
+                    Box::new(Formula::Int(7)),
+                )),
+                Box::new(Formula::Int(1)),
+            )),
+            Box::new(prior_read.clone()),
+        );
+
+        let normalized = normalize_decidable_array_read_over_write(&formula);
+        assert_eq!(normalized, Formula::Eq(Box::new(prior_read.clone()), Box::new(prior_read)));
+        assert!(
+            trust_spec_predicate_from_formula(&normalized).is_some(),
+            "the exact distinct-index identity should lower through the scalar Select fragment"
+        );
+    }
+
+    #[test]
+    fn symbolic_array_index_aliasing_remains_fail_closed() {
+        let array_sort = Sort::Array(Box::new(Sort::Int), Box::new(Sort::Int));
+        let formula = Formula::Eq(
+            Box::new(Formula::Select(
+                Box::new(Formula::Store(
+                    Box::new(Formula::Var("xs".to_string(), array_sort)),
+                    Box::new(Formula::Var("write_index".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(7)),
+                )),
+                Box::new(Formula::Var("read_index".to_string(), Sort::Int)),
+            )),
+            Box::new(Formula::Int(7)),
+        );
+
+        assert_eq!(normalize_decidable_array_read_over_write(&formula), formula);
+        let payload = vc_formula_payload(
+            &VcKind::LoopInvariantConsecution {
+                invariant: "xs[read_index] == 7".to_string(),
+                header_block: 1,
+            },
+            &formula,
+        );
+        assert_eq!(payload.typed_payload, None);
+        assert_eq!(payload.selected_formula, None);
+        assert!(!payload.pruned);
+    }
+
+    #[test]
+    fn malformed_or_non_int_array_store_cannot_splice_into_the_scalar_lane() {
+        let malformed = Formula::Not(Box::new(Formula::Eq(
+            Box::new(Formula::Select(
+                Box::new(Formula::Store(
+                    Box::new(Formula::Int(0)),
+                    Box::new(Formula::Int(0)),
+                    Box::new(Formula::Int(7)),
+                )),
+                Box::new(Formula::Int(0)),
+            )),
+            Box::new(Formula::Int(7)),
+        )));
+        assert!(check_formula_sort(&malformed).is_err());
+        assert_eq!(normalize_decidable_array_read_over_write(&malformed), malformed);
+
+        let memory_sort = Sort::Array(Box::new(Sort::BitVec(64)), Box::new(Sort::BitVec(8)));
+        let address = Formula::BitVec { value: 0, width: 64 };
+        let non_int_indexed = Formula::Eq(
+            Box::new(Formula::Select(
+                Box::new(Formula::Store(
+                    Box::new(Formula::Var("memory".to_string(), memory_sort)),
+                    Box::new(address.clone()),
+                    Box::new(Formula::BitVec { value: 7, width: 8 }),
+                )),
+                Box::new(address),
+            )),
+            Box::new(Formula::BitVec { value: 7, width: 8 }),
+        );
+        assert_eq!(normalize_decidable_array_read_over_write(&non_int_indexed), non_int_indexed);
+
+        for formula in [&malformed, &non_int_indexed] {
+            let payload = vc_formula_payload(
+                &VcKind::LoopInvariantInitiation {
+                    invariant: "unsupported array store".to_string(),
+                    header_block: 1,
+                },
+                formula,
+            );
+            assert_eq!(payload.typed_payload, None);
+            assert_eq!(payload.selected_formula, None);
+        }
+    }
+
+    #[test]
+    fn false_array_read_after_write_is_transported_without_becoming_true() {
+        let array_sort = Sort::Array(Box::new(Sort::Int), Box::new(Sort::Int));
+        let formula = Formula::Eq(
+            Box::new(Formula::Select(
+                Box::new(Formula::Store(
+                    Box::new(Formula::Var("xs".to_string(), array_sort)),
+                    Box::new(Formula::UInt(0)),
+                    Box::new(Formula::Int(7)),
+                )),
+                Box::new(Formula::Int(0)),
+            )),
+            Box::new(Formula::Int(8)),
+        );
+
+        let payload = vc_formula_payload(
+            &VcKind::LoopInvariantInitiation {
+                invariant: "xs[0] == 8".to_string(),
+                header_block: 1,
+            },
+            &formula,
+        );
+        let selected = payload.selected_formula.expect("the false scalar residue must transport");
+        assert_eq!(selected, Formula::Eq(Box::new(Formula::Int(7)), Box::new(Formula::Int(8))));
+        assert!(payload.typed_payload.is_some());
     }
 
     #[test]

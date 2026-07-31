@@ -39,7 +39,7 @@ impl Widget for Button {
 }
 
 fn use_widget(w: &dyn Widget) -> i32
-//~^ ERROR Trust Level 0 safety verification incomplete for `trust_sealed_dyn_summary::use_widget`
+//~^ WARN Trust Level 0 safety verification incomplete for `trust_sealed_dyn_summary::use_widget`
 //~| ERROR Trust strict verification failed for `trust_sealed_dyn_summary::use_widget`
 contract_ensures { move |result| *result >= 0 }
 {
@@ -47,7 +47,7 @@ contract_ensures { move |result| *result >= 0 }
 }
 
 fn main() {
-    //~^ ERROR Trust Level 0 safety verification incomplete for `trust_sealed_dyn_summary::main`
+    //~^ WARN Trust Level 0 safety verification incomplete for `trust_sealed_dyn_summary::main`
     //~| ERROR Trust strict verification failed for `trust_sealed_dyn_summary::main`
     let b = Button;
     let _ = use_widget(&b);

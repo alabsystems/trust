@@ -518,6 +518,27 @@ fn restored_sysroot_bins_follow_enabled_tool_surface() {
 }
 
 #[test]
+fn trustup_is_staged_when_selected_and_only_when_selected() {
+    // Trust: `trustup` is the Trust-native replacement for rustup. It must
+    // survive a sysroot rewrite like any other user-facing tool, or the binary
+    // installed by `ensure_user_facing_tools` is deleted by the next assembly.
+    let tools = HashSet::from_iter(["targo".to_string(), "trustup".to_string()]);
+    let bins = restored_sysroot_bins_for_tool_settings(true, Some(&tools), false, false);
+    assert!(bins.contains(&("trustup", "trustup")), "selected `trustup` must be restored");
+    assert!(tool_enabled_for_tool_settings(true, Some(&tools), "trustup"));
+
+    // Wiring it in is not adopting it: an unselected `trustup` stages nothing,
+    // and no other tool's selection drags it in.
+    let without = HashSet::from_iter(["targo".to_string(), "targo-trust".to_string()]);
+    let bins = restored_sysroot_bins_for_tool_settings(true, Some(&without), false, false);
+    assert!(!bins.contains(&("trustup", "trustup")));
+    assert!(!tool_enabled_for_tool_settings(true, Some(&without), "trustup"));
+
+    // `trustup` has no upstream spelling, so it can never re-emit a stock name.
+    assert_eq!(upstream_compat_bin_for_tool_source("trustup"), None);
+}
+
+#[test]
 fn upstream_compat_bins_are_cargo_only() {
     // Trust: the sysroot bin ships Trust-branded names ONLY. `cargo` is the sole
     // retained upstream-compat alias (rustup needs a `cargo` entrypoint; `rustc`

@@ -119,6 +119,10 @@ pub enum Executability {
     /// A certified monitor exists; `targo trust test` installs it, and checks
     /// it only when the associated clause is reached by a selected test.
     Monitored,
+    /// A certified E5 scalar evaluator exists; authenticated test artifacts
+    /// combine it with exact loop/recursion transition provenance to check
+    /// strict descent when the measured edge is reached.
+    Measured,
     /// No certified monitor — the clause's only evidence lanes are static.
     /// Never approximated by code that returns `true`.
     Unmonitored,
@@ -663,17 +667,17 @@ mod tests {
         assert_eq!(back, record);
     }
 
-    /// E4 static discharge does not imply per-iteration execution.  Until the
-    /// compiler has certified loop placement, an exact loop-invariant row is
-    /// carried as explicitly unmonitored rather than being left ambiguous or
-    /// upgraded from its proof strength.
+    /// E4 static discharge does not imply per-iteration execution. The
+    /// compiler has an exact certified loop-placement lane, but a row with no
+    /// matching placement evidence is still carried as explicitly unmonitored
+    /// rather than being left ambiguous or upgraded from its proof strength.
     #[test]
-    fn e4_unmonitored_transport_refines_only_executability() {
+    fn unmatched_e4_monitor_row_refines_only_executability() {
         use crate::result::{TransportMonitorEvidence, TransportMonitorStatus};
 
         let monitor = TransportMonitorEvidence {
             status: TransportMonitorStatus::Unmonitored,
-            reason: "per-iteration loop-invariant monitor placement is not certified".into(),
+            reason: "no kernel-certified loop monitor evidence matched this row".into(),
             predicate_digest: format!("sha256:{}", "d".repeat(64)),
         };
         let baseline = GradeRecord::smt_backed();
@@ -684,6 +688,23 @@ mod tests {
         assert_eq!(refined.axiom_closure, baseline.axiom_closure);
         assert_eq!(refined.coverage, baseline.coverage);
         assert_eq!(refined.reflection, baseline.reflection);
+        assert_eq!(refined.to_legacy(), baseline.to_legacy());
+    }
+
+    #[test]
+    fn e5_measured_transport_preserves_its_distinct_executability() {
+        use crate::result::{TransportMonitorEvidence, TransportMonitorStatus};
+
+        let measure = TransportMonitorEvidence {
+            status: TransportMonitorStatus::Measured,
+            reason: "kernel-bound scalar plus authenticated transition placement".into(),
+            predicate_digest: format!("sha256:{}", "e".repeat(64)),
+        };
+        let baseline = GradeRecord::smt_backed();
+        let refined = baseline.clone().with_monitor_evidence(Some(&measure));
+
+        assert_eq!(refined.executability, Executability::Measured);
+        assert_eq!(refined.validation, baseline.validation);
         assert_eq!(refined.to_legacy(), baseline.to_legacy());
     }
 }

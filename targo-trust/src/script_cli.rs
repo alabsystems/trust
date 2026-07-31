@@ -128,7 +128,7 @@ Commands:
   conformance                  Run Trust conformance checks
   ledger-expirations           Fail on expired upstream-parity ledger entries
   seed-freshness               Require a current seed and all digest-bound payloads
-  certified-monitors           Run real-Targo monitor E2Es (Linux x86_64/aarch64)
+  certified-monitors           Run real-Targo monitor E2Es (Linux/macOS x86_64/aarch64)
 ";
 
 const GATE_USAGE: &str = "\
@@ -237,7 +237,7 @@ static RELEASE_VALIDATE_SPECS: &[ScriptSpec] = &[
     ScriptSpec {
         names: &["certified-monitors"],
         script: CERTIFIED_MONITOR_RELEASE_SCRIPT,
-        summary: "Run the Linux stage2 certified-monitor release E2E gate",
+        summary: "Run the Linux/macOS stage2 certified-monitor release E2E gate",
         runner: MaintenanceRunner::Shell,
         fixed_args: &[],
     },
@@ -405,12 +405,41 @@ pub(crate) fn run_verify_subcommand(args: &[String]) -> ExitCode {
             );
             ExitCode::from(2)
         }
+        Some(alias @ ("preflight" | "full-preflight")) => {
+            eprintln!(
+                "targo trust verify {alias}: removed shell/Python-era release alias"
+            );
+            eprintln!(
+                "  Use Rust-native gates ({RUST_NATIVE_RELEASE_GATE_ADVICE}) for release evidence."
+            );
+            ExitCode::from(2)
+        }
         Some("cargo-cache") => crate::cargo_cache_materialization_cli::run(&args[1..]),
         Some("repo-gate") => run_verify_repo_gate(&args[1..]),
         Some("solvers") => run_trust_cli_subcommand("verify solvers", "solvers", &args[1..]),
         Some("self") => crate::self_verify_cli::run(&args[1..]),
+        Some(alias @ ("example-corpus" | "verify-examples")) => {
+            removed_verify_alias(alias, "examples")
+        }
+        Some(alias @ ("cache-materialize" | "cache-materialization")) => {
+            removed_verify_alias(alias, "cargo-cache")
+        }
+        Some(alias @ ("solver-check" | "native-solver-sample")) => {
+            removed_verify_alias(alias, "solvers")
+        }
+        Some(alias @ ("gate" | "check-all")) => removed_verify_alias(alias, "repo-gate"),
+        Some(alias @ ("compiler" | "compiler-verifier")) => {
+            removed_verify_alias(alias, "self --full-verifier")
+        }
         _ => run_leaf_command("verify", args, VERIFY_SPECS, VERIFY_USAGE),
     }
+}
+
+fn removed_verify_alias(alias: &str, replacement: &str) -> ExitCode {
+    eprintln!(
+        "targo trust verify {alias}: removed alias; use `targo trust verify {replacement}`"
+    );
+    ExitCode::from(2)
 }
 
 fn run_verify_repo_gate(args: &[String]) -> ExitCode {
@@ -439,8 +468,16 @@ pub(crate) fn run_repo_subcommand(args: &[String]) -> ExitCode {
         Some("check") => run_check_all_gate(&args[1..], true, "targo trust repo check"),
         Some("scripts") => run_check_all_gate(&args[1..], false, "targo trust repo scripts"),
         Some("verify-examples") => crate::verify_examples_cli::run(&args[1..]),
+        Some("check-all") => removed_repo_alias("check-all", "check"),
+        Some("script-syntax") => removed_repo_alias("script-syntax", "scripts"),
+        Some("examples") => removed_repo_alias("examples", "verify-examples"),
         _ => run_maintenance_leaf_command("repo", args, REPO_SPECS, REPO_USAGE),
     }
+}
+
+fn removed_repo_alias(alias: &str, replacement: &str) -> ExitCode {
+    eprintln!("targo trust repo {alias}: removed alias; use `targo trust repo {replacement}`");
+    ExitCode::from(2)
 }
 
 pub(crate) fn run_bootstrap_subcommand(args: &[String]) -> ExitCode {
@@ -2606,6 +2643,17 @@ mod tests {
         assert!(script.contains("--exact --ignored"));
         assert!(script.contains("RELEASE_TEST_PREFIX=\"tests::real_targo_test_\""));
         assert!(script.contains("does not match the exact reviewed set"));
+        assert!(
+            !script.contains("mapfile"),
+            "macOS /bin/bash 3.2 has no mapfile; release inventory must remain portable"
+        );
+        assert!(script.contains("SHA256_TOOL=/usr/bin/shasum"));
+        assert!(script.contains("SHA256_TOOL=/usr/bin/sha256sum"));
+        assert!(
+            !script.contains("| sha256sum"),
+            "macOS release evidence must not depend on a non-system GNU sha256sum"
+        );
+        assert!(script.contains("while IFS= read -r inventory_name"));
         assert!(script.contains("/usr/bin/env -i"));
         assert!(script.contains("export PATH=/usr/bin:/bin"));
         assert!(script.contains("cd / || exit 1"));
@@ -2639,8 +2687,8 @@ mod tests {
         assert!(script.contains("native controlled-Git postcheck required for release PASS"));
         assert!(!script.contains("certified-monitor E2E: PASS"));
         assert!(script.contains("hash_stable_regular_file \"$evidence_file\""));
-        assert!(script.contains("chmod 400 -- \"$evidence_file\""));
-        assert!(script.contains("chmod 500 -- \"$LOG_DIR\""));
+        assert!(script.contains("chmod 400 \"$evidence_file\""));
+        assert!(script.contains("chmod 500 \"$LOG_DIR\""));
         assert!(script.contains("FINAL_MANIFEST_SHA256"));
         assert!(script.contains("FINAL_LOCK_SHA256"));
         assert!(script.contains("TERMINAL_TRUSTC_SHA256"));

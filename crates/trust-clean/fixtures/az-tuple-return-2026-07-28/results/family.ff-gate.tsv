@@ -1,0 +1,7 @@
+def_path	cluster_tag	via_ir_shape	via_ir_safety	via_mirsem_shape	via_mirsem_sl_safety_discharged	via_mirsem_call_requires	via_mirsem_loop_full	fully_faithful	iter_loop_projection	struct_return	iter_premise_witnessed
+az::int::<impl az::OverflowingCast<i16> for i32>::overflowing_cast	SHAPE_GAP	false	false	false	false	false	false	false	declined	declined	not-witnessed
+az::int::<impl az::OverflowingCast<u8> for u16>::overflowing_cast	SHAPE_GAP	false	false	false	false	false	false	false	declined	declined	not-witnessed
+az::overflowing_cast::<i32, i16>	SHAPE_GAP	false	false	false	false	false	false	false	declined	declined	not-witnessed
+az::int::<impl az::WrappingCast<i16> for i32>::wrapping_cast	SHAPE_GAP	false	false	false	false	false	false	false	declined	declined	not-witnessed
+az::overflowing_cast::<u16, u8>	SHAPE_GAP	false	false	false	false	false	false	false	declined	declined	not-witnessed
+az::int::<impl az::WrappingCast<u8> for u16>::wrapping_cast	SHAPE_GAP	false	false	false	false	false	false	false	declined	declined	not-witnessed
