@@ -359,6 +359,7 @@ mod tests {
                     },
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 VerificationResult::Failed {
                     solver: "ay".into(),
@@ -382,6 +383,7 @@ mod tests {
                     },
                     formula: Formula::Bool(false),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 VerificationResult::Proved {
                     solver: "ay".into(),
@@ -399,6 +401,7 @@ mod tests {
                     location: SourceSpan::default(),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 VerificationResult::Unknown {
                     solver: "ay".into(),
@@ -583,6 +586,7 @@ mod tests {
                     location: SourceSpan::default(),
                     formula: Formula::Bool(false),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 VerificationResult::Proved {
                     solver: "ay".into(),
@@ -603,6 +607,7 @@ mod tests {
                     location: SourceSpan::default(),
                     formula: Formula::Bool(false),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 VerificationResult::Proved {
                     solver: "ay".into(),
@@ -620,6 +625,7 @@ mod tests {
                     location: SourceSpan::default(),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 VerificationResult::Failed {
                     solver: "ay".into(),
@@ -634,6 +640,7 @@ mod tests {
                     location: SourceSpan::default(),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 VerificationResult::Timeout { solver: "ay".into(), timeout_ms: 5000 },
             ),

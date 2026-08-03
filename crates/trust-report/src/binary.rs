@@ -7919,6 +7919,7 @@ mod tests {
             location: SourceSpan::binary_address(0x401010),
             formula,
             contract_metadata: None,
+            obligation: None,
         });
 
         let summary = BinaryVerificationSummary {
@@ -8601,6 +8602,7 @@ mod tests {
             location: SourceSpan::binary_address(0x401010),
             formula,
             contract_metadata: None,
+            obligation: None,
         });
         let mut raw = raw_unchecked_unreplayed_dispatch("entry:vc1", "entry", 0x401014);
         raw.vc = Some(SerializableVc {
@@ -8609,6 +8611,7 @@ mod tests {
             location: SourceSpan::binary_address(0x401014),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         });
 
         let artifact = DecompilationArtifact {

@@ -120,6 +120,9 @@ pub fn slice_vc(vc: &VerificationCondition) -> VerificationCondition {
         location: vc.location.clone(),
         formula: sliced_formula,
         contract_metadata: vc.contract_metadata,
+        // The formula is SLICED here, so a recorded obligation body would no longer
+        // reconstruct it — drop it fail-closed (the consumer would DECLINE anyway).
+        obligation: None,
     }
 }
 
@@ -186,6 +189,7 @@ mod tests {
             location: SourceSpan::default(),
             formula,
             contract_metadata: None,
+            obligation: None,
         }
     }
 

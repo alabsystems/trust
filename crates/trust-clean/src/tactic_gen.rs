@@ -514,6 +514,7 @@ mod tests {
                 Box::new(Formula::Int(u64::MAX as i128)),
             ),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -527,6 +528,7 @@ mod tests {
                 Box::new(Formula::Add(Box::new(Formula::Int(1)), Box::new(Formula::Int(1)))),
             ),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -543,6 +545,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             ),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -562,6 +565,7 @@ mod tests {
                 )),
             ),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -581,6 +585,7 @@ mod tests {
                 ),
             ]),
             contract_metadata: None,
+            obligation: None,
         }
     }
 

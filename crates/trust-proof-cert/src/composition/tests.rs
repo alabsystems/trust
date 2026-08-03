@@ -33,6 +33,7 @@ fn sample_vc(function: &str) -> VerificationCondition {
         },
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     }
 }
 

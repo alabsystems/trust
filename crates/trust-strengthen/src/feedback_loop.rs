@@ -440,6 +440,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -450,6 +451,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -460,6 +462,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -878,6 +881,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let results = make_crate_result(vec![(vc, failed_result())]);
         let entries = analyze_failures(&results);
@@ -893,6 +897,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let results = make_crate_result(vec![(vc, failed_result())]);
         let entries = analyze_failures(&results);
@@ -908,6 +913,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let results = make_crate_result(vec![(vc, failed_result())]);
         let entries = analyze_failures(&results);

@@ -70,6 +70,25 @@ fn int(k: i128) -> Box<Formula> {
     Box::new(Formula::Int(k))
 }
 
+/// Trust: test-local mixed-`Or` detector — replaces the deleted production `contains_mixed_or`
+/// peel (which existed only to let the arithmetic lane decline on this shape). Does `f`
+/// contain an `Or` with BOTH an `And` disjunct and a non-`And` one? That is the shape
+/// `v2_formula_with_path_guards` emits for a block reached by one GUARDED and one UNGUARDED
+/// path. Used only to assert a fixture PREMISE (the emitter really builds a mixed `Or`), never
+/// to drive the live certifier, which now authenticates a recorded obligation.
+fn contains_mixed_or(f: &Formula) -> bool {
+    let here = matches!(f, Formula::Or(v)
+        if v.iter().any(|d| matches!(d, Formula::And(_)))
+            && v.iter().any(|d| !matches!(d, Formula::And(_))));
+    here
+        || match f {
+            Formula::And(v) | Formula::Or(v) => v.iter().any(contains_mixed_or),
+            Formula::Not(a) => contains_mixed_or(a),
+            Formula::Implies(a, b) => contains_mixed_or(a) || contains_mixed_or(b),
+            _ => false,
+        }
+}
+
 /// Every `(kind, verdict)` this tier mints for the safety VCs of `func` that match
 /// `pick`, driving the REAL emitter — the same empirical grounding the tier's own
 /// function-level gate rests on.
@@ -135,7 +154,7 @@ fn const_add_func(k: i128, width: u32) -> VerifiableFunction {
 
 /// A function with NO `Assert` terminator at all. Every hand-built VC below whose
 /// subject is a DIRECT-position lane is checked against this: the condition-local route
-/// ([`violation_candidates_resolved`]) needs the MIR to define an asserted condition
+/// (`violation_candidates_resolved`) needs the MIR to define an asserted condition
 /// local, and there is none here, so the route contributes nothing and the test
 /// measures the lane it is named for.
 fn no_assert_func() -> VerifiableFunction {
@@ -397,13 +416,38 @@ fn a_precondition_can_never_supply_the_certified_negation_width() {
 // SAME SHAPE is indistinguishable by shape and only POSITION can tell them apart.
 // ---------------------------------------------------------------------------
 
+/// Authenticated-path adapter (2026-08-01, FIELD-REQUIRED): the record's `body` IS the
+/// given formula (empty wrapper list), so the arm reads it directly. A formula that is not
+/// this kind's `Ge(i, len)` core declines. Tests pinning a WRAPPED body (a hypothesis fact
+/// or a path-guard split) build their records explicitly.
 fn bounds_vc(formula: Formula) -> VerificationCondition {
+    let obligation = Some(trust_types::ObligationRecord {
+        body: formula.clone(),
+        wrappers: vec![],
+        subject: None,
+        width: None,
+    });
     VerificationCondition {
         kind: VcKind::IndexOutOfBounds,
         function: "crate::f".into(),
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation,
+    }
+}
+
+/// Authenticated bounds VC with an explicit `body`/`wrappers` split — for the tests that
+/// pin a wrapped body (a signed `Or` core behind a `Ge(len,0)` hypothesis fact, or a
+/// path-guard split over a shared `Ge(i,len)` core).
+fn bounds_vc_recorded(rec: trust_types::ObligationRecord) -> VerificationCondition {
+    VerificationCondition {
+        kind: VcKind::IndexOutOfBounds,
+        function: "crate::f".into(),
+        location: SourceSpan::default(),
+        formula: reconstruct_obligation(&rec),
+        contract_metadata: None,
+        obligation: Some(rec),
     }
 }
 
@@ -478,6 +522,7 @@ fn a_precondition_can_never_supply_the_certified_divisor() {
             Formula::Eq(var("N"), Box::new(Formula::UInt(0))),
         ]),
         contract_metadata: None,
+        obligation: None,
     };
     assert!(
         matches!(
@@ -489,54 +534,11 @@ fn a_precondition_can_never_supply_the_certified_divisor() {
 }
 
 // ---------------------------------------------------------------------------
-// The selection's coverage over the corpus — the singleton requirement costs no row.
+// [REMOVED 2026-08-01] `the_emitter_pair_is_total_on_the_ladder_shift_corpus` was a PURE
+// PEEL-MECHANISM coverage census: it asserted the deleted `emitted_shift_violation` locator
+// yields a singleton pair for every shift VC in the ladder corpora. That locator is gone
+// (production authenticates a recorded obligation), so there is no coverage left to census.
 // ---------------------------------------------------------------------------
-
-/// Ambiguity fails closed, so the singleton requirement must be shown not to be
-/// paying for the tightening with capability. Over BOTH committed ladder corpora:
-/// every emitted shift VC carries the emitter's `And([input_range(n), invalid])` pair,
-/// and NONE of them is multi-distinct.
-#[test]
-fn the_emitter_pair_is_total_on_the_ladder_shift_corpus() {
-    let mut with_pair = 0usize;
-    let mut total = 0usize;
-    for dir in [LADDER_ROOT, "fixtures/crate-ladder-recensus-2026-07-11"] {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
-        let mut stack = vec![root];
-        while let Some(d) = stack.pop() {
-            let Ok(rd) = std::fs::read_dir(&d) else { continue };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    stack.push(p);
-                    continue;
-                }
-                if p.extension().is_none_or(|x| x != "json") {
-                    continue;
-                }
-                let Ok(bytes) = std::fs::read(&p) else { continue };
-                let Ok(func) = serde_json::from_slice::<VerifiableFunction>(&bytes) else {
-                    continue;
-                };
-                for vc in trust_vcgen::generate_vcs(&func) {
-                    if !matches!(vc.kind, VcKind::ShiftOverflow { .. }) {
-                        continue;
-                    }
-                    total += 1;
-                    if emitted_shift_violation(&func, &vc.formula).is_some() {
-                        with_pair += 1;
-                    }
-                }
-            }
-        }
-    }
-    assert!(total > 0, "the ladder corpora must still contain shift VCs");
-    assert_eq!(
-        with_pair, total,
-        "the emitter pair must be present for EVERY shift VC (and the singleton \
-         collapse must not drop any): {with_pair} of {total}"
-    );
-}
 
 // ---------------------------------------------------------------------------
 // THE SHAPE CHECK MAY NOT FIX AN ARITY — a legitimate row was being withdrawn.
@@ -676,6 +678,7 @@ fn only_a_direct_positive_sibling_conjunct_can_define_the_certified_core() {
             location: SourceSpan::default(),
             formula,
             contract_metadata: None,
+            obligation: None,
         };
         assert!(
             matches!(
@@ -734,6 +737,7 @@ fn the_negation_width_must_agree_with_the_vcs_own_negated_type() {
             Formula::Var(COND.into(), Sort::Bool),
         ]),
         contract_metadata: None,
+        obligation: None,
     };
     assert!(
         matches!(
@@ -759,16 +763,26 @@ fn uadd_or(lo_bound: i128, max: i128) -> Formula {
 }
 
 fn uadd_vc(a_lo: i128, max: i128, tys: (Ty, Ty)) -> VerificationCondition {
+    // Authenticated-path conversion (2026-08-01, FIELD-REQUIRED): the record's `body` is the
+    // `Or` out-of-range core; the operand ranges are demoted to a `ConjoinFactsLast` wrapper,
+    // exactly as the emitter records them. `reconstruct_obligation == And([range(a),
+    // range(b), oor])`, so the formula is unchanged and the vacuity side condition is read off
+    // the record's own facts.
+    let rec = trust_types::ObligationRecord {
+        body: uadd_or(0, max),
+        wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast {
+            facts: vec![urange("a", a_lo, max), urange("b", 0, max)],
+        }],
+        subject: None,
+        width: None,
+    };
     VerificationCondition {
         kind: VcKind::ArithmeticOverflow { op: trust_types::BinOp::Add, operand_tys: tys },
         function: "crate::f".into(),
         location: SourceSpan::default(),
-        formula: Formula::And(vec![
-            urange("a", a_lo, max),
-            urange("b", 0, max),
-            uadd_or(0, max),
-        ]),
+        formula: reconstruct_obligation(&rec),
         contract_metadata: None,
+        obligation: Some(rec),
     }
 }
 
@@ -803,19 +817,28 @@ fn the_arithmetic_width_must_be_one_the_vcs_own_operand_types_mention() {
 
     // The SIGNED lane is where the fabricated-`i64` constant actually lands (a mixed
     // signed/unsigned pair is not a Rust binop and routes to `not modeled`).
-    let signed_vc = |tys: (Ty, Ty), min: i128, max: i128| VerificationCondition {
-        kind: VcKind::ArithmeticOverflow { op: trust_types::BinOp::Add, operand_tys: tys },
-        function: "crate::f".into(),
-        location: SourceSpan::default(),
-        formula: Formula::And(vec![
-            urange("a", min, max),
-            urange("b", min, max),
-            Formula::Or(vec![
+    let signed_vc = |tys: (Ty, Ty), min: i128, max: i128| {
+        // Authenticated-path conversion: body = the `Or` core, operand ranges demoted to a
+        // `ConjoinFactsLast` wrapper; `reconstruct_obligation` reproduces the And formula.
+        let rec = trust_types::ObligationRecord {
+            body: Formula::Or(vec![
                 Formula::Lt(Box::new(Formula::Add(var("a"), var("b"))), int(min)),
                 Formula::Gt(Box::new(Formula::Add(var("a"), var("b"))), int(max)),
             ]),
-        ]),
-        contract_metadata: None,
+            wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast {
+                facts: vec![urange("a", min, max), urange("b", min, max)],
+            }],
+            subject: None,
+            width: None,
+        };
+        VerificationCondition {
+            kind: VcKind::ArithmeticOverflow { op: trust_types::BinOp::Add, operand_tys: tys },
+            function: "crate::f".into(),
+            location: SourceSpan::default(),
+            formula: reconstruct_obligation(&rec),
+            contract_metadata: None,
+            obligation: Some(rec),
+        }
     };
     let i8t = Ty::Int { width: 8, signed: true };
     let i64t = Ty::Int { width: 64, signed: true };
@@ -903,49 +926,60 @@ fn the_discarded_uadd_disjunct_must_be_provably_vacuous() {
         "the genuine unsigned row must be unaffected"
     );
 
-    // AND IT MUST HOLD ON EVERY PATH. The multi-path guard split repeats the same
-    // violation once per path, each with its OWN conjuncts, so reading the side
-    // condition off whichever occurrence comes first is not enough: below, path 1
-    // pins `0 <= a` and path 2 does not, and the violation node is identical, so a
-    // first-occurrence check certifies while the VC is still satisfiable at
-    // `a = -128, b = 0` on path 2.
-    let path = |a_lo: i128, g: &str| {
-        Formula::And(vec![
-            Formula::Var(g.into(), Sort::Bool),
-            urange("a", a_lo, 255),
-            urange("b", 0, 255),
-            uadd_or(0, 255),
-        ])
-    };
-    let split = VerificationCondition {
-        kind: VcKind::ArithmeticOverflow {
-            op: trust_types::BinOp::Add,
-            operand_tys: (u8t.clone(), u8t.clone()),
-        },
-        function: "crate::f".into(),
-        location: SourceSpan::default(),
-        formula: Formula::Or(vec![path(0, "g1"), path(-128, "g2")]),
-        contract_metadata: None,
+    // AND IT MUST HOLD ACROSS EVERY PATH. Under the authenticated design the operand ranges
+    // are the INNERMOST `ConjoinFactsLast` wrapper, SHARED by every `PathGuardOr` disjunct —
+    // so per-path range divergence (the peel-era hazard, path 1 pinning `0 <= a` and path 2
+    // not) is not even RECORDABLE: one shared fact set governs all paths. The property is
+    // therefore stated over the shared facts: a multi-path record whose shared operand range
+    // does NOT pin `a ≥ 0` declines on every path, and the sound one certifies.
+    let split_vc = |a_lo: i128| {
+        let rec = trust_types::ObligationRecord {
+            body: uadd_or(0, 255),
+            wrappers: vec![
+                trust_types::ObligationWrapper::ConjoinFactsLast {
+                    facts: vec![urange("a", a_lo, 255), urange("b", 0, 255)],
+                },
+                trust_types::ObligationWrapper::PathGuardOr {
+                    paths: vec![
+                        trust_types::PathGuardTerm::Guarded {
+                            guards: vec![Formula::Var("g1".into(), Sort::Bool)],
+                        },
+                        trust_types::PathGuardTerm::Guarded {
+                            guards: vec![Formula::Var("g2".into(), Sort::Bool)],
+                        },
+                    ],
+                },
+            ],
+            subject: None,
+            width: None,
+        };
+        VerificationCondition {
+            kind: VcKind::ArithmeticOverflow {
+                op: trust_types::BinOp::Add,
+                operand_tys: (u8t.clone(), u8t.clone()),
+            },
+            function: "crate::f".into(),
+            location: SourceSpan::default(),
+            formula: reconstruct_obligation(&rec),
+            contract_metadata: None,
+            obligation: Some(rec),
+        }
     };
     assert!(
         matches!(
-            trustir_safety_vc_adequate(&no_assert_func(), &split),
+            trustir_safety_vc_adequate(&no_assert_func(), &split_vc(-128)),
             RefinementVerdict::KernelRejected(_)
         ),
-        "the vacuity side condition must hold at EVERY body position the violation \
-         occupies, not just the first"
+        "a multi-path record whose SHARED operand range does not pin `a ≥ 0` must decline on \
+         every path — the vacuity is read off the record's own facts"
     );
     // ...and the all-paths-sound version of the same split still certifies.
-    let split_ok = VerificationCondition {
-        formula: Formula::Or(vec![path(0, "g1"), path(0, "g2")]),
-        ..split
-    };
     assert!(
         matches!(
-            trustir_safety_vc_adequate(&no_assert_func(), &split_ok),
+            trustir_safety_vc_adequate(&no_assert_func(), &split_vc(0)),
             RefinementVerdict::ProvenModulo3
         ),
-        "the multi-path split with sound ranges on both paths must still certify"
+        "the multi-path split over sound shared ranges must still certify"
     );
     let _ = u8t;
 }
@@ -960,13 +994,21 @@ fn the_discarded_uadd_disjunct_must_be_provably_vacuous() {
 /// violation that says the index is negative.
 #[test]
 fn a_signed_index_bounds_violation_is_declined_not_half_certified() {
-    let vc = bounds_vc(Formula::And(vec![
-        Formula::Ge(var("len"), int(0)),
-        Formula::Or(vec![
+    // Authenticated: body = the SIGNED `Or([Lt(i,0), Ge(i,len)])` core, the `Ge(len,0)`
+    // hypothesis demoted to a `ConjoinFactsLast` fact. It declines because the recorded body
+    // is the signed form, which `idxOob` does not model — not because it is not a bounds
+    // shape at all.
+    let vc = bounds_vc_recorded(trust_types::ObligationRecord {
+        body: Formula::Or(vec![
             Formula::Lt(var("i"), int(0)),
             Formula::Ge(var("i"), var("len")),
         ]),
-    ]));
+        wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast {
+            facts: vec![Formula::Ge(var("len"), int(0))],
+        }],
+        subject: None,
+        width: None,
+    });
     assert!(
         matches!(
             trustir_safety_vc_adequate(&no_assert_func(), &vc),
@@ -974,18 +1016,23 @@ fn a_signed_index_bounds_violation_is_declined_not_half_certified() {
         ),
         "certifying `idxOob(len, i)` for `i < 0 OR i >= len` covers half the violation"
     );
-    // POSITIVE CONTROL: the multi-path guard split is ALSO an `Or`, and its `And`
-    // disjuncts must keep resolving — the descent is narrowed, not removed.
-    let split = bounds_vc(Formula::Or(vec![
-        Formula::And(vec![
-            Formula::Var("g1".into(), Sort::Bool),
-            Formula::Ge(var("i"), var("len")),
-        ]),
-        Formula::And(vec![
-            Formula::Var("g2".into(), Sort::Bool),
-            Formula::Ge(var("i"), var("len")),
-        ]),
-    ]));
+    // POSITIVE CONTROL: a multi-path guard split over the SAME shared `Ge(i,len)` core (a
+    // `PathGuardOr` wrapper) must still certify — the body is the recorded unsigned core.
+    let split = bounds_vc_recorded(trust_types::ObligationRecord {
+        body: Formula::Ge(var("i"), var("len")),
+        wrappers: vec![trust_types::ObligationWrapper::PathGuardOr {
+            paths: vec![
+                trust_types::PathGuardTerm::Guarded {
+                    guards: vec![Formula::Var("g1".into(), Sort::Bool)],
+                },
+                trust_types::PathGuardTerm::Guarded {
+                    guards: vec![Formula::Var("g2".into(), Sort::Bool)],
+                },
+            ],
+        }],
+        subject: None,
+        width: None,
+    });
     assert!(
         matches!(
             trustir_safety_vc_adequate(&no_assert_func(), &split),
@@ -1144,15 +1191,24 @@ fn a_precondition_can_never_define_the_assert_condition_local_the_mir_does_not_d
 fn a_mir_bound_assert_condition_local_still_supplies_the_certified_core() {
     let func =
         assert_cond_func("d", 0, AssertMessage::DivisionByZero, Ty::Int { width: 32, signed: false });
+    // Authenticated: the body is the bare assert-condition local `Var(COND)`; the block
+    // definition `Eq(COND, Eq(d, 0))` is a demoted `ConjoinFactsLast` fact. The arm reads
+    // the body, sees it is not the core, and resolves it through the MIR-confirmed binding.
+    let rec = trust_types::ObligationRecord {
+        body: Formula::Var(COND.into(), Sort::Bool),
+        wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast {
+            facts: vec![Formula::Eq(bvar(COND), Box::new(Formula::Eq(var("d"), int(0))))],
+        }],
+        subject: None,
+        width: None,
+    };
     let vc = VerificationCondition {
         kind: VcKind::DivisionByZero,
         function: "crate::f".into(),
         location: SourceSpan::default(),
-        formula: Formula::And(vec![
-            Formula::Eq(bvar(COND), Box::new(Formula::Eq(var("d"), int(0)))),
-            Formula::Var(COND.into(), Sort::Bool),
-        ]),
+        formula: reconstruct_obligation(&rec),
         contract_metadata: None,
+        obligation: Some(rec),
     };
     assert_eq!(
         trustir_safety_vc_adequate_kind(&func, &vc).0,
@@ -1162,124 +1218,19 @@ fn a_mir_bound_assert_condition_local_still_supplies_the_certified_core() {
 }
 
 // ---------------------------------------------------------------------------
-// LATENT FAIL-OPEN — a side condition read off the siblings must not pass
-// vacuously.
+// [REMOVED 2026-08-01] Two PURE PEEL-MECHANISM tests exercised the deleted candidate
+// producer directly and are gone with it:
+//   * `a_side_condition_over_zero_sibling_sets_must_not_pass` pinned
+//     `LocatedViolation::all_siblings`' fail-closed-on-empty behaviour;
+//   * `the_body_position_discriminator_is_enforced_where_it_is_documented` pinned
+//     `candidate_at_body_position` / `violation_candidates`' body-position invariant.
+// Production authenticates a recorded obligation (`record_pins_nonneg` reads the record's
+// own `ConjoinFactsLast` facts) instead of reading a side condition off guessed siblings, so
+// these types and the invariants they pinned no longer exist. The surviving vacuity property
+// is pinned against the LIVE certifier by
+// `a_path_with_no_operand_ranges_must_fail_the_uadd_vacuity_check_not_drop_out` and
+// `a_mixed_or_hides_an_occurrence_from_the_uadd_universal_and_must_decline`.
 // ---------------------------------------------------------------------------
-
-/// `LocatedViolation::all_siblings` is how the uadd lane checks that the discarded
-/// `Lt(a+b, 0)` disjunct is vacuous. It used to be a bare `.all()`, documented as
-/// "vacuously true is impossible: the constructor rejects an empty set". The
-/// constructor rejects an empty CANDIDATE list; it builds `sibling_sets` by
-/// `filter_map`ping the candidates' `siblings`, which is EMPTY whenever every candidate
-/// carries `None` — exactly what the condition-local route pushes.
-///
-/// PRE-FIX: the assertion below returns `true` — a side condition satisfied by zero
-/// paths. The property survived only because the single caller pre-filtered
-/// `c.siblings.is_some()`; the second caller (extending the arith locator to the assert
-/// route `v2_build_assert_overflow_vc` builds, checked_vcs.rs:49) would have got a
-/// `Gt`-only uadd certificate with no vacuity evidence at all.
-#[test]
-fn a_side_condition_over_zero_sibling_sets_must_not_pass() {
-    let node = Formula::Ge(var("i"), var("len"));
-    let empty = LocatedViolation { node: &node, sibling_sets: Vec::new() };
-    assert!(
-        !empty.all_siblings(|_| true),
-        "a side condition checked over ZERO body positions must fail closed, not pass \
-         vacuously"
-    );
-    // …and the non-empty case still behaves as an `all`.
-    let sibs = vec![Formula::Ge(var("len"), int(0)), node.clone()];
-    let one = LocatedViolation { node: &node, sibling_sets: vec![Some(sibs.as_slice())] };
-    assert!(one.all_siblings(|s| s.len() == 2));
-    assert!(!one.all_siblings(|s| s.is_empty()));
-    // …and an occurrence carrying NO sibling list FAILS the universal rather than
-    // dropping out of it (round-5 defects [5]/[6]): it is a body position at which the
-    // side condition has no evidence at all, which is the case the check exists for.
-    let mixed =
-        LocatedViolation { node: &node, sibling_sets: vec![Some(sibs.as_slice()), None] };
-    assert!(
-        !mixed.all_siblings(|s| s.len() == 2),
-        "an occurrence with no sibling list carries no evidence for the side condition, \
-         so the universal over the occurrences must FAIL — a `filter_map` that drops it \
-         quantifies over the paths that happen to agree"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// POSITION IS CHECKED BY THE CONSUMER, not assumed of the producer.
-// ---------------------------------------------------------------------------
-
-/// `emitted_bounds_violation` and `emitted_divzero_violation` have no emitter pair to
-/// anchor on and their docs name POSITION as their whole discriminator, yet they used
-/// to filter on shape alone — the position check lived only in the producer. It is now
-/// asserted in both consumers ([`candidate_at_body_position`]), which is a no-op today
-/// (MEASURED: certified 584 and gate 238-of-362 unchanged over the 2326-function
-/// corpus) and stops being one the moment [`violation_candidates`] is widened.
-///
-/// This test pins BOTH halves: the helper really does reject a node that is not the
-/// last conjunct, and the producer's invariant — every candidate it yields with a
-/// sibling list IS at the body position — still holds, so widening the producer without
-/// re-reading the consumers now trips a test.
-#[test]
-fn the_body_position_discriminator_is_enforced_where_it_is_documented() {
-    let sibs = vec![Formula::Ge(var("i"), var("len")), Formula::Ge(var("j"), var("cap"))];
-    // A hypothesis-position node: present in the conjunction, but NOT last.
-    let hypothesis = ViolationCandidate { node: &sibs[0], siblings: Some(sibs.as_slice()) };
-    assert!(
-        !candidate_at_body_position(&hypothesis),
-        "a conjunct that is not the LAST one is not at the emitter's body position"
-    );
-    let body = ViolationCandidate { node: &sibs[1], siblings: Some(sibs.as_slice()) };
-    assert!(candidate_at_body_position(&body));
-
-    // The producer invariant the two locators' no-op status rests on.
-    let shapes = [
-        Formula::Ge(var("i"), var("len")),
-        Formula::And(vec![Formula::Ge(var("len"), int(0)), Formula::Eq(var("d"), int(0))]),
-        Formula::Or(vec![
-            Formula::And(vec![
-                Formula::Var("g1".into(), Sort::Bool),
-                Formula::Ge(var("i"), var("len")),
-            ]),
-            Formula::And(vec![
-                Formula::Var("g2".into(), Sort::Bool),
-                Formula::Ge(var("i"), var("len")),
-            ]),
-        ]),
-        Formula::And(vec![
-            Formula::Ge(var("len"), int(0)),
-            Formula::Or(vec![Formula::Lt(var("i"), int(0)), Formula::Ge(var("i"), var("len"))]),
-        ]),
-        // Round-6 F4: the EMPTY `And`, which used to be the one shape yielding NO
-        // candidate at all — bare, in body position, and as an `Or` disjunct. PRE-FIX
-        // (observed 2026-07-31, by reverting `violation_candidates`'s `F::And` arm to
-        // `if let Some(last) = v.last()`): `every shape must yield at least one
-        // candidate: And([])`.
-        Formula::And(Vec::new()),
-        Formula::And(vec![Formula::Ge(var("len"), int(0)), Formula::And(Vec::new())]),
-        Formula::Or(vec![
-            Formula::And(vec![
-                Formula::Var("g1".into(), Sort::Bool),
-                Formula::Ge(var("i"), var("len")),
-            ]),
-            Formula::And(Vec::new()),
-        ]),
-    ];
-    for f in &shapes {
-        let mut out = Vec::new();
-        violation_candidates(f, None, &mut out);
-        assert!(!out.is_empty(), "every shape must yield at least one candidate: {f:?}");
-        for c in &out {
-            assert!(
-                candidate_at_body_position(c),
-                "the producer yielded a candidate that is NOT at the body position — the \
-                 bounds and div/rem locators' position check has stopped being a no-op and \
-                 their measured cost must be re-taken: {:?} in {f:?}",
-                c.node
-            );
-        }
-    }
-}
 
 // ===========================================================================
 // ROUND 4 (2026-07-30) — the three defects the round-4 adversarial verify minted
@@ -1448,76 +1399,128 @@ fn the_signed_abs_negation_lane_still_certifies() {
 #[test]
 fn a_path_with_no_operand_ranges_must_fail_the_uadd_vacuity_check_not_drop_out() {
     let u8t = Ty::Int { width: 8, signed: false };
-    let guarded = |g: &str, with_ranges: bool| {
-        let mut conj = vec![Formula::Var(g.into(), Sort::Bool)];
-        if with_ranges {
-            conj.push(urange("a", 0, 255));
-            conj.push(urange("b", 0, 255));
-        }
-        conj.push(uadd_or(0, 255));
-        Formula::And(conj)
-    };
-    let vc = |formula| VerificationCondition {
+    let guard = |g: &str| Formula::Var(g.into(), Sort::Bool);
+    let vc = |rec: trust_types::ObligationRecord| VerificationCondition {
         kind: VcKind::ArithmeticOverflow {
             op: BinOp::Add,
             operand_tys: (u8t.clone(), u8t.clone()),
         },
         function: "crate::f".into(),
         location: SourceSpan::default(),
-        formula,
+        formula: reconstruct_obligation(&rec),
         contract_metadata: None,
+        obligation: Some(rec),
     };
-    let forged = vc(Formula::Or(vec![guarded("g1", true), guarded("g2", false)]));
+    // Trust: AUTHENTICATED-PATH CONVERSION (2026-08-01). The formula is byte-IDENTICAL to
+    // the peel-era `Or([And([g1, range(a), range(b), oor]), And([g2, oor])])`, but now it is
+    // a faithful `reconstruct_obligation`: the ranges are recorded INSIDE the first path's
+    // guards, NOT in a shared `ConjoinFactsLast`. `record_pins_nonneg` reads only the
+    // `ConjoinFactsLast` wrappers (where the emitter demotes the shared ranges), so ranges
+    // smuggled into a single path's guards do NOT satisfy the vacuity — the split declines.
+    let forged = vc(trust_types::ObligationRecord {
+        body: uadd_or(0, 255),
+        wrappers: vec![trust_types::ObligationWrapper::PathGuardOr {
+            paths: vec![
+                trust_types::PathGuardTerm::Guarded {
+                    guards: vec![guard("g1"), urange("a", 0, 255), urange("b", 0, 255)],
+                },
+                trust_types::PathGuardTerm::Guarded { guards: vec![guard("g2")] },
+            ],
+        }],
+        subject: None,
+        width: None,
+    });
     let got = trustir_safety_vc_adequate_kind(&no_assert_func(), &forged);
     assert!(
         matches!(got.1, RefinementVerdict::KernelRejected(_)),
-        "a path carrying no vacuity evidence must FAIL the side condition, not drop out \
-         of the set it quantifies over — minted {:?}",
+        "operand ranges recorded in ONE path's guards, not the shared `ConjoinFactsLast`, \
+         must FAIL the vacuity side condition — minted {:?}",
         got.0
     );
-    // POSITIVE CONTROL: both paths carrying the ranges still certifies.
-    let honest = vc(Formula::Or(vec![guarded("g1", true), guarded("g2", true)]));
+    // POSITIVE CONTROL: the ranges recorded in the SHARED `ConjoinFactsLast` (the emitter's
+    // own placement), a `PathGuardOr` outside them, still certifies.
+    let honest = vc(trust_types::ObligationRecord {
+        body: uadd_or(0, 255),
+        wrappers: vec![
+            trust_types::ObligationWrapper::ConjoinFactsLast {
+                facts: vec![urange("a", 0, 255), urange("b", 0, 255)],
+            },
+            trust_types::ObligationWrapper::PathGuardOr {
+                paths: vec![
+                    trust_types::PathGuardTerm::Guarded { guards: vec![guard("g1")] },
+                    trust_types::PathGuardTerm::Guarded { guards: vec![guard("g2")] },
+                ],
+            },
+        ],
+        subject: None,
+        width: None,
+    });
     assert_eq!(
         trustir_safety_vc_adequate_kind(&no_assert_func(), &honest).0,
         Some(IrSafetyVcKind::UAddOverflow(IrUWidth::W8)),
-        "the honest two-path split must be unaffected"
+        "the honest two-path split with SHARED recorded ranges must be unaffected"
     );
 }
 
-/// The other half of the same defect: an occurrence the candidate producer cannot see
-/// at all. `violation_candidates` descends only the `And` disjuncts of an `Or`
-/// (trustir_safety.rs, the `F::Or` arm), so a BARE disjunct — the shape an empty-guard
-/// path pushes (`terms.push(formula.clone())`, safety.rs:1078-1080) — contributes no
-/// sibling set, and the vacuity universal would range over the guarded twin alone.
+/// The other half of the same defect, migrated to the AUTHENTICATED path (2026-08-01). A
+/// mixed path-guard `Or` for a block reached by one GUARDED and one UNGUARDED (empty-guard)
+/// path — `Or([And([g1, range(a), range(b), oor]), oor])` — is recorded FAITHFULLY as a
+/// `PathGuardOr` with a `Guarded` first path carrying the operand ranges and a `Raw` (bare)
+/// second path; `reconstruct_obligation` reproduces it bit-for-bit, so the record
+/// authenticates. The ranges live in a PATH GUARD, not the shared `ConjoinFactsLast` the
+/// vacuity check reads (`record_pins_nonneg`), so the discarded `Lt(a+b,0)` half is not
+/// provably vacuous and the lane must decline: `a = −1, b = 0` satisfies the bare disjunct's
+/// obligation while the `Gt`-half certificate says nothing about it.
 ///
-/// PRE-FIX (MEASURED, by removing the `contains_mixed_or` decline):
+/// PRE-FIX (peel era, MEASURED by removing the `contains_mixed_or` decline):
 ///   `Some(UAddOverflow(W8))` / `ProvenModulo3`.
 #[test]
 fn a_mixed_or_hides_an_occurrence_from_the_uadd_universal_and_must_decline() {
     let u8t = Ty::Int { width: 8, signed: false };
-    let forged = VerificationCondition {
-        kind: VcKind::ArithmeticOverflow { op: BinOp::Add, operand_tys: (u8t.clone(), u8t) },
-        function: "crate::f".into(),
-        location: SourceSpan::default(),
-        formula: Formula::Or(vec![
-            Formula::And(vec![
-                Formula::Var("g1".into(), Sort::Bool),
-                urange("a", 0, 255),
-                urange("b", 0, 255),
-                uadd_or(0, 255),
-            ]),
-            uadd_or(0, 255),
-        ]),
-        contract_metadata: None,
+    let guard = |g: &str| Formula::Var(g.into(), Sort::Bool);
+    let forged = {
+        let rec = trust_types::ObligationRecord {
+            body: uadd_or(0, 255),
+            wrappers: vec![trust_types::ObligationWrapper::PathGuardOr {
+                paths: vec![
+                    trust_types::PathGuardTerm::Guarded {
+                        guards: vec![guard("g1"), urange("a", 0, 255), urange("b", 0, 255)],
+                    },
+                    trust_types::PathGuardTerm::Raw,
+                ],
+            }],
+            subject: None,
+            width: None,
+        };
+        VerificationCondition {
+            kind: VcKind::ArithmeticOverflow {
+                op: BinOp::Add,
+                operand_tys: (u8t.clone(), u8t.clone()),
+            },
+            function: "crate::f".into(),
+            location: SourceSpan::default(),
+            formula: reconstruct_obligation(&rec),
+            contract_metadata: None,
+            obligation: Some(rec),
+        }
     };
     assert!(contains_mixed_or(&forged.formula), "the test subject must BE a mixed `Or`");
     let got = trustir_safety_vc_adequate_kind(&no_assert_func(), &forged);
     assert!(
         matches!(got.1, RefinementVerdict::KernelRejected(_)),
-        "a mixed `Or` hides a bare occurrence from the vacuity universal, so the \
-         arithmetic lane must decline rather than quantify over what it can see — \
+        "a mixed `Or` whose bare disjunct carries the operand ranges only inside one path's \
+         guards hides them from the vacuity check, so the arithmetic lane must decline — \
          minted {:?}",
         got.0
+    );
+    // POSITIVE CONTROL: the emitter's own recorded shape (the SAME `oor` body, ranges demoted
+    // to the SHARED `ConjoinFactsLast`) certifies — so the decline above is the hidden-range
+    // vacuity failure, not an unrecognized body or a failed authentication.
+    assert_eq!(
+        trustir_safety_vc_adequate_kind(&no_assert_func(), &uadd_vc(0, 255, (u8t.clone(), u8t)))
+            .0,
+        Some(IrSafetyVcKind::UAddOverflow(IrUWidth::W8)),
+        "the honest recorded shape with SHARED operand ranges must still certify"
     );
 }
 
@@ -1691,163 +1694,12 @@ fn a_mixed_path_guard_or_is_emitter_reachable_through_an_unwind_edge() {
 }
 
 // ---------------------------------------------------------------------------
-// THE MEASUREMENT HARNESS — `#[ignore]`d, so it never runs in the suite; it exists
-// so that every corpus number this file or `trustir_safety.rs` states is a command
-// someone else can re-run instead of a figure someone transcribed.
+// [REMOVED 2026-08-01] `trustir_corpus_census` (and its `kind_label` helper) was the
+// `#[ignore]`d measurement harness. It tallied the tier's per-shape census with the deleted
+// `emitted_shift_violation` / `emitted_arith_violation` / `contains_mixed_or` peels, so it
+// cannot compile once the peels are gone. It never ran in the suite (`#[ignore]`), and its
+// figures were peel-mechanism census numbers, not live-certifier soundness assertions.
 // ---------------------------------------------------------------------------
-
-/// Walk `crates/trust-clean/fixtures`, drive the REAL emitter over every parseable
-/// `VerifiableFunction`, and print the tier's census: functions, emitted safety VCs,
-/// certified rows, the function-level gate, and the per-kind certified split. With
-/// `TRUSTIR_CENSUS_OUT=<path>` it also writes one line per safety VC
-/// (`<fixture>\t<vc index>\t<kind>\t<minted kind>\t<proven>`), so two trees can be
-/// diffed ROW BY ROW rather than compared on totals.
-///
-/// ```text
-/// cd crates && RUSTC_BOOTSTRAP=1 TRUSTIR_CENSUS_OUT=/tmp/rows.txt \
-///   cargo test --offline -p trust-clean --lib -- --ignored --nocapture \
-///   selection_tests::trustir_corpus_census
-/// ```
-#[test]
-#[ignore = "measurement harness over the whole fixture corpus (minutes); run explicitly"]
-fn trustir_corpus_census() {
-    use std::fmt::Write as _;
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-    let mut files: Vec<std::path::PathBuf> = Vec::new();
-    let mut stack = vec![root.clone()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.extension().is_some_and(|x| x == "json") {
-                files.push(p);
-            }
-        }
-    }
-    files.sort();
-
-    let (mut funcs, mut vcs, mut certified) = (0usize, 0usize, 0usize);
-    let (mut gate_true, mut gate_denom) = (0usize, 0usize);
-    let mut per_kind: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
-    let mut shift_pairs: std::collections::BTreeMap<(Option<u32>, i128), usize> =
-        Default::default();
-    // The D2 population: arithmetic VCs whose two `operand_tys` have DIFFERENT widths,
-    // and how many of those have an integer LITERAL in the wider position of the located
-    // core — the constant that justifies certifying at the narrower width.
-    let (mut mixed_width, mut mixed_width_literal, mut mixed_width_located) = (0usize, 0, 0);
-    // The D7 population: safety VCs whose formula contains a MIXED `Or` anywhere (an
-    // `Or` with both an `And` and a non-`And` disjunct) — the shape whose bare disjunct
-    // the candidate producer cannot see, and which every lane now declines on.
-    let mut mixed_or_vcs = 0usize;
-    let mut rows = String::new();
-    for p in &files {
-        let Ok(bytes) = std::fs::read(p) else { continue };
-        let Ok(func) = serde_json::from_slice::<VerifiableFunction>(&bytes) else { continue };
-        funcs += 1;
-        let rel = p.strip_prefix(&root).unwrap_or(p).display().to_string();
-        let emitted = trust_vcgen::generate_vcs(&func);
-        let mut safety = 0usize;
-        let mut all_ok = true;
-        for (i, vc) in emitted.iter().enumerate() {
-            if !is_safety_vc_kind(&vc.kind) {
-                continue;
-            }
-            safety += 1;
-            vcs += 1;
-            let (kind, verdict) = trustir_safety_vc_adequate_kind(&func, vc);
-            let proven = matches!(verdict, RefinementVerdict::ProvenModulo3);
-            all_ok &= proven;
-            certified += usize::from(proven);
-            // The D3 census: for every shift VC that LOCATES a violation, the pair
-            // (the width `operand_ty` records in the kind, the width the emitted
-            // threshold states). They are not the same read, and the gap between them
-            // is this tier's documented deferral.
-            if let VcKind::ShiftOverflow { operand_ty, .. } = &vc.kind
-                && let Some(inv) = emitted_shift_violation(&func, &vc.formula)
-                && let Some((_, threshold, _)) = shift_violation_shape(inv)
-            {
-                *shift_pairs.entry((operand_ty.int_width(), threshold)).or_default() += 1;
-            }
-            if let VcKind::ArithmeticOverflow { operand_tys: (a, b), .. } = &vc.kind
-                && let (Some(wa), Some(wb)) = (a.int_width(), b.int_width())
-                && wa != wb
-            {
-                mixed_width += 1;
-                if let Some(loc) = emitted_arith_violation(&func, &vc.formula) {
-                    mixed_width_located += 1;
-                    let ops = match loc {
-                        Formula::Or(v) => match v.as_slice() {
-                            [Formula::Lt(l, _), Formula::Gt(..)] => binop_operands(l),
-                            _ => None,
-                        },
-                        Formula::Lt(l, _) => binop_operands(l),
-                        _ => None,
-                    };
-                    if let Some((a_op, b_op)) = ops {
-                        let wider = if wa > wb { a_op } else { b_op };
-                        if matches!(wider, Formula::Int(_) | Formula::UInt(_)) {
-                            mixed_width_literal += 1;
-                        }
-                    }
-                }
-            }
-            if contains_mixed_or(&vc.formula) {
-                mixed_or_vcs += 1;
-            }
-            let bucket = format!("{:?}", std::mem::discriminant(&vc.kind));
-            let e = per_kind.entry(kind_label(&vc.kind, bucket)).or_default();
-            e.0 += 1;
-            e.1 += usize::from(proven);
-            let _ = writeln!(rows, "{rel}\t{i}\t{:?}\t{kind:?}\t{proven}", vc.kind);
-        }
-        if safety > 0 {
-            gate_denom += 1;
-            gate_true += usize::from(all_ok);
-        }
-    }
-    if let Ok(out) = std::env::var("TRUSTIR_CENSUS_OUT") {
-        std::fs::write(&out, &rows).expect("write census rows");
-        println!("rows written to {out}");
-    }
-    println!("CENSUS funcs={funcs} safetyVCs={vcs} certified={certified} gate={gate_true}/{gate_denom}");
-    for (k, (n, c)) in &per_kind {
-        println!("  {k}: {c} certified of {n}");
-    }
-    println!("MIXED-`Or`-bearing safety VCs: {mixed_or_vcs}");
-    println!(
-        "MIXED-WIDTH arithmetic VCs: {mixed_width} (located {mixed_width_located}, of which \
-         wider-position-is-a-literal {mixed_width_literal})"
-    );
-    println!("SHIFT (operand_ty width, emitted threshold) over located shift violations:");
-    for ((kw, th), n) in &shift_pairs {
-        println!("  ({kw:?}, {th}): {n}");
-    }
-}
-
-/// A stable per-kind bucket label for [`trustir_corpus_census`].
-fn kind_label(kind: &VcKind, fallback: String) -> String {
-    use trust_types::BinOp;
-    match kind {
-        VcKind::IndexOutOfBounds | VcKind::SliceBoundsCheck => "bounds".into(),
-        VcKind::DivisionByZero | VcKind::RemainderByZero => "divrem".into(),
-        VcKind::NegationOverflow { .. } => "neg".into(),
-        VcKind::ShiftOverflow { .. } => "shift".into(),
-        VcKind::ArithmeticOverflow { op, operand_tys: (a, b) } => {
-            let signed = matches!(a, Ty::Int { signed: true, .. })
-                || matches!(b, Ty::Int { signed: true, .. });
-            match (op, signed) {
-                (BinOp::Add, false) => "uadd".into(),
-                (BinOp::Sub, false) => "usub".into(),
-                (_, true) => "signed".into(),
-                _ => "arith-other".into(),
-            }
-        }
-        _ => fallback,
-    }
-}
-
 
 // ---------------------------------------------------------------------------
 // ROUND 5 — the five survivors and the three holes round 4 opened.
@@ -1890,6 +1742,7 @@ fn a_mixed_width_signed_kind_may_not_pick_its_own_width() {
         location: SourceSpan::default(),
         formula: body(min, max),
         contract_metadata: None,
+        obligation: None,
     };
     let f = no_assert_func();
     // An `i8`-thresholded body under `(i8, i64)`: the `i64` position is a bare `Var`,
@@ -1983,6 +1836,7 @@ fn neg_subject_vc(subject: &str, width: u32, min: i128) -> VerificationCondition
             Formula::Eq(var(subject), int(min)),
         ]),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -2072,6 +1926,7 @@ fn a_rangeless_occurrence_must_fail_the_vacuity_universal_not_drop_out_of_it() {
             ]),
         ]),
         contract_metadata: None,
+        obligation: None,
     };
     let got = trustir_safety_vc_adequate_kind(&func, &vc);
     assert!(
@@ -2113,6 +1968,7 @@ fn a_mixed_path_guard_or_declines_at_every_lane_not_only_the_arithmetic_one() {
             Formula::Ge(var("j"), var("other_len")),
         ),
         contract_metadata: None,
+        obligation: None,
     };
     let bounds_got = trustir_safety_vc_adequate_kind(&f, &bounds);
     let divzero = VerificationCondition {
@@ -2124,6 +1980,7 @@ fn a_mixed_path_guard_or_declines_at_every_lane_not_only_the_arithmetic_one() {
             Formula::Eq(var("c"), int(0)),
         ),
         contract_metadata: None,
+        obligation: None,
     };
     let divzero_got = trustir_safety_vc_adequate_kind(&f, &divzero);
     let shift = VerificationCondition {
@@ -2139,6 +1996,7 @@ fn a_mixed_path_guard_or_declines_at_every_lane_not_only_the_arithmetic_one() {
             Formula::Ge(var("m"), int(64)),
         ),
         contract_metadata: None,
+        obligation: None,
     };
     let shift_got = trustir_safety_vc_adequate_kind(&f, &shift);
     // Reported TOGETHER: each lane is a separate instance of the same defect, and a
@@ -2176,6 +2034,7 @@ fn two_different_body_positions_are_ambiguous_not_a_singleton() {
             ]),
         ]),
         contract_metadata: None,
+        obligation: None,
     };
     let got = trustir_safety_vc_adequate_kind(&f, &vc);
     assert!(
@@ -2207,13 +2066,9 @@ fn the_signed_index_bounds_form_is_recognized_and_declined_by_name() {
         bounds_violation_shape(&Formula::Ge(var("i"), var("len"))).map(|(_, _, s)| s),
         Some(false)
     );
-    let vc = VerificationCondition {
-        kind: VcKind::IndexOutOfBounds,
-        function: "crate::f".into(),
-        location: SourceSpan::default(),
-        formula: signed,
-        contract_metadata: None,
-    };
+    // Authenticated: body = the signed `Or` core (empty wrappers), so the arm recognizes
+    // and declines it BY NAME rather than for want of a record.
+    let vc = bounds_vc(signed);
     match trustir_safety_vc_adequate(&no_assert_func(), &vc) {
         RefinementVerdict::KernelRejected(msg) => assert!(
             msg.contains("SIGNED"),
@@ -2264,6 +2119,7 @@ fn an_empty_and_disjunct_is_a_body_position_stating_true_not_a_droppable_one() {
         location: SourceSpan::default(),
         formula: vacuous(Formula::Ge(var("i"), var("len"))),
         contract_metadata: None,
+        obligation: None,
     };
     let bounds_got = trustir_safety_vc_adequate_kind(&f, &bounds);
     let divzero = VerificationCondition {
@@ -2272,6 +2128,7 @@ fn an_empty_and_disjunct_is_a_body_position_stating_true_not_a_droppable_one() {
         location: SourceSpan::default(),
         formula: vacuous(Formula::Eq(var("b"), int(0))),
         contract_metadata: None,
+        obligation: None,
     };
     let divzero_got = trustir_safety_vc_adequate_kind(&f, &divzero);
     let shift = VerificationCondition {
@@ -2287,6 +2144,7 @@ fn an_empty_and_disjunct_is_a_body_position_stating_true_not_a_droppable_one() {
             Formula::Ge(var("n"), int(32)),
         ])),
         contract_metadata: None,
+        obligation: None,
     };
     let shift_got = trustir_safety_vc_adequate_kind(&f, &shift);
     // Reported TOGETHER, as the D7 test above does: one failing assertion would hide
@@ -2301,31 +2159,201 @@ fn an_empty_and_disjunct_is_a_body_position_stating_true_not_a_droppable_one() {
     );
 }
 
-/// The producer half of F4, stated directly: an empty `And` must YIELD a candidate
-/// rather than vanish. Held separately from the lane-level test above so that a future
-/// change which keeps the lanes declining for some unrelated reason cannot silently
-/// restore the drop.
+// [REMOVED 2026-08-01] `an_empty_and_still_yields_a_candidate` was the PRODUCER half of F4,
+// stated directly against the deleted `violation_candidates_resolved` / `is_path_guard_splice`
+// peel (that an empty `And` yields a candidate rather than vanishing). The candidate producer
+// is deleted — production authenticates a recorded obligation — so this tests behaviour that
+// no longer exists. The LANE-level F4 property (an empty-`And` disjunct folding to `True` may
+// not be certified) is still pinned by `an_empty_and_disjunct_is_a_body_position_stating_true_
+// not_a_droppable_one` above, which drives the live certifier.
+
+// ---------------------------------------------------------------------------
+// THE AUTHENTICATED-OBLIGATION FIELD — trust-ir twin of
+// `mirsem::obligation_region_tests::a_truthful_recorded_obligation_certifies_and_a_
+// hostile_one_is_declined`. The recorded `vc.obligation` REPLACES the peel for the
+// div/rem and negation lanes, but only after `reconstruct_obligation(rec) == vc.formula`
+// authenticates it; a hostile record (field claims one core, formula asserts a different
+// violable one) is DECLINED, never certified and never silently ignored. Both lanes MUST
+// agree (the parity checker pins them), which is why this mirrors the mirsem test.
+// ---------------------------------------------------------------------------
+
+/// A function whose MIR negates the operand named `name` at width `w` (signed), so
+/// `negation_subjects` finds it for the body-route negation lane. The trust-ir twin of
+/// mirsem's `named_neg_func`.
+fn raw_neg_func(name: &str, w: u32) -> VerifiableFunction {
+    let t = Ty::Int { width: w, signed: true };
+    VerifiableFunction {
+        name: "neg".into(),
+        def_path: "crate::neg".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: t.clone(), name: Some("_0".into()) },
+                LocalDecl { index: 1, ty: t.clone(), name: Some(name.into()) },
+            ],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::UnaryOp(UnOp::Neg, Operand::Copy(Place::local(1))),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: t,
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+/// TRUTHFUL RECORD CERTIFIES, HOSTILE RECORD DECLINES, on both sliced lanes.
+///
+/// FALSIFICATION (constraint 4), verified by reverting IN PLACE: relax
+/// `select_obligation`'s equate (make it `if true`, or route its `Decline` arm to the
+/// peel) and the hostile div VC mints `(Some(DivByZero), ProvenModulo3)` off the field's
+/// `Eq(w,0)` body while the hostile negation VC mints `(Some(NegOverflow(W32)), …)` off the
+/// peel's real `Eq(y, i32::MIN)`.
 #[test]
-fn an_empty_and_still_yields_a_candidate() {
-    let f = no_assert_func();
-    let empty = Formula::And(Vec::new());
-    let cands: Vec<&Formula> =
-        violation_candidates_resolved(&f, &empty).into_iter().map(|c| c.node).collect();
+fn a_truthful_recorded_obligation_certifies_and_a_hostile_one_is_declined_ir() {
+    let proven = |(k, v): (Option<IrSafetyVcKind>, RefinementVerdict)| {
+        (k, matches!(v, RefinementVerdict::ProvenModulo3))
+    };
+
+    // ---- ARM 1: div-by-zero (body-only) --------------------------------------------
+    let div_hyp = Formula::Ge(var("p"), int(0));
+    let div_core = Formula::Eq(var("z"), int(0));
+    let div_formula = Formula::And(vec![div_hyp.clone(), div_core.clone()]);
+    let div_vc = |obligation: Option<trust_types::ObligationRecord>| VerificationCondition {
+        kind: VcKind::DivisionByZero,
+        function: "crate::f".into(),
+        location: SourceSpan::default(),
+        formula: div_formula.clone(),
+        contract_metadata: None,
+        obligation,
+    };
+    let conjoin = |facts: Vec<Formula>| {
+        vec![trust_types::ObligationWrapper::ConjoinFactsLast { facts }]
+    };
+    let div_truthful = trust_types::ObligationRecord {
+        body: div_core.clone(),
+        wrappers: conjoin(vec![div_hyp.clone()]),
+        subject: None,
+        width: None,
+    };
+    let div_hostile = trust_types::ObligationRecord {
+        body: Formula::Eq(var("w"), int(0)),
+        wrappers: conjoin(vec![div_hyp.clone()]),
+        subject: None,
+        width: None,
+    };
+
+    // FIELD-REQUIRED (2026-08-01): the peel is deleted, so a TRUTHFUL record is the ONLY
+    // thing that certifies, and it certifies to this kind's own `IrSafetyVcKind`.
     assert_eq!(
-        cands.len(),
-        1,
-        "the empty `And` is a body position and must be an occurrence: {cands:?}"
+        proven(trustir_safety_vc_adequate_kind(&no_assert_func(), &div_vc(Some(div_truthful)))),
+        (Some(IrSafetyVcKind::DivByZero), true),
+        "a TRUTHFUL recorded obligation (reconstruct == formula) must certify DivByZero"
     );
-    assert_eq!(cands[0], &empty);
-    // …and nested under an `Or`, BOTH disjuncts' body positions are occurrences, so the
-    // agreement rule has something to disagree about.
-    let core = Formula::Ge(var("i"), var("len"));
-    let or = Formula::Or(vec![Formula::And(vec![core.clone()]), Formula::And(Vec::new())]);
-    let nodes: Vec<&Formula> = violation_candidates_resolved(&f, &or)
-        .into_iter()
-        .filter(|c| !is_path_guard_splice(c.node))
-        .map(|c| c.node)
-        .collect();
-    assert_eq!(nodes.len(), 2, "both disjuncts' bodies must be occurrences: {nodes:?}");
-    assert!(nodes.contains(&&core) && nodes.contains(&&empty), "{nodes:?}");
+    assert_eq!(
+        trustir_safety_vc_adequate_kind(&no_assert_func(), &div_vc(Some(div_hostile))).0,
+        None,
+        "a HOSTILE recorded obligation (field says `Eq(w,0)`, formula asserts the violable \
+         `Eq(z,0)`) reconstructs to a DIFFERENT formula, so the authentication must DECLINE"
+    );
+
+    // ---- ARM 2: negation overflow (body + subject + width) -------------------------
+    // The emitter's raw-neg pair: `And([range(y), Eq(y, i32::MIN)])`, so the peel's range
+    // sibling is present and the None baseline certifies too.
+    let neg_range = Formula::And(vec![
+        Formula::Le(int(-2147483648), var("y")),
+        Formula::Le(var("y"), int(2147483647)),
+    ]);
+    let neg_core = Formula::Eq(var("y"), int(-2147483648));
+    let neg_formula = Formula::And(vec![neg_range.clone(), neg_core.clone()]);
+    let neg_vc = |obligation: Option<trust_types::ObligationRecord>| VerificationCondition {
+        kind: VcKind::NegationOverflow { ty: Ty::Int { width: 32, signed: true } },
+        function: "crate::neg".into(),
+        location: SourceSpan::default(),
+        formula: neg_formula.clone(),
+        contract_metadata: None,
+        obligation,
+    };
+    let neg_truthful = trust_types::ObligationRecord {
+        body: neg_core.clone(),
+        wrappers: conjoin(vec![neg_range.clone()]),
+        subject: Some(*var("y")),
+        width: Some(32),
+    };
+    // The [10]-class WIDTH forgery: the field's body claims the i8 MIN threshold.
+    let neg_hostile = trust_types::ObligationRecord {
+        body: Formula::Eq(var("y"), int(-128)),
+        wrappers: conjoin(vec![neg_range.clone()]),
+        subject: Some(*var("y")),
+        width: Some(8),
+    };
+
+    assert_eq!(
+        proven(trustir_safety_vc_adequate_kind(&raw_neg_func("y", 32), &neg_vc(Some(neg_truthful)))),
+        (Some(IrSafetyVcKind::NegOverflow(IrSWidth::W32)), true),
+        "a TRUTHFUL recorded negation obligation must certify NegOverflow(W32)"
+    );
+    assert_eq!(
+        trustir_safety_vc_adequate_kind(&raw_neg_func("y", 32), &neg_vc(Some(neg_hostile))).0,
+        None,
+        "a HOSTILE recorded negation obligation (field says the width-8 `Eq(y,-128)`, formula \
+         asserts the width-32 `Eq(y,-2147483648)`) reconstructs to a DIFFERENT formula, so the \
+         authentication must DECLINE"
+    );
+}
+
+/// A recorded obligation that FAILS to authenticate DECLINES; it never falls back to the
+/// peel (constraint 3). The peel WOULD certify this formula, yet a `Some(obligation)` whose
+/// wrappers do not reproduce `formula` fails closed. Falsified by routing
+/// `ObligationSelection::Decline` to the peel.
+#[test]
+fn an_unfaithful_recorded_obligation_declines_it_does_not_fall_back_to_the_peel_ir() {
+    let hyp = Formula::Ge(var("p"), int(0));
+    let core = Formula::Eq(var("z"), int(0));
+    let formula = Formula::And(vec![hyp.clone(), core.clone()]);
+    let vc = |obligation: Option<trust_types::ObligationRecord>| VerificationCondition {
+        kind: VcKind::DivisionByZero,
+        function: "crate::f".into(),
+        location: SourceSpan::default(),
+        formula: formula.clone(),
+        contract_metadata: None,
+        obligation,
+    };
+    // Control (field-required): a TRUTHFUL record (reconstruct == formula) certifies the same
+    // formula, so the decline below is the authentication rejecting the unfaithful record.
+    let truthful = trust_types::ObligationRecord {
+        body: core.clone(),
+        wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast {
+            facts: vec![hyp.clone()],
+        }],
+        subject: None,
+        width: None,
+    };
+    assert_eq!(
+        trustir_safety_vc_adequate_kind(&no_assert_func(), &vc(Some(truthful))).0,
+        Some(IrSafetyVcKind::DivByZero),
+        "control: a TRUTHFUL record must certify this formula, else the test proves nothing"
+    );
+    // A record whose wrappers carry an EXTRA fact not present in `formula`.
+    let unfaithful = trust_types::ObligationRecord {
+        body: core.clone(),
+        wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast {
+            facts: vec![hyp, Formula::Ge(var("q"), int(0))],
+        }],
+        subject: None,
+        width: None,
+    };
+    assert_eq!(
+        trustir_safety_vc_adequate_kind(&no_assert_func(), &vc(Some(unfaithful))).0,
+        None,
+        "a recorded-but-unfaithful obligation must DECLINE, not fall back to the peel"
+    );
 }

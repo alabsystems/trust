@@ -1,0 +1,8 @@
+error: dependency `itoa v1.0.11` is built from a source outside this tree
+  |
+  = note: cargo resolves it from `registry+https://github.com/rust-lang/crates.io-index`
+  = help: vendor the source in-tree — a path dependency, a workspace member, or a copy under `vendor/` — so it compiles under `trustc` with the rest of this tree, where it can be given contracts and repaired in place
+  = note: `-D clippy::trust-external-dependency-source` implied by `-D warnings`
+  = help: to override `-D warnings` add `#[allow(clippy::trust_external_dependency_source)]`
+
+error: could not compile `trust_external_dependency_source` (bin "trust_external_dependency_source") due to 1 previous error

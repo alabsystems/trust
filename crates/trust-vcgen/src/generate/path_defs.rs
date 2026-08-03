@@ -764,6 +764,80 @@ pub(crate) fn block_entry_versions(
     func.body.blocks.iter().enumerate().map(|(i, b)| (b.id, in_sets[i].clone())).collect()
 }
 
+/// True iff an opaque deref-store to `place` provably CONFINES its effect —
+/// *within the storing pointer's OWN pointee tree* — to the exact place written,
+/// so a SIBLING field path under that same pointer cannot be disturbed by it.
+///
+/// Trust (P0 multi-write postcondition false-refutation, 2026-08-01). This exists
+/// solely to let [`stmt_writes_name`] subtract the storing pointer's own tree from
+/// the block-level [`deref_store_havoc_names`] over-approximation. That list is a
+/// *whole-function* set of BASE LOCAL names (`mutable_pointer_local_names` walks
+/// locals, so a `&mut` parameter contributes the bare name `self`), and
+/// `place_names_overlap` treats `*` as a projection separator — so
+/// `place_names_overlap("self", "self*.0")` is TRUE and the store `(*self).1 = v`
+/// was reported as a write of its own SIBLING `self*.0`. For the fact KILL that is
+/// merely conservative, but `stmt_writes_name` ALSO chooses WHICH statement stamps
+/// a name's version token, and moving `self*.0`'s token onto a statement that never
+/// wrote it severs the token from the exact-token out-parameter pin in
+/// `with_out_param_pins` — leaving the postcondition's read of `self*.0` a FREE
+/// variable that the solver "refutes" with a *verified counterexample* against a
+/// body that plainly establishes it. Every `&mut self` method that writes two
+/// fields was affected.
+///
+/// FAIL-CLOSED. Returns `false` — keeping today's whole-pointee havoc verbatim —
+/// unless every step is positively certified:
+///   * a leading `Deref` with a NON-EMPTY, all-constant-`Field` path after it (a
+///     whole-pointee store `*p = v` has no sibling to spare; a symbolic `Index`
+///     may hit any slot; a nested `Deref` re-opens aliasing; a `Downcast` makes
+///     the field's location variant-dependent),
+///   * an unambiguous declared pointer type for the storing local, and
+///   * every ADT traversed along that path positively confirmed
+///     `Some(AdtKind::Struct)`. A `union`'s fields OVERLAP at byte offset 0, so
+///     sibling independence is OPERATIONALLY FALSE for one; an `enum` (non-empty
+///     `variants`) is variant-dependent; and `None` means the ADT was never lowered
+///     from a rustc `AdtDef` and its kind is simply unknown. This is the same
+///     G-STRUCT-KIND posture `clean_ground::sem_field_set_shape_of` already applies
+///     to the field-setter frame surface, for the identical reason.
+///
+/// Note this certifies ONLY intra-pointer sibling disjointness. CROSS-pointer
+/// aliasing is deliberately untouched by the caller: a store through `q` still
+/// havocs every name under `p`, which is what the out-param pin's soundness
+/// argument (contract_vcs.rs, "ALIASING IS NOT ASSUMED AWAY") relies on.
+pub(super) fn opaque_store_confined_to_written_place(
+    func: &VerifiableFunction,
+    place: &trust_types::Place,
+) -> bool {
+    let Some((trust_types::Projection::Deref, rest)) = place.projections.split_first() else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    // An ambiguous (duplicated) declaration index makes the type unusable; refuse,
+    // matching `is_out_param_place`.
+    let mut decls = func.body.locals.iter().filter(|d| d.index == place.local);
+    let Some(decl) = decls.next() else { return false };
+    if decls.next().is_some() {
+        return false;
+    }
+    let mut ty: &trust_types::Ty = match &decl.ty {
+        trust_types::Ty::Ref { inner, .. } => inner,
+        trust_types::Ty::RawPtr { pointee, .. } => pointee,
+        _ => return false,
+    };
+    for proj in rest {
+        let trust_types::Projection::Field(idx) = proj else { return false };
+        let trust_types::Ty::Adt { fields, variants, adt_kind, .. } = ty else { return false };
+        // G-STRUCT-KIND: a positively-confirmed `struct` with no variant structure.
+        if !variants.is_empty() || *adt_kind != Some(trust_types::AdtKind::Struct) {
+            return false;
+        }
+        let Some((_, field_ty)) = fields.get(*idx) else { return false };
+        ty = field_ty;
+    }
+    true
+}
+
 /// True iff statement `bb.stmts[k]` ITSELF writes a place overlapping `name` — a
 /// direct `Assign`/`SetDiscriminant` dest, or an opaque deref-store (`*p = v` with
 /// `p` non-canonicalizable) that havocs `name`. The single-statement test the
@@ -782,9 +856,33 @@ pub(super) fn stmt_writes_name(
             if place_names_overlap(&dest, name) || write_covers_derived_slice_len(&dest, name) {
                 return true;
             }
-            matches!(place.projections.first(), Some(trust_types::Projection::Deref))
-                && crate::deref_pointer_is_opaque(func, place.local)
-                && deref_store_havoc_names(func, bb).iter().any(|h| place_names_overlap(h, name))
+            if !matches!(place.projections.first(), Some(trust_types::Projection::Deref))
+                || !crate::deref_pointer_is_opaque(func, place.local)
+            {
+                return false;
+            }
+            let havoc = deref_store_havoc_names(func, bb);
+            // Trust (P0 multi-write postcondition false-refutation): when the store's
+            // own field path is certified disjointly-addressable, the exact written
+            // place `dest` (tested above) ALREADY is the precise answer inside the
+            // storing pointer's own tree — ancestors (`p*`, `p`) and descendants of
+            // `dest` still report true through that branch. Subtract only that tree
+            // from the alias havoc, which exists for the OTHER locals the store might
+            // reach. Every other name in the list is retained, so cross-pointer
+            // aliasing (`q*` havoced by a store through `p`) is fully preserved.
+            if opaque_store_confined_to_written_place(func, place) {
+                // Minted with the SAME construction `mutable_pointer_local_names` uses,
+                // so the exclusion is name-consistent with the list by construction.
+                let store_base = crate::place_to_var_name(
+                    func,
+                    &trust_types::Place { local: place.local, projections: Vec::new() },
+                );
+                return havoc
+                    .iter()
+                    .filter(|h| !place_names_overlap(h, &store_base))
+                    .any(|h| place_names_overlap(h, name));
+            }
+            havoc.iter().any(|h| place_names_overlap(h, name))
         }
         Statement::SetDiscriminant { place, .. } => {
             place_names_overlap(&crate::place_to_var_name(func, place), name)
@@ -1097,6 +1195,21 @@ pub(crate) fn conjoin_preconditions_versioned(
     killed: &FxHashSet<String>,
     formula: Formula,
 ) -> Formula {
+    conjoin_preconditions_versioned_recorded(func, block, preconditions, killed, formula).0
+}
+
+/// As [`conjoin_preconditions_versioned`], but also returns the exact facts it
+/// conjoined onto the (renamed) body — the filtered preconditions. Trust: the
+/// obligation recorder mirrors the whole-formula rename onto its stored body/facts,
+/// then records a `ConjoinFactsLast { facts }` from THIS return so reconstruction
+/// reproduces `And([facts.., renamed_body])` exactly.
+pub(crate) fn conjoin_preconditions_versioned_recorded(
+    func: &VerifiableFunction,
+    block: BlockId,
+    preconditions: &[Formula],
+    killed: &FxHashSet<String>,
+    formula: Formula,
+) -> (Formula, Vec<Formula>) {
     use crate::versioned::{Fact, Vc, conjoin};
     let _ = killed; // the kill is REPLACED by the version rename (item 3: deleted)
     let sv = StmtVersionCtx::build(func);
@@ -1113,13 +1226,13 @@ pub(crate) fn conjoin_preconditions_versioned(
     let vc = Vc::versioned(version_rename_at(&formula, &sv, func, block, terminal), block);
     // Defense in depth for callers that invoke a lower-level generator without
     // passing through `generate_vcs_impl`'s sanitized function view.
-    let facts: Vec<Fact> = preconditions
+    let kept: Vec<Formula> = preconditions
         .iter()
         .filter(|pre| !contracts::formula_uses_unmodeled_machine_arithmetic_in_function(func, pre))
         .cloned()
-        .map(Fact::entry)
         .collect();
-    conjoin(&facts, vc)
+    let facts: Vec<Fact> = kept.iter().cloned().map(Fact::entry).collect();
+    (conjoin(&facts, vc), kept)
 }
 
 // DELETED (S2c item 3): `conjoin_live_preconditions` — the precondition KILL

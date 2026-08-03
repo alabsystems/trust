@@ -30,6 +30,7 @@ pub fn make_test_vc_with_formula(
         location: test_source_span(),
         formula,
         contract_metadata: None,
+        obligation: None,
     }
 }
 

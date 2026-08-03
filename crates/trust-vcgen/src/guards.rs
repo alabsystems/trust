@@ -32,6 +32,116 @@ use crate::{
     operand_ty, slice_len_formula, u128_to_formula,
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Crate-origin anchors for the callee-name-keyed fact producers in this file
+// (round-5 false-proof close). A GENUINE primitive/std callee renders CRATE-ROOTED
+// — `core::slice::<impl [T]>::…`, `std::vec::Vec::<T>::…`, `core::str::<impl str>::…`,
+// `core::num::<impl iN>::…`, `<T as core::ops::…>::m` — none of which a user free fn
+// (`mycrate::…`) nor a user-trait impl (`<T as mycrate::…>::m`, carrying ` as mycrate`)
+// can spell. These MIRROR the generate.rs round-4 helpers
+// (`callee_is_std_slice_inherent`, `callee_is_std_vec_inherent`, `is_std_num_intrinsic`)
+// and the shared `trust_types::total_call_summaries` doctrine, kept local so this file's
+// forgery-rejection is self-contained. Fail-closed on a miss: a missed anchor just
+// leaves the honest runtime-checked obligation (a missed proof, never a wrong one).
+// `alloc`/`std`/`core` are foreign crates a user cannot shadow (the `--crate-name`
+// literal attack is the accepted doctrine boundary, same as the mirrored helpers).
+
+/// MIRROR of `generate::callee_is_std_vec_inherent`: an INHERENT method on the
+/// std/alloc `Vec` type (`alloc::vec::Vec::<T>::…`, `std::vec::Vec::<T, A>::…`, the
+/// UFCS `<alloc::vec::Vec<T>>::…`). Rejects a user free fn (no `alloc`/`std` root,
+/// e.g. `userlib::Vec::<u32>::as_mut_slice`) and a user-trait impl on `Vec` (` as `).
+fn callee_is_std_vec_inherent(callee: &str) -> bool {
+    if callee.contains(" as ") {
+        return false;
+    }
+    let c = callee.strip_prefix('<').unwrap_or(callee);
+    c.starts_with("alloc::vec::Vec") || c.starts_with("std::vec::Vec")
+}
+
+/// MIRROR of `generate::callee_is_std_slice_inherent`: an INHERENT primitive-slice
+/// method whose def-path ends in one of `suffixes` — `core::slice::<impl [T]>::…`
+/// (crate root) or the bare inherent UFCS `<[T]>::…`. Rejects the free fn and the
+/// ` as `-qualified user-trait impl on `[T]`.
+fn callee_is_std_slice_inherent(callee: &str, suffixes: &[&str]) -> bool {
+    if !suffixes.iter().any(|s| callee.ends_with(s)) {
+        return false;
+    }
+    if callee.contains(" as ") {
+        return false;
+    }
+    callee.starts_with("core::slice::")
+        || callee.starts_with("std::slice::")
+        || callee.starts_with("<[")
+}
+
+/// Companion for the INHERENT `str`/`String` methods (`is_empty`, `as_bytes`) whose
+/// crate roots the slice/Vec mirrors do not cover. Genuine renderings:
+/// `core::str::<impl str>::as_bytes`, `<str>::is_empty`,
+/// `alloc::string::String::as_bytes`, `std::string::String::is_empty`. Rejects the
+/// free fn (`mycrate::as_bytes`) and the ` as `-qualified user-trait UFCS.
+fn callee_is_std_str_inherent(callee: &str, suffixes: &[&str]) -> bool {
+    if !suffixes.iter().any(|s| callee.ends_with(s)) {
+        return false;
+    }
+    if callee.contains(" as ") {
+        return false;
+    }
+    callee.starts_with("core::str::")
+        || callee.starts_with("std::str::")
+        || callee.starts_with("alloc::str::")
+        || callee.starts_with("<str")
+        || callee.starts_with("alloc::string::String")
+        || callee.starts_with("std::string::String")
+}
+
+/// MIRROR of `generate::is_std_num_intrinsic`: a `core::num::<impl iN>::…` /
+/// `std::num::…` inherent — the un-forgeable `::num::` std segment under a core/std
+/// crate root. A user `fn checked_add(..)->Option<..>` renders `mycrate::checked_add`
+/// (no `::num::` under a std root) and is DECLINED.
+fn is_std_num_intrinsic(callee: &str) -> bool {
+    (callee.starts_with("core::") || callee.starts_with("std::")) && callee.contains("::num::")
+}
+
+/// A GENUINE `core::ops::`/`std::ops::` operator-trait method — `Index::index`,
+/// `IndexMut::index_mut`, `Deref::deref`, `DerefMut::deref_mut`, `Try::branch` — in
+/// EITHER the unqualified (`core::ops::index::Index::index`) or the `<T as core::ops::…>::m`
+/// qualified form. CRATE-ROOT anchored (round-5 fix): a bare `contains("core::ops::")`
+/// was forgeable by a NESTED USER MODULE (`mycrate::core::ops::mymod::index_mut`, or a
+/// user-trait impl `<T as mycrate::core::ops::Deref>::deref`) — a strictly lower bar
+/// than the accepted `--crate-name`-literal boundary. We strip one leading `<` and
+/// require the `core::ops::`/`std::ops::` segment to be at the callee ROOT (unqualified)
+/// or immediately after ` as ` (qualified). The nested forgery carries
+/// ` as mycrate::core::ops::` — NOT ` as core::ops::` — so it is DECLINED. A user free fn
+/// (`mycrate::index`) and `<T as mycrate::ops::Index>::index` are likewise DECLINED. (A
+/// genuine std trait impl on a USER type — `<MyWrap as core::ops::deref::Deref>::deref` —
+/// is admitted but inert here: its base is not a coll_len-modeled container.)
+fn callee_is_std_ops_method(callee: &str) -> bool {
+    let c = callee.strip_prefix('<').unwrap_or(callee);
+    c.starts_with("core::ops::")
+        || c.starts_with("std::ops::")
+        || c.contains(" as core::ops::")
+        || c.contains(" as std::ops::")
+}
+
+/// A GENUINE length-PRESERVING deref/view hop for the base-collection tracer
+/// ([`base_collection_step`]): `Deref::deref`/`DerefMut::deref_mut` (the `*v` of a
+/// `Vec`/`String`) or the inherent `Vec::as_slice`/`as_mut_slice`. The result and the
+/// receiver denote the SAME sequence with IDENTICAL length, so tracing the result's
+/// length to the receiver's base is sound. The bare `method_tail` match this backs
+/// admitted a user `fn as_slice(v:&Vec<T>)->&[T]` (renders `userlib::…::as_slice` /
+/// `mycrate::as_slice`) that returns a DIFFERENT-length view → the tie then discharges
+/// an OOB index on the view. Fail-closed on a miss.
+fn callee_is_length_preserving_deref(callee: &str) -> bool {
+    match crate::generate::method_tail(callee) {
+        "deref" | "deref_mut" => callee_is_std_ops_method(callee),
+        "as_slice" | "as_mut_slice" => {
+            callee_is_std_vec_inherent(callee)
+                || callee_is_std_slice_inherent(callee, &["::as_slice", "::as_mut_slice"])
+        }
+        _ => false,
+    }
+}
+
 /// Convert a single GuardCondition into an SMT Formula.
 ///
 /// SwitchIntMatch: discr == value
@@ -393,7 +503,17 @@ fn is_empty_result_len(func: &VerifiableFunction, discr: &Operand) -> Option<For
         _ => return None,
     };
     let (callee, arg) = call_defining_local(func, local)?;
-    if !callee.to_lowercase().contains("is_empty") {
+    // CRATE-ANCHOR (round-5 false-proof close): only the GENUINE std `[T]`/`Vec`/`str`/
+    // `String` inherent `is_empty`. A user free fn `fn is_empty(s:&[i32])->bool{false}`
+    // renders `mycrate::is_empty` and a user-trait UFCS `<T as mycrate::Trait>::is_empty`
+    // carries ` as mycrate`; both are DECLINED — else `!is_empty ⇒ len>0` forges the
+    // `v[0]` bound (OOB). The bare `contains("is_empty")` this replaces matched either
+    // forgery (any path merely mentioning the substring).
+    let is_genuine_is_empty = callee_is_std_slice_inherent(callee, &["::is_empty"])
+        || (callee_is_std_vec_inherent(callee)
+            && crate::generate::method_tail(callee) == "is_empty")
+        || callee_is_std_str_inherent(callee, &["::is_empty"]);
+    if !is_genuine_is_empty {
         return None;
     }
     // Slice / array / slice-ref receiver: its type-based length var (existing path).
@@ -508,10 +628,9 @@ pub(crate) fn owned_container_len_var(func: &VerifiableFunction, arg: &Operand) 
 /// returns the no-fact value `Bool(true)` on the FALSE branch.
 fn ascii_predicate_bound(func: &VerifiableFunction, discr: &Operand) -> Option<Formula> {
     /// `char`/`u8` predicate methods whose TRUE-set is bounded by `[0, 127]`.
-    /// Every entry is matched as a lowercased substring of the callee path,
-    /// consistent with how the codebase matches std callees (e.g. `is_empty`,
-    /// `checked_add`). Listed longest-first only for readability; the match is
-    /// membership, not prefix.
+    /// Matched as the EXACT method LEAF (`method_tail`) of a crate-anchored std
+    /// callee (round-5): membership of the leaf in this set, never a substring of
+    /// the whole path (which admitted a same-named user free fn / nested module).
     const ASCII_PREDICATES: &[&str] = &[
         "is_ascii_alphanumeric",
         "is_ascii_alphabetic",
@@ -531,8 +650,19 @@ fn ascii_predicate_bound(func: &VerifiableFunction, discr: &Operand) -> Option<F
         _ => return None,
     };
     let (callee, arg) = call_defining_local(func, local)?;
-    let lc = callee.to_lowercase();
-    if !ASCII_PREDICATES.iter().any(|name| lc.contains(name)) {
+    // (a) CRATE-ANCHOR (round-5 false-proof close): the GENUINE std `char`/`u8` ascii
+    // predicate renders `core::num::<impl u8>::is_ascii*` or
+    // `core::char::methods::<impl char>::is_ascii*`. Require a core/std crate root, the
+    // un-forgeable `::num::`/`::char::` std segment, AND the method LEAF (not a substring
+    // anywhere in the path) to be an ascii predicate. The bare `lc.contains(name)` this
+    // replaces matched a user `fn is_ascii_digit(x:u64)->bool` (renders
+    // `mycrate::…::is_ascii_digit`, substring hit) → a false `x <= 127` that discharges a
+    // bounds/shift on a WIDE int (OOB/overflow).
+    let tail = crate::generate::method_tail(callee);
+    let name_is_genuine = (callee.starts_with("core::") || callee.starts_with("std::"))
+        && (callee.contains("::num::") || callee.contains("::char::"))
+        && ASCII_PREDICATES.contains(&tail);
+    if !name_is_genuine {
         return None;
     }
     // The char/byte under test is bounded by 0x7F = 127. A method receiver
@@ -542,6 +672,21 @@ fn ascii_predicate_bound(func: &VerifiableFunction, discr: &Operand) -> Option<F
     // checked quantity. Bounding the reference local itself would be inert. A
     // by-value argument (no `&` indirection) is bound directly.
     let bounded = deref_through_ref(func, arg).unwrap_or_else(|| arg.clone());
+    // (b) TYPE GATE (round-5 false-proof close): apply the `<= 127` bound ONLY when the
+    // tested value is a `char`/`u8` — the ONLY types the std ascii predicates receive.
+    // The real extractor spells `char` as `Ty::Char`; the older extractor / this file's
+    // `ascii_guarded_shift_func` test lower it to `u32`, and `u8` is width 8 — so a
+    // genuinely WIDE (u64/u128) arg is NOT a std ascii receiver and is DECLINED. This is
+    // defense in depth behind (a): together they close the "forged is_ascii* on a wide
+    // int" witness even if a name somehow slipped the anchor.
+    let ty_is_char_or_byte = match operand_ty(func, &bounded) {
+        Some(Ty::Char) => true,
+        Some(Ty::Int { width, .. }) => width == 8 || width == 32,
+        _ => false,
+    };
+    if !ty_is_char_or_byte {
+        return None;
+    }
     // SOUNDNESS (P0 false proof, 2026-06-17 hunt-8): the `x <= 127` bound describes x AT THE
     // GUARD point. If x's local is REASSIGNED (`x = 200`) or mutably borrowed in the guarded
     // region — `if x.is_ascii() { x = 200; arr[x as usize] }` — the symbol `x` is reused for a
@@ -730,7 +875,15 @@ pub(crate) fn as_bytes_length_receiver(
     local: usize,
 ) -> Option<&Operand> {
     let (callee, arg) = call_defining_local(func, local)?;
-    if crate::generate::method_tail(callee) == "as_bytes" {
+    // CRATE-ANCHOR (round-5 false-proof close): only the GENUINE byte-length-preserving
+    // `str::as_bytes` (`core::str::<impl str>::as_bytes`, `<str>::as_bytes`) /
+    // `String::as_bytes` (`alloc::string::String::as_bytes`). A user
+    // `fn as_bytes(&Foo)->&[u8]` renders `mycrate::…::as_bytes` (or a ` as mycrate`
+    // UFCS) and is DECLINED. The bare `method_tail == "as_bytes"` this replaces admitted
+    // a length-CHANGING impostor: when its receiver is itself slice-typed (so
+    // `slice_len_formula(recv)` is `Some`), a shorter/longer forged result borrows the
+    // receiver's length var → discharges an OOB index on the fresh `as_bytes` result.
+    if callee_is_std_str_inherent(callee, &["::as_bytes"]) {
         return Some(arg);
     }
     None
@@ -1196,20 +1349,24 @@ pub(crate) fn build_checked_arith_facts(func: &VerifiableFunction) -> Vec<Formul
         let Terminator::Call { func: callee, args, dest, .. } = &block.terminator else {
             continue;
         };
-        let lc = callee.to_lowercase();
-        if args.len() >= 2 {
-            let val = if lc.contains("checked_add") {
-                Some(Formula::Add(
+        // CRATE-ANCHOR (round-5 false-proof close): only the GENUINE
+        // `core::num::<impl iN>::checked_add`/`checked_sub` inherent mints the
+        // `Some-payload == a OP b` value. A user `fn checked_add(a:u32,b:u32)->Option<u32>{Some(BIG)}`
+        // renders `mycrate::checked_add` (no `::num::` under a core/std root) and is
+        // DECLINED — the bare `lc.contains("checked_add")` this replaces would conjoin a
+        // FALSE `payload == a+b` globally (its `Some(BIG) != a+b`) → discharges a bounds
+        // check. Method LEAF exact-match (not substring).
+        if args.len() >= 2 && is_std_num_intrinsic(callee) {
+            let val = match crate::generate::method_tail(callee) {
+                "checked_add" => Some(Formula::Add(
                     Box::new(operand_to_formula(func, &args[0])),
                     Box::new(operand_to_formula(func, &args[1])),
-                ))
-            } else if lc.contains("checked_sub") {
-                Some(Formula::Sub(
+                )),
+                "checked_sub" => Some(Formula::Sub(
                     Box::new(operand_to_formula(func, &args[0])),
                     Box::new(operand_to_formula(func, &args[1])),
-                ))
-            } else {
-                None
+                )),
+                _ => None,
             };
             if let Some(val) = val {
                 // Only record the value when both operands are SSA-stable, so the
@@ -1221,7 +1378,16 @@ pub(crate) fn build_checked_arith_facts(func: &VerifiableFunction) -> Vec<Formul
             }
         }
         // `Try::branch(opt)` re-wraps the value into `ControlFlow::Continue`.
-        if lc.contains("branch")
+        // CRATE-ANCHOR (round-5): only the GENUINE `Try::branch`
+        // (`core::ops::try_trait::Try::branch`, `<Option<T> as core::ops::try_trait::Try>::branch`,
+        // the `std::ops::Try::branch` shorthand). The bare `lc.contains("branch")` this
+        // replaces admitted a user `fn branch(o:Option<u32>)->ControlFlow<_,u32>{Continue(BIG)}`
+        // (renders `mycrate::branch`) that re-wraps a DIFFERENT payload than the source's
+        // `a OP b` → a FALSE `payload == a OP b` fact. The value it hops (`val`) is only
+        // present for a source already anchored to a genuine `checked_*` above, but the
+        // re-wrap must itself be the genuine total-hop to keep the payload identity true.
+        if callee_is_std_ops_method(callee)
+            && crate::generate::method_tail(callee) == "branch"
             && let Some(src) = args.first().and_then(operand_local)
             && let Some((val, _)) = value_of.get(&src).cloned()
         {
@@ -2397,6 +2563,14 @@ pub(crate) fn local_mut_borrows_may_resize(func: &VerifiableFunction, local: usi
         for b in &func.body.blocks {
             if let Terminator::Call { func: callee, args, .. } = &b.terminator
                 && matches!(crate::generate::method_tail(callee), "index" | "index_mut")
+                // CRATE-ANCHOR (round-5 audit): a `&mut` reborrow is length-benign ONLY
+                // when consumed by the GENUINE `Index`/`IndexMut` trait method (which
+                // never resizes — std contract). A user free fn `fn index_mut(v:&mut Vec,..)`
+                // that DOES resize renders `mycrate::index_mut`; counting it "benign" would
+                // suppress the resize hazard and ADMIT a stale length tie → OOB. Genuine
+                // renderings carry `core::ops::`/`std::ops::` (unqualified
+                // `core::ops::index::IndexMut::index_mut` or `<Vec as core::ops::index::…>`).
+                && callee_is_std_ops_method(callee)
                 && let Some(Operand::Copy(p) | Operand::Move(p)) = args.first()
                 && p.local == t
                 && p.projections.is_empty()
@@ -2454,10 +2628,7 @@ fn base_collection_step(func: &VerifiableFunction, cur: usize) -> Option<usize> 
         if let Terminator::Call { func: callee, args, dest, .. } = &b.terminator
             && dest.local == cur
             && dest.projections.is_empty()
-            && matches!(
-                crate::generate::method_tail(callee),
-                "deref" | "deref_mut" | "as_slice" | "as_mut_slice"
-            )
+            && callee_is_length_preserving_deref(callee)
             && let Some(Operand::Copy(p) | Operand::Move(p)) = args.first()
             && p.projections.is_empty()
         {
@@ -2771,7 +2942,18 @@ pub(crate) fn slice_last_some_nonempty_definitions(
         // `_len - 1` underflow and the index bound both need `_len == coll_len`).
         let Some(base) = base_collection_place_unique(func, p.local) else { continue };
         match crate::generate::method_tail(callee) {
-            "last" | "first" | "last_mut" | "first_mut" => {
+            // CRATE-ANCHOR (round-5 false-proof close): `first`/`last`(`_mut`) are
+            // INHERENT `[T]` methods (a `Vec`/array receiver derefs to the slice, so the
+            // genuine callee is `core::slice::<impl [T]>::first` etc.). A user free fn
+            // `fn first(v:&Vec<i32>)->Option<i32>{Some(0)}` renders `mycrate::first` and is
+            // DECLINED — else its `Some` in the match arm seeds `coll_len >= 1` and
+            // discharges `v[0]` on an actually-empty collection (OOB).
+            "last" | "first" | "last_mut" | "first_mut"
+                if callee_is_std_slice_inherent(
+                    callee,
+                    &["::last", "::first", "::last_mut", "::first_mut"],
+                ) =>
+            {
                 last_opt_base.insert(dest.local, base);
             }
             // `_len = Y.len()` is a Call whose result is live in the RETURN target;
@@ -2784,7 +2966,19 @@ pub(crate) fn slice_last_some_nonempty_definitions(
             // they keep the tie; MUST stay synced with the recovery gate
             // (`collection_abstract_len_with_base_opts`), else a guarded write would
             // emit its bounds VC without the `_len == coll_len` fact and false-refute.
-            "len" if coll_base_len_stable(func, &base) => {
+            // CRATE-ANCHOR (round-5 false-proof close): only a GENUINE std container
+            // `len` mints the `_len == coll_len(base)` tie. A user free fn
+            // `fn len(v:&Vec<i32>)->usize{1_000_000}` renders `mycrate::len` and is
+            // DECLINED by the shared `total_summary_len_bound` matcher — else the tie ties
+            // the container's abstract length var to a forged huge value → discharges
+            // `v[k]` for a large `k` (OOB). `total_summary_len_bound` is the same
+            // doctrine matcher the VC len-bound producer uses (generate.rs), so mint and
+            // recovery cannot drift; it rejects the same-prefixed impostors
+            // (`std::vec::VecEvil::len`, `core::slice::Iter::len`) too.
+            "len"
+                if trust_types::total_call_summaries::total_summary_len_bound(callee)
+                    && coll_base_len_stable(func, &base) =>
+            {
                 let Some(tgt) = target else { continue };
                 let dest_var = Formula::var_owned(
                     crate::place_to_var_name(

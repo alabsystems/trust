@@ -22,10 +22,9 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TRUSTC="${TRUSTC:-$REPO_ROOT/build/host/stage2/bin/trustc}"
 FIX="$REPO_ROOT/tests/trust-falsification/ownership"
-# The shims dir must EXIST: a missing LIBRARY_PATH entry makes ld warn
-# "search path not found", which leaks into diagnostics-sensitive tests.
-mkdir -p /tmp/trust_link_shims
-export LIBRARY_PATH="/tmp/trust_link_shims:/opt/homebrew/opt/z3/lib:${LIBRARY_PATH:-}"
+# No z3/LIBRARY_PATH export: the `ay` SMT solver is pure-Rust and stage2 `trustc`
+# links no libz3 (verified 2026-08-01: no z3-sys/links="z3" in any Cargo.lock;
+# `otool -L trustc` is z3-clean). Re-adding one would resurrect a dead knob.
 
 if [ ! -x "$TRUSTC" ]; then
   echo "ERROR: trustc not found at $TRUSTC"

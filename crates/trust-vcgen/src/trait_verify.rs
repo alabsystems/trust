@@ -107,6 +107,7 @@ pub fn verify_liskov(trait_c: &TraitContract, impl_c: &ImplContract) -> Vec<Veri
                 location: SourceSpan::default(),
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             }]
         };
     }
@@ -142,6 +143,7 @@ pub fn verify_liskov(trait_c: &TraitContract, impl_c: &ImplContract) -> Vec<Veri
             location: location.clone(),
             formula: Formula::Not(Box::new(implication)),
             contract_metadata: None,
+            obligation: None,
         });
     }
 
@@ -164,6 +166,7 @@ pub fn verify_liskov(trait_c: &TraitContract, impl_c: &ImplContract) -> Vec<Veri
             location: location.clone(),
             formula: Formula::Not(Box::new(implication)),
             contract_metadata: None,
+            obligation: None,
         });
     }
 

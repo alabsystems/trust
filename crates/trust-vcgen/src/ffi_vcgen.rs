@@ -43,6 +43,7 @@ fn unmodeled_ffi_obligation(
         location: span.clone(),
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -220,6 +221,7 @@ pub(crate) fn generate_call_site_vcs(
             location: span.clone(),
             formula: vc.formula,
             contract_metadata: None,
+            obligation: None,
         });
     }
 
@@ -261,6 +263,7 @@ pub(crate) fn generate_call_site_vcs(
                         Box::new(Formula::Int(0)),
                     ),
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
             SideEffect::FreesMemory => {
@@ -278,6 +281,7 @@ pub(crate) fn generate_call_site_vcs(
                         // Conservative: always SAT = "cannot verify allocation provenance"
                         formula: Formula::Bool(true),
                         contract_metadata: None,
+                        obligation: None,
                     });
                 }
             }
@@ -313,6 +317,7 @@ pub(crate) fn generate_call_site_vcs(
                     location: span.clone(),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
             // ReadsGlobal and None have no verification obligations.
@@ -341,6 +346,7 @@ fn format_string_violation_vc(
         // current model only tells us the format is symbolic/tainted, fail closed.
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     })
 }
 

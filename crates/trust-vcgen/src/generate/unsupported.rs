@@ -351,6 +351,7 @@ pub(super) fn unsupported_mir_vc(
         // path preclassifies this VC as Unknown before solver dispatch.
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     }
 }
 

@@ -847,6 +847,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             ))),
             contract_metadata: None,
+            obligation: None,
         };
 
         let term =

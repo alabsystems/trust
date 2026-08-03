@@ -628,6 +628,7 @@ fn test_roundtrip_batch_report_generation() {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             };
             (vc, result.clone())
         })

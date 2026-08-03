@@ -465,6 +465,7 @@ fn fail_closed_ensures_vc(
         // before solver dispatch (`generate_vcs_with_discharge`).
         formula: Formula::Bool(true),
         contract_metadata,
+        obligation: None,
     }
 }
 
@@ -807,6 +808,7 @@ pub(crate) fn check_contracts_with_loop_invariant_feedback(
                     location: contract.span.clone(),
                     formula: Formula::Not(Box::new(parsed)),
                     contract_metadata: Some(trust_wp_metadata()),
+                    obligation: None,
                 });
                 continue;
             }
@@ -837,6 +839,7 @@ pub(crate) fn check_contracts_with_loop_invariant_feedback(
                                 Box::new(Formula::Var(name.to_string(), sort)),
                             ))),
                             contract_metadata: Some(trust_wp_metadata()),
+                            obligation: None,
                         });
                     }
                 }
@@ -961,6 +964,7 @@ pub(crate) fn check_contracts_with_loop_invariant_feedback(
                     ..ContractMetadata::default()
                 }
             }),
+            obligation: None,
         });
     }
 }
@@ -1000,6 +1004,7 @@ pub(crate) fn spec_unverifiable_vc(
         // Direct solver callers must not be able to report proof either.
         formula: Formula::Bool(true),
         contract_metadata,
+        obligation: None,
     }
 }
 
@@ -1039,6 +1044,7 @@ fn loop_contract_unsupported_vc(
         // Direct solver callers must not be able to prove the placeholder.
         formula: Formula::Bool(true),
         contract_metadata: Some(trust_wp_metadata()),
+        obligation: None,
     }
 }
 
@@ -1210,6 +1216,7 @@ fn generate_loop_invariant_vcs(
         location: contract.span.clone(),
         formula: initiation,
         contract_metadata: Some(trust_wp_metadata_for_source(contract_index)),
+        obligation: None,
     });
 
     vcs.push(VerificationCondition {
@@ -1218,6 +1225,7 @@ fn generate_loop_invariant_vcs(
         location: contract.span.clone(),
         formula: preservation,
         contract_metadata: Some(trust_wp_metadata_for_source(contract_index)),
+        obligation: None,
     });
 }
 
@@ -1361,6 +1369,7 @@ fn generate_loop_decreases_vc(
         location: contract.span.clone(),
         formula: violation,
         contract_metadata: Some(trust_wp_metadata_for_source(contract_index)),
+        obligation: None,
     });
 }
 
@@ -6777,6 +6786,105 @@ mod tests {
             Some(Formula::Not(Box::new(Formula::Var("cond".to_string(), Sort::Bool)))),
             "Boolean Not remains in the exact transition fragment",
         );
+    }
+
+    #[test]
+    fn e4_e5_machine_translation_covers_every_rust_integer_width_and_sign() {
+        let domains = [
+            (Ty::u8(), 8, false, "u8"),
+            (Ty::i8(), 8, true, "i8"),
+            (Ty::u16(), 16, false, "u16"),
+            (Ty::i16(), 16, true, "i16"),
+            (Ty::u32(), 32, false, "u32"),
+            (Ty::i32(), 32, true, "i32"),
+            (Ty::u64(), 64, false, "u64"),
+            (Ty::i64(), 64, true, "i64"),
+            (Ty::u128(), 128, false, "u128"),
+            (Ty::i128(), 128, true, "i128"),
+            (Ty::PtrSizedInt { signed: false }, 64, false, "usize"),
+            (Ty::PtrSizedInt { signed: true }, 64, true, "isize"),
+        ];
+
+        for (ty, width, signed, name) in domains {
+            let mut func = feedback_loop_function();
+            func.body.locals[1].ty = ty.clone();
+            func.body.locals[2].ty = ty;
+            func.contracts[0].body = "bb1: i + 1 >= i".to_string();
+            func.body.blocks[2].stmts = vec![Statement::Assign {
+                place: Place::local(2),
+                rvalue: Rvalue::BinaryOp(
+                    BinOp::Add,
+                    Operand::Copy(Place::local(2)),
+                    Operand::Constant(ConstValue::Int(1)),
+                ),
+                span: SourceSpan::default(),
+            }];
+
+            let mut vcs = Vec::new();
+            check_contracts(&func, &mut vcs);
+            assert!(
+                !vcs.iter().any(|vc| matches!(vc.kind, VcKind::UnsupportedMir { .. })),
+                "{name}: a standard Rust integer domain must retain exact E4/E5 rows: {vcs:#?}",
+            );
+            let (initiation, consecution) = e4_pair(&vcs);
+            let decrease = vcs
+                .iter()
+                .find(|vc| {
+                    matches!(
+                        &vc.kind,
+                        VcKind::NonTermination { context, .. } if context == "loop-decreases"
+                    )
+                })
+                .expect("one exact E5 row");
+
+            for (role, row) in
+                [("initiation", &initiation), ("consecution", &consecution), ("decrease", decrease)]
+            {
+                let mut width_exact_add = false;
+                let mut signed_order = false;
+                let mut unsigned_order = false;
+                let mut unbounded_arithmetic = false;
+                row.formula.visit(&mut |formula| {
+                    width_exact_add |=
+                        matches!(formula, Formula::BvAdd(_, _, node_width) if *node_width == width);
+                    signed_order |= matches!(
+                        formula,
+                        Formula::BvSLt(_, _, node_width) | Formula::BvSLe(_, _, node_width)
+                            if *node_width == width
+                    );
+                    unsigned_order |= matches!(
+                        formula,
+                        Formula::BvULt(_, _, node_width) | Formula::BvULe(_, _, node_width)
+                            if *node_width == width
+                    );
+                    unbounded_arithmetic |= matches!(
+                        formula,
+                        Formula::Add(..)
+                            | Formula::Sub(..)
+                            | Formula::Mul(..)
+                            | Formula::Div(..)
+                            | Formula::Rem(..)
+                            | Formula::Neg(..)
+                    );
+                });
+                assert!(
+                    width_exact_add,
+                    "{name} {role}: the source/body addition must remain at width {width}: {row:#?}",
+                );
+                assert_eq!(
+                    signed_order, signed,
+                    "{name} {role}: comparison signedness must follow the declared domain: {row:#?}",
+                );
+                assert_eq!(
+                    unsigned_order, !signed,
+                    "{name} {role}: comparison signedness must follow the declared domain: {row:#?}",
+                );
+                assert!(
+                    !unbounded_arithmetic,
+                    "{name} {role}: no mathematical-Int arithmetic may survive exact translation: {row:#?}",
+                );
+            }
+        }
     }
 
     #[test]

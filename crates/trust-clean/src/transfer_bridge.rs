@@ -280,6 +280,7 @@ mod tests {
             },
             formula: formula.clone(),
             contract_metadata: None,
+            obligation: None,
         }
     }
 

@@ -126,6 +126,7 @@ impl<'a> UnsafeVerifier<'a> {
                 location: span.clone(),
                 formula: Formula::Eq(Box::new(ptr_var.clone()), Box::new(Formula::Int(0))),
                 contract_metadata: None,
+                obligation: None,
             },
             unsafe_kind: UnsafeVcKind::RawPointerDeref { pointer_expr: format!("*{ptr_expr}") },
         });
@@ -147,6 +148,7 @@ impl<'a> UnsafeVerifier<'a> {
                 // Always SAT = conservatively "cannot verify alignment"
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             },
             unsafe_kind: UnsafeVcKind::RawPointerDeref { pointer_expr: format!("*{ptr_expr}") },
         });
@@ -162,6 +164,7 @@ impl<'a> UnsafeVerifier<'a> {
                 // Always SAT = conservatively "cannot verify bounds"
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             },
             unsafe_kind: UnsafeVcKind::RawPointerDeref { pointer_expr: format!("*{ptr_expr}") },
         });
@@ -190,6 +193,7 @@ impl<'a> UnsafeVerifier<'a> {
                 // Always SAT = conservatively "cannot verify layout compatibility"
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             },
             unsafe_kind: UnsafeVcKind::Transmute {
                 from_ty: from_ty.clone(),
@@ -214,6 +218,7 @@ impl<'a> UnsafeVerifier<'a> {
                 // Always SAT = conservatively "cannot verify validity"
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             },
             unsafe_kind: UnsafeVcKind::Transmute { from_ty, to_ty },
         });
@@ -235,6 +240,7 @@ impl<'a> UnsafeVerifier<'a> {
                 location: span.clone(),
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             },
             unsafe_kind: UnsafeVcKind::FfiCall { callee: callee.to_string() },
         });
@@ -252,6 +258,7 @@ impl<'a> UnsafeVerifier<'a> {
                 location: span.clone(),
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             },
             unsafe_kind: UnsafeVcKind::FfiCall { callee: callee.to_string() },
         });
@@ -270,6 +277,7 @@ impl<'a> UnsafeVerifier<'a> {
                 location: span.clone(),
                 formula: Formula::Eq(Box::new(null_var), Box::new(Formula::Int(0))),
                 contract_metadata: None,
+                obligation: None,
             },
             unsafe_kind: UnsafeVcKind::FfiCall { callee: callee.to_string() },
         });

@@ -41,11 +41,57 @@ where
     // hash-visible (it asserts concrete bytes and belongs in identity).
     // Trust: W19 — `adt_kind` follows the SAME discipline: its `None` is exactly
     // the pre-W19 (un-migrated) semantics; a `Some(kind)` IS hash-visible.
+    // Trust (C1): `AggregateKind::Adt::args` joins the SAME rule. The generic-arg
+    // discriminator is a real soundness win (arg erasure once kernel-certified a
+    // `Vec::<[u8; 1<<40]>` capacity overflow as proved), and a `Some(args)` IS
+    // hash-visible — it belongs in identity and stays there. But a `None` is
+    // exactly the pre-C1 semantics (args not recorded), so hashing that default
+    // would move audited pins while carrying no information. `args` is the only
+    // `Option`-typed member of that name in this model, so `Vec<Operand>` call
+    // arguments (always a JSON array) can never match this fragment.
+    // Trust (obligation-record slice): `VerificationCondition::obligation` /
+    // `SerializableVc::obligation` join the SAME rule. The emitter's
+    // authenticated-obligation record is a real soundness win and a
+    // `Some(record)` IS hash-visible — it names WHICH sub-formula of `formula`
+    // the emitter claims as the obligation, so two VCs that agree on `formula`
+    // but disagree on the record are different objects and must not share a
+    // canonical VC digest. But a `None` is exactly the pre-record semantics
+    // ("this producer did not write the obligation down"), which is what every
+    // VC meant before the field existed and what the back-fill re-stated at 487
+    // construction sites; hashing that default would move audited certificate
+    // pins while carrying no information. `obligation` is the only `Option`-typed
+    // member of that name in this model — `obligations` (always a JSON array),
+    // `obligation_id`, and `total_obligations` are distinct keys whose fragments
+    // cannot match, because the byte after `obligation` here is `"` and theirs
+    // is `s`/`_`.
     Ok(json
         .replace(",\"faithful_enum_repr\":null", "")
         .replace(",\"layout\":null", "")
         .replace(",\"enum_layout\":null", "")
-        .replace(",\"adt_kind\":null", ""))
+        .replace(",\"adt_kind\":null", "")
+        .replace(",\"args\":null", "")
+        .replace(",\"obligation\":null", ""))
+}
+
+/// Canonical JSON hash material, as bytes, for any Trust model value.
+///
+/// This is the public form of [`stable_model_json`] and exists so that hash
+/// domains OUTSIDE this module (notably the canonical verification-condition
+/// digest that binds a checked binary certificate to its VC) can use the ONE
+/// canonicalizer instead of calling `serde_json::to_vec` directly. A hash
+/// domain that spells its own `serde_json` is exactly how an additive
+/// `#[serde(default)] Option<_>` field moves already-audited digests: it did so
+/// for `faithful_enum_repr`, `layout`, `enum_layout`, `adt_kind`, `args`, and
+/// then `obligation`. Route new digests here rather than re-deriving them.
+///
+/// The bytes are the ordinary serde JSON with default-valued additive members
+/// omitted; every field that carries information is present. Use this ONLY for
+/// hashing — the lossless wire form is plain `serde_json`/binary serialization.
+pub fn stable_model_json_bytes<T>(value: &T) -> Result<Vec<u8>, serde_json::Error>
+where
+    T: Serialize + ?Sized,
+{
+    stable_model_json(value).map(String::into_bytes)
 }
 
 /// Legacy formula-only digest. This deliberately omits source variable
@@ -9444,6 +9490,139 @@ mod tests {
             func1.content_hash(),
             func2.content_hash(),
             "hash depends only on body+contracts, not name/span"
+        );
+    }
+
+    /// Trust (C1): the two halves of the `AggregateKind::Adt::args` hash domain.
+    ///
+    /// A `None` is exactly the pre-C1 semantics (generic args not recorded), so
+    /// it must be INVISIBLE to the stable hash — otherwise a schema-only change
+    /// moves audited pins that no one re-audited. A `Some` IS the soundness
+    /// discriminator and must be VISIBLE — generic-arg erasure once let a
+    /// `Vec::<[u8; 1<<40]>` capacity overflow be kernel-certified as proved
+    /// (hunt-11), so blinding the hash to it would reopen a real false-proof
+    /// vector. Both halves are asserted here so neither can be "fixed" alone.
+    #[test]
+    fn adt_generic_args_none_is_hash_invisible_but_some_is_hash_visible() {
+        let adt_body = |args: Option<&str>| VerifiableBody {
+            locals: vec![LocalDecl { index: 0, ty: Ty::Unit, name: None }],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Aggregate(
+                        AggregateKind::Adt {
+                            name: "m::Wrapper".to_string(),
+                            variant: 0,
+                            active_field: None,
+                            args: args.map(str::to_string),
+                        },
+                        vec![],
+                    ),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 0,
+            return_ty: Ty::Unit,
+        };
+
+        // Half 1: the default is stripped from hash material entirely, so a
+        // legacy record that predates the field hashes identically to one that
+        // decodes it as `None`.
+        let none_material = stable_model_json(&adt_body(None)).expect("stable hash material");
+        assert!(
+            !none_material.contains("\"args\""),
+            "a None args must not appear in stable hash material at all, got {none_material}"
+        );
+
+        // Half 2: real generic arguments stay in identity, and DIFFERENT
+        // arguments are DIFFERENT identities.
+        let hash = |args: Option<&str>| {
+            stable_sha256_hex(
+                stable_model_json(&adt_body(args)).expect("stable hash material").as_bytes(),
+            )
+        };
+        let erased = hash(None);
+        let small = hash(Some("m::Wrapper<u8>"));
+        let huge = hash(Some("m::Wrapper<[u8; 1099511627776]>"));
+        assert_ne!(erased, small, "Some(args) must be hash-visible, not stripped like the default");
+        assert_ne!(
+            small, huge,
+            "distinct monomorphizations must not share a content hash (hunt-11 false-proof vector)"
+        );
+    }
+
+    /// The canonical verification-condition digest must obey the SAME two-halves
+    /// rule as every other additive `#[serde(default)] Option<_>` member.
+    ///
+    /// Half 1 (no erasure of history): the authenticated-obligation record was
+    /// added after checked-binary-certificate digests had already shipped, and the
+    /// back-fill re-stated `obligation: None` at 487 construction sites. A `None`
+    /// says exactly what every pre-record VC said — "this producer did not write
+    /// the obligation down" — so it must be invisible to the digest, or an audited
+    /// certificate pin moves for a change that carries no information.
+    ///
+    /// Half 2 (no widening into erasure): a `Some(record)` names WHICH sub-formula
+    /// of `formula` the emitter claims as the obligation. Two VCs that agree on
+    /// `formula` but disagree on that claim are DIFFERENT objects, and stripping
+    /// them together would let a forged record ride an audited digest. The strip
+    /// must never grow past the literal `null`.
+    #[test]
+    fn vc_obligation_none_is_hash_invisible_but_some_is_hash_visible() {
+        use crate::{
+            Formula, ObligationRecord, ObligationWrapper, SerializableVc, Sort, SourceSpan, VcKind,
+            VerificationCondition,
+        };
+
+        let vc = |obligation: Option<ObligationRecord>| VerificationCondition {
+            kind: VcKind::DivisionByZero,
+            function: "main".into(),
+            location: SourceSpan::default(),
+            formula: Formula::Eq(
+                Box::new(Formula::Var("d".into(), Sort::Int)),
+                Box::new(Formula::Int(0)),
+            ),
+            contract_metadata: None,
+            obligation,
+        };
+        let record = |body: Formula| ObligationRecord {
+            body,
+            wrappers: vec![ObligationWrapper::ConjoinFactsLast { facts: vec![] }],
+            subject: None,
+            width: None,
+        };
+
+        // Half 1: the default is stripped from hash material entirely, so a
+        // pre-record VC hashes identically to one that decodes it as `None`.
+        let none_material =
+            stable_model_json(&SerializableVc::from_vc(&vc(None))).expect("stable hash material");
+        assert!(
+            !none_material.contains("\"obligation\""),
+            "a None obligation must not appear in canonical VC hash material at all, \
+             got {none_material}"
+        );
+
+        // Half 2: a real obligation record stays in identity, and DIFFERENT
+        // records are DIFFERENT identities even under an identical `formula`.
+        let hash = |obligation: Option<ObligationRecord>| {
+            stable_sha256_hex(
+                stable_model_json(&SerializableVc::from_vc(&vc(obligation)))
+                    .expect("stable hash material")
+                    .as_bytes(),
+            )
+        };
+        let undeclared = hash(None);
+        let claims_core = hash(Some(record(Formula::Var("core".into(), Sort::Bool))));
+        let claims_decoy = hash(Some(record(Formula::Var("decoy".into(), Sort::Bool))));
+        assert_ne!(
+            undeclared, claims_core,
+            "Some(obligation) must be hash-visible, not stripped like the default"
+        );
+        assert_ne!(
+            claims_core, claims_decoy,
+            "two different obligation claims over the same formula must not share a \
+             canonical VC digest (that is the certificate-forgery vector the record closes)"
         );
     }
 

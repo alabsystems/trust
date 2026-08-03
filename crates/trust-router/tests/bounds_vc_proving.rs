@@ -42,6 +42,7 @@ fn guarded_index_bounds_vc_proves_with_certificate() {
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation: None,
     };
     assert!(backend.can_handle(&vc));
     let result = backend.verify(&vc);
@@ -64,6 +65,7 @@ fn pure_lia_conflict_proves_with_certificate() {
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation: None,
     };
     let result = backend.verify(&vc);
     assert!(
@@ -89,6 +91,7 @@ fn bool_eq_guarded_conflict_proves_with_certificate() {
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation: None,
     };
     let result = backend.verify(&vc);
     assert!(

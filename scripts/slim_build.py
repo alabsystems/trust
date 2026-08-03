@@ -25,9 +25,16 @@ It does NOT touch: stage2/ (the sysroot), stage2-tools-bin, stage0*, llvm,
 bootstrap-tools, or anything under crates/. Those are either the product or are
 not regenerable from a target tree.
 
-COST OF RUNNING THIS: the next `x.py build` recompiles from scratch. This trades
-disk for build time. It does not change what a build PRODUCES -- for that, see
-docs/zero-stock-rust-plan.md and the `tools = [...]` list in bootstrap.toml.
+COST OF RUNNING THIS: purging the CHEAP tier (tool target trees, scratch)
+costs a tools rebuild -- minutes to tens of minutes. Purging the rustc caches
+(`--rustc-caches`) is what makes the next build "start from zero" -- the front
+~half of a ~50-minute attempt -- so it is opt-in and last-resort. Measured
+2026-08-01: stage2-tools was 196G of mostly dead fingerprint variants while
+stage1-rustc + stage2-rustc (34G + 58G) held the only warm compiler caches;
+the tools tree was the bloat, the rustc caches were the value. It does not
+change what a build PRODUCES -- for that, see docs/zero-stock-rust-plan.md and
+the `tools = [...]` list in bootstrap.toml. Design context:
+docs/BUILD_THROUGHPUT_DESIGN.md.
 """
 
 from __future__ import annotations
@@ -39,9 +46,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Intermediate cargo target trees. Each is regenerable and each has its installed
-# artifacts hardlinked into the sysroot. Order is cosmetic.
-PURGE_TARGETS = ("stage1-rustc", "stage2-rustc", "stage2-tools")
+# CHEAP tier: tool target trees. Regenerable in minutes-to-tens-of-minutes and
+# the first casualties of any first-party pin bump anyway. Installed artifacts
+# are hardlinked into the sysroot, so deletion never touches the product.
+PURGE_CHEAP = ("stage2-tools", "stage3-tools", "bootstrap-tools")
+
+# EXPENSIVE tier: the compiler caches. Losing these is why rebuilds "start from
+# zero". Purged only with --rustc-caches, as the last resort.
+PURGE_RUSTC_CACHES = ("stage1-rustc", "stage2-rustc")
 
 # Never purge these, and say why -- a future cleanup will read this list before
 # it reads the docstring.
@@ -51,7 +63,9 @@ KEEP = {
     "stage0": "the checksum-pinned Trust seed; re-fetching needs authenticated gh",
     "stage0-sysroot": "extracted seed sysroot; same",
     "llvm": "hours to rebuild and not a cargo target tree",
-    "bootstrap-tools": "the bootstrap driver itself",
+    # bootstrap-tools moved to PURGE_CHEAP 2026-08-01: it is a stage0 cargo
+    # target tree (86G that day), not the driver -- the driver lives in
+    # build/bootstrap. Proven regenerable mid-flight by the attempt-8 build.
     "stage1": "stage1 sysroot; stage2 is built FROM it",
     "stage1-std": "holds the only copy of some std artifacts the sysroot links to",
 }
@@ -91,11 +105,31 @@ def tree_size(path: Path) -> int:
     return total
 
 
+def extra_reap_paths(build: Path, host_root: Path) -> list[Path]:
+    """Unconditionally-dead scratch: pre-cache-recovery husks, superseded
+    rustc-private sysroot variants (all but the newest), and build/tmp."""
+    extras: list[Path] = []
+    extras += sorted(host_root.glob("stage*.pre-cache-recovery.*"))
+    sysroots = host_root / "rustc-private-sysroots"
+    if sysroots.is_dir():
+        variants = sorted(
+            sysroots.glob("rustc-private-tool-*"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        extras += variants[:-1]  # keep only the newest
+    tmp = build / "tmp"
+    if tmp.is_dir():
+        extras.append(tmp)  # recreated empty after deletion
+    return extras
+
+
 def build_in_progress(root: Path) -> str | None:
     lock = root / "build" / "lock"
     try:
         out = subprocess.run(
-            ["pgrep", "-f", "x.py|recreate_bootstrap"],
+            # "bootstrap build" too: the python x.py wrapper can die while its
+            # bootstrap child keeps building (observed 2026-08-01, attempt 8).
+            ["pgrep", "-f", "x.py|recreate_bootstrap|bootstrap build"],
             capture_output=True, text=True, check=False,
         )
         if out.returncode == 0 and out.stdout.strip():
@@ -141,6 +175,9 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="report, delete nothing")
     ap.add_argument("--force", action="store_true",
                     help="skip the in-progress-build refusal (NOT the sysroot check)")
+    ap.add_argument("--rustc-caches", action="store_true",
+                    help="ALSO purge stage1-rustc/stage2-rustc -- forces the next "
+                         "build to recompile the compiler from scratch; last resort")
     args = ap.parse_args()
 
     root = Path(args.root).resolve()
@@ -182,9 +219,12 @@ def main() -> int:
         return 1
     print(f"sysroot OK: {detail}")
 
+    names = list(PURGE_CHEAP)
+    if args.rustc_caches:
+        names += list(PURGE_RUSTC_CACHES)
     total = 0
     plan: list[tuple[Path, int]] = []
-    for name in PURGE_TARGETS:
+    for name in names:
         path = host_root / name
         if not path.is_dir():
             print(f"  {name:16} absent")
@@ -193,6 +233,14 @@ def main() -> int:
         plan.append((path, size))
         total += size
         print(f"  {name:16} {human(size):>10} reclaimable")
+    for path in extra_reap_paths(build, host_root):
+        size = tree_size(path) if path.is_dir() else 0
+        plan.append((path, size))
+        total += size
+        print(f"  {path.name:40} {human(size):>10} reclaimable (scratch)")
+    if not args.rustc_caches:
+        print("  sparing stage1-rustc / stage2-rustc -- the caches that keep rebuilds")
+        print("  warm. Pass --rustc-caches only when they are the last thing left.")
 
     if not plan:
         print("nothing to reclaim")
@@ -208,6 +256,9 @@ def main() -> int:
     for path, size in plan:
         print(f"removing {path.name} ({human(size)}) ...", flush=True)
         shutil.rmtree(path, ignore_errors=True)
+    tmp = build / "tmp"
+    if not tmp.exists():
+        tmp.mkdir()  # bootstrap expects it
 
     ok, detail = sysroot_is_complete(host_root)
     if not ok:

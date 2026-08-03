@@ -1163,6 +1163,7 @@ pub fn generate_ffi_vcs(
                 location: location.clone(),
                 formula: null_vc,
                 contract_metadata: None,
+                obligation: None,
             });
         }
     }
@@ -1189,6 +1190,7 @@ pub fn generate_ffi_vcs(
                 location: location.clone(),
                 formula: range_violation,
                 contract_metadata: None,
+                obligation: None,
             });
         }
     }
@@ -1222,6 +1224,7 @@ pub fn generate_ffi_vcs(
                     location: location.clone(),
                     formula: alias_vc,
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
         }

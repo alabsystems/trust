@@ -21,6 +21,7 @@ fn overflow_vc(formula: Formula) -> VerificationCondition {
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation: None,
     }
 }
 

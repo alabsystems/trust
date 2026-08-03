@@ -5,7 +5,7 @@
 #   scripts/corpus_census.sh <census-binary> <fixtures-root> <out-dir> [per-dir-cap-secs]
 #
 # Build the binary first:
-#   RUSTC_BOOTSTRAP=1 cargo build -p trust-clean --manifest-path crates/Cargo.toml \
+#   build/host/stage2/bin/targo --unverified build -p trust-clean --manifest-path crates/Cargo.toml \
 #     --bin corpus-census-2026-07-24
 #
 # Needs NO `trustc` and NO stage2 build: committed dumps are serialized

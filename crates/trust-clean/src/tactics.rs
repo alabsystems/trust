@@ -559,6 +559,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             ))),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -578,6 +579,7 @@ mod tests {
                 Box::new(Formula::Int(u64::MAX as i128)),
             ),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -591,6 +593,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             ),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -607,6 +610,7 @@ mod tests {
                 )),
             ),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -881,6 +885,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Implies(Box::new(Formula::Bool(true)), Box::new(Formula::Bool(true))),
             contract_metadata: None,
+            obligation: None,
         };
         let script = generate_tactic_script(&vc);
         let code = script.to_lean_code();
@@ -900,6 +905,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Eq(Box::new(Formula::Int(1)), Box::new(Formula::Int(1))),
             contract_metadata: None,
+            obligation: None,
         };
         let script = generate_tactic_script(&vc);
         let code = script.to_lean_code();

@@ -745,13 +745,13 @@ fn formula_var_name(f: &trust_types::Formula) -> Option<&str> {
 // fix. Certified 584 and gate 238-of-362 BEFORE and AFTER, with 0 of the 772 per-VC
 // verdicts differing (row-by-row diff, not just the totals):
 //   * the assert-condition route now confirms the located binding against the MIR
-//     ([`violation_candidates_resolved`]) — a `#[requires]` that binds the assert's
+//     (`violation_candidates_resolved`) — a `#[requires]` that binds the assert's
 //     condition local was otherwise indistinguishable from its block definition, and
 //     minted `NegOverflow(W32)` for a negation of a variable the body never negates;
 //   * `LocatedViolation::all_siblings` fails closed on an EMPTY sibling set instead of
 //     passing vacuously;
 //   * the bounds and div/rem locators assert the body position themselves
-//     ([`candidate_at_body_position`]) instead of inheriting it from the producer.
+//     (`candidate_at_body_position`) instead of inheriting it from the producer.
 // The third is a no-op today by construction and is pinned as one; the first two have
 // regression tests verified to FAIL on the reverted tree.
 //
@@ -768,10 +768,10 @@ fn formula_var_name(f: &trust_types::Formula) -> Option<&str> {
 //     `x` was narrowed.
 //   * UADD VACUITY — the range side condition is now a universal over EVERY occurrence
 //     of the located violation, not a pre-filter on the set the universal ranges over
-//     ([`emitted_arith_violation_located`]); and that lane declines on a mixed `Or`,
+//     (`emitted_arith_violation_located`); and that lane declines on a mixed `Or`,
 //     whose bare disjunct the candidate producer cannot see at all.
 // RETRACTED: the claim that a MIXED path-guard `Or` is unreachable. It is reachable
-// through an unwind edge; see [`violation_candidates`], which now says so and says what
+// through an unwind edge; see `violation_candidates`, which now says so and says what
 // is true instead.
 //
 // ROUND 5 — THE SELECTION IS ONE LOCATOR, AND EVERY DEFENCE IS SHARED BY EVERY LANE.
@@ -790,17 +790,17 @@ fn formula_var_name(f: &trust_types::Formula) -> Option<&str> {
 //   `(fixture, vc index, kind, minted kind, ProvenModulo3?)` dumps is EMPTY modulo the
 //   `Bounds` → `Bounds { signed: false }` label change. 0 rows withdrawn, 0 recovered.
 //
-//   * ONE LOCATOR ([`locate_violation`]). Each lane used to `filter` the candidates by
+//   * ONE LOCATOR (`locate_violation`). Each lane used to `filter` the candidates by
 //     its own shape predicate and only then collapse to a singleton, so a body position
 //     the lane did not recognize was DROPPED from the set the ambiguity rule ranged
 //     over. The agreement rule now runs over the UNFILTERED occurrences and the shape
 //     predicate is applied to the collapsed node.
 //   * THE MIXED `Or` DECLINES FOR EVERY LANE, at the producer
-//     ([`violation_candidates_resolved`]) — round 4 declined on it in the arithmetic
+//     (`violation_candidates_resolved`) — round 4 declined on it in the arithmetic
 //     lane alone, leaving bounds, shift and div/rem certifying off a guarded twin while
 //     a body position they never examined sat in the same formula.
 //   * A RANGELESS OCCURRENCE FAILS THE SIDE CONDITION INSTEAD OF DROPPING OUT OF IT
-//     ([`LocatedViolation::all_siblings`], now over `Option<&[Formula]>`).
+//     (`LocatedViolation::all_siblings`, now over `Option<&[Formula]>`).
 //   * THE NEGATION SUBJECT GATE IS KEYED ON THE SUBJECT, NOT THE ROUTE
 //     ([`negation_subjects`]) — round 4's gate ran only on the assert-condition route,
 //     so the same forgery re-minted through the direct route, which this API accepts
@@ -905,179 +905,12 @@ fn range_constraint_parts(
     (is_int_literal(lo) && is_int_literal(hi) && t_lo == t_hi).then(|| (&**t_lo, &**lo))
 }
 
-/// The term an `input_range_constraint` constrains (see [`range_constraint_parts`]).
-fn range_constrained_term(f: &trust_types::Formula) -> Option<&trust_types::Formula> {
-    range_constraint_parts(f).map(|(t, _)| t)
-}
-
-/// Whether some conjunct of `sibs` is an `input_range_constraint` on `term` — the
-/// emitter's own operand bound. The ARITY of `sibs` is deliberately not fixed: a
-/// dominating path guard is FLATTENED into the same `And` as the emitter's
-/// range/violation group (`v2_formula_with_path_guards`, safety.rs:1110-1115,
-/// `Formula::And(inner) => conj.extend(inner)`), so the group's own conjuncts are
-/// siblings of the guards rather than a nested pair/triple. Anchoring is unchanged:
-/// the caller still requires the violation to be the LAST conjunct, which is the
-/// only position the VC body ever occupies.
-fn has_range_sibling(sibs: &[trust_types::Formula], term: &trust_types::Formula) -> bool {
-    sibs.iter().any(|s| range_constrained_term(s) == Some(term))
-}
-
-/// As [`has_range_sibling`], and the bound's LOWER end is exactly `0` — i.e. the
+/// As `has_range_sibling`, and the bound's LOWER end is exactly `0` — i.e. the
 /// emitter proved `term ≥ 0` alongside the violation (an UNSIGNED operand range).
 fn has_nonneg_range_sibling(sibs: &[trust_types::Formula], term: &trust_types::Formula) -> bool {
     sibs.iter().any(|s| {
         range_constraint_parts(s).is_some_and(|(t, lo)| t == term && is_zero_literal(lo))
     })
-}
-
-/// Whether `node` sits at the emitter's BODY position in `sibs`: the LAST conjunct,
-/// by identity (not by value — a hypothesis equal to the body must not qualify).
-fn is_body_position(sibs: &[trust_types::Formula], node: &trust_types::Formula) -> bool {
-    sibs.last().is_some_and(|last| std::ptr::eq(last, node))
-}
-
-/// One candidate for THIS VC's own violation: the node, plus the conjunct list of
-/// the `And` it was taken as the LAST element of (`None` when it sits directly
-/// under an `Or` or is the whole formula — then no emitter pair can be checked).
-#[derive(Clone, Copy)]
-struct ViolationCandidate<'a> {
-    node: &'a trust_types::Formula,
-    siblings: Option<&'a [trust_types::Formula]>,
-}
-
-/// Every node the VC BODY can occupy, per construction fact (1) above: descend the
-/// LAST conjunct of each `And`, and the `And` disjuncts of an `Or` (the multi-path
-/// guard split) — keeping the `Or` itself, because a violation can BE an `Or` (the
-/// signed out-of-range and signed-shift forms). Hypotheses are unreachable from here.
-///
-/// WHY THE `Or` DESCENT IS RESTRICTED TO `And` DISJUNCTS.
-///
-/// Trust: CORRECTED (2026-07-29, lane-A cross-lane finding). This comment used to say
-/// "`v2_formula_with_path_guards` builds every disjunct as `Formula::And(conj)` — a
-/// bare non-`And` disjunct is therefore never a wrapper artifact". The first clause is
-/// FALSE OF THAT FUNCTION: an EMPTY-guard path pushes the RAW body
-/// (`if guards.is_empty() { terms.push(formula.clone()) }`, safety.rs:1078-1080), and
-/// only a non-empty one pushes `And([guards…, body…])` (safety.rs:1115). Considered
-/// alone, the splice can therefore emit a MIXED `Or`.
-///
-/// Trust: CORRECTED AGAIN (2026-07-30, round-4 defect [8] — the SECOND false claim at
-/// this site, introduced by the commit that fixed the first). The replacement text
-/// argued that the mixed `Or` is UNREACHABLE, because `v2_build_path_guard_map`
-/// "pushes a guard on EVERY edge it follows (`next_guards.push(..)`, safety.rs:1047),
-/// so only `bb0` can receive an empty path". THAT IS FALSE, and the counterexample is
-/// four lines below the line it cites. safety.rs:1051-1053 is
-/// `for target in block.terminator.unguarded_successors() { queue.push_back((target,
-/// succ_guards.clone(), path_blocks.clone())) }` — the guard list threaded UNCHANGED —
-/// and `Terminator::unguarded_successors` (trust-types/src/model.rs:6882-6900) returns
-/// the `Goto`/`Call`/`Drop`/`Opaque` targets AND, for every terminator that has one,
-/// the `unwind_cleanup_target` (model.rs:6872-6879, which covers `Call`, `Assert` and
-/// `Drop`). An EMPTY path therefore reaches every block reachable from `bb0` along
-/// unguarded edges, and a block reachable by both a guarded and an unguarded edge gets
-/// a MIXED path list. The instance two committed tests actually drive:
-/// `bb0 = Drop { target: bb1, unwind: Cleanup(bb2) }` — BOTH edges unguarded, so `bb2`
-/// inherits `bb0`'s empty list — `bb1 = SwitchInt` (a `discovered_clauses` edge, so its
-/// edge to `bb3` pushes a guard), `bb2 = Goto(bb3)`. `bb3`'s list is `[[g], []]`, which
-/// safety.rs:1078-1080 + 1115 + 1121 splice into an `Or` with one `And([g, body…])`
-/// disjunct and one BARE `body` disjunct — provided the body is not itself an `And`,
-/// which is why both tests use an assert whose condition local this block does NOT
-/// define. The two tests are lane A's
-/// `mirsem::obligation_region_tests::a_mixed_path_guard_or_can_never_supply_a_bounds_core`
-/// (obligation_region_tests.rs:913, `assert!(contains_mixed_or(&vc.formula))` at :955)
-/// and this file's own
-/// `selection_tests::a_mixed_path_guard_or_is_emitter_reachable_through_an_unwind_edge`.
-/// So: the mixed `Or` is EMITTER-REACHABLE. Do not re-derive an impossibility argument
-/// here.
-///
-/// WHAT IS TRUE, stated as what it is — one measurement and one direction.
-///
-/// MEASURED (re-taken 2026-07-30, not inherited; RE-CONFIRMED 2026-07-31 by
-/// `selection_tests::trustir_corpus_census`, which now counts this population itself):
-/// over the 2326 committed fixture functions, of the 772 safety VCs they emit, 0 contain
-/// an `Or` anywhere with both an `And` and a non-`And` disjunct. That is a corpus fact
-/// about the fixtures, not a property of the emitter.
-///
-/// DIRECTION: skipping a bare disjunct can only DROP a candidate, never admit one, so
-/// it cannot let a hypothesis be certified — the failure mode this restriction exists
-/// for. In every mixed `Or` traced through `v2_formula_with_path_guards`, the bare
-/// disjunct is the RAW `formula` argument (safety.rs:1078-1080), i.e. the same body the
-/// guarded disjuncts carry flattened alongside their guards (safety.rs:1112-1113), so
-/// what is dropped is a DUPLICATE of a candidate that survives. That is a statement
-/// about the traced cases, not a proof over all inputs.
-///
-/// WHERE DROPPING A DUPLICATE IS NOT HARMLESS, the consumer says so itself: a lane that
-/// reads a SIDE CONDITION off the surviving occurrences' siblings would then quantify
-/// over the guarded paths only. That is round-4 defect [3].
-///
-/// Trust: AND IT IS NOT ONLY THE SIDE-CONDITION LANE (2026-07-31, round-5 defect [7]).
-/// Round 4 closed it by declining on a mixed `Or` inside `emitted_arith_violation_located`
-/// — "the one such lane". That was wrong about the scope: a lane that reads its CERTIFIED
-/// PROPOSITION off the surviving occurrences is equally exposed, since the unexamined
-/// bare disjunct is a body position stating something this tier never read. All four
-/// other lanes do exactly that. The decline therefore lives in
-/// [`violation_candidates_resolved`] now, where every lane inherits it, and no consumer
-/// relies on this paragraph.
-///
-/// Every OTHER `Or` reachable here IS a violation:
-/// `Or([Lt(i,0), Ge(i,len)])` (signed index), `Or([Lt(a∘b,MIN), Gt(a∘b,MAX)])`
-/// (out-of-range), `Or([Lt(n,0), Ge(n,W)])` (signed shift amount) — and its disjuncts
-/// are HALVES of that violation, not violations. Descending into them let the tier
-/// certify half a proposition: the signed-index bounds VC minted `idxOob(len, i)`, a
-/// kernel certificate that says nothing about the `i < 0` half the VC also states.
-/// That is the same defect class as certifying a hypothesis (a certificate about a
-/// proposition other than the one the VC carries), so it fails closed here instead.
-fn violation_candidates<'a>(
-    f: &'a trust_types::Formula,
-    siblings: Option<&'a [trust_types::Formula]>,
-    out: &mut Vec<ViolationCandidate<'a>>,
-) {
-    use trust_types::Formula as F;
-    match f {
-        F::And(v) => match v.last() {
-            Some(last) => violation_candidates(last, Some(v.as_slice()), out),
-            // Trust: AN EMPTY `And` IS AN OCCURRENCE, NOT A NON-EVENT (2026-07-31,
-            // round-6 F4). This arm used to be `if let Some(last)`, so an empty `And`
-            // yielded NO candidate — and `Or([And([core]), And([])])` therefore
-            // presented exactly one occurrence, the lane's own core, which agrees with
-            // itself and mints. `clean_ground::ground_prop` folds an empty `And` to
-            // `True` (`F::And(v) => fold_prop(v, "And", "True", params)`,
-            // clean_ground.rs:8526), so that VC's obligation is `core ∨ True` —
-            // identically true — while the certificate states `core`. The parent `Or`
-            // is `is_path_guard_splice` by round 5's own predicate and so is filtered
-            // out of [`locate_violation`]'s domain, leaving nothing that mentions the
-            // vacuous disjunct at all. Emitting the empty `And` as its own candidate
-            // makes the agreement rule FAIL on it (it is not the core), which is this
-            // file's standing verb: a body position no lane can read is an obligation
-            // this tier declines, never one it drops.
-            //
-            // MEASURED 2026-07-31 over `crates/trust-clean/fixtures`, by running
-            //     cd crates && RUSTC_BOOTSTRAP=1 \
-            //       TRUSTIR_CENSUS_OUT=<path> cargo test --offline -p trust-clean --lib \
-            //       -- --ignored --nocapture selection_tests::trustir_corpus_census
-            // on this tree and on the same tree with this arm reverted to
-            // `if let Some(last)`, then `diff`ing the two per-VC row dumps: funcs=2326,
-            // safetyVCs=772, certified=584, gate=238/362 on BOTH, and the 772 rows are
-            // byte-identical — 0 certificates withdrawn.
-            //
-            // CONSEQUENCE FOR THE SPLICE FILTER, and the reason this is the right level
-            // to fix it: `violation_candidates` now yields AT LEAST ONE candidate for
-            // every input (empty `And` pushes itself; non-empty `And` recurses on a
-            // `last` that exists; `Or` and every leaf push themselves). So each `And`
-            // disjunct of a path-guard splice is represented by a body position of its
-            // own, and dropping the splice `Or` in [`locate_violation`] can no longer
-            // silence a disjunct outright. Before this arm, `And([])` was the one
-            // formula with zero candidates, which is exactly what made the drop lossy.
-            None => out.push(ViolationCandidate { node: f, siblings }),
-        },
-        F::Or(v) => {
-            out.push(ViolationCandidate { node: f, siblings });
-            for d in v {
-                if matches!(d, F::And(_)) {
-                    violation_candidates(d, None, out);
-                }
-            }
-        }
-        other => out.push(ViolationCandidate { node: other, siblings }),
-    }
 }
 
 /// The base place name of a versioned VC variable — `_6#s3_0` names the same place as
@@ -1137,7 +970,7 @@ fn formula_agrees_modulo_versions(a: &trust_types::Formula, b: &trust_types::For
 ///   * a block whose terminator is an `expected == false` `Assert` on the local named
 ///     `want` — the only lowering that makes a bare `Var(_c)` the obligation body
 ///     (`v2_assert_failure_formula` emits `Not(Var _c)` for `expected == true`, a shape
-///     [`violation_candidates_resolved`] does not admit at all),
+///     `violation_candidates_resolved` does not admit at all),
 ///   * exactly ONE statement in THAT block assigning it (the region
 ///     `extract_block_definitions_until` reads; SSA, so a second assignment means the
 ///     name does not identify a unique definition), and
@@ -1336,297 +1169,6 @@ fn callee_method_tail(callee: &str) -> &str {
     tail.split('<').next().unwrap_or(tail).trim()
 }
 
-/// The candidate set for `formula`, with the ASSERT-CONDITION indirection resolved
-/// against the MIR `func` the emitter itself read.
-///
-/// `v2_assert_failure_formula` (overflow_vc.rs:1834) makes the body of an
-/// assert-driven VC the bare condition local — `Var(_c)` when the assert expects
-/// `false`, `Not(Var(_c))` when it expects `true` — and `v2_formula_with_block_defs`
-/// conjoins that local's own definition `Eq(Var(_c), <core>)` as a hypothesis. The
-/// core is therefore genuinely inside a block-def for this family (the
-/// precondition-guarded `abs`: `_6 = (x == i32::MIN); assert!(!_6)`).
-///
-/// SIBLING ANCHORING IS NECESSARY BUT NOT SUFFICIENT. `combine_relevant_block_defs`
-/// conjoins the defs and the body into ONE `And` (`conjuncts.push(formula)`,
-/// block_defs.rs:696), and the only wrapper that can come between them FLATTENS rather
-/// than nests (`v2_formula_with_path_guards`, safety.rs:1110-1115) — so the definition
-/// of the condition local is always a conjunct of the SAME `And` whose last element is
-/// the `Var(_c)` body. Measured over the 2326 committed fixture functions: of the 40
-/// condition-local body occurrences in the corpus's safety VCs, 40 have their
-/// definition as a direct sibling and 0 are reachable only by a wider walk — so the
-/// anchoring costs nothing and deletes the residual whole-formula scan.
-///
-/// Trust: A DIRECT SIBLING IS NOT A BLOCK-DEF (2026-07-29, lane-B finding [1]). This
-/// function used to accept ANY direct sibling `Eq(Var(_c), rhs)` as "the definition",
-/// on the argument that only a block-def can sit there. That argument is FALSE.
-/// `combine_relevant_block_defs` returns the body BARE when the block has no def
-/// (`if keep_rev.is_empty() { return formula; }`, block_defs.rs:693-695), and
-/// `versioned::conjoin` (versioned.rs:62-68) then makes every PRECONDITION a direct
-/// sibling of that bare `Var(_c)` body. MEASURED through the real
-/// `trust_vcgen::generate_vcs`: `bb0 = Assert { cond: ok, expected: false, msg:
-/// OverflowNeg }`, `bb1 = _0 = Neg(k)` with `k: i32`, and
-/// `#[requires] ok == (other == i32::MIN)` emitted `And([Eq(ok, Eq(other, -2147483648)),
-/// Var(ok, Bool)])` and certified `NegOverflow(W32)` — for an operand the body never
-/// negates. The width cross-check is no defense: the forger picks the matching literal.
-///
-/// So the located binding is now CONFIRMED against the MIR
-/// ([`mir_assert_condition_core`]): the function must carry an `expected == false`
-/// `Assert` on this local in a block that DEFINES it with exactly one statement, that
-/// statement must be the `_c := (x == k)` comparison, and the sibling binding must BE
-/// that definition — operand for operand through the emitter's own
-/// `trust_vcgen::operand_to_formula`, modulo the `#token` version stamps
-/// `version_block_def_at_establish` adds. A `#[requires]`/`#[ensures]` cannot
-/// manufacture a body statement, so the contract surface is closed rather than merely
-/// outnumbered. This is the same standard `mirsem::vc_faithful::assert_condition_binding`
-/// applies on the MirSem lane.
-///
-/// COST: zero. Measured over the same 2326 fixture functions — 37 safety VCs carry a
-/// `Var(_, Bool)` body, 40 occurrences in all; 40 have a single direct-sibling binding,
-/// the MIR defines the asserted local for 40 of 40, and the sibling binding agrees with
-/// that definition modulo version stamps in 40 of 40. Certified rows and the function
-/// gate are unchanged (584 and 238 of 362), with 0 of the 772 per-VC verdicts differing.
-///
-/// The scan it replaces recursed into `Not`, into every `Or` disjunct and into both
-/// sides of `Implies`, and accepted ANY `Eq(Var(name), rhs)` occurrence as "the
-/// definition". That is the very defect this file's header describes, one level down:
-/// a NEGATED equation `Not(Eq(_6, Eq(z,0)))` is not what `_6` means, yet it supplied
-/// the certified core (demonstrated by the reviewer on the post-fix tree, and pinned
-/// by `selection_tests::only_a_direct_positive_sibling_conjunct_can_define_the_certified_core`).
-///
-/// POLARITY. Only the `expected == false` spelling — a BARE `Var(_c)` body, whose
-/// violation IS the definition's right-hand side — is resolved. For `Not(Var(_c))`
-/// the violation is `Not(rhs)`, so handing `rhs` to a shape matcher would certify the
-/// COMPLEMENT of what the VC states. No modeled kind's shape currently matches an
-/// `expected == true` condition (rustc spells those `Lt(index, len)` / `Ne(d, 0)`,
-/// which the `Ge` / `Eq(_, 0)` matchers reject), so refusing the negative polarity
-/// outright costs nothing today and closes the hazard permanently. The definition
-/// side is now held to the same rule: only a positive, direct `Eq(Var(_c), rhs)`
-/// CONJUNCT counts, so a negated or disjoined occurrence contributes nothing.
-///
-/// SORT. The body occurrence must be a `Sort::Bool` variable — an assert condition
-/// local is boolean by construction (`v2_assert_failure_formula`), and an integer
-/// `Var` body is not a condition indirection at all. 0 of the corpus's 40
-/// occurrences are non-`Bool`, so this too costs nothing.
-fn violation_candidates_resolved<'a>(
-    func: &trust_types::VerifiableFunction,
-    formula: &'a trust_types::Formula,
-) -> Vec<ViolationCandidate<'a>> {
-    // Trust: THE MIXED `Or` DECLINES FOR EVERY LANE (2026-07-31, round-5 defect [7]).
-    // `violation_candidates` descends only the `And` disjuncts of an `Or`, so a BARE
-    // disjunct — the shape an empty-guard path pushes (`terms.push(formula.clone())`,
-    // safety.rs:1078-1080) — contributes NO occurrence at all. Round 4 closed that for
-    // the arithmetic lane only, by declining there; the bounds, shift and div/rem lanes
-    // kept certifying off the guarded twin while a body position they never examined sat
-    // in the same formula. A dropped body position is a body position no side condition
-    // and no ambiguity collapse can see, so the decline belongs at the PRODUCER, where
-    // every lane inherits it. MEASURED over the 2326 committed fixture functions
-    // (`selection_tests::trustir_corpus_census`, 2026-07-31): 0 of the 772 emitted safety
-    // VCs contain a mixed `Or` anywhere, so this withdraws no row of that corpus —
-    // certified 584 and gate 238-of-362 before and after, 0 of the 772 per-VC verdicts
-    // differing. The shape IS emitter-reachable (see [`violation_candidates`]); this is a
-    // corpus fact, not an impossibility claim.
-    if contains_mixed_or(formula) {
-        return Vec::new();
-    }
-    let mut cands = Vec::new();
-    violation_candidates(formula, None, &mut cands);
-
-    // Trust: A RESOLVED CONDITION LOCAL REPLACES ITS BODY OCCURRENCE (2026-07-31,
-    // round-5 defect [6]). The resolved core used to be APPENDED, leaving the `Var(_c)`
-    // body in the candidate list for the consumers to drop on a shape mismatch. Dropping
-    // is the wrong verb everywhere in this file: a body position that no lane recognizes
-    // is an obligation this tier cannot read, and the tier must decline rather than
-    // certify off a different occurrence. Replacing means an UNRESOLVED `Var(_c)` stays
-    // in the list, matches no `is_core`, and so fails [`locate_violation`]'s agreement
-    // rule instead of vanishing from it.
-    cands
-        .into_iter()
-        .map(|c| resolved_condition_local(func, &c).unwrap_or(c))
-        .collect()
-}
-
-/// The assert-condition indirection resolved for ONE candidate: if `c` is a `Var(_c,
-/// Bool)` body whose MIR-confirmed defining comparison is a direct sibling conjunct,
-/// the candidate for that comparison; `None` when `c` is not that shape or the
-/// resolution fails (in which case the caller keeps `c` itself, so the unread body
-/// position still counts against the locator).
-///
-/// See [`violation_candidates_resolved`] for why each clause is required.
-fn resolved_condition_local<'a>(
-    func: &trust_types::VerifiableFunction,
-    c: &ViolationCandidate<'a>,
-) -> Option<ViolationCandidate<'a>> {
-    use trust_types::Formula as F;
-    // The body names the condition local POSITIVELY (`Var(_c)`, never `Not(Var(_c))` —
-    // that shape is not a candidate at all) and as a BOOLEAN.
-    let F::Var(name, trust_types::Sort::Bool) = c.node else { return None };
-    // Its definition must be a DIRECT conjunct of the same `And`.
-    let sibs = c.siblings?;
-    // … and the MIR must actually DEFINE it, at the assert this body came from.
-    // No such definition ⇒ the assert-condition route does not exist for this VC
-    // and every sibling `Eq(Var(_c), …)` is a hypothesis ⇒ fail closed.
-    let base = base_var_name(c.node)?;
-    let mir_core = mir_assert_condition_core(func, base)?;
-    let defs: Vec<&'a trust_types::Formula> = sibs
-        .iter()
-        .filter_map(|s| match s {
-            F::Eq(l, r) if matches!(&**l, F::Var(n, _) if n == name) => Some(&**r),
-            _ => None,
-        })
-        .collect();
-    let first = defs.first().copied()?;
-    // One binding, and it must BE the MIR's own definition.
-    (defs.iter().all(|d| *d == first) && formula_agrees_modulo_versions(first, &mir_core))
-        .then_some(ViolationCandidate { node: first, siblings: None })
-}
-
-/// A located violation together with EVERY body-position occurrence of it: the
-/// conjunct list it was the last element of, or `None` for an occurrence that carries
-/// no such list (the whole formula, or an assert-condition core resolved against the
-/// MIR). The multi-path guard split repeats the same body once per path, so a side
-/// condition read off the siblings (the uadd vacuity check) must hold on ALL of them,
-/// not on whichever happens to be first: two paths could in principle conjoin
-/// different operand ranges around the same violation.
-struct LocatedViolation<'a> {
-    node: &'a trust_types::Formula,
-    sibling_sets: Vec<Option<&'a [trust_types::Formula]>>,
-}
-
-impl<'a> LocatedViolation<'a> {
-    /// Whether `pred` holds of EVERY body-position occurrence's sibling list — and
-    /// there is at least one occurrence, and none of them lacks a sibling list.
-    ///
-    /// Trust: FAIL CLOSED ON THE EMPTY SET (2026-07-29, lane-B finding [2]). This used
-    /// to be a bare `.all()`, documented as "vacuously true is impossible: the
-    /// constructor rejects an empty set". That was FALSE: the constructor rejected an
-    /// empty CANDIDATE list but built `sibling_sets` by `filter_map`ping the candidates'
-    /// `siblings`, which is empty whenever every candidate carries `None`.
-    ///
-    /// Trust: AND A RANGELESS OCCURRENCE MUST FAIL, NOT DROP (2026-07-31, round-5
-    /// defects [5]/[6]). Making the empty set fail was only half of it: `filter_map`
-    /// SILENTLY DISCARDED the `None`-sibling occurrences, so a violation occurring once
-    /// with the emitter's operand ranges beside it and once WITHOUT them (the same body
-    /// reached through the assert-condition indirection, or as a bare disjunct) had the
-    /// second occurrence excluded from the universal instead of failing it — and the
-    /// uadd vacuity argument, which is a claim about EVERY path the violation sits on,
-    /// passed on the paths that happened to carry evidence. `sibling_sets` now records
-    /// EVERY occurrence, `None` included, and an occurrence with no sibling list has no
-    /// range evidence and therefore FAILS this universal.
-    fn all_siblings(&self, pred: impl Fn(&'a [trust_types::Formula]) -> bool) -> bool {
-        !self.sibling_sets.is_empty() && self.sibling_sets.iter().all(|s| s.is_some_and(&pred))
-    }
-}
-
-/// Whether `f` is a PATH-GUARD `Or` splice rather than a violation: a non-empty `Or`
-/// every disjunct of which is an `And`. That is the only shape
-/// `v2_formula_with_path_guards` builds when every path carries a guard
-/// (safety.rs:1115 + :1121), and no modeled violation has it — the three `Or`-shaped
-/// violations this tier knows (`Or([Lt,Gt])` out-of-range, `Or([Lt,Ge])` signed shift,
-/// `Or([Lt,Ge])` signed index) have COMPARISON disjuncts. [`violation_candidates`]
-/// keeps such an `Or` as a candidate because a violation CAN be an `Or`; this predicate
-/// is how [`locate_violation`] tells the splice back out again, so that the splice does
-/// not count as a second, disagreeing body position.
-///
-/// The MIXED `Or` (some `And` disjuncts, some not) is not classified here at all: it is
-/// declined outright, for every lane, in [`violation_candidates_resolved`].
-///
-/// Trust: THIS DROP IS ONLY SAFE BECAUSE EVERY DISJUNCT STILL SPEAKS (2026-07-31,
-/// round-6 F4). Removing the splice `Or` from [`locate_violation`]'s domain removes the
-/// only node that MENTIONS all of its disjuncts at once, so it is sound only while each
-/// disjunct contributes a body position of its own. It did not: an EMPTY `And` disjunct
-/// yielded no candidate at all, and `Or([And([core]), And([])])` — identically true,
-/// since `clean_ground::ground_prop` folds an empty `And` to `True` — presented the
-/// lane's own core as the sole occurrence and minted. `violation_candidates`'s `F::And`
-/// arm now emits a candidate for the empty `And`, which restores the invariant this
-/// predicate depends on: every formula yields at least one candidate.
-fn is_path_guard_splice(f: &trust_types::Formula) -> bool {
-    use trust_types::Formula as F;
-    matches!(f, F::Or(v) if !v.is_empty() && v.iter().all(|d| matches!(d, F::And(_))))
-}
-
-/// THE ONE LOCATOR every kind's lane goes through: the single proposition this VC's
-/// BODY states, together with every body-position occurrence of it.
-///
-/// `None` — fail closed — unless ALL of:
-///   * at least one body-position occurrence exists,
-///   * every occurrence that is not a path-guard `Or` splice names the STRUCTURALLY
-///     SAME proposition (two different bodies give no principled way to say which one
-///     the VC's kind is about),
-///   * every one of them really is at the emitter's body position
-///     ([`candidate_at_body_position`]), and
-///   * that proposition matches the lane's own shape predicate `is_core`.
-///
-/// Trust: THE AGREEMENT RULE RANGES OVER THE UNFILTERED SET (2026-07-31, round-5
-/// defects [5]/[6]/[7]). Each lane used to `filter` the candidates by its own `is_core`
-/// and only THEN collapse to a singleton, so a body position the lane did not recognize
-/// — an unresolved `Var(_c)` condition local, a different violation on another guarded
-/// path — was DROPPED from the set the ambiguity rule ranged over instead of failing
-/// it. A universal quantified over a set that the very predicate under test has already
-/// pruned proves nothing about what it dropped. `is_core` is now applied to the
-/// COLLAPSED node, after every occurrence has had to agree with it.
-fn locate_violation<'a>(
-    func: &trust_types::VerifiableFunction,
-    formula: &'a trust_types::Formula,
-    is_core: impl Fn(&'a trust_types::Formula) -> bool,
-) -> Option<LocatedViolation<'a>> {
-    let occurrences: Vec<ViolationCandidate<'a>> = violation_candidates_resolved(func, formula)
-        .into_iter()
-        .filter(|c| !is_path_guard_splice(c.node))
-        .collect();
-    let first = *occurrences.first()?;
-    if !occurrences.iter().all(|c| c.node == first.node) {
-        return None; // two different body propositions ⇒ ambiguous ⇒ fail closed
-    }
-    if !occurrences.iter().all(candidate_at_body_position) {
-        return None;
-    }
-    if !is_core(first.node) {
-        return None;
-    }
-    Some(LocatedViolation {
-        node: first.node,
-        sibling_sets: occurrences.iter().map(|c| c.siblings).collect(),
-    })
-}
-
-/// Whether a candidate sits at the emitter's BODY position.
-///
-/// A candidate carrying a sibling list must be the LAST conjunct of it
-/// ([`is_body_position`]). One carrying none is either the whole formula — which IS
-/// the body — or an assert-condition core resolved by
-/// [`violation_candidates_resolved`], which is anchored to the MIR's own definition
-/// rather than to a position.
-///
-/// Trust: A CONSUMER-SIDE CHECK (2026-07-29, lane-B finding [4]). Every candidate
-/// [`violation_candidates`] yields with `Some(sibs)` satisfies this by construction, so
-/// the check is a no-op today — measured: certified/gate unchanged at 584 / 238-of-362
-/// over the 2326-function corpus with it added to the bounds and div/rem locators. It
-/// is here because those two locators' own docs name POSITION as their whole
-/// discriminator, and a future widening of the producer (re-admitting a non-`And` `Or`
-/// disjunct, descending a second wrapper shape) must not be silently accepted by the
-/// two lanes that have no emitter pair to fall back on.
-fn candidate_at_body_position(c: &ViolationCandidate<'_>) -> bool {
-    match c.siblings {
-        Some(sibs) => is_body_position(sibs, c.node),
-        None => true,
-    }
-}
-
-/// Trust: SHIFT — the emitted violation, located from `v2_shift_violation_formula`'s
-/// verbatim `And([input_range_constraint(n, shift_ty), invalid])` pair
-/// (checked_vcs.rs:494) with the SAME shifted-amount term on both sides.
-fn emitted_shift_violation<'a>(
-    func: &trust_types::VerifiableFunction,
-    formula: &'a trust_types::Formula,
-) -> Option<&'a trust_types::Formula> {
-    let located = locate_violation(func, formula, |n| shift_violation_shape(n).is_some())?;
-    let (n, _, _) = shift_violation_shape(located.node)?;
-    // The emitter's own `input_range_constraint(n)` must sit beside the violation at
-    // EVERY occurrence of it — a universal, not a filter: an occurrence lacking it used
-    // to drop out of the located set instead of failing this check (round-5 defect [5]).
-    located.all_siblings(|sibs| has_range_sibling(sibs, n)).then_some(located.node)
-}
-
 /// The SHAPE of a shift VC's emitted violation, destructured into
 /// `(amount, threshold W, is_signed_form)` — exactly the two forms
 /// `v2_shift_violation_formula` builds (checked_vcs.rs:537):
@@ -1652,206 +1194,6 @@ fn shift_violation_shape(
         }
         _ => None,
     }
-}
-
-/// Trust: ARITHMETIC OVERFLOW/UNDERFLOW — the emitted violation, located from
-/// `v2_build_overflow_vc_for_operands`'s verbatim
-/// `And([input_range(lhs), input_range(rhs), out_of_range])` triple
-/// (overflow_vc.rs:467), with the group's two constrained terms required to be
-/// EXACTLY the computed operands inside `out_of_range`.
-///
-/// THE GROUP IS NOT AN ARITY. The emitter builds `And([range(a), range(b), oor])`,
-/// but `v2_formula_with_path_guards` FLATTENS that `And` into the guard conjunction
-/// (safety.rs:1110-1115), so on a guarded block with no block-defs and no
-/// type-range wrapper the same three conjuncts arrive as `[guard…, range(a),
-/// range(b), oor]`. Requiring `Some([ra, rb, last])` therefore declined a violation
-/// that IS at the body position — MEASURED: 2 rows over the 2326-function corpus
-/// (`arrayvec::ArrayVec::<T, CAP>::retain::process_one`'s two
-/// `Or([Lt(g+1,0), Gt(g+1,u64::MAX)])` VCs), located 453 → 455. Anchoring is
-/// unchanged: [`is_body_position`] still pins the violation to the LAST conjunct.
-///
-/// THE RANGE PAIR IS A SIDE CONDITION, NOT A FILTER.
-///
-/// Trust: A REJECTED OCCURRENCE MUST FAIL, NOT DROP (2026-07-30, round-4 defect [3]).
-/// The range-sibling requirement used to sit inside the `filter` that builds `found`.
-/// The uadd caller then quantified its vacuity check over `found`'s sibling sets — a
-/// universal over a set the very same predicate had already pruned, so an occurrence
-/// carrying NO range evidence was EXCLUDED from the universal instead of FAILING it.
-/// Demonstrated: `Or([And([g1, urange(a), urange(b), oor]), And([g2, oor])])` certified
-/// `uaddOverflowsU8` off the first disjunct alone, and `a = −1, b = 0` satisfies the
-/// second path's `Lt(a+b, 0)` half — the certificate was strictly weaker than the
-/// emitted obligation. The range pair is no longer part of the filter that builds
-/// `found`; it is applied AFTER the collapse, as a universal over every occurrence that
-/// SURVIVES that filter — i.e. every body-position occurrence carrying a sibling set. So
-/// an occurrence with siblings but NO range evidence now FAILS the side condition instead
-/// of being excluded from it.
-///
-/// Trust: AND SO DOES AN OCCURRENCE CARRYING NO SIBLING SET AT ALL (2026-07-31, round-5
-/// defects [5]/[6]). The round-4 text ended "occurrences carrying no sibling set at all
-/// are still dropped by the filter" — which is the same defect one notch smaller: an
-/// occurrence with no sibling list has NO range evidence whatever, so it is the strongest
-/// possible counterexample to the vacuity claim and the weakest possible reason to
-/// exclude it. [`locate_violation`] no longer filters on `siblings.is_some()`, and
-/// [`LocatedViolation::all_siblings`] fails on a `None`.
-///
-/// AND THE OCCURRENCE SET MUST BE COMPLETE. `violation_candidates` descends only the
-/// `And` disjuncts of an `Or`, so a BARE disjunct — the shape an empty-guard path
-/// pushes (`terms.push(formula.clone())`, safety.rs:1078-1080) — contributes no
-/// occurrence at all, and the universal above would range over the guarded twins only.
-/// The MIXED `Or` that requires is not hypothetical: it is emitter-reachable through an
-/// unwind edge (see [`violation_candidates`]'s note and
-/// `mirsem::obligation_region_tests::a_mixed_path_guard_or_can_never_supply_a_bounds_core`).
-/// The mixed `Or` therefore DECLINES outright rather than this lane reasoning about
-/// which half it can see.
-///
-/// Trust: THAT DECLINE HAS MOVED TO THE PRODUCER (2026-07-31, round-5 defect [7]).
-/// Round 4 put the `contains_mixed_or` call HERE, in the arithmetic lane alone. The
-/// unexamined body position is not an arithmetic-lane fact: the bounds, shift and
-/// div/rem lanes read their certified proposition from the same candidate set and had
-/// no such decline, so each of them could certify off a guarded twin while an
-/// unexamined bare disjunct stated something else. [`violation_candidates_resolved`]
-/// now returns NO candidates for a formula containing a mixed `Or`, so every lane
-/// inherits it and this one keeps its property by construction. MEASURED (re-taken
-/// 2026-07-31 with `selection_tests::trustir_corpus_census`): 0 of the 772 safety VCs
-/// the 2326-function corpus emits contain a mixed `Or` at all, so the decline withdraws
-/// nothing there.
-fn emitted_arith_violation_located<'a>(
-    func: &trust_types::VerifiableFunction,
-    formula: &'a trust_types::Formula,
-) -> Option<LocatedViolation<'a>> {
-    use trust_types::Formula as F;
-    fn computed(f: &F) -> Option<(&trust_types::Formula, &trust_types::Formula)> {
-        match f {
-            // `Or([Lt(a∘b, MIN), Gt(a∘b, MAX)])` — the general out-of-range form.
-            F::Or(v) => {
-                let [F::Lt(l, lo), F::Gt(r, hi)] = v.as_slice() else { return None };
-                if !is_int_literal(lo) || !is_int_literal(hi) || l != r {
-                    return None;
-                }
-                binop_operands(l)
-            }
-            // `Lt(a−b, Int 0)` — the unsigned-sub underflow-only form.
-            F::Lt(l, lo) if is_int_literal(lo) => binop_operands(l),
-            _ => None,
-        }
-    }
-    let located = locate_violation(func, formula, |n| computed(n).is_some())?;
-    let (a, b) = computed(located.node)?;
-    located
-        .all_siblings(|sibs| has_range_sibling(sibs, a) && has_range_sibling(sibs, b))
-        .then_some(located)
-}
-
-/// Whether `f` contains, anywhere, an `Or` with BOTH an `And` disjunct and a non-`And`
-/// one — the MIXED path-guard shape [`violation_candidates`] descends only half of.
-///
-/// Trust: the production twin of the test-only predicate lane A wrote for the same
-/// shape (`mirsem::obligation_region_tests::contains_mixed_or`, which that lane's
-/// committed `a_mixed_path_guard_or_can_never_supply_a_bounds_core` asserts the emitter
-/// really produces for a `Drop` with a `Cleanup` unwind edge).
-fn contains_mixed_or(f: &trust_types::Formula) -> bool {
-    use trust_types::Formula as F;
-    let here = matches!(f, F::Or(v)
-        if v.iter().any(|d| matches!(d, F::And(_)))
-            && v.iter().any(|d| !matches!(d, F::And(_))));
-    here || match f {
-        F::And(v) | F::Or(v) => v.iter().any(contains_mixed_or),
-        F::Not(a) => contains_mixed_or(a),
-        F::Implies(a, b) => contains_mixed_or(a) || contains_mixed_or(b),
-        _ => false,
-    }
-}
-
-/// [`emitted_arith_violation_located`], keeping only the located node.
-fn emitted_arith_violation<'a>(
-    func: &trust_types::VerifiableFunction,
-    formula: &'a trust_types::Formula,
-) -> Option<&'a trust_types::Formula> {
-    emitted_arith_violation_located(func, formula).map(|c| c.node)
-}
-
-/// Trust: NEGATION OVERFLOW — the emitted violation `Eq(v, Int INT_MIN)`.
-/// `v2_build_negation_raw_vc` (checked_vcs.rs:775) builds the verbatim pair
-/// `And([input_range_constraint(v, W, true), Eq(v, type_min_formula(W, true))])`;
-/// `signed_abs_panic_body` (unwrap_panic.rs:138-151) builds the SAME pair for an
-/// `iN::abs` call's argument — the THIRD producer of this kind, whose subject is an
-/// opaque `Call` argument rather than a negated operand;
-/// `v2_build_assert_negation_vc` (checked_vcs.rs:57) instead makes the body the
-/// assert's condition local, whose own definition supplies the same `Eq(v, MIN)` —
-/// resolved by [`violation_candidates_resolved`], never by a free scan.
-///
-/// Returns the located core AND whether any occurrence of it arrived WITHOUT the
-/// emitter's own range/violation group beside it (`siblings: None`) — i.e. through the
-/// assert-condition indirection, or as the whole formula. It is `true` if ANY occurrence
-/// took that route, not only if all did (fail-closed).
-///
-/// Trust: THAT FLAG NO LONGER KEYS THE SUBJECT CHECK (2026-07-31, round-5 defects
-/// [1]/[8]). It used to, on the argument that the direct route is authenticated by the
-/// body position — true of the EMITTER, false of a VC handed to this API. The caller now
-/// authenticates the subject on every route against [`negation_subjects`] and uses this
-/// flag only to additionally demand the STRICTER assert-route read
-/// ([`assert_negation_subject`]), which pins the subject to that assert's own target
-/// block.
-fn emitted_neg_violation<'a>(
-    func: &trust_types::VerifiableFunction,
-    formula: &'a trust_types::Formula,
-) -> Option<(&'a trust_types::Formula, bool)> {
-    use trust_types::Formula as F;
-    let is_core = |f: &F| {
-        matches!(f, F::Eq(l, r) if formula_var_name(l).is_some() && matches!(&**r, F::Int(_)))
-    };
-    let located = locate_violation(func, formula, is_core)?;
-    let F::Eq(v, _) = located.node else { return None };
-    // The raw lane must sit in the emitter's own range/violation group over the SAME
-    // negated operand (arity unfixed — see `emitted_arith_violation_located`); the
-    // assert lane reaches the core through the condition local's MIR-confirmed
-    // definition and carries no group, so it has no range sibling to require.
-    //
-    // Trust: A GROUPLESS OCCURRENCE FAILS, IT DOES NOT DROP (2026-07-31, round-5
-    // defect [5]). This used to be a `filter`: an occurrence WITH siblings but without
-    // the emitter's range constraint was silently removed from the located set, and the
-    // certificate was read off whichever occurrences remained. Now it fails the lane.
-    if !located
-        .sibling_sets
-        .iter()
-        .all(|s| s.is_none_or(|sibs| has_range_sibling(sibs, v)))
-    {
-        return None;
-    }
-    let indirect = located.sibling_sets.iter().any(Option::is_none);
-    Some((located.node, indirect))
-}
-
-/// Trust: BOUNDS — the emitted violation. `v2_build_bounds_assert_vc`
-/// (checked_vcs.rs:244) emits it BARE, as `Ge(index, len)` for an unsigned index or
-/// `Or([Lt(index, 0), Ge(index, len)])` for a signed one, so no emitter pair exists
-/// and POSITION is the whole discriminator: the located node must be one the VC
-/// BODY can occupy. A precondition / guard / type-bound `Ge(a,b)` — which the old
-/// pre-order scan certified in its place — is not on that path. That discriminator is
-/// now asserted HERE, by [`candidate_at_body_position`], and not left to the producer.
-///
-/// THE SIGNED-INDEX FORM IS DECLINED, NOT HALF-CERTIFIED. `idxOob len i` models
-/// `i ≥ len` only, so grounding the `Ge` disjunct of `Or([Lt(i,0), Ge(i,len)])` mints
-/// a certificate that is silent about the `i < 0` half the VC also states. That is a
-/// certificate about a proposition other than the VC's violation — the same defect
-/// class as certifying a hypothesis, one disjunct smaller. Since
-/// [`violation_candidates`] no longer descends into non-`And` `Or` disjuncts, the
-/// bare `Ge` half is not a candidate; and the `Or` itself is now RECOGNIZED, with its
-/// signedness, by [`bounds_violation_shape`], so the caller declines it BY NAME rather
-/// than by failing a `Ge`-only matcher (round-5 defect [4] — the right verdict was
-/// being reached as if the shape were not a bounds violation at all).
-/// MEASURED: 0 of the corpus's 33 certified
-/// bounds rows came from that position, so closing it withdrew nothing; modeling the
-/// signed form properly needs an `idxOobSigned` spec, which is a capability gap, not
-/// a selection bug. The UNSIGNED `Or`-free form — every bounds row the corpus
-/// actually certifies — is unaffected.
-fn emitted_bounds_violation<'a>(
-    func: &trust_types::VerifiableFunction,
-    formula: &'a trust_types::Formula,
-) -> Option<(&'a trust_types::Formula, bool)> {
-    let located = locate_violation(func, formula, |n| bounds_violation_shape(n).is_some())?;
-    let (_, _, signed) = bounds_violation_shape(located.node)?;
-    Some((located.node, signed))
 }
 
 /// The SHAPE of a bounds VC's emitted violation, destructured into
@@ -1891,26 +1233,6 @@ fn bounds_violation_shape(
         }
         _ => None,
     }
-}
-
-/// Trust: DIV/REM BY ZERO — the emitted violation `Eq(divisor, Int 0)`
-/// (`v2_divisor_is_zero_formula`, block_defs.rs:199). Emitted bare, like bounds, so
-/// POSITION is the discriminator — asserted HERE by [`candidate_at_body_position`],
-/// not left to the producer; a `#[requires] z == 0` on an unrelated variable no
-/// longer supplies the certified divisor. The assert-driven twin
-/// (`checked_div`/`guarded_div`, whose body is the bare condition local) reaches its
-/// core through [`violation_candidates_resolved`], which confirms the binding against
-/// the MIR's own defining statement.
-fn emitted_divzero_violation<'a>(
-    func: &trust_types::VerifiableFunction,
-    formula: &'a trust_types::Formula,
-) -> Option<&'a trust_types::Formula> {
-    use trust_types::Formula as F;
-    let is_core = |f: &F| {
-        matches!(f, F::Eq(a, b)
-            if formula_var_name(a).is_some() && matches!(&**b, F::Int(0)))
-    };
-    locate_violation(func, formula, is_core).map(|c| c.node)
 }
 
 /// Whether an integer operand `Formula` is in the formula-aware fragment — a bare
@@ -2237,6 +1559,139 @@ fn is_safety_vc_kind(kind: &trust_types::VcKind) -> bool {
     )
 }
 
+/// Trust: AUTHENTICATED-OBLIGATION RECONSTRUCTION (2026-07-31) — the trust-ir twin of
+/// `mirsem::vc_faithful::reconstruct_obligation`, byte-identical replay of the emitter's
+/// recorded wrappers (innermost-first) onto the recorded raw violation `body`. The two
+/// lanes MUST agree (the parity checker
+/// `prove::diagnosis_fully_faithful_matches_production_gate` pins them), so this is a
+/// deliberate copy, not a shared call across the module boundary. It is the load-bearing
+/// authenticator: the recorded obligation is admitted ONLY when
+/// `reconstruct_obligation(rec) == vc.formula` bit-for-bit, and the closed vocabulary
+/// (no `Implies`, no `Not`, no free-disjunct) makes every wrapper-spelling decoy fail the
+/// equate ⇒ DECLINE (fail-closed).
+fn reconstruct_obligation(rec: &trust_types::ObligationRecord) -> trust_types::Formula {
+    use trust_types::{Formula as F, ObligationWrapper as W, PathGuardTerm as P};
+    let mut cur = rec.body.clone();
+    for w in &rec.wrappers {
+        cur = match w {
+            W::ConjoinFactsLast { facts } => {
+                let mut v = facts.clone();
+                v.push(cur);
+                F::And(v)
+            }
+            W::PathGuardOr { paths } => {
+                let terms: Vec<F> = paths
+                    .iter()
+                    .map(|p| match p {
+                        P::Raw => cur.clone(),
+                        P::Guarded { guards } => {
+                            let mut c = guards.clone();
+                            match cur.clone() {
+                                F::And(inner) => c.extend(inner),
+                                other => c.push(other),
+                            }
+                            F::And(c)
+                        }
+                    })
+                    .collect();
+                match terms.len() {
+                    0 => cur,
+                    1 => terms.into_iter().next().expect("len checked == 1"),
+                    _ => F::Or(terms),
+                }
+            }
+        };
+    }
+    cur
+}
+
+/// The trust-ir twin of `mirsem::vc_faithful::authenticated_record` (FIELD-REQUIRED). Every
+/// safety arm certifies off the emitter's RECORDED obligation, admitted ONLY when it
+/// reconstructs to `vc.formula` bit-for-bit. `None` (no record) and a non-reconstructing
+/// (hostile/desync) record BOTH decline — the peel is deleted, so there is no fallback. The
+/// two lanes move in lockstep (parity checker).
+fn authenticated_record(
+    vc: &trust_types::VerificationCondition,
+) -> Option<&trust_types::ObligationRecord> {
+    let rec = vc.obligation.as_ref()?;
+    (reconstruct_obligation(rec) == vc.formula).then_some(rec)
+}
+
+/// The trust-ir twin of `mirsem::vc_faithful::record_pins_nonneg`: whether the record's
+/// conjoined FACTS pin `term ≥ 0` — the authenticated replacement for the sibling-conjunct
+/// read the deleted peel used for the unsigned-overflow vacuity side condition. The operand
+/// ranges are the innermost `ConjoinFactsLast` wrapper, shared across every path, so one
+/// check over the record's facts covers every occurrence the peel's universal quantified.
+fn record_pins_nonneg(
+    rec: &trust_types::ObligationRecord,
+    term: &trust_types::Formula,
+) -> bool {
+    rec.wrappers.iter().any(|w| match w {
+        trust_types::ObligationWrapper::ConjoinFactsLast { facts } => {
+            has_nonneg_range_sibling(facts, term)
+        }
+        trust_types::ObligationWrapper::PathGuardOr { .. } => false,
+    })
+}
+
+/// The certified core from an ALREADY-AUTHENTICATED obligation `body`, with a flag saying
+/// whether it came through the assert-condition indirection. The trust-ir twin of
+/// `mirsem::vc_faithful::assert_bound_or_body_core_with`: the body IS the core, or it is
+/// the bare `expected == false` assert-condition local whose MIR-confirmed binding
+/// ([`assert_condition_binding`]) is the core. No peel — the body was selected by the
+/// authenticated field read, not guessed out of the wrapped formula.
+fn authenticated_core<'a>(
+    func: &trust_types::VerifiableFunction,
+    formula: &'a trust_types::Formula,
+    body: &'a trust_types::Formula,
+    is_core: impl Fn(&trust_types::Formula) -> bool,
+) -> Option<(&'a trust_types::Formula, bool)> {
+    if is_core(body) {
+        return Some((body, false));
+    }
+    if formula_var_name(body).is_none() {
+        return None;
+    }
+    let bound = assert_condition_binding(func, formula, body)?;
+    is_core(bound).then_some((bound, true))
+}
+
+/// The MIR-confirmed binding of an `expected == false` assert-condition local named by the
+/// authenticated obligation `body` (a bare `Var(_c)`). The trust-ir twin of
+/// `mirsem::vc_faithful::assert_condition_binding`: the formula must carry exactly one
+/// `Eq(Var(_c), rhs)` conjunct, and that `rhs` must BE the comparison the MIR's own
+/// `extract_block_definitions_until` region defines `_c` by ([`mir_assert_condition_core`]).
+/// A `#[requires]` cannot manufacture a MIR defining statement, so this is closed rather
+/// than merely outnumbered.
+fn assert_condition_binding<'a>(
+    func: &trust_types::VerifiableFunction,
+    formula: &'a trust_types::Formula,
+    cond: &trust_types::Formula,
+) -> Option<&'a trust_types::Formula> {
+    use trust_types::Formula as F;
+    let want = base_var_name(cond)?;
+    let mir_core = mir_assert_condition_core(func, want)?;
+    fn collect<'a>(f: &'a F, want: &str, out: &mut Vec<&'a F>) {
+        if let F::Eq(lhs, rhs) = f
+            && base_var_name(lhs).is_some_and(|n| n == want)
+        {
+            out.push(rhs);
+            return;
+        }
+        match f {
+            F::And(v) | F::Or(v) => v.iter().for_each(|x| collect(x, want, out)),
+            _ => {}
+        }
+    }
+    let mut found: Vec<&F> = Vec::new();
+    collect(formula, want, &mut found);
+    let first = *found.first()?;
+    if !found.iter().all(|f| *f == first) {
+        return None;
+    }
+    formula_agrees_modulo_versions(first, &mir_core).then_some(first)
+}
+
 /// FORMULA-AWARE adequacy for ONE safety VC, keyed to the TRUST-IR specs, with the
 /// classified kind on success: ground the ACTUAL emitted violation core through the
 /// LIVE `clean_ground::ground_prop` and kernel-check it def-eq (modulo 3) to the
@@ -2249,7 +1704,7 @@ fn is_safety_vc_kind(kind: &trust_types::VcKind) -> bool {
 /// `func` must be the function this VC was EMITTED FROM. It is not consulted for the
 /// obligation — the certified core still comes out of `vc.formula` — but the
 /// assert-condition indirection is confirmed against its MIR
-/// ([`violation_candidates_resolved`]), which is the only thing that distinguishes the
+/// (`violation_candidates_resolved`), which is the only thing that distinguishes the
 /// emitter's own block definition of a condition local from a `#[requires]` that binds
 /// the same name.
 fn trustir_safety_vc_adequate_kind(
@@ -2264,12 +1719,22 @@ fn trustir_safety_vc_adequate_kind(
         // WHOLE core → `Int.le (g len) (g i)`; spec `idxOob (g len) i` over the SAME
         // grounded length term + index bvar.
         K::IndexOutOfBounds | K::SliceBoundsCheck => {
-            let Some((leaf, signed_index)) = emitted_bounds_violation(func, &vc.formula) else {
+            // Trust: AUTHENTICATED OBLIGATION (2026-08-01, FIELD-REQUIRED, trust-ir twin).
+            // The bounds core is the emitter's RECORDED body, admitted only when it
+            // reconstructs to `vc.formula`. No peel.
+            let Some(rec) = authenticated_record(vc) else {
                 return declined(
-                    "bounds VC: this VC's OWN emitted `Ge(index, len)` violation could not be \
-                     located unambiguously",
+                    "bounds VC: no authenticated recorded obligation (unrecorded, or \
+                     reconstruct != formula — hostile/desync) — fail closed",
                 );
             };
+            let Some((_, _, signed_index)) = bounds_violation_shape(&rec.body) else {
+                return declined(
+                    "bounds VC: the recorded obligation body is not this kind's \
+                     `Ge(index, len)` core",
+                );
+            };
+            let leaf = &rec.body;
             if signed_index {
                 // The KIND GAP, stated as one (round-5 defect [4]): the emitted
                 // violation is `Or([Lt(i,0), Ge(i,len)])` and `idxOob` models the `Ge`
@@ -2312,10 +1777,26 @@ fn trustir_safety_vc_adequate_kind(
         // DIV / REM by zero (kinds 3/8): the emitted core is `Eq(b, 0)`. Live-ground
         // → `@Eq Int b (Int.ofNat 0)`; spec `divByZero b` / `remByZero b`.
         K::DivisionByZero | K::RemainderByZero => {
-            let Some(leaf) = emitted_divzero_violation(func, &vc.formula) else {
+            // Trust: AUTHENTICATED OBLIGATION (2026-07-31, vertical slice ARM 1, trust-ir
+            // twin). Read the emitter's RECORDED obligation body when it authenticates
+            // (`reconstruct_obligation == vc.formula`); fall back to the peel
+            // (`emitted_divzero_violation`) when nothing is recorded (legacy dumps);
+            // DECLINE a recorded-but-unfaithful (hostile) claim rather than peeling around
+            // it. Must move in lockstep with the mirsem lane (parity checker).
+            let is_core = |f: &F| {
+                matches!(f, F::Eq(a, b)
+                    if formula_var_name(a).is_some() && matches!(&**b, F::Int(0)))
+            };
+            let Some(rec) = authenticated_record(vc) else {
                 return declined(
-                    "div/rem VC: this VC's OWN emitted `Eq(divisor, 0)` violation could not be \
-                     located unambiguously",
+                    "div/rem VC: no authenticated recorded obligation (unrecorded, or \
+                     reconstruct != formula — hostile/desync) — fail closed",
+                );
+            };
+            let Some((leaf, _)) = authenticated_core(func, &vc.formula, &rec.body, is_core) else {
+                return declined(
+                    "div/rem VC: the recorded obligation body is not this kind's \
+                     `Eq(divisor, 0)` core (nor a MIR-confirmed assert-condition binding of it)",
                 );
             };
             let F::Eq(b_f, _) = leaf else { unreachable!("guarded by the finder") };
@@ -2341,12 +1822,16 @@ fn trustir_safety_vc_adequate_kind(
             // emitted `Ge(Int(44), Int(64))`, the `ExprMeta::loose_bvar_range`-class
             // constant shift). Mirrors `mirsem.rs`'s Lemma-7 closed-literal arm
             // byte-for-byte, ported onto the trust-ir spec names.
-            let Some(invalid) = emitted_shift_violation(func, &vc.formula) else {
+            // Trust: AUTHENTICATED OBLIGATION (2026-08-01, FIELD-REQUIRED, trust-ir twin).
+            // The shift core is the emitter's RECORDED body, admitted only when it
+            // reconstructs to `vc.formula`. No peel.
+            let Some(rec) = authenticated_record(vc) else {
                 return declined(
-                    "shift VC: this VC's OWN emitted `And([input_range(n), invalid(n)])` \
-                     violation could not be located unambiguously",
+                    "shift VC: no authenticated recorded obligation (unrecorded, or \
+                     reconstruct != formula — hostile/desync) — fail closed",
                 );
             };
+            let invalid = &rec.body;
             // Destructure the emitter's own construction (`shift_violation_shape` is
             // what located it, so the re-match succeeds), and require the located
             // form's SIGNEDNESS to agree with `shift_ty` — a disagreement means the VC
@@ -2408,6 +1893,30 @@ fn trustir_safety_vc_adequate_kind(
             let Some(w) = u32::try_from(threshold).ok().and_then(IrShiftWidth::from_bits) else {
                 return declined("shift VC: emitted threshold is not a modeled width");
             };
+            // Trust: (D)/(E) AUTHENTICATED SUBJECT/WIDTH (2026-08-01, the [10] fix, trust-ir
+            // twin). The record carries the TRUE shifted-operand width (from MIR, not the
+            // fabricated `operand_ty`) and the shift amount as its subject. The recorded
+            // width must equal the emitted threshold `W` (which the emitter records as that
+            // true shifted width), and a recorded plain-`Var` subject must name the shift
+            // amount. This closes the shift width cross-check the peel era left open.
+            if let Some(rec_w) = rec.width {
+                if i128::from(rec_w) != threshold {
+                    return declined(
+                        "shift VC: the recorded shifted width disagrees with the emitted \
+                         threshold — a desynchronised record",
+                    );
+                }
+            }
+            if let Some(rec_subject) = rec.subject.as_ref() {
+                if let (Some(rs), Some(ns)) = (base_var_name(rec_subject), base_var_name(n_f)) {
+                    if rs != ns {
+                        return declined(
+                            "shift VC: the recorded subject names a variable other than the \
+                             certified shift amount",
+                        );
+                    }
+                }
+            }
             // Trust: M6 rung 6 — the CLOSED-LITERAL amount arm (unsigned only, exactly
             // mirroring the mirsem-side gate: a literal SIGNED amount has no observed
             // real-MIR `Or` core at a literal, so it stays declined rather than guessed).
@@ -2455,14 +1964,20 @@ fn trustir_safety_vc_adequate_kind(
                     // guard beneath, which turns "the `Lt` half is vacuous" from a
                     // comment into a checked side condition. The disjunct is taken
                     // FROM the located `Or`, never from a second walk of the formula.
-                    let Some(cand) = emitted_arith_violation_located(func, &vc.formula) else {
+                    // Trust: AUTHENTICATED OBLIGATION (2026-08-01, FIELD-REQUIRED, trust-ir
+                    // twin). The out-of-range core is the emitter's RECORDED body
+                    // (`Or([Lt(a+b,0), Gt(a+b,MAX)])`, operand ranges demoted to
+                    // `ConjoinFactsLast`), admitted only when it reconstructs to
+                    // `vc.formula`. The vacuity of the discarded half is checked against the
+                    // record's own conjoined ranges ([`record_pins_nonneg`]).
+                    let Some(rec) = authenticated_record(vc) else {
                         return declined(
-                            "uadd VC: this VC's OWN emitted `And([range(a), range(b), \
-                             out_of_range])` violation could not be located unambiguously",
+                            "uadd VC: no authenticated recorded obligation (unrecorded, or \
+                             reconstruct != formula — hostile/desync) — fail closed",
                         );
                     };
-                    let F::Or(disjuncts) = cand.node else {
-                        return declined("uadd VC: emitted violation is not the `Or` range form");
+                    let F::Or(disjuncts) = &rec.body else {
+                        return declined("uadd VC: recorded obligation body is not the `Or` range form");
                     };
                     let [F::Lt(under_t, zero_f), leaf @ F::Gt(..)] = disjuncts.as_slice() else {
                         return declined("uadd VC: no `Gt(a+b, MAX)` disjunct in the violation");
@@ -2511,10 +2026,7 @@ fn trustir_safety_vc_adequate_kind(
                              less than the emitted violation",
                         );
                     }
-                    if !cand.all_siblings(|sibs| {
-                        has_nonneg_range_sibling(sibs, a_op)
-                            && has_nonneg_range_sibling(sibs, b_op)
-                    }) {
+                    if !(record_pins_nonneg(rec, a_op) && record_pins_nonneg(rec, b_op)) {
                         return declined(
                             "uadd VC: the operand ranges do not pin both operands to `≥ 0`, \
                              so the discarded `Lt(a+b, 0)` disjunct is not provably vacuous",
@@ -2531,6 +2043,16 @@ fn trustir_safety_vc_adequate_kind(
                             "uadd VC: the width recovered from the emitted threshold is not a \
                              width this VC's own `operand_tys` mentions",
                         );
+                    }
+                    // Trust: (E) AUTHENTICATED WIDTH (2026-08-01). Recorded REAL operand
+                    // width must equal the width recovered from the emitted `MAX`.
+                    if let Some(rec_w) = rec.width {
+                        if rec_w != w.bits() {
+                            return declined(
+                                "uadd VC: the recorded operand width disagrees with the emitted \
+                                 threshold width — a desynchronised record",
+                            );
+                        }
                     }
                     if !mixed_width_narrowing_is_justified(&vc.kind, w.bits(), a_op, b_op) {
                         return declined(
@@ -2558,15 +2080,20 @@ fn trustir_safety_vc_adequate_kind(
                         BinOp::Sub => IrSignedOp::Sub,
                         _ => IrSignedOp::Mul,
                     };
-                    let Some(or) = emitted_arith_violation(func, &vc.formula) else {
+                    // Trust: AUTHENTICATED OBLIGATION (2026-08-01, FIELD-REQUIRED, trust-ir
+                    // twin). The out-of-range core is the emitter's RECORDED body
+                    // (`Or([Lt(a∘b,MIN), Gt(a∘b,MAX)])`), admitted only when it reconstructs
+                    // to `vc.formula`. A `var*var` BV mul records no such body ⇒ declines.
+                    let Some(rec) = authenticated_record(vc) else {
                         return declined(
-                            "signed overflow VC: this VC's OWN emitted `And([range(a), \
-                             range(b), Or([Lt(a∘b,MIN), Gt(a∘b,MAX)])])` violation could not be \
-                             located unambiguously (a var*var BV mul stays honestly deferred)",
+                            "signed overflow VC: no authenticated recorded obligation \
+                             (unrecorded, or reconstruct != formula — hostile/desync) — fail \
+                             closed (a var*var BV mul stays honestly deferred)",
                         );
                     };
+                    let or = &rec.body;
                     let F::Or(v) = or else {
-                        return declined("signed overflow VC: emitted violation is not the `Or` form");
+                        return declined("signed overflow VC: recorded body is not the `Or` form");
                     };
                     let [F::Lt(under_t, min_f), F::Gt(over_t, max_f)] = v.as_slice() else {
                         return declined("signed overflow VC: unexpected disjunct shape");
@@ -2594,6 +2121,17 @@ fn trustir_safety_vc_adequate_kind(
                              is not a width this VC's own `operand_tys` mentions",
                         );
                     }
+                    // Trust: (E) AUTHENTICATED WIDTH (2026-08-01). The record carries the
+                    // REAL operand width (the signed mixed-width fix — NOT `min(wa,wb)`); it
+                    // must equal the width recovered from the emitted `(MIN,MAX)`.
+                    if let Some(rec_w) = rec.width {
+                        if rec_w != w.bits() {
+                            return declined(
+                                "signed overflow VC: the recorded operand width disagrees with \
+                                 the emitted (MIN,MAX) width — a desynchronised record",
+                            );
+                        }
+                    }
                     if !mixed_width_narrowing_is_justified(&vc.kind, w.bits(), a_op, b_op) {
                         return declined(
                             "signed overflow VC: this VC's operand types have DIFFERENT widths \
@@ -2616,21 +2154,35 @@ fn trustir_safety_vc_adequate_kind(
                     let Some(w) = usub_underflow_vc_width(&vc.kind) else {
                         return declined("usub VC: operand widths unmodeled or mismatched");
                     };
-                    let Some(leaf) = emitted_arith_violation(func, &vc.formula) else {
+                    // Trust: AUTHENTICATED OBLIGATION (2026-08-01, FIELD-REQUIRED, trust-ir
+                    // twin). The underflow core is the emitter's RECORDED body
+                    // (`Lt(a-b, 0)`), admitted only when it reconstructs to `vc.formula`.
+                    let Some(rec) = authenticated_record(vc) else {
                         return declined(
-                            "usub VC: this VC's OWN emitted `And([range(a), range(b), \
-                             Lt(a−b, 0)])` violation could not be located unambiguously",
+                            "usub VC: no authenticated recorded obligation (unrecorded, or \
+                             reconstruct != formula — hostile/desync) — fail closed",
                         );
                     };
+                    let leaf = &rec.body;
                     let F::Lt(sub_t, zero) = leaf else {
-                        return declined("usub VC: emitted violation is not the `Lt(a−b, 0)` form");
+                        return declined("usub VC: recorded body is not the `Lt(a−b, 0)` form");
                     };
                     if !matches!(&**sub_t, F::Sub(_, _)) || !matches!(&**zero, F::Int(0)) {
-                        return declined("usub VC: emitted violation is not the `Lt(a−b, 0)` form");
+                        return declined("usub VC: recorded body is not the `Lt(a−b, 0)` form");
                     }
                     let Some((a_op, b_op)) = binop_operands(sub_t) else {
                         return declined("usub VC: operands outside the formula-aware fragment");
                     };
+                    // Trust: (E) AUTHENTICATED WIDTH (2026-08-01). The recorded REAL operand
+                    // width must equal the VC kind's tally width.
+                    if let Some(rec_w) = rec.width {
+                        if rec_w != w.bits() {
+                            return declined(
+                                "usub VC: the recorded operand width disagrees with the VC \
+                                 kind's width — a desynchronised record",
+                            );
+                        }
+                    }
                     let name = usub_underflows_ir_name(w);
                     (
                         Some(IrSafetyVcKind::USubUnderflow(w)),
@@ -2650,10 +2202,27 @@ fn trustir_safety_vc_adequate_kind(
         // constant-assignment block-def `Eq(k, -128)` and certified `NegOverflow(W8)`
         // for an `i32` negation (MEASURED before this fix).
         K::NegationOverflow { ty } => {
-            let Some((leaf, via_condition_local)) = emitted_neg_violation(func, &vc.formula) else {
+            // Trust: AUTHENTICATED OBLIGATION (2026-07-31, vertical slice ARM 2, trust-ir
+            // twin). Same three-way gate as div/rem: authenticated recorded body replaces
+            // the peel, peel is the legacy fallback, a recorded-but-unfaithful claim fails
+            // closed. The subject/width MIR cross-checks below are unchanged, and the
+            // recorded subject/width are additionally cross-checked (design (D)/(E)).
+            let is_core = |f: &F| {
+                matches!(f, F::Eq(l, r)
+                    if formula_var_name(l).is_some() && matches!(&**r, F::Int(_)))
+            };
+            let Some(rec) = authenticated_record(vc) else {
                 return declined(
-                    "negation VC: this VC's OWN emitted `Eq(x, MIN)` violation could not be \
-                     located unambiguously",
+                    "negation VC: no authenticated recorded obligation (unrecorded, or \
+                     reconstruct != formula — hostile/desync) — fail closed",
+                );
+            };
+            let Some((leaf, via_condition_local)) =
+                authenticated_core(func, &vc.formula, &rec.body, is_core)
+            else {
+                return declined(
+                    "negation VC: the recorded obligation body is not this kind's \
+                     `Eq(x, MIN)` core (nor a MIR-confirmed assert-condition binding of it)",
                 );
             };
             let F::Eq(x_f, min_f) = leaf else { unreachable!("guarded by the finder") };
@@ -2670,7 +2239,7 @@ fn trustir_safety_vc_adequate_kind(
             // Trust: SUBJECT AUTHENTICATION (2026-07-30, round-4 defect [2]). The two
             // checks that existed authenticated the OTHER two coordinates and were then
             // never brought into contact with the subject:
-            // [`violation_candidates_resolved`] authenticates WHICH COMPARISON the body's
+            // `violation_candidates_resolved` authenticates WHICH COMPARISON the body's
             // condition local is bound to, and the width cross-check below authenticates
             // the emitted threshold against `vc.kind`'s stored `ty`. Neither asks what
             // the located `Eq(x, MIN)` is ABOUT. So a dominating
@@ -2791,6 +2360,34 @@ fn trustir_safety_vc_adequate_kind(
                     "negation VC: the width recovered from the emitted `INT_MIN` threshold \
                      disagrees with the VC kind's own negated type",
                 );
+            }
+            // Trust: THE RECORDED SUBJECT/WIDTH ARE AUTHENTICATED TOO (2026-07-31,
+            // vertical-slice design (D)/(E), trust-ir twin of the mirsem check). When the
+            // emitter recorded an obligation (the `Authenticated` branch), its
+            // `subject`/`width` are CLAIMS cross-checked against the values MIR and the
+            // authenticated body already fixed: the recorded width must equal the
+            // MIR/threshold width proven above, and a recorded plain-`Var` subject must name
+            // the certified variable. A mismatch is a desynchronised/hostile record ⇒ fail
+            // closed. Runs only on the `Some` path, so no legacy row is affected.
+            if let Some(rec) = vc.obligation.as_ref() {
+                if let Some(rec_w) = rec.width {
+                    if rec_w != w.bits() {
+                        return declined(
+                            "negation VC: the recorded obligation width disagrees with the \
+                             MIR/threshold width being certified",
+                        );
+                    }
+                }
+                if let Some(rec_subject) = rec.subject.as_ref() {
+                    if let Some(rec_subject_name) = base_var_name(rec_subject) {
+                        if rec_subject_name != x_name {
+                            return declined(
+                                "negation VC: the recorded obligation subject names a variable \
+                                 other than the certified one",
+                            );
+                        }
+                    }
+                }
             }
             let name = neg_overflows_ir_name(w);
             (
@@ -3462,8 +3059,15 @@ mod tests {
             .iter()
             .find(|vc| matches!(vc.kind, VcKind::ArithmeticOverflow { .. }))
             .expect("u32 add raises an overflow VC");
-        let core =
-            emitted_arith_violation(&func, &vc.formula).expect("the emitted violation exists");
+        // Read the emitter's AUTHENTICATED obligation body (reconstruct-and-equate), exactly
+        // as the live certifier does — not a peel of the wrapped formula.
+        let rec = vc.obligation.as_ref().expect("the u32-add VC records its obligation");
+        assert_eq!(
+            reconstruct_obligation(rec),
+            vc.formula,
+            "the recorded obligation must authenticate against `vc.formula`"
+        );
+        let core = &rec.body;
         let F::Or(disjuncts) = core else { panic!("the u32-add core is the `Or` range form") };
         let leaf = &disjuncts[1];
         let F::Gt(add_t, _) = leaf else { panic!("guarded") };
@@ -3499,6 +3103,7 @@ mod tests {
                 Box::new(F::Int(1i128 << 32)), // off-by-one: 2^32, not 2^32−1
             ),
             contract_metadata: None,
+            obligation: None,
         };
         let verdict = trustir_safety_vc_adequate(&binop_func(BinOp::Add, 32, false), &vc);
         assert!(
@@ -3517,6 +3122,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: F::Var("x".into(), Sort::Int),
             contract_metadata: None,
+            obligation: None,
         };
         assert!(
             matches!(

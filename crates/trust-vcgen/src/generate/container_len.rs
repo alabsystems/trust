@@ -6,6 +6,28 @@
 
 use super::*;
 
+/// Whether `callee` is a canonical std container's inherent raw-pointer
+/// accessor. This licenses a non-null fact for FFI arguments, so both the
+/// method tail and the crate root are load-bearing.
+pub(super) fn is_std_container_as_ptr(callee: &str) -> bool {
+    let lower = callee.to_lowercase();
+    (lower.ends_with("::as_ptr") || lower.ends_with("::as_mut_ptr"))
+        && (callee.starts_with("core::")
+            || callee.starts_with("std::")
+            || callee.starts_with("alloc::"))
+        && (lower.contains("core::slice")
+            || lower.contains("std::slice")
+            || lower.contains("alloc::vec")
+            || lower.contains("std::vec")
+            || lower.contains("core::str")
+            || lower.contains("std::str")
+            || lower.contains("core::array")
+            || lower.contains("vec_deque")
+            || lower.contains("::c_str::")
+            || lower.contains("::ffi::cstr")
+            || lower.contains("::ffi::cstring"))
+}
+
 /// True iff the single whole-local def of `local` is an EMPTY `Vec` constructor
 /// (`Vec::new` / `Vec::with_capacity`). A non-empty / unknown creation (`vec![..]`,
 /// `to_vec`, `collect`, `Vec::from`, or a plain `Assign`) declines: only an empty
@@ -16,7 +38,7 @@ pub(super) fn vec_created_empty(func: &VerifiableFunction, local: usize) -> bool
             && dest.local == local
             && dest.projections.is_empty()
         {
-            return callee.contains("Vec")
+            return vc_callee_is_std_vec_inherent(callee)
                 && matches!(method_tail(callee), "new" | "with_capacity");
         }
     }
@@ -84,7 +106,9 @@ pub(super) fn vec_mut_borrows_only_feed_push(func: &VerifiableFunction, local: u
                     for (i, a) in args.iter().enumerate() {
                         if let Operand::Copy(pl) | Operand::Move(pl) = a
                             && pl.local == t
-                            && !(i == 0 && method_tail(callee) == "push" && callee.contains("Vec"))
+                            && !(i == 0
+                                && method_tail(callee) == "push"
+                                && vc_callee_is_std_vec_inherent(callee))
                         {
                             return false;
                         }
@@ -310,7 +334,7 @@ pub(super) fn pushes_all_guarded_same_bound(
     let mut saw_push = false;
     for block in &func.body.blocks {
         let Terminator::Call { func: callee, args, .. } = &block.terminator else { continue };
-        if method_tail(callee) != "push" || !callee.contains("Vec") {
+        if method_tail(callee) != "push" || !vc_callee_is_std_vec_inherent(callee) {
             continue;
         }
         let Some(Operand::Copy(recv) | Operand::Move(recv)) = args.first() else { continue };
@@ -875,26 +899,7 @@ pub(super) fn ffi_nonnull_locals(func: &VerifiableFunction) -> std::collections:
                 }
             }
             if let Terminator::Call { func: callee, dest, .. } = &block.terminator {
-                let lower = callee.to_lowercase();
-                let is_std_container_as_ptr = (lower.ends_with("::as_ptr")
-                    || lower.ends_with("::as_mut_ptr"))
-                    && (lower.contains("core::slice")
-                        || lower.contains("std::slice")
-                        || lower.contains("alloc::vec")
-                        || lower.contains("std::vec")
-                        || lower.contains("core::str")
-                        || lower.contains("std::str")
-                        || lower.contains("core::array")
-                        || lower.contains("vec_deque")
-                        // `CStr`/`CString::as_ptr` — a pointer INTO the owned
-                        // NUL-terminated buffer (the canonical libc-call
-                        // argument shape: `libc::access(path.as_ptr(), ..)`).
-                        // Never null: a `CString` always owns an allocation of
-                        // at least the NUL byte, and `CStr` is a reference.
-                        || lower.contains("::c_str::")
-                        || lower.contains("::ffi::cstr")
-                        || lower.contains("::ffi::cstring"));
-                if is_std_container_as_ptr && dest.projections.is_empty() {
+                if is_std_container_as_ptr(callee) && dest.projections.is_empty() {
                     nonnull.insert(place_to_var_name(func, dest));
                 }
             }

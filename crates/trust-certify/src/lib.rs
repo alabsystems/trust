@@ -7666,6 +7666,7 @@ mod tests {
                 Formula::Lt(Box::new(zero()), Box::new(x())),
             ]),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -7686,6 +7687,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: violation.clone(),
             contract_metadata: None,
+            obligation: None,
         };
         let ProofEvidence::CleanCic { term, context, lineage, .. } =
             certify_vc(&vc).expect("full-VC producer family must certify")
@@ -7947,6 +7949,7 @@ mod tests {
                 Formula::Lt(Box::new(Formula::Int(0)), Box::new(x())),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
 
         assert_eq!(term_to_smt(&x()).as_deref(), Some("trust_var_7829203a3a20696e6a6563746564"));
@@ -7979,6 +7982,7 @@ mod tests {
                 Formula::Not(Box::new(Formula::Ge(Box::new(sum()), Box::new(Formula::Int(0))))),
             ]),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -8017,6 +8021,7 @@ mod tests {
                 Formula::Lt(Box::new(x()), Box::new(minus_one())),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
 
         assert_eq!(term_to_smt(&minus_one()).as_deref(), Some("(- 1)"));
@@ -8285,6 +8290,7 @@ mod tests {
                 five(),
             ]),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -8299,6 +8305,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             ))))),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -8584,6 +8591,7 @@ mod tests {
                 Box::new(Formula::BitVec { value: 0, width: 64 }),
             ),
             contract_metadata: None,
+            obligation: None,
         };
         assert!(certify_vc(&bv_vc).is_none(), "BitVec violation must fail closed");
     }
@@ -8938,6 +8946,7 @@ mod tests {
                 ),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
 
         let vc_a = make("func_a");
@@ -9519,6 +9528,7 @@ mod tests {
                 ule(bv(violation_bound), idx()),
             ]),
             contract_metadata: None,
+            obligation: None,
         }
     }
 

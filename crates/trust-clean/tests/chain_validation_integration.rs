@@ -33,6 +33,7 @@ fn sample_vc() -> VerificationCondition {
             Box::new(Formula::Int(0)),
         ))),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -61,6 +62,7 @@ fn overflow_vc() -> VerificationCondition {
             ),
         ]))),
         contract_metadata: None,
+        obligation: None,
     }
 }
 

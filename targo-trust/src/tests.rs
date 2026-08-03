@@ -37,7 +37,7 @@ use super::{
     binary_solver_result_report_with_replay, binary_verify_shared_verification_summary,
     bounded_machine_architecture, build_binary_cli_proof_grade_gate, build_convert_cli_gate,
     build_convert_cli_gate_with_loader, build_decompile_report, build_exploit_evidence_gate,
-    build_exploit_find_report, build_lift_report, build_verify_binary_report,
+    build_exploit_find_report, build_lift_report, build_verify_binary_report, canonical_vc_bytes,
     checked_certificate_import_proof_grade_release_transcript_row_with_target_consumer,
     checked_certificate_import_release_transcript_binding,
     convert_checked_certificate_blocker_code, convert_checked_certificate_loader_failure_report,
@@ -271,7 +271,7 @@ fn attach_decompile_normalized_proof_export_artifact(
         .get_mut(0)
         .expect("fixture decompilation artifact should carry one dispatch");
     let canonical_vc_bytes =
-        serde_json::to_vec(dispatch.vc.as_ref().expect("fixture dispatch has canonical VC"))
+        canonical_vc_bytes(dispatch.vc.as_ref().expect("fixture dispatch has canonical VC"))
             .expect("fixture VC should serialize");
     attach_normalized_proof_export_artifact(
         root,
@@ -464,6 +464,7 @@ fn binary_vc(kind: VcKind) -> VerificationCondition {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -1496,7 +1497,7 @@ fn importable_binary_dispatch_with_kind(
     let vc = binary_vc(kind);
     let serializable_vc = SerializableVc::from_vc(&vc);
     let canonical_vc_bytes =
-        serde_json::to_vec(&serializable_vc).expect("fixture VC should serialize");
+        canonical_vc_bytes(&serializable_vc).expect("fixture VC should serialize");
     let dispatch = SolverDispatchRecord {
         id: id.to_string(),
         function: Some("main".to_string()),
@@ -2655,6 +2656,7 @@ fn test_exact_replay_sat_candidate_matches_checked_in_golden() {
         location: SourceSpan::binary_address(0x401010),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
     let (_reports, provenance_dispatch_records) = dispatch_binary_vcs_with_replay_evidence(
         &router,
@@ -3263,6 +3265,7 @@ fn replay_test_vc() -> trust_types::VerificationCondition {
         location: trust_types::SourceSpan::binary_address(0x401010),
         formula: trust_types::Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -4943,6 +4946,7 @@ fn test_verify_binary_dispatch_records_include_vc_origin_and_stable_canonical_by
         location: SourceSpan::binary_address(0x401010),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     let (reports, dispatch_records) = dispatch_binary_vcs_with_replay_evidence(
@@ -4978,11 +4982,11 @@ fn test_verify_binary_dispatch_records_include_vc_origin_and_stable_canonical_by
     assert_eq!(origin.instruction_bytes, vec![0x90]);
     assert_eq!(origin.source.as_ref(), Some(&SourceSpan::binary_address(0x401010)));
 
-    let canonical_bytes = serde_json::to_vec(record_vc).expect("serialize record VC");
+    let canonical_bytes = canonical_vc_bytes(record_vc).expect("serialize record VC");
     let regenerated_bytes =
-        serde_json::to_vec(&SerializableVc::from_vc(&vc)).expect("serialize regenerated VC");
+        canonical_vc_bytes(&SerializableVc::from_vc(&vc)).expect("serialize regenerated VC");
     assert_eq!(canonical_bytes, regenerated_bytes);
-    assert_eq!(canonical_bytes, serde_json::to_vec(record_vc).expect("serialize VC again"));
+    assert_eq!(canonical_bytes, canonical_vc_bytes(record_vc).expect("serialize VC again"));
 }
 
 #[test]
@@ -4999,6 +5003,7 @@ fn test_verify_binary_dispatch_context_binds_selected_image_identity_and_assumpt
         location: SourceSpan::binary_address(0x401010),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
     let (_reports, mut dispatch_records) = dispatch_binary_vcs_with_replay_evidence(
         &router,
@@ -5039,6 +5044,7 @@ fn test_verify_binary_dispatch_origin_omits_noncanonical_instruction_bytes() {
         location: SourceSpan::binary_address(0x401010),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     let (_reports, dispatch_records) = dispatch_binary_vcs_with_replay_evidence(
@@ -5088,6 +5094,7 @@ fn test_verify_binary_dispatch_origin_strips_noncanonical_memory_origin_bytes() 
         location: SourceSpan::binary_address(0x401010),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     let (_reports, dispatch_records) = dispatch_binary_vcs_with_replay_evidence(
@@ -16983,4 +16990,77 @@ fn test_parse_vc_kind_rejects_lossy_tags_and_keeps_unknown_assertions() {
         VcKind::Assertion { message } => assert_eq!(message, "custom::check"),
         other => panic!("expected assertion fallback, got {other:?}"),
     }
+}
+
+/// The canonical VC digest that binds every checked binary certificate in this
+/// crate is PINNED, and both halves of the pin are load-bearing.
+///
+/// Half 1 — an obligation-less VC keeps its ORIGINAL, pre-`obligation` digest.
+/// `d2515b3f…` is the value that shipped in
+/// `checked_certificate_export_blocker_golden.json`,
+/// `checked_certificate_export_raw_bytes_fail_closed_golden.json`, and
+/// `proof_grade_release_transcript_synthetic_unit_golden.json`. Adding a
+/// `#[serde(default)] Option<ObligationRecord>` field re-serialized these audited
+/// certificate identities as `…,"contract_metadata":null,"obligation":null}` and
+/// moved the digest to `77dd925b…` while saying nothing new — a `None` states
+/// exactly what every VC stated before the field existed. Routing the digest
+/// through `trust_types::stable_model_json_bytes` restores it bit-for-bit. If this
+/// assertion fails, a hash-domain change moved a shipped certificate pin; the
+/// repair is to canonicalize the new field, NOT to re-mint the goldens.
+///
+/// Half 2 — the strip must never widen into erasure. A populated obligation
+/// record names WHICH sub-formula of `formula` the emitter claims as the
+/// obligation. Two VCs with an identical `formula` but different claims are
+/// different objects; if they shared a digest, a forged record could ride an
+/// audited certificate identity. Only the literal default is invisible.
+#[test]
+fn canonical_vc_digest_pins_the_preobligation_value_and_stays_sensitive_to_a_real_record() {
+    let hash = |vc: &VerificationCondition| {
+        trust_types::digest::stable_sha256_hex(
+            &canonical_vc_bytes(&SerializableVc::from_vc(vc)).expect("canonical VC bytes"),
+        )
+    };
+
+    // Half 1: the exact digest the three checked-certificate goldens pin.
+    let undeclared = binary_vc(VcKind::DivisionByZero);
+    assert_eq!(
+        hash(&undeclared),
+        "d2515b3f23c3a1f4796b4586cc98ca0d1c836d9257f36e563ca18364b1ae5b89",
+        "an obligation-less VC must keep the canonical digest that shipped in the \
+         checked-certificate goldens; a `None` carries no information and must not \
+         move an audited certificate identity"
+    );
+    assert!(
+        !String::from_utf8(
+            canonical_vc_bytes(&SerializableVc::from_vc(&undeclared)).expect("canonical VC bytes")
+        )
+        .expect("canonical VC bytes are UTF-8 JSON")
+        .contains("\"obligation\""),
+        "a None obligation must not appear in canonical VC bytes at all"
+    );
+
+    // Half 2: a real record IS part of VC identity, and different records are
+    // different identities under the very same formula.
+    let with_record = |body: &str| {
+        let mut vc = binary_vc(VcKind::DivisionByZero);
+        vc.obligation = Some(trust_types::ObligationRecord {
+            body: Formula::Var(body.into(), trust_types::Sort::Bool),
+            wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast { facts: vec![] }],
+            subject: None,
+            width: None,
+        });
+        vc
+    };
+    let claims_core = hash(&with_record("core"));
+    let claims_decoy = hash(&with_record("decoy"));
+    assert_ne!(
+        hash(&undeclared),
+        claims_core,
+        "a populated obligation record must be hash-visible, not stripped like the default"
+    );
+    assert_ne!(
+        claims_core, claims_decoy,
+        "two different obligation claims over the same formula must not share a canonical \
+         VC digest — that is the certificate-forgery vector the record exists to close"
+    );
 }

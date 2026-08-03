@@ -4086,6 +4086,7 @@ fn selected_slice_release_transcript_dispatch(
         location: SourceSpan::binary_address(function_entry),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
     let serializable_vc = SerializableVc::from_vc(&vc);
     let canonical_vc_bytes =
@@ -4154,6 +4155,7 @@ fn checked_certificate_readback_dispatch(dispatch_id: &str) -> (SolverDispatchRe
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
     let serializable_vc = SerializableVc::from_vc(&vc);
     let canonical_vc_bytes =

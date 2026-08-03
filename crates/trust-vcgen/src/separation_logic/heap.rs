@@ -164,6 +164,7 @@ impl SymbolicHeap {
                     location: span.clone(),
                     formula: Formula::Bool(true), // definite violation
                     contract_metadata: None,
+                    obligation: None,
                 });
                 return vcs;
             }
@@ -181,6 +182,7 @@ impl SymbolicHeap {
                     location: span.clone(),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
 
@@ -198,6 +200,7 @@ impl SymbolicHeap {
                     location: span.clone(),
                     formula: Formula::Not(Box::new(bounds)),
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
         }
@@ -233,6 +236,7 @@ impl SymbolicHeap {
                     location: span.clone(),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 });
                 return vcs;
             }
@@ -250,6 +254,7 @@ impl SymbolicHeap {
                     location: span.clone(),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
         }

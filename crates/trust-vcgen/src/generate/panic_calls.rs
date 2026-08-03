@@ -919,7 +919,7 @@ pub(super) fn v2_overflow_call_body(
     kind: OverflowCall,
     args: &[Operand],
     dest: &Place,
-) -> Option<(Formula, BinOp, Ty, Ty)> {
+) -> Option<(Formula, BinOp, Ty, Ty, u32)> {
     match kind {
         OverflowCall::Unchecked(op) => {
             // `unchecked_{add,sub,mul}(a, b)`: identical obligation to the inner
@@ -948,7 +948,9 @@ pub(super) fn v2_overflow_call_body(
                 Formula::Gt(Box::new(result), Box::new(max_f)),
             ]);
             let body = Formula::And(vec![lhs_range, rhs_range, out_of_range]);
-            Some((body, op, lhs_ty, rhs_ty))
+            // `width` is the REAL operand width (`int_op_type`, non-constant operand);
+            // the call arm records it on the authenticated obligation.
+            Some((body, op, lhs_ty, rhs_ty, width))
         }
         OverflowCall::Pow => {
             // `base.pow(exp)` — the receiver is the first arg, the exponent the
@@ -1001,7 +1003,7 @@ pub(super) fn v2_overflow_call_body(
                     return None;
                 }
                 // Provably-overflowing constant pow: emit a fail-closed obligation.
-                return Some((Formula::Bool(true), BinOp::Mul, result_ty.clone(), result_ty));
+                return Some((Formula::Bool(true), BinOp::Mul, result_ty.clone(), result_ty, width));
             }
 
             // CONSTANT exponent (the dominant case: `.pow(2)`, `.pow(3)`). Unroll
@@ -1034,7 +1036,7 @@ pub(super) fn v2_overflow_call_body(
                     ]);
                     let base_range = crate::range::input_range_constraint(&base_f, width, signed);
                     let body = Formula::And(vec![base_range, out_of_range]);
-                    return Some((body, BinOp::Mul, result_ty.clone(), result_ty));
+                    return Some((body, BinOp::Mul, result_ty.clone(), result_ty, width));
                 }
             }
 
@@ -1051,7 +1053,7 @@ pub(super) fn v2_overflow_call_body(
             let base_big = Formula::Ge(Box::new(base_f), Box::new(Formula::Int(2)));
             let exp_big = Formula::Ge(Box::new(exp_f), Box::new(Formula::Int(exp_threshold)));
             let body = Formula::And(vec![base_big, exp_big]);
-            Some((body, BinOp::Mul, result_ty.clone(), result_ty))
+            Some((body, BinOp::Mul, result_ty.clone(), result_ty, width))
         }
     }
 }

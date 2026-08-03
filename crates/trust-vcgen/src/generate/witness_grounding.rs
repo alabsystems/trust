@@ -959,8 +959,7 @@ pub(super) fn dominating_len_equality_guard(
                     if dest.local == l
                         && dest.projections.is_empty()
                         && method_tail(callee) == "len"
-                        && callee.contains("Vec")
-                        && !callee.contains(" as "))
+                        && vc_callee_is_std_vec_inherent(callee))
         })
     };
     let len_local_for = |op: &Operand, cands: &[Place]| -> Option<usize> {
@@ -1074,7 +1073,7 @@ pub(super) fn leaf_push_blocks(func: &VerifiableFunction, leaf: usize) -> Vec<us
     let mut out = Vec::new();
     for block in &func.body.blocks {
         let Terminator::Call { func: callee, args, .. } = &block.terminator else { continue };
-        if method_tail(callee) != "push" || !callee.contains("Vec") {
+        if method_tail(callee) != "push" || !vc_callee_is_std_vec_inherent(callee) {
             continue;
         }
         let Some(Operand::Copy(recv) | Operand::Move(recv)) = args.first() else { continue };

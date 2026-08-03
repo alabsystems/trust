@@ -949,8 +949,28 @@ const P_ACYC_EXPR_ARC_TYPE_HASHES: &[&str] = &[
     "375a273ab89b0c245a9401fbff0e1f75f88cf5291ba71d1ae6247eac5cc4b7b2",
 ];
 
+/// Hash a payload type in the SAME canonical domain the audited pins were
+/// minted in — [`Ty::try_stable_shape_hash`], whose whole purpose is
+/// "audited type-layout pins".
+///
+/// Hashing the RAW `serde_json` bytes instead makes every pin above a hostage
+/// of `Ty`'s serde ENVELOPE rather than of the type GRAPH it is supposed to
+/// pin: each additive `#[serde(default)] Option<_>` field on `Ty::Adt`
+/// re-serializes as `,"<key>":null` for every already-audited type and moves
+/// all eight Adt hashes at once, while carrying no type information. That has
+/// now happened twice — `faithful_enum_repr` (B3-1), then `layout` (B3-4 T3),
+/// `enum_layout` (B3-3) and `adt_kind` (W19) — and the first occurrence was
+/// closed by fae9701cda, which restored the golden pins rather than accepting
+/// re-pinned ones, precisely because a re-pin launders an unreviewed graph
+/// through a mechanical-looking digest refresh.
+///
+/// `try_stable_shape_hash` strips exactly those defaulted `None`s (a `Some` IS
+/// hash-visible and belongs in identity), so the golden pins stay valid and
+/// the next such field cannot move them either. Verified: with this domain,
+/// all eleven pinned hashes across both lists reproduce their original audited
+/// values bit-for-bit.
 fn p_acyc_type_hash(ty: &Ty) -> Option<String> {
-    serde_json::to_vec(ty).ok().map(|bytes| trust_types::stable_sha256_hex(&bytes))
+    ty.try_stable_shape_hash().ok()
 }
 
 fn p_acyc_pinned_payload_type(ty: &Ty) -> bool {

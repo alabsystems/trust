@@ -92,6 +92,7 @@ pub fn generate_infoflow_vcs_with_policy(
             // proved the leak, so the obligation is intentionally undischargeable.
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         })
         .collect()
 }

@@ -533,6 +533,7 @@ pub fn generate_lifetime_vcs(
             location: span,
             formula: Formula::Bool(false), // error = unsatisfiable
             contract_metadata: None,
+            obligation: None,
         });
     }
 
@@ -550,6 +551,7 @@ pub fn generate_lifetime_vcs(
                 location: constraint.span.clone(),
                 formula: Formula::Bool(true), // constraint, not violation
                 contract_metadata: None,
+                obligation: None,
             });
         }
     }

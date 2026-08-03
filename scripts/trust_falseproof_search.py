@@ -52,10 +52,11 @@ import re
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TRUSTC = os.environ.get("TRUSTC", os.path.join(REPO, "build/host/stage2/bin/trustc"))
+# No z3 link/runtime paths: the stage2 `trustc` SMT backend is the pure-Rust
+# `ay` solver — it links no libz3 and dlopens none at runtime (verified
+# 2026-08-01: no z3-sys/links="z3" in any Cargo.lock; `otool -L trustc` is
+# z3-clean). Re-adding these would resurrect a dead knob.
 ENV = dict(os.environ)
-ENV["LIBRARY_PATH"] = "/tmp/trust_link_shims:/opt/homebrew/opt/z3/lib:" + ENV.get("LIBRARY_PATH", "")
-ENV["LD_LIBRARY_PATH"] = "/opt/homebrew/opt/z3/lib:" + ENV.get("LD_LIBRARY_PATH", "")
-ENV["DYLD_LIBRARY_PATH"] = "/opt/homebrew/opt/z3/lib:" + ENV.get("DYLD_LIBRARY_PATH", "")
 
 VERDICT_RE = re.compile(
     r"Trust verification: (\d+) proved, (\d+) failed, (\d+) unknown, "

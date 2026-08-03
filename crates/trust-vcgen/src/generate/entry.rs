@@ -602,6 +602,11 @@ pub(super) fn generate_vcs_impl(
             // cheap containment check so an `Ite`-free VC pays no rewrite.
             if formula_contains_ite(&vc.formula) {
                 vc.formula = eliminate_term_ites(&vc.formula, ITE_ELIM_CASE_CAP);
+                // Trust (GAP 2): apply the SAME term-`Ite` elimination to the recorded
+                // obligation's body/subject/wrappers, so an `Ite`-carrying VC's record
+                // still reconstructs to the REWRITTEN `formula` rather than the
+                // pre-elimination form. No-op when the VC carries no obligation.
+                ob_record_eliminate_ites(vc, ITE_ELIM_CASE_CAP);
             }
         }
     }

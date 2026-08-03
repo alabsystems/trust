@@ -358,6 +358,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: trust_types::Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
         let result = VerificationResult::Proved {
             solver: "constant-folder".into(),
@@ -421,6 +422,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: trust_types::Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
         let descriptors = descriptors_for_vcs([&vc], Some(MirStrategy::BoundedModelCheck));
         let function_result = VerifierFunctionResult::from_function_level_result(

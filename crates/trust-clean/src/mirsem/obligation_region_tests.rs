@@ -85,6 +85,54 @@ fn var(n: &str) -> Formula {
     Formula::Var(n.into(), Sort::Int)
 }
 
+/// Trust: THE AUTHENTICATED-PATH TEST ADAPTER (2026-08-01, FIELD-REQUIRED). Every safety
+/// arm now REQUIRES an authenticated obligation (the peel is deleted), so a hand-built VC
+/// whose `formula` IS the emitter's raw violation body carries a record whose `body` is
+/// exactly that formula and whose wrapper list is empty — `reconstruct_obligation(rec) ==
+/// formula` holds trivially, so the arm reads `body` and behaves EXACTLY as the deleted
+/// peel did on an unwrapped formula. This preserves each pinned property (a decoy body
+/// still fails `is_core`; a bare core still certifies) while routing it through the field
+/// authentication rather than the peel. Tests that pin a WRAPPED body (operand ranges as
+/// `ConjoinFactsLast` — the uadd/umul vacuity tests) build their records explicitly.
+fn authed_body(formula: &Formula) -> Option<trust_types::ObligationRecord> {
+    Some(trust_types::ObligationRecord {
+        body: formula.clone(),
+        wrappers: vec![],
+        subject: None,
+        width: None,
+    })
+}
+
+/// Trust: the test-side mirror of the production `vc_faithful::authenticated_record` (which
+/// is private to the certifier): the emitter's obligation body for a VC, `Some(&body)` iff a
+/// record is present AND reconstructs to `vc.formula` bit-for-bit — the same admission gate
+/// the live certifier applies before it reads the body. This is the FAITHFUL replacement for
+/// the deleted `emitted_obligation_body` peel at the sites that read the certified body: the
+/// peel guessed the body out of the wrapped formula; this reads the authenticated field. On
+/// this corpus the two agree exactly (measured 2026-08-01), which is why the substitution
+/// preserves every assertion.
+fn authenticated_obligation_body(vc: &VerificationCondition) -> Option<&Formula> {
+    let rec = vc.obligation.as_ref()?;
+    (reconstruct_obligation(rec) == vc.formula).then_some(&rec.body)
+}
+
+/// Trust: the test-side replacement for the deleted `#[cfg(test)]` `find_violation_leaf`
+/// probe — does `f` contain a subterm matching `pred` anywhere? Used ONLY to assert a
+/// fixture's own PREMISE (a hypothesis decoy is present in the wrapped formula; a recorded
+/// body carries / does not carry a modeled leaf), never to drive the live certifier, which
+/// reads the authenticated body directly and never searches the tree.
+fn contains_leaf(f: &Formula, pred: &dyn Fn(&Formula) -> bool) -> bool {
+    if pred(f) {
+        return true;
+    }
+    match f {
+        Formula::And(v) | Formula::Or(v) => v.iter().any(|x| contains_leaf(x, pred)),
+        Formula::Not(a) => contains_leaf(a, pred),
+        Formula::Implies(a, b) => contains_leaf(a, pred) || contains_leaf(b, pred),
+        _ => false,
+    }
+}
+
 /// The empty body a HAND-BUILT `VerificationCondition` is certified against. The
 /// formula-driven routes never read it; the ASSERT-bound route does — and an empty body
 /// binds no assert condition local, which is exactly the fail-closed answer for a VC
@@ -116,42 +164,12 @@ fn certified_kinds(func: &VerifiableFunction) -> Vec<SafetyVcKind> {
 }
 
 // ---------------------------------------------------------------------------------
-// 0. The wrapper-inverse, cross-validated against the PROVEN shift locator.
+// 0. [REMOVED 2026-08-01] `obligation_body_agrees_with_the_shift_emitter_locator` was a
+//    PURE PEEL-MECHANISM cross-check: it asserted the two deleted peel derivations
+//    (`emitted_obligation_body` and the `emitted_shift_violation_pair_probe`) agree on the
+//    ladder's shift VCs. Both peels are deleted (production authenticates a recorded
+//    obligation instead), so there is nothing left to cross-check.
 // ---------------------------------------------------------------------------------
-
-/// `emitted_obligation_body` (derived from the CONJOIN discipline: every wrapper pushes
-/// the body last, and the path-guard map distributes one copy of it per path) and
-/// `emitted_shift_violation_pair_probe` (derived from `v2_shift_violation_formula`'s
-/// VERBATIM `And([input_range_constraint, invalid])` pair, singleton-or-nothing) are two
-/// INDEPENDENT derivations of "this VC's own emitted violation". On every shift VC in
-/// the committed ladder they must agree exactly — that agreement is the evidence the
-/// wrapper-inverse is the wrapper-inverse and not a heuristic. It is also the guard
-/// that keeps the two from drifting apart.
-///
-/// Trust: the pair probe is `#[cfg(test)]` (lane A round-3 finding [1]) — it was the
-/// production locator until the shape match was shown forgeable when run over the whole
-/// `vc.formula`. It survives ONLY as this cross-check.
-#[test]
-fn obligation_body_agrees_with_the_shift_emitter_locator() {
-    let mut total = 0usize;
-    for path in ladder_fixtures() {
-        let bytes = std::fs::read(&path).expect("read fixture");
-        let Ok(func) = serde_json::from_slice::<VerifiableFunction>(&bytes) else { continue };
-        for vc in &trust_vcgen::generate_vcs(&func) {
-            if !matches!(vc.kind, VcKind::ShiftOverflow { .. }) {
-                continue;
-            }
-            total += 1;
-            assert_eq!(
-                emitted_shift_violation_pair_probe(&vc.formula),
-                emitted_obligation_body(&vc.formula),
-                "{}: the wrapper-inverse and the shift emitter locator disagree",
-                path.display()
-            );
-        }
-    }
-    assert_eq!(total, 77, "the ladder raises 77 shift VCs");
-}
 
 // ---------------------------------------------------------------------------------
 // 1. THE SITE-WIDE CONTRACT — an obligation with no modeled core is never certified.
@@ -271,6 +289,7 @@ fn no_site_certifies_an_obligation_whose_own_body_has_no_modeled_core() {
             location: SourceSpan::default(),
             formula: Formula::And(vec![hypothesis.clone(), Formula::Bool(true)]),
             contract_metadata: None,
+            obligation: None,
         };
         if let Some((k, _)) = safety_vc_is_faithful_formula_aware(&probe_func(), &vc) {
             forged.push(format!("{tag} -> {k:?}"));
@@ -330,6 +349,7 @@ fn no_site_certifies_through_a_negation_or_an_implication_hypothesis() {
                 location: SourceSpan::default(),
                 formula,
                 contract_metadata: None,
+                obligation: None,
             };
             if let Some((k, _)) = safety_vc_is_faithful_formula_aware(&probe_func(), &vc) {
                 forged.push(format!("{tag} / {shape} -> {k:?}"));
@@ -393,15 +413,22 @@ fn a_slice_length_type_bound_can_never_supply_a_bounds_core() {
                     && (formula_var_name(b).is_some() || matches!(&**b, Formula::Int(_))))
         };
         for vc in bounds {
-            // The obligation itself carries NO modeled `Ge(i, len)` core …
-            let body = emitted_obligation_body(&vc.formula).expect("an obligation body");
+            // The VC carries NO authenticated modeled `Ge(i, len)` core: either no record
+            // (these container-length slice-range VCs record `obligation: None`) or a record
+            // whose body is not the modeled shape. Read through the SAME admission gate the
+            // live certifier uses (reconstruct-and-equate), never a peel of the formula.
             assert!(
-                find_violation_leaf(body, &is_bounds_probe).is_none(),
-                "{name}: this test needs a bounds VC OUTSIDE the modeled shape; got {body:?}"
+                authenticated_obligation_body(vc).is_none_or(|b| !is_bounds_probe(b)),
+                "{name}: this test needs a bounds VC OUTSIDE the modeled shape; got an \
+                 authenticated modeled core {:?}",
+                authenticated_obligation_body(vc)
             );
-            // … but the WRAPPED formula does — otherwise this test measures nothing.
+            // … but the WRAPPED formula still carries a `Ge`-shaped hypothesis (the
+            // slice-length type bound) — the leaf the pre-authentication whole-formula scan
+            // used to read. Asserted so the fixture drifting away from the collision this
+            // test pins fails loudly rather than passing vacuously.
             assert!(
-                find_violation_leaf(&vc.formula, &is_bounds_probe).is_some(),
+                contains_leaf(&vc.formula, &is_bounds_probe),
                 "{name}: the wrapper no longer carries a `Ge`-shaped hypothesis, so the \
                  collision this test exists to pin is gone — re-derive it before \
                  weakening the assertion"
@@ -451,12 +478,14 @@ fn an_unsigned_add_certifies_its_own_width_not_a_semantic_guard() {
             {
                 continue;
             }
-            let body = emitted_obligation_body(&vc.formula).expect("an obligation body");
+            // Read the emitter's authenticated obligation body (reconstruct-and-equate),
+            // exactly as the live certifier does — not a peel of the wrapped formula.
+            let body = authenticated_obligation_body(vc).expect("the itoa add VC records its \
+                obligation, authenticating against `vc.formula`");
             // Only the rows whose own threshold is the u8 MAX are the mis-certified ones.
-            let emits_u8 = find_violation_leaf(body, &|f| {
+            let emits_u8 = contains_leaf(body, &|f| {
                 matches!(f, Formula::Gt(_, r) if matches!(&**r, Formula::Int(255)))
-            })
-            .is_some();
+            });
             if !emits_u8 {
                 continue;
             }
@@ -993,11 +1022,10 @@ fn a_mixed_path_guard_or_can_never_supply_a_bounds_core() {
             vc.formula
         );
         assert!(
-            find_violation_leaf(&vc.formula, &|f| matches!(f, Formula::Ge(_, r)
-                if matches!(&**r, Formula::Int(8))))
-            .is_some(),
+            contains_leaf(&vc.formula, &|f| matches!(f, Formula::Ge(_, r)
+                if matches!(&**r, Formula::Int(8)))),
             "the dominating guard `Ge(i, 8)` must still be IN the wrapped formula — it is \
-             the leaf the forgery reads"
+             the leaf the pre-authentication whole-formula scan read"
         );
         assert_eq!(
             safety_vc_is_faithful_formula_aware(&func, vc).map(|(k, _)| k),
@@ -1250,12 +1278,18 @@ fn the_certified_width_must_agree_with_the_vc_kinds_own_width() {
 
     let mut forged: Vec<String> = Vec::new();
     for (tag, kind, body) in mismatched {
+        // Authenticated-path conversion: the record's `body` IS this honest-shaped violation
+        // (no wrapper), so the arm reads it and the WIDTH cross-check runs exactly as it did
+        // off the peeled body — `width: None` leaves the recorded-width check inert, so the
+        // decline is the formula/kind width disagreement, not a missing record.
+        let obligation = authed_body(&body);
         let vc = VerificationCondition {
             kind,
             function: "crate::probe".into(),
             location: SourceSpan::default(),
             formula: body,
             contract_metadata: None,
+            obligation,
         };
         // The negation rows are probed against a MIR that really negates `y` at i32, so
         // the SUBJECT check (round-5 defect [1]) passes and the row keeps measuring the
@@ -1313,12 +1347,14 @@ fn the_certified_width_must_agree_with_the_vc_kinds_own_width() {
         ),
     ];
     for (tag, kind, body, want) in agreeing {
+        let obligation = authed_body(&body);
         let vc = VerificationCondition {
             kind,
             function: "crate::probe".into(),
             location: SourceSpan::default(),
             formula: body,
             contract_metadata: None,
+            obligation,
         };
         // See the note on the `mismatched` loop: the negation row is probed against a MIR
         // that negates `y` at i32, which is what makes this a POSITIVE control for the
@@ -1620,12 +1656,20 @@ fn an_implication_is_a_wrapper_only_at_the_outermost_position() {
     let assumption = || Formula::Var("__trust_alias_no_alias".into(), Sort::Bool);
     let mut forged: Vec<String> = Vec::new();
     for (tag, kind, core) in site_cores() {
-        let vc_at = |formula: Formula| VerificationCondition {
-            kind: kind.clone(),
-            function: "crate::probe".into(),
-            location: SourceSpan::default(),
-            formula,
-            contract_metadata: None,
+        // Authenticated-path conversion: the record's `body` IS the given formula (bare core
+        // or `Implies`-wrapped), so `is_core` is applied to it directly. A bare core
+        // certifies; an `Implies`/case-split body fails `is_core` and declines — the same
+        // verdict the peel's position restriction produced, now via the field authentication.
+        let vc_at = |formula: Formula| {
+            let obligation = authed_body(&formula);
+            VerificationCondition {
+                kind: kind.clone(),
+                function: "crate::probe".into(),
+                location: SourceSpan::default(),
+                formula,
+                contract_metadata: None,
+                obligation,
+            }
         };
         // The MIR each row's core is honest against. Only the NEGATION arm reads the
         // function at all (round-5 defect [1]: the certified variable must be one this
@@ -1734,6 +1778,13 @@ fn signed_add_vc(
     b_op: Formula,
 ) -> VerificationCondition {
     let sum = Formula::Add(Box::new(a_op), Box::new(b_op));
+    let formula = Formula::Or(vec![
+        Formula::Lt(Box::new(sum.clone()), Box::new(Formula::Int(min))),
+        Formula::Gt(Box::new(sum), Box::new(Formula::Int(max))),
+    ]);
+    // Authenticated-path conversion: the record's `body` IS the `Or` out-of-range core, so
+    // the arm reads it and the mixed-width narrowing check runs exactly as off the peel.
+    let obligation = authed_body(&formula);
     VerificationCondition {
         kind: VcKind::ArithmeticOverflow {
             op: BinOp::Add,
@@ -1744,11 +1795,9 @@ fn signed_add_vc(
         },
         function: "crate::probe".into(),
         location: SourceSpan::default(),
-        formula: Formula::Or(vec![
-            Formula::Lt(Box::new(sum.clone()), Box::new(Formula::Int(min))),
-            Formula::Gt(Box::new(sum), Box::new(Formula::Int(max))),
-        ]),
+        formula,
         contract_metadata: None,
+        obligation,
     }
 }
 
@@ -1941,6 +1990,7 @@ fn a_negation_certificate_must_name_a_variable_the_mir_actually_negates() {
         location: SourceSpan::default(),
         formula: Formula::Eq(Box::new(var("y")), Box::new(Formula::Int(-128))),
         contract_metadata: None,
+        obligation: None,
     };
     // NOT VACUOUS: `vc.kind`'s own width check passes — W8 kind, W8 threshold — so the
     // ONLY thing that can decline this row is the subject's own type.
@@ -2034,7 +2084,7 @@ fn a_signed_index_bounds_violation_is_certified_by_no_arm() {
     let bodies: Vec<_> = trust_vcgen::generate_vcs(&signed)
         .iter()
         .filter(|vc| matches!(vc.kind, VcKind::IndexOutOfBounds | VcKind::SliceBoundsCheck))
-        .filter_map(|vc| emitted_obligation_body(&vc.formula).cloned())
+        .filter_map(|vc| authenticated_obligation_body(vc).cloned())
         .collect();
     // NOT VACUOUS: the shape this test is about must actually be what the emitter built.
     assert!(
@@ -2050,23 +2100,46 @@ fn a_signed_index_bounds_violation_is_certified_by_no_arm() {
         certified_kinds(&signed)
     );
 
-    // API: the same violation under an ordinary conjoining wrapper, and bare.
+    // API: the same violation, AUTHENTICATED — bare, and under an ordinary conjoining
+    // wrapper (the emitter's `ConjoinFactsLast`). Each record reconstructs to its `formula`,
+    // so the decline below is the bounds arm rejecting the SIGNED `Or` form
+    // (`carries_signed_index_violation`), not the authentication failing for want of a record.
     let signed_or = || {
         Formula::Or(vec![
             Formula::Lt(Box::new(var("i")), Box::new(Formula::Int(0))),
             Formula::Ge(Box::new(var("i")), Box::new(var("n"))),
         ])
     };
-    for (tag, formula) in [
-        ("bare", signed_or()),
-        ("wrapped", Formula::And(vec![Formula::Bool(true), signed_or()])),
-    ] {
+    let api_recs = [
+        (
+            "bare",
+            trust_types::ObligationRecord {
+                body: signed_or(),
+                wrappers: vec![],
+                subject: None,
+                width: None,
+            },
+        ),
+        (
+            "wrapped",
+            trust_types::ObligationRecord {
+                body: signed_or(),
+                wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast {
+                    facts: vec![Formula::Bool(true)],
+                }],
+                subject: None,
+                width: None,
+            },
+        ),
+    ];
+    for (tag, rec) in api_recs {
         let vc = VerificationCondition {
             kind: VcKind::IndexOutOfBounds,
             function: "crate::probe".into(),
             location: SourceSpan::default(),
-            formula,
+            formula: reconstruct_obligation(&rec),
             contract_metadata: None,
+            obligation: Some(rec),
         };
         assert_eq!(
             safety_vc_is_faithful_formula_aware(&probe_func(), &vc).map(|(k, _)| k),
@@ -2105,57 +2178,68 @@ fn a_uadd_certificate_requires_its_discarded_disjunct_to_be_vacuous() {
     };
     let guard = |g: &str| Formula::Var(g.into(), Sort::Bool);
     let u8t = || Ty::Int { width: 8, signed: false };
-    let vc_at = |formula: Formula| VerificationCondition {
-        kind: VcKind::ArithmeticOverflow { op: BinOp::Add, operand_tys: (u8t(), u8t()) },
-        function: "crate::probe".into(),
-        location: SourceSpan::default(),
-        formula,
-        contract_metadata: None,
+    // Trust: AUTHENTICATED-PATH CONVERSION (2026-08-01). The vacuity of the discarded
+    // `Lt(a+b, 0)` half is now checked against the RECORD's own `ConjoinFactsLast` facts
+    // (the operand ranges the emitter demotes there), not against sibling conjuncts a peel
+    // read out of the formula. So each row builds a record whose `body` is the two-disjunct
+    // `oor` and whose facts are the given operand-range list; `formula` is the faithful
+    // `reconstruct_obligation`. The multi-path negative controls of the peel era are gone
+    // by construction: the ranges are the INNERMOST wrapper, shared across every path-guard
+    // disjunct, so per-path range divergence cannot be recorded at all — the property is
+    // "the record's facts pin both operands ≥ 0, or decline".
+    let vc_with = |facts: Vec<Formula>, extra: Vec<trust_types::ObligationWrapper>| {
+        let mut wrappers = vec![trust_types::ObligationWrapper::ConjoinFactsLast { facts }];
+        wrappers.extend(extra);
+        let rec = trust_types::ObligationRecord {
+            body: oor(),
+            wrappers,
+            subject: None,
+            width: None,
+        };
+        let formula = reconstruct_obligation(&rec);
+        VerificationCondition {
+            kind: VcKind::ArithmeticOverflow { op: BinOp::Add, operand_tys: (u8t(), u8t()) },
+            function: "crate::probe".into(),
+            location: SourceSpan::default(),
+            formula,
+            contract_metadata: None,
+            obligation: Some(rec),
+        }
     };
-    let minted = |formula: Formula| {
-        safety_vc_is_faithful_formula_aware(&probe_func(), &vc_at(formula)).map(|(k, _)| k)
+    let minted = |facts: Vec<Formula>, extra: Vec<trust_types::ObligationWrapper>| {
+        safety_vc_is_faithful_formula_aware(&probe_func(), &vc_with(facts, extra)).map(|(k, _)| k)
     };
 
-    // POSITIVE CONTROL 1 — the emitter's own shape: both ranges beside the violation.
+    // POSITIVE CONTROL 1 — the emitter's own shape: both ranges recorded beside the body.
     assert_eq!(
-        minted(Formula::And(vec![range("a"), range("b"), oor()])),
+        minted(vec![range("a"), range("b")], vec![]),
         Some(SafetyVcKind::Overflow(UWidth::W8)),
-        "the emitter's own `And([range(a), range(b), out_of_range])` must still certify"
+        "the emitter's own recorded `body = oor`, facts = both operand ranges must certify"
     );
-    // POSITIVE CONTROL 2 — the multi-path split with the ranges on EVERY path.
+    // POSITIVE CONTROL 2 — the multi-path split (a `PathGuardOr` wrapper OUTSIDE the shared
+    // ranges); the ranges are innermost, so both paths carry them and the vacuity holds.
     assert_eq!(
-        minted(Formula::Or(vec![
-            Formula::And(vec![guard("g1"), range("a"), range("b"), oor()]),
-            Formula::And(vec![guard("g2"), range("a"), range("b"), oor()]),
-        ])),
+        minted(
+            vec![range("a"), range("b")],
+            vec![trust_types::ObligationWrapper::PathGuardOr {
+                paths: vec![
+                    trust_types::PathGuardTerm::Guarded { guards: vec![guard("g1")] },
+                    trust_types::PathGuardTerm::Guarded { guards: vec![guard("g2")] },
+                ],
+            }],
+        ),
         Some(SafetyVcKind::Overflow(UWidth::W8)),
-        "a guard split that carries the ranges on every path must still certify"
+        "a recorded guard split over the SAME shared operand ranges must still certify"
     );
 
     let mut forged: Vec<String> = Vec::new();
-    for (tag, formula) in [
-        (
-            "round-4 recipe: a second guarded path with NO ranges",
-            Formula::Or(vec![
-                Formula::And(vec![guard("g1"), range("a"), range("b"), oor()]),
-                Formula::And(vec![guard("g2"), oor()]),
-            ]),
-        ),
-        (
-            "the mixed `Or`: the empty-guard path pushes the body RAW",
-            Formula::Or(vec![
-                Formula::And(vec![guard("g1"), range("a"), range("b"), oor()]),
-                oor(),
-            ]),
-        ),
-        ("no range evidence anywhere", Formula::And(vec![Formula::Bool(true), oor()])),
-        (
-            "ranges on terms that are not the operands",
-            Formula::And(vec![range("p"), range("q"), oor()]),
-        ),
-        ("the violation IS the whole formula", oor()),
+    for (tag, facts) in [
+        ("no range evidence at all", vec![Formula::Bool(true)]),
+        ("only a's range recorded", vec![range("a")]),
+        ("only b's range recorded", vec![range("b")]),
+        ("ranges on terms that are not the operands", vec![range("p"), range("q")]),
     ] {
-        if let Some(k) = minted(formula) {
+        if let Some(k) = minted(facts, vec![]) {
             forged.push(format!("{tag} -> {k:?}"));
         }
     }
@@ -2163,46 +2247,19 @@ fn a_uadd_certificate_requires_its_discarded_disjunct_to_be_vacuous() {
         forged.is_empty(),
         "a kernel-checked `uadd_overflows` certificate was minted for the `Gt` half of a \
          two-disjunct violation whose discarded `Lt(a+b, 0)` half is NOT provably \
-         vacuous — `a = −1, b = 0` satisfies the obligation and refutes the \
-         certificate: {forged:#?}"
+         vacuous from the record's own facts — `a = −1, b = 0` satisfies the obligation \
+         and refutes the certificate: {forged:#?}"
     );
 }
 
-/// D7, for this lane, stated as a MEASUREMENT rather than an argument: the peel here has
-/// no `And`-only `Or` descent, so the bare disjunct of a mixed path-guard `Or` IS
-/// examined — it becomes an occurrence carrying no siblings, and any side condition read
-/// off the siblings fails on it (see the mixed-`Or` row of the uadd test above).
-///
-/// The trust-ir lane's `violation_candidates` descends only the `And` disjuncts of an
-/// `Or`, which is why that lane has to decline on a mixed `Or` outright. Both lanes
-/// therefore refuse to certify from a formula whose bare disjunct they cannot vouch for;
-/// the mechanisms differ and the verdict does not.
-#[test]
-fn the_bare_disjunct_of_a_mixed_or_is_examined_not_dropped() {
-    let body = Formula::Ge(Box::new(var("i")), Box::new(Formula::Int(8)));
-    let mixed = Formula::Or(vec![
-        Formula::And(vec![Formula::Var("g".into(), Sort::Bool), body.clone()]),
-        body.clone(),
-    ]);
-    let (located, occurrences) =
-        emitted_obligation_body_located(&mixed).expect("the two paths carry the same body");
-    assert_eq!(located, &body);
-    assert_eq!(occurrences.len(), 2, "both disjuncts must contribute an occurrence");
-    assert!(
-        occurrences.iter().any(|o| o.siblings.is_none()),
-        "the RAW (empty-guard) disjunct must be visible as a sibling-less occurrence"
-    );
-
-    // And a mixed `Or` whose bare disjunct DISAGREES fails closed at the peel itself.
-    let disagreeing = Formula::Or(vec![
-        Formula::And(vec![Formula::Var("g".into(), Sort::Bool), body.clone()]),
-        Formula::Ge(Box::new(var("i")), Box::new(Formula::Int(16))),
-    ]);
-    assert!(
-        emitted_obligation_body(&disagreeing).is_none(),
-        "two paths peeling to DIFFERENT bodies must fail closed"
-    );
-}
+// [REMOVED 2026-08-01] `the_bare_disjunct_of_a_mixed_or_is_examined_not_dropped` was a
+// PURE PEEL-MECHANISM test: it exercised `emitted_obligation_body_located` /
+// `emitted_obligation_body` directly (the sibling-less-occurrence bookkeeping of the
+// wrapper-inverse, and its fail-closed on two paths peeling to different bodies). Both peels
+// are deleted — production authenticates a recorded obligation by reconstruct-and-equate —
+// so the behaviour this pinned no longer exists. The surviving mixed-`Or` decline property is
+// pinned against the LIVE certifier by the migrated
+// `trustir_safety_selection_tests::a_mixed_or_hides_an_occurrence_from_the_uadd_universal_and_must_decline`.
 
 // ---------------------------------------------------------------------------------
 // 12. ROUND 6 — `is_core` APPLIES TO THE COLLAPSED PEELED BODY, NEVER TO A LEAF FOUND
@@ -2255,12 +2312,16 @@ fn a_disjoined_decoy_is_certified_by_no_arm() {
     let decoy = || Formula::Gt(Box::new(var("__decoy")), Box::new(Formula::Int(5)));
     let mut forged: Vec<String> = Vec::new();
     for (tag, kind, core) in site_cores() {
-        let vc_at = |formula: Formula| VerificationCondition {
-            kind: kind.clone(),
-            function: "crate::probe".into(),
-            location: SourceSpan::default(),
-            formula,
-            contract_metadata: None,
+        let vc_at = |formula: Formula| {
+            let obligation = authed_body(&formula);
+            VerificationCondition {
+                kind: kind.clone(),
+                function: "crate::probe".into(),
+                location: SourceSpan::default(),
+                formula,
+                contract_metadata: None,
+                obligation,
+            }
         };
         // Only the negation arm reads the MIR (the certified variable must be one this
         // function negates), and its core here is `Eq(y, i32::MIN)`.
@@ -2317,57 +2378,61 @@ fn a_umul_certificate_requires_its_discarded_disjunct_to_be_vacuous() {
     };
     let guard = |g: &str| Formula::Var(g.into(), Sort::Bool);
     let u8t = || Ty::Int { width: 8, signed: false };
-    let vc_at = |formula: Formula| VerificationCondition {
-        kind: VcKind::ArithmeticOverflow { op: BinOp::Mul, operand_tys: (u8t(), u8t()) },
-        function: "crate::probe".into(),
-        location: SourceSpan::default(),
-        formula,
-        contract_metadata: None,
+    // Trust: AUTHENTICATED-PATH CONVERSION (2026-08-01) — the unsigned-mul twin of the
+    // uadd vacuity conversion. Vacuity is read off the record's own `ConjoinFactsLast`
+    // facts; see [`a_uadd_certificate_requires_its_discarded_disjunct_to_be_vacuous`].
+    let vc_with = |facts: Vec<Formula>, extra: Vec<trust_types::ObligationWrapper>| {
+        let mut wrappers = vec![trust_types::ObligationWrapper::ConjoinFactsLast { facts }];
+        wrappers.extend(extra);
+        let rec = trust_types::ObligationRecord {
+            body: oor(),
+            wrappers,
+            subject: None,
+            width: None,
+        };
+        let formula = reconstruct_obligation(&rec);
+        VerificationCondition {
+            kind: VcKind::ArithmeticOverflow { op: BinOp::Mul, operand_tys: (u8t(), u8t()) },
+            function: "crate::probe".into(),
+            location: SourceSpan::default(),
+            formula,
+            contract_metadata: None,
+            obligation: Some(rec),
+        }
     };
-    let minted = |formula: Formula| {
-        safety_vc_is_faithful_formula_aware(&probe_func(), &vc_at(formula)).map(|(k, _)| k)
+    let minted = |facts: Vec<Formula>, extra: Vec<trust_types::ObligationWrapper>| {
+        safety_vc_is_faithful_formula_aware(&probe_func(), &vc_with(facts, extra)).map(|(k, _)| k)
     };
 
-    // POSITIVE CONTROL 1 — the emitter's own shape: both ranges beside the violation.
+    // POSITIVE CONTROL 1 — the emitter's own shape: both ranges recorded beside the body.
     assert_eq!(
-        minted(Formula::And(vec![range("a"), range("b"), oor()])),
+        minted(vec![range("a"), range("b")], vec![]),
         Some(SafetyVcKind::UnsignedMulOverflow(UWidth::W8)),
-        "the emitter's own `And([range(a), range(b), out_of_range])` must still certify"
+        "the emitter's own recorded `body = oor`, facts = both operand ranges must certify"
     );
-    // POSITIVE CONTROL 2 — the multi-path split with the ranges on EVERY path.
+    // POSITIVE CONTROL 2 — the multi-path split over the SAME shared ranges.
     assert_eq!(
-        minted(Formula::Or(vec![
-            Formula::And(vec![guard("g1"), range("a"), range("b"), oor()]),
-            Formula::And(vec![guard("g2"), range("a"), range("b"), oor()]),
-        ])),
+        minted(
+            vec![range("a"), range("b")],
+            vec![trust_types::ObligationWrapper::PathGuardOr {
+                paths: vec![
+                    trust_types::PathGuardTerm::Guarded { guards: vec![guard("g1")] },
+                    trust_types::PathGuardTerm::Guarded { guards: vec![guard("g2")] },
+                ],
+            }],
+        ),
         Some(SafetyVcKind::UnsignedMulOverflow(UWidth::W8)),
-        "a guard split that carries the ranges on every path must still certify"
+        "a recorded guard split over the SAME shared operand ranges must still certify"
     );
 
     let mut forged: Vec<String> = Vec::new();
-    for (tag, formula) in [
-        (
-            "a second guarded path with NO ranges",
-            Formula::Or(vec![
-                Formula::And(vec![guard("g1"), range("a"), range("b"), oor()]),
-                Formula::And(vec![guard("g2"), oor()]),
-            ]),
-        ),
-        (
-            "the mixed `Or`: the empty-guard path pushes the body RAW",
-            Formula::Or(vec![
-                Formula::And(vec![guard("g1"), range("a"), range("b"), oor()]),
-                oor(),
-            ]),
-        ),
-        ("no range evidence anywhere", Formula::And(vec![Formula::Bool(true), oor()])),
-        (
-            "ranges on terms that are not the operands",
-            Formula::And(vec![range("p"), range("q"), oor()]),
-        ),
-        ("the violation IS the whole formula", oor()),
+    for (tag, facts) in [
+        ("no range evidence at all", vec![Formula::Bool(true)]),
+        ("only a's range recorded", vec![range("a")]),
+        ("only b's range recorded", vec![range("b")]),
+        ("ranges on terms that are not the operands", vec![range("p"), range("q")]),
     ] {
-        if let Some(k) = minted(formula) {
+        if let Some(k) = minted(facts, vec![]) {
             forged.push(format!("{tag} -> {k:?}"));
         }
     }
@@ -2388,7 +2453,7 @@ fn assert_route_certificates(func: &VerifiableFunction) -> Vec<SafetyVcKind> {
         .iter()
         .filter(|vc| is_safety_vc_kind(&vc.kind))
         .filter(|vc| {
-            matches!(emitted_obligation_body(&vc.formula), Some(Formula::Var(_, Sort::Bool)))
+            matches!(authenticated_obligation_body(vc), Some(Formula::Var(_, Sort::Bool)))
         })
         .filter_map(|vc| safety_vc_is_faithful_formula_aware(func, vc).map(|(k, _)| k))
         .collect()
@@ -2532,11 +2597,13 @@ fn the_assert_route_certifies_only_its_own_targets_negation() {
 /// still certify, so this is a name-boundary decline and not a blanket one.
 #[test]
 fn a_versioned_mir_local_name_can_never_authenticate_a_bare_negation_subject() {
+    let formula = Formula::Eq(Box::new(var("y")), Box::new(Formula::Int(-2147483648)));
     let vc = VerificationCondition {
         kind: VcKind::NegationOverflow { ty: Ty::Int { width: 32, signed: true } },
         function: "crate::neg".into(),
         location: SourceSpan::default(),
-        formula: Formula::Eq(Box::new(var("y")), Box::new(Formula::Int(-2147483648))),
+        obligation: authed_body(&formula),
+        formula,
         contract_metadata: None,
     };
     assert_eq!(
@@ -2555,161 +2622,197 @@ fn a_versioned_mir_local_name_can_never_authenticate_a_bare_negation_subject() {
 }
 
 // ---------------------------------------------------------------------------------
-// THE MEASUREMENT HARNESS — `#[ignore]`d, so it never runs in the suite; it exists so
-// every COST number this lane's docs quote can be RE-RUN rather than transcribed. It is
-// not a weakened assertion: it asserts the recorded census exactly, so a drift in any
-// per-kind tally fails it loudly the moment someone runs it.
+// 13. THE AUTHENTICATED-OBLIGATION FIELD (2026-07-31, the vertical-slice CONSUMER half).
+//     The recorded `vc.obligation` REPLACES the wrapper peel for the div/rem and negation
+//     arms — but only after `reconstruct_obligation(rec) == vc.formula` authenticates it
+//     against the formula. A TRUTHFUL record certifies exactly as the peel does; a HOSTILE
+//     record (the field claims one core, the formula asserts a DIFFERENT violable one) is
+//     DECLINED by that equate, never certified and never silently ignored. Each test is
+//     falsified by reverting the named check IN PLACE — the pre-fix mint is quoted.
 // ---------------------------------------------------------------------------------
 
-/// Walk every committed dump under `crates/trust-clean/fixtures`, drive the REAL emitter
-/// on each, and tally `safety_vc_is_faithful_formula_aware` per VC and
-/// `function_safety_vcs_faithful` per function.
-///
-/// ```text
-/// cd crates && RUSTC_BOOTSTRAP=1 cargo test --offline \
-///   -p trust-clean --lib -- --ignored --nocapture mirsem_corpus_census
-/// ```
-///
-/// The pinned numbers below are the census taken 2026-07-31, and they are IDENTICAL
-/// before the round-5 fixes, after them, and after the round-6 fixes (F1's collapsed-body
-/// shape match at all six remaining arms, F2's assert-route negation subject, F3's
-/// one-sided `#` strip): none of them costs this corpus a row. Four of the tallies are
-/// load-bearing beyond the totals:
-///
-///   * `neg_certs = 12` — the subject checks keep every negation row, and 7 of the 12
-///     take the assert-condition route, the route F2 additionally authenticates;
-///   * `uadd Or2-Lt0 = 114` and `umul Or2-Lt0 = 51` — every unsigned-add AND every
-///     unsigned-mul certificate really is the two-disjunct partial-adequacy shape, so the
-///     vacuity condition applies to all 165 of them and none fails it;
-///   * `named_with_hash = 0` — no `LocalDecl` source name in this corpus carries a `#`,
-///     which is what the emitter-side alternative to F3 would have cost.
-///
-/// Trust: A FALSE "IN BOTH LANES" CORRECTED (2026-07-31, round-6 item F5). The text that
-/// stood here said the unguarded unsigned-mul shape was open "in BOTH lanes". FALSE:
-/// `trustir_safety.rs` has no unsigned-mul arm at all, so nothing can be open there.
-/// RE-RUN in this tree on 2026-07-31, from `crates/`:
-///
-/// ```text
-/// grep -c 'umul\|UMul\|UnsignedMul' trust-clean/src/trustir_safety.rs   # 0
-/// ```
-///
-/// The mul twin is closed HERE, on the lane that has the arm, by
-/// [`vc_faithful::discarded_negative_disjunct_is_vacuous`] — pinned by
-/// [`a_umul_certificate_requires_its_discarded_disjunct_to_be_vacuous`].
-#[test]
-#[ignore = "measurement harness over the whole fixture corpus (~250 s); run explicitly"]
-fn mirsem_corpus_census() {
-    use std::collections::BTreeMap;
-    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                walk(&p, out);
-            } else if p.extension().is_some_and(|x| x == "json") {
-                out.push(p);
-            }
-        }
-    }
-    let mut files = Vec::new();
-    walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures"), &mut files);
-    files.sort();
-    assert_eq!(files.len(), 2330, "the committed fixture tree is 2330 dumps");
-
-    let (mut funcs, mut safety, mut certs, mut fn_certified) = (0usize, 0usize, 0usize, 0usize);
-    // Trust: THE F3 COST, MEASURED (2026-07-31, round 6). `negation_subject_ty` no longer
-    // strips the `#` version stamp off the MIR side of its name comparison; the
-    // alternative F3 named was to demote `#` at the emitter beside `.`/`[`/`*`/`@`. What
-    // that alternative would have cost is the number of LocalDecl source names in this
-    // corpus carrying a `#` — tallied here so the doc block in `vc_faithful.rs` states a
-    // number this harness re-derives rather than one transcribed from a review.
-    let (mut locals, mut named_locals, mut named_with_hash) = (0usize, 0usize, 0usize);
-    let mut per_kind: BTreeMap<String, usize> = BTreeMap::new();
-    let (mut neg_vcs, mut neg_certs, mut neg_assert_route) = (0usize, 0usize, 0usize);
-    let (mut bounds_vcs, mut bounds_certs, mut bounds_signed_body) = (0usize, 0usize, 0usize);
-    let mut uadd_shape: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut umul_shape: BTreeMap<&str, usize> = BTreeMap::new();
-    for path in &files {
-        let bytes = std::fs::read(path).expect("read fixture");
-        let Ok(func) = serde_json::from_slice::<VerifiableFunction>(&bytes) else { continue };
-        funcs += 1;
-        for decl in &func.body.locals {
-            locals += 1;
-            if let Some(n) = &decl.name {
-                named_locals += 1;
-                named_with_hash += usize::from(n.contains('#'));
-            }
-        }
-        if function_safety_vcs_faithful(&func).is_some() {
-            fn_certified += 1;
-        }
-        for vc in &trust_vcgen::generate_vcs(&func) {
-            if !is_safety_vc_kind(&vc.kind) {
-                continue;
-            }
-            safety += 1;
-            let got = safety_vc_is_faithful_formula_aware(&func, vc);
-            if let Some((k, _)) = &got {
-                certs += 1;
-                *per_kind.entry(format!("{k:?}")).or_default() += 1;
-            }
-            let body = emitted_obligation_body(&vc.formula);
-            match &vc.kind {
-                VcKind::NegationOverflow { .. } => {
-                    neg_vcs += 1;
-                    if got.is_some() {
-                        neg_certs += 1;
-                        if matches!(body, Some(Formula::Var(_, Sort::Bool))) {
-                            neg_assert_route += 1;
-                        }
-                    }
-                }
-                VcKind::IndexOutOfBounds | VcKind::SliceBoundsCheck => {
-                    bounds_vcs += 1;
-                    bounds_certs += usize::from(got.is_some());
-                    if body.is_some_and(|b| bounds_violation_shape(b).is_some_and(|(.., s)| s)) {
-                        bounds_signed_body += 1;
-                    }
-                }
-                VcKind::ArithmeticOverflow { op, operand_tys: (a, b) }
-                    if matches!(op, BinOp::Add | BinOp::Mul)
-                        && matches!(a, Ty::Int { signed: false, .. })
-                        && matches!(b, Ty::Int { signed: false, .. })
-                        && got.is_some() =>
-                {
-                    let shape = match body {
-                        Some(Formula::Or(v)) if v.len() == 2 => {
-                            if matches!(&v[0], Formula::Lt(_, z) if matches!(&**z, Formula::Int(0)))
-                            {
-                                "Or2-Lt0"
-                            } else {
-                                "Or2-other"
-                            }
-                        }
-                        Some(Formula::Or(_)) => "OrN",
-                        Some(Formula::Gt(..)) => "Gt",
-                        Some(_) => "other",
-                        None => "none",
-                    };
-                    let bucket =
-                        if matches!(op, BinOp::Add) { &mut uadd_shape } else { &mut umul_shape };
-                    *bucket.entry(shape).or_default() += 1;
-                }
-                _ => {}
-            }
-        }
-    }
-    println!("CENSUS funcs={funcs} safety={safety} certs={certs} fn_certified={fn_certified}");
-    println!("CENSUS per_kind={per_kind:?}");
-    println!("CENSUS neg={neg_vcs}/{neg_certs} (assert route {neg_assert_route})");
-    println!("CENSUS bounds={bounds_vcs}/{bounds_certs} signed_body={bounds_signed_body}");
-    println!("CENSUS uadd={uadd_shape:?} umul={umul_shape:?}");
-    println!("CENSUS locals={locals} named={named_locals} named_with_hash={named_with_hash}");
-
-    assert_eq!((funcs, safety, certs, fn_certified), (2326, 772, 635, 286));
-    assert_eq!((locals, named_locals, named_with_hash), (16827, 4923, 0));
-    assert_eq!((neg_vcs, neg_certs, neg_assert_route), (12, 12, 7));
-    assert_eq!((bounds_vcs, bounds_certs, bounds_signed_body), (68, 33, 0));
-    assert_eq!(uadd_shape, BTreeMap::from([("Or2-Lt0", 114)]));
-    assert_eq!(umul_shape, BTreeMap::from([("Or2-Lt0", 51)]));
-    assert_eq!(per_kind.values().sum::<usize>(), certs);
+/// The emitter's own conjoining wrapper: hypotheses first, the violation body LAST — the
+/// single shape `ObligationWrapper::ConjoinFactsLast` records and `reconstruct_obligation`
+/// replays. A benign parameter-domain hypothesis stands in for the block-defs / guards /
+/// preconditions the real emitter conjoins.
+fn conjoin_hyp_last(body: Formula) -> (Formula, Formula) {
+    let hyp = Formula::Ge(Box::new(var("p")), Box::new(Formula::Int(0)));
+    (hyp.clone(), Formula::And(vec![hyp, body]))
 }
+
+/// TRUTHFUL RECORD CERTIFIES, HOSTILE RECORD DECLINES — div/rem (ARM 1, body-only) and
+/// negation (ARM 2, body + subject + width).
+///
+/// For each arm three VCs share ONE `formula` (the emitter's `And([hyp, <real core>])`):
+///   * `obligation: None`        — the legacy dumps; the peel certifies (the BASELINE).
+///   * `obligation: Some(truthful)` — `body = <real core>`, wrappers reproduce `formula`;
+///     `reconstruct_obligation == formula`, so it certifies IDENTICALLY to the peel.
+///   * `obligation: Some(hostile)`  — `body = <a DIFFERENT is_core-valid predicate>`, so
+///     `reconstruct_obligation(rec) != formula`. `select_obligation` returns `Decline` and
+///     the arm fails closed. The negation hostile is the [10]-class WIDTH forgery: the
+///     field claims `Eq(y, i8::MIN)` (width 8) while the formula asserts `Eq(y, i32::MIN)`
+///     (width 32) — a benign narrow claim standing in front of a wide violation.
+///
+/// FALSIFICATION (constraint 4), verified by reverting IN PLACE:
+///   * Relax `select_obligation`'s equate to `if true` (or route its `Decline` arm to the
+///     peel): the hostile div VC then certifies `Some(DivByZero)` off the field's
+///     `Eq(w, 0)` body, and the hostile negation VC certifies `Some(NegationOverflow(W32))`
+///     off the peel's real `Eq(y, i32::MIN)` — the mint this test forbids.
+#[test]
+fn a_truthful_recorded_obligation_certifies_and_a_hostile_one_is_declined() {
+    // ---- ARM 1: div-by-zero (body-only) --------------------------------------------
+    let divisor = || var("z");
+    let real_div_core = Formula::Eq(Box::new(divisor()), Box::new(Formula::Int(0)));
+    let (div_hyp, div_formula) = conjoin_hyp_last(real_div_core.clone());
+    let div_vc = |obligation: Option<trust_types::ObligationRecord>| VerificationCondition {
+        kind: VcKind::DivisionByZero,
+        function: "crate::probe".into(),
+        location: SourceSpan::default(),
+        formula: div_formula.clone(),
+        contract_metadata: None,
+        obligation,
+    };
+    let div_truthful = trust_types::ObligationRecord {
+        body: real_div_core.clone(),
+        wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast {
+            facts: vec![div_hyp.clone()],
+        }],
+        subject: None,
+        width: None,
+    };
+    // The field claims a DIFFERENT divisor `w` — benign against `z`'s real violation.
+    let div_hostile = trust_types::ObligationRecord {
+        body: Formula::Eq(Box::new(var("w")), Box::new(Formula::Int(0))),
+        wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast {
+            facts: vec![div_hyp.clone()],
+        }],
+        subject: None,
+        width: None,
+    };
+
+    // FIELD-REQUIRED (2026-08-01): the peel is deleted, so there is no `obligation: None`
+    // baseline; a TRUTHFUL record is the ONLY thing that certifies, and it certifies to this
+    // kind's own `SafetyVcKind`.
+    assert_eq!(
+        safety_vc_is_faithful_formula_aware(&probe_func(), &div_vc(Some(div_truthful)))
+            .map(|(k, _)| k),
+        Some(SafetyVcKind::DivByZero),
+        "a TRUTHFUL recorded obligation (reconstruct == formula) must certify DivByZero"
+    );
+    assert!(
+        safety_vc_is_faithful_formula_aware(&probe_func(), &div_vc(Some(div_hostile))).is_none(),
+        "a HOSTILE recorded obligation (field says `Eq(w,0)`, formula asserts the violable \
+         `Eq(z,0)`) reconstructs to a formula OTHER than `vc.formula`, so the authentication \
+         must DECLINE; reverting the `reconstruct_obligation == vc.formula` equate mints \
+         `Some(DivByZero)` off the field body"
+    );
+
+    // ---- ARM 2: negation overflow (body + subject + width) -------------------------
+    let neg_func = || named_neg_func("y", 32);
+    let real_neg_core =
+        Formula::Eq(Box::new(var("y")), Box::new(Formula::Int(-2147483648)));
+    let (neg_hyp, neg_formula) = conjoin_hyp_last(real_neg_core.clone());
+    let neg_vc = |obligation: Option<trust_types::ObligationRecord>| VerificationCondition {
+        kind: VcKind::NegationOverflow { ty: Ty::Int { width: 32, signed: true } },
+        function: "crate::neg".into(),
+        location: SourceSpan::default(),
+        formula: neg_formula.clone(),
+        contract_metadata: None,
+        obligation,
+    };
+    let neg_truthful = trust_types::ObligationRecord {
+        body: real_neg_core.clone(),
+        wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast {
+            facts: vec![neg_hyp.clone()],
+        }],
+        subject: Some(var("y")),
+        width: Some(32),
+    };
+    // The [10]-class WIDTH forgery: the field's body claims the i8 MIN threshold.
+    let neg_hostile = trust_types::ObligationRecord {
+        body: Formula::Eq(Box::new(var("y")), Box::new(Formula::Int(-128))),
+        wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast {
+            facts: vec![neg_hyp.clone()],
+        }],
+        subject: Some(var("y")),
+        width: Some(8),
+    };
+
+    assert_eq!(
+        safety_vc_is_faithful_formula_aware(&neg_func(), &neg_vc(Some(neg_truthful)))
+            .map(|(k, _)| k),
+        Some(SafetyVcKind::NegationOverflow(SWidth::W32)),
+        "a TRUTHFUL recorded negation obligation must certify NegationOverflow(W32)"
+    );
+    assert!(
+        safety_vc_is_faithful_formula_aware(&neg_func(), &neg_vc(Some(neg_hostile))).is_none(),
+        "a HOSTILE recorded negation obligation (field says the width-8 `Eq(y,-128)`, formula \
+         asserts the width-32 `Eq(y,-2147483648)`) reconstructs to a DIFFERENT formula, so the \
+         authentication must DECLINE; reverting the equate mints `Some(NegationOverflow(W32))` \
+         off the peel's real core"
+    );
+}
+
+/// A recorded obligation that FAILS to authenticate never falls back to the peel — the
+/// fail-closed disposition constraint 3 mandates. Here the peel WOULD certify (the formula
+/// carries a real, region-selected div-by-zero), yet a `Some(obligation)` whose `body`
+/// disagrees with `formula` makes the arm DECLINE rather than silently ignore the field.
+///
+/// This is the precise hole a "fall back to the peel on any `Some`" design would leave: a
+/// hostile fixture pairs a benign `obligation` with a violable `formula` and, if the field
+/// were merely advisory, the peel would mint anyway. Falsified by changing
+/// `ObligationSelection::Decline => return None` to fall through to the peel.
+#[test]
+fn an_unfaithful_recorded_obligation_declines_it_does_not_fall_back_to_the_peel() {
+    let real_core = Formula::Eq(Box::new(var("z")), Box::new(Formula::Int(0)));
+    let (hyp, formula) = conjoin_hyp_last(real_core);
+    let vc = VerificationCondition {
+        kind: VcKind::DivisionByZero,
+        function: "crate::probe".into(),
+        location: SourceSpan::default(),
+        formula: formula.clone(),
+        contract_metadata: None,
+        // A record whose wrappers do NOT reproduce `formula` (an EXTRA fact that is not in
+        // the formula) — reconstruct != formula.
+        obligation: Some(trust_types::ObligationRecord {
+            body: Formula::Eq(Box::new(var("z")), Box::new(Formula::Int(0))),
+            wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast {
+                facts: vec![hyp, Formula::Ge(Box::new(var("q")), Box::new(Formula::Int(0)))],
+            }],
+            subject: None,
+            width: None,
+        }),
+    };
+    // CONTROL (field-required, 2026-08-01): the SAME formula with a TRUTHFUL record (body =
+    // the real core, wrappers reproduce `formula` exactly) certifies — so the decline below
+    // is the authentication rejecting the unfaithful record, not a formula nothing certifies.
+    let truthful = VerificationCondition {
+        obligation: Some(trust_types::ObligationRecord {
+            body: Formula::Eq(Box::new(var("z")), Box::new(Formula::Int(0))),
+            wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast {
+                facts: vec![Formula::Ge(Box::new(var("p")), Box::new(Formula::Int(0)))],
+            }],
+            subject: None,
+            width: None,
+        }),
+        ..vc.clone()
+    };
+    assert!(
+        safety_vc_is_faithful_formula_aware(&probe_func(), &truthful).is_some(),
+        "control: a TRUTHFUL record (reconstruct == formula) must certify, else the test \
+         proves nothing"
+    );
+    assert!(
+        safety_vc_is_faithful_formula_aware(&probe_func(), &vc).is_none(),
+        "a recorded-but-unfaithful obligation must DECLINE (reconstruct != formula), never \
+         fall back to a peel; the peel is deleted, so the field is the only authority"
+    );
+}
+
+// ---------------------------------------------------------------------------------
+// [REMOVED 2026-08-01] `mirsem_corpus_census` was the `#[ignore]`d measurement harness. Its
+// per-shape tallies (`emitted_obligation_body` bucketed by uadd/umul/bounds/negation shape)
+// were computed with the now-deleted wrapper-inverse peel, so the harness cannot compile
+// once the peel is gone. It never ran in the suite (`#[ignore]`), and the COST numbers it
+// re-derived were peel-mechanism census figures, not live-certifier soundness assertions.
+// ---------------------------------------------------------------------------------

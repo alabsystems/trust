@@ -1234,18 +1234,75 @@ mod tests {
         }
     }
 
+    /// Names the shim `otool` the child must refuse; its presence also arms the
+    /// child half of the ambient-lookup-authority regression.
+    #[cfg(target_os = "macos")]
+    const INSPECTOR_LOOKUP_SHIM_CHILD_VAR: &str = "TRUST_TRUSTD_INSPECTOR_LOOKUP_SHIM_CHILD";
+
+    #[cfg(target_os = "macos")]
+    const INSPECTOR_LOOKUP_SHIM_CHILD_RAN: &str = "ambient-inspector-lookup-child-ran";
+
+    /// The hostile ambient lookup authority is installed on a dedicated CHILD
+    /// process rather than on this one. `cargo test` runs the whole suite in a
+    /// single process on a thread pool, so replacing this process's `PATH`
+    /// would delete `sh`, `git` and `cc` out from under every concurrently
+    /// scheduled test that resolves a program through `PATH` — which is exactly
+    /// the ENOENT flake this split removes. Spawning is also the stronger
+    /// proof: the shim owns the child's `PATH`/`DEVELOPER_DIR` for the whole of
+    /// its lifetime, not just for a window inside one test.
     #[cfg(target_os = "macos")]
     #[test]
     fn trustd_runtime_closure_inspection_ignores_path_shims_and_developer_dir() {
-        let _guard = crate::TEST_ENV_LOCK.lock().expect("environment lock");
         let fake_root = tempfile::Builder::new()
             .prefix("trustd-fake-otool-")
             .tempdir()
             .expect("fake inspector directory");
         let fake_otool = fake_root.path().join("otool");
         write_executable(&fake_otool, "#!/bin/sh\nprintf '%s\\n' 'attacker-controlled otool'\n");
-        let _path = EnvVarGuard::set("PATH", fake_root.path());
-        let _developer_dir = EnvVarGuard::set("DEVELOPER_DIR", fake_root.path());
+
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .args([
+                    "--exact",
+                    "pipeline::probe::tests::trustd_runtime_closure_inspection_ignores_path_shims_and_developer_dir_child",
+                    "--nocapture",
+                ])
+                .env(INSPECTOR_LOOKUP_SHIM_CHILD_VAR, &fake_otool)
+                .env("PATH", fake_root.path())
+                .env("DEVELOPER_DIR", fake_root.path())
+                .output()
+                .expect("run isolated inspector-authority regression child");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .contains(INSPECTOR_LOOKUP_SHIM_CHILD_RAN),
+            "isolated ambient inspector-lookup regression failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Child half of the regression above: it runs with a shim-only `PATH` and
+    /// a shim `DEVELOPER_DIR` as its genuine process environment, so the
+    /// assertions below are made against real ambient lookup authority.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trustd_runtime_closure_inspection_ignores_path_shims_and_developer_dir_child() {
+        let Some(fake_otool) = env::var_os(INSPECTOR_LOOKUP_SHIM_CHILD_VAR) else {
+            return;
+        };
+        let fake_otool = PathBuf::from(fake_otool);
+        let fake_root = fake_otool.parent().expect("shim inspector parent").to_path_buf();
+        assert_eq!(
+            env::var_os("PATH").map(PathBuf::from),
+            Some(fake_root.clone()),
+            "isolated child must begin with a shim-only ambient PATH"
+        );
+        assert_eq!(
+            env::var_os("DEVELOPER_DIR").map(PathBuf::from),
+            Some(fake_root),
+            "isolated child must begin with a shim ambient DEVELOPER_DIR"
+        );
 
         let closure = inspect_trustd_runtime_closure(
             &std::env::current_exe().expect("current test executable"),
@@ -1257,6 +1314,7 @@ mod tests {
         assert!(closure.system_dependencies.iter().all(|dependency| {
             dependency.starts_with("/usr/lib/") || dependency.starts_with("/System/Library/")
         }));
+        println!("{INSPECTOR_LOOKUP_SHIM_CHILD_RAN}");
     }
 
     #[cfg(target_os = "macos")]

@@ -14,8 +14,8 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use trust_types::{
-    AggregateKind, BasicBlock, Formula, Operand, Projection, Rvalue, Sort, SourceSpan, Ty, VcKind,
-    VerifiableFunction, VerificationCondition,
+    AggregateKind, BasicBlock, Formula, ObligationRecord, Operand, Projection, Rvalue, Sort,
+    SourceSpan, Ty, VcKind, VerifiableFunction, VerificationCondition,
 };
 
 use crate::{
@@ -92,6 +92,7 @@ pub(crate) fn check_rvalue_safety(
                     location: stmt_span.clone(),
                     formula: not_adt,
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
         }
@@ -115,6 +116,7 @@ pub(crate) fn check_rvalue_safety(
                         location: stmt_span.clone(),
                         formula: mismatch,
                         contract_metadata: None,
+                        obligation: None,
                     });
                 }
             }
@@ -265,8 +267,22 @@ fn index_projection_vc(
         kind: projection_vc_kind(&Projection::Index(index_local), collection_ty),
         function: func.name.as_str().into(),
         location: stmt_span.clone(),
-        formula: violation,
+        // Trust (bounds ARM, GAP 1): seed the authenticated-obligation record from the
+        // raw violation the emitter is ALREADY building — the atomic bounds core
+        // (`Ge(i, len)` unsigned, or `Or([Lt(i,0), Ge(i,len)])` signed). No wrappers
+        // yet: the SEPARATE rvalue pipeline (`generate_v2_rvalue_safety_vcs_impl`)
+        // appends every wrapper it applies (yield facts, preconditions, path guards,
+        // semantic guards) so the stored `{body, wrappers}` replays to `formula`.
+        // Bounds is payload-free for subject/width (the consumer reads index+len from
+        // the body, cross-checked structurally, not against a MIR-implied width).
+        formula: violation.clone(),
         contract_metadata: None,
+        obligation: Some(ObligationRecord {
+            body: violation,
+            wrappers: Vec::new(),
+            subject: None,
+            width: None,
+        }),
     })
 }
 
@@ -291,6 +307,7 @@ fn constant_index_projection_vc(
         ));
     }
 
+    let violation = any_violation(violations);
     Some(VerificationCondition {
         kind: projection_vc_kind(
             &Projection::ConstantIndex { offset, min_length, from_end },
@@ -298,8 +315,16 @@ fn constant_index_projection_vc(
         ),
         function: func.name.as_str().into(),
         location: stmt_span.clone(),
-        formula: any_violation(violations),
+        // Trust (bounds ARM, GAP 1): record the raw violation as the body; the rvalue
+        // pipeline appends the wrappers it applies (see `index_projection_vc`).
+        formula: violation.clone(),
         contract_metadata: None,
+        obligation: Some(ObligationRecord {
+            body: violation,
+            wrappers: Vec::new(),
+            subject: None,
+            width: None,
+        }),
     })
 }
 
@@ -328,8 +353,16 @@ fn subslice_projection_vc(
         kind: VcKind::SliceBoundsCheck,
         function: func.name.as_str().into(),
         location: stmt_span.clone(),
-        formula: violation,
+        // Trust (bounds ARM, GAP 1): record the raw subslice violation as the body; the
+        // rvalue pipeline appends the wrappers it applies (see `index_projection_vc`).
+        formula: violation.clone(),
         contract_metadata: None,
+        obligation: Some(ObligationRecord {
+            body: violation,
+            wrappers: Vec::new(),
+            subject: None,
+            width: None,
+        }),
     })
 }
 

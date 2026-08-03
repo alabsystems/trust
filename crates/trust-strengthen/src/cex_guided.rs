@@ -645,6 +645,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         }
     }
 

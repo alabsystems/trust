@@ -200,6 +200,7 @@ impl RefinementVcToVc for RefinementVc {
             location: SourceSpan::default(),
             formula: self.check.formula.clone(),
             contract_metadata: None,
+            obligation: None,
         }
     }
 }

@@ -164,6 +164,7 @@ fn overflow_add_safe_formula() -> VerificationCondition {
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -309,6 +310,7 @@ fn index_safe_formula() -> VerificationCondition {
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -463,6 +465,7 @@ fn overflow_mul_safe_formula() -> VerificationCondition {
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -523,6 +526,7 @@ fn shift_overflow_safe_formula() -> VerificationCondition {
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -580,6 +584,7 @@ fn cast_overflow_safe_formula() -> VerificationCondition {
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -637,6 +642,7 @@ fn negation_overflow_safe_formula() -> VerificationCondition {
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -690,6 +696,7 @@ fn assertion_safe_formula() -> VerificationCondition {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -814,6 +821,7 @@ fn slice_bounds_safe_formula() -> VerificationCondition {
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation: None,
     }
 }
 

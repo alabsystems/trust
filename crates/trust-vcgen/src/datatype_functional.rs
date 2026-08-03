@@ -113,6 +113,7 @@ pub fn datatype_functional_vcs(func: &VerifiableFunction) -> Vec<VerificationCon
                 location: func.span.clone(),
                 formula,
                 contract_metadata: None,
+                obligation: None,
             }
         })
         .collect()

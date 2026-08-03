@@ -1717,8 +1717,12 @@ fn live_stage2_trustd_protocol_smoke(
         commit: version.commit.clone(),
         executable_sha256: executable.sha256.clone(),
     };
+    // Same wall-clock/contention hazard as a bounded probe deadline, so it is
+    // resolved through the same helper. A daemon that never becomes ready is
+    // still rejected; only the patience is longer when built as a test harness.
+    let ready_timeout = crate::bounded_process::resolve_probe_deadline(TRUSTD_READY_TIMEOUT);
     let deadline = Instant::now()
-        .checked_add(TRUSTD_READY_TIMEOUT)
+        .checked_add(ready_timeout)
         .ok_or_else(|| "trustd live-smoke readiness deadline overflowed".to_string())?;
     loop {
         match crate::bounded_process::exited_without_reaping(&mut child.child) {
@@ -1740,7 +1744,7 @@ fn live_stage2_trustd_protocol_smoke(
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "exact stage2 trustd did not become closed IDENTITY/STATUS ready within {TRUSTD_READY_TIMEOUT:?}"
+                "exact stage2 trustd did not become closed IDENTITY/STATUS ready within {ready_timeout:?}"
             ));
         }
         thread::sleep(TRUSTD_READY_POLL_INTERVAL);
@@ -2351,7 +2355,13 @@ fn run_stage(plan: &StagePlan, root: &Path, report_dir: &Path) -> Value {
                 // value into an unbounded subprocess or a conversion panic.
                 let timeout =
                     Duration::try_from_secs_f64(plan.timeout_sec).unwrap_or(Duration::ZERO);
-                match crate::bounded_process::output(
+                // A stage budget is data the caller handed us via `--timeout-sec`,
+                // not a fixed hang probe this code chose, so it is honoured
+                // exactly in every build. Multiplying a declared budget would
+                // mean a caller who asks for N seconds silently gets a different
+                // number; the test-harness stretch exists for probe constants,
+                // which have no declared value to distort.
+                match crate::bounded_process::output_with_exact_deadline(
                     &mut command,
                     "self-verification stage command",
                     MAX_STAGE_LOG_STREAM_BYTES,
@@ -6222,6 +6232,10 @@ fn is_help_arg(arg: &str) -> bool {
 mod tests {
     use super::*;
 
+    mod fake_trustd;
+
+    use fake_trustd::FakeTrustd;
+
     fn bound_transport_artifact(
         kind: &str,
         payload: &[u8],
@@ -7472,11 +7486,7 @@ mod tests {
             "trustdoc",
             &unit_compiler_version_script("trustdoc", label, "test-host", "1.99.0-test"),
         );
-        install_stage2_tool_with_contents(
-            &root,
-            "trustd",
-            &unit_trustd_version_and_server_script(label, "1.99.0-test"),
-        );
+        let _trustd = FakeTrustd::install(&root, label, "1.99.0-test");
         let identity = validate_stage2_toolchain(&root).expect("valid stage2 identity");
         assert_eq!(identity.targo_version.commit, label);
         assert_eq!(identity.trustc_version.commit, label);
@@ -7532,10 +7542,10 @@ mod tests {
                 "trustdoc",
                 unit_compiler_version_script("trustdoc", label, "test-host", "1.99.0-test"),
             ),
-            ("trustd", unit_trustd_version_and_server_script(label, "1.99.0-test")),
         ] {
             install_stage2_tool_with_contents(&root, tool, &script);
         }
+        let _trustd = FakeTrustd::install(&root, label, "1.99.0-test");
         let lib = root.join("build/host/stage2/lib");
         let rustlib = lib.join("rustlib/test-host/lib");
         fs::create_dir_all(&rustlib).expect("stage2 runtime directories");
@@ -7875,163 +7885,6 @@ mod tests {
         format!(
             "#!/bin/sh\n[ \"${{1:-}}\" = \"-Vv\" ] || exit 2\nprintf 'rustc {release} ({tool})\\nbinary: {tool}\\ncommit-hash: {commit}\\nhost: {host}\\nrelease: {release}\\n'\n"
         )
-    }
-
-    fn unit_trustd_version_and_server_script(commit: &str, release: &str) -> String {
-        let python = unit_python_interpreter();
-        let release = serde_json::to_string(release).expect("quote fake trustd release");
-        let commit = serde_json::to_string(commit).expect("quote fake trustd commit");
-        let status_version = serde_json::to_string(trust_router::coordinator::STATUS_VERSION)
-            .expect("quote fake trustd status version");
-        let identity_version = serde_json::to_string(trust_router::coordinator::IDENTITY_VERSION)
-            .expect("quote fake trustd identity version");
-        r#"#!__PYTHON__
-import hashlib
-import json
-import os
-import socket
-import sys
-import threading
-import time
-
-RELEASE = __RELEASE__
-COMMIT = __COMMIT__
-STATUS_VERSION = __STATUS_VERSION__
-IDENTITY_VERSION = __IDENTITY_VERSION__
-
-if sys.argv[1:] == ["--version"]:
-    print(f"trustd {RELEASE}")
-    print("trust.identity=trustd")
-    print(f"trust.protocol={STATUS_VERSION}")
-    print(f"commit-hash: {COMMIT}")
-    raise SystemExit(0)
-
-if len(sys.argv) != 3 or sys.argv[1] != "--socket" or not sys.argv[2]:
-    raise SystemExit(2)
-
-with open(sys.argv[0], "rb") as executable:
-    executable_sha256 = hashlib.sha256(executable.read()).hexdigest()
-identity = {
-    "version": IDENTITY_VERSION,
-    "protocol": STATUS_VERSION,
-    "release": RELEASE,
-    "commit": COMMIT,
-    "executable_sha256": executable_sha256,
-}
-state_lock = threading.Lock()
-state = {
-    "budget_bytes": 1024,
-    "reserved_bytes": 0,
-    "granted_total": 0,
-    "released_total": 0,
-    "started_at": max(1, int(time.time())),
-    "next_token": 1,
-    "active": [],
-}
-
-def status_snapshot():
-    return {
-        "version": STATUS_VERSION,
-        "budget_bytes": state["budget_bytes"],
-        "reserved_bytes": state["reserved_bytes"],
-        "free_bytes": state["budget_bytes"] - state["reserved_bytes"],
-        "queue_depth": 0,
-        "granted_total": state["granted_total"],
-        "released_total": state["released_total"],
-        "started_at": state["started_at"],
-        "active": [dict(entry) for entry in state["active"]],
-    }
-
-def handle(connection):
-    with connection:
-        stream = connection.makefile("rwb", buffering=0)
-        for raw in stream:
-            request = raw.decode("utf-8").rstrip("\r\n")
-            if request == "PING":
-                response = "PONG"
-            elif request == "IDENTITY":
-                response = json.dumps(identity, separators=(",", ":"))
-            elif request == "STATUS":
-                with state_lock:
-                    response = json.dumps(status_snapshot(), separators=(",", ":"))
-            elif request.startswith("RESERVE "):
-                parts = request.split(" ", 3)
-                if len(parts) != 4:
-                    response = "ERR malformed"
-                else:
-                    byte_count = int(parts[1])
-                    pid = int(parts[2])
-                    label = parts[3]
-                    with state_lock:
-                        if byte_count <= 0 or state["reserved_bytes"] + byte_count > state["budget_bytes"]:
-                            response = "DEGRADED"
-                        else:
-                            token = state["next_token"]
-                            state["next_token"] += 1
-                            state["reserved_bytes"] += byte_count
-                            state["granted_total"] += 1
-                            state["active"].append({
-                                "pid": pid,
-                                "bytes": byte_count,
-                                "label": label,
-                                "since_secs": 0,
-                                "token": token,
-                            })
-                            response = f"GRANTED {token}"
-            elif request.startswith("RELEASE "):
-                token = int(request.split(" ", 1)[1])
-                with state_lock:
-                    released = next(
-                        (entry for entry in state["active"] if entry["token"] == token),
-                        None,
-                    )
-                    if released is not None:
-                        state["active"].remove(released)
-                        state["reserved_bytes"] -= released["bytes"]
-                        state["released_total"] += 1
-                response = "OK"
-            else:
-                response = "ERR unsupported"
-            stream.write(response.encode("utf-8") + b"\n")
-
-listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-try:
-    os.unlink(sys.argv[2])
-except FileNotFoundError:
-    pass
-listener.bind(sys.argv[2])
-os.chmod(sys.argv[2], 0o600)
-listener.listen(8)
-while True:
-    connection, _ = listener.accept()
-    threading.Thread(target=handle, args=(connection,), daemon=True).start()
-"#
-        .replace("__PYTHON__", &python)
-        .replace("__RELEASE__", &release)
-        .replace("__COMMIT__", &commit)
-        .replace("__STATUS_VERSION__", &status_version)
-        .replace("__IDENTITY_VERSION__", &identity_version)
-    }
-
-    fn unit_python_interpreter() -> String {
-        static PYTHON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        PYTHON
-            .get_or_init(|| {
-                let output = Command::new("python3")
-                    .args(["-c", "import os,sys; print(os.path.realpath(sys.executable))"])
-                    .output()
-                    .expect("locate Python 3 for the fake trustd endpoint");
-                assert!(output.status.success(), "Python 3 discovery failed");
-                let path = String::from_utf8(output.stdout).expect("Python path is UTF-8");
-                let path = path.trim();
-                assert!(path.starts_with('/'), "Python path is not absolute: {path}");
-                assert!(
-                    !path.chars().any(|character| matches!(character, '\n' | '\r')),
-                    "Python path contains a newline"
-                );
-                path.to_string()
-            })
-            .clone()
     }
 
     fn install_stage2_tool_with_contents(repo_root: &Path, tool: &str, contents: &str) -> PathBuf {

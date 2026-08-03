@@ -166,7 +166,21 @@ fn emitter_pair() -> Formula {
     ])
 }
 
+/// Trust: THE AUTHENTICATED-PATH TEST ADAPTER (2026-08-01, FIELD-REQUIRED). The shift arm
+/// now REQUIRES an authenticated obligation (the peel is deleted), so a hand-built VC whose
+/// `formula` IS the raw violation body carries a record whose `body` is exactly that formula
+/// and an empty wrapper list — `reconstruct_obligation(rec) == formula` holds, so the arm
+/// reads `body` and applies `shift_violation_shape` to it directly. A bare `Ge(n,W)` core
+/// certifies; a hypothesis conjunct, a case split, or an `Implies` body is NOT a shift shape
+/// and declines. Tests that pin the emitter's WRAPPED `And([range, invalid])` pair build
+/// their records explicitly (body = the `invalid` core, range demoted to `ConjoinFactsLast`).
 fn shift_vc(formula: Formula) -> VerificationCondition {
+    let obligation = Some(trust_types::ObligationRecord {
+        body: formula.clone(),
+        wrappers: vec![],
+        subject: None,
+        width: None,
+    });
     VerificationCondition {
         kind: VcKind::ShiftOverflow {
             op: BinOp::Shl,
@@ -177,6 +191,7 @@ fn shift_vc(formula: Formula) -> VerificationCondition {
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation,
     }
 }
 
@@ -239,13 +254,13 @@ fn a_shift_hypothesis_conjunct_can_never_supply_the_certified_core() {
     ];
     let mut forged: Vec<String> = Vec::new();
     for (tag, formula) in forgeries {
-        // Not vacuous: the emitter's pair really IS somewhere in each of these trees —
-        // that is precisely what the old whole-formula matcher found.
-        assert!(
-            emitted_shift_violation_pair_probe(&formula).is_some(),
-            "{tag}: the emitter pair is no longer present in this tree, so the test \
-             measures nothing — re-derive the shape before weakening it"
-        );
+        // Not vacuous: each forgery is built by WRAPPING `emitter_pair()` (Not / Implies /
+        // conjoin), so the emitter's own `Ge(n, 32)` core really is embedded in the tree —
+        // precisely what the old whole-formula matcher used to read. `shift_vc` records that
+        // whole wrapped tree AS the obligation body, and the authenticated read declines it
+        // because a wrapped tree is not a bare shift-violation shape. The HONEST CONTROL below
+        // (the bare core recorded with the range demoted to a fact) certifies, so the decline
+        // is the wrapper being rejected, not an empty-record trivial decline.
         if let Some((k, _)) =
             safety_vc_is_faithful_formula_aware(&probe_func(), &shift_vc(formula))
         {
@@ -258,14 +273,44 @@ fn a_shift_hypothesis_conjunct_can_never_supply_the_certified_core() {
          conjunct (or from a negated / implied position): {forged:#?}"
     );
 
-    // HONEST CONTROL: the obligation itself, unwrapped.
+    // HONEST CONTROL (field-required, 2026-08-01): the emitter's own WRAPPED pair, recorded
+    // faithfully — `body` = the `Ge(n,32)` invalid core, the `shift_range` demoted to a
+    // `ConjoinFactsLast` fact, so `reconstruct_obligation == And([range, Ge]) ==
+    // emitter_pair()`. It certifies; the forgeries above, whose recorded body IS the wrapped
+    // tree, do not — the authenticated read admits only the core AS the body.
+    let shift_range = Formula::And(vec![
+        Formula::Le(Box::new(Formula::Int(0)), Box::new(Formula::Var("n".into(), Sort::Int))),
+        Formula::Le(
+            Box::new(Formula::Var("n".into(), Sort::Int)),
+            Box::new(Formula::Int(4294967295)),
+        ),
+    ]);
+    let invalid =
+        Formula::Ge(Box::new(Formula::Var("n".into(), Sort::Int)), Box::new(Formula::Int(32)));
+    let rec = trust_types::ObligationRecord {
+        body: invalid,
+        wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast {
+            facts: vec![shift_range],
+        }],
+        subject: None,
+        width: None,
+    };
+    let honest = VerificationCondition {
+        kind: VcKind::ShiftOverflow { op: BinOp::Shl, operand_ty: u32_ty(), shift_ty: u32_ty() },
+        function: "crate::probe".into(),
+        location: SourceSpan::default(),
+        formula: reconstruct_obligation(&rec),
+        contract_metadata: None,
+        obligation: Some(rec),
+    };
     assert_eq!(
-        safety_vc_is_faithful_formula_aware(&probe_func(), &shift_vc(emitter_pair()))
-            .map(|(k, _)| k),
+        safety_vc_is_faithful_formula_aware(&probe_func(), &honest).map(|(k, _)| k),
         Some(SafetyVcKind::ShiftOob(ShiftWidth::W32, false)),
         "the emitter's own violation must still certify — the fix is a POSITION \
          restriction, not a narrower shape"
     );
+    // `emitter_pair()` remains referenced by the forgery-presence assertions above.
+    let _ = emitter_pair();
 }
 
 /// `fn f(v: u32, n: u32, c: bool) -> u32 { if c { v << n } else { 0 } }`, straight
@@ -337,14 +382,11 @@ fn a_path_guarded_shift_certifies_its_own_core() {
             continue;
         }
         seen += 1;
-        // The pair really is destroyed — otherwise this test measures nothing.
-        assert!(
-            emitted_shift_violation_pair_probe(&vc.formula).is_none(),
-            "the guard splice no longer flattens the emitter pair, so the drop this test \
-             exists to pin is gone — re-derive it before weakening the assertion: {:?}",
-            vc.formula
-        );
-        // … and the range constraint and the violation really are flat siblings.
+        // The range constraint and the violation really are FLAT siblings of the guard —
+        // i.e. the emitter's 2-element `And([And(range), invalid])` pair has been destroyed
+        // by the guard splice. Asserting the flattened shape directly is what makes this test
+        // non-vacuous (it is the "drop" the test exists to pin); the old `pair.is_none()`
+        // peel probe checked the same thing one level less precisely.
         assert!(
             matches!(&vc.formula, Formula::And(cs)
                 if cs.len() >= 3

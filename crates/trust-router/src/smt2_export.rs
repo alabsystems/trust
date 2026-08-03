@@ -39,24 +39,29 @@ pub(crate) fn emit_declarations(formula: &Formula) -> Vec<String> {
     let vars = collect_free_vars(formula);
 
     // Lever A: datatype sorts must be DECLARED before any `declare-fun` that
-    // uses them. Gather every datatype declaration reachable from the free
-    // vars' sorts, de-duplicated and topologically ordered (a referenced
-    // datatype before the one that uses it). A datatype that appears only as a
-    // BY-NAME reference (empty constructors — a recursive back-edge whose full
-    // definition is modeled by the flat-`Ty::Adt` encoding, not as a real SMT
-    // datatype) has no `declare-datatype`; it is declared as an uninterpreted
-    // sort (`declare-sort … 0`) so the referencing `declare-fun` is well-formed.
-    // Without this, a `(declare-fun e () Expr)` over an undeclared sort `Expr`
-    // makes the whole SMT query malformed.
+    // uses them. Gather every datatype declaration reachable from the formula's
+    // datatype-bearing sorts, de-duplicated and topologically ordered (a
+    // referenced datatype before the one that uses it). A datatype that appears
+    // only as a BY-NAME reference (empty constructors — a recursive back-edge
+    // whose full definition is modeled by the flat-`Ty::Adt` encoding, not as a
+    // real SMT datatype) has no `declare-datatype`; it is declared as an
+    // uninterpreted sort (`declare-sort … 0`) so the referencing `declare-fun`
+    // is well-formed. Without this, a `(declare-fun e () Expr)` over an
+    // undeclared sort `Expr` makes the whole SMT query malformed.
+    //
+    // The walk is over `visit_datatype_bearing_sorts`, NOT over `vars`: a
+    // formula whose only datatype content is a ground `Ctor`/`Sel`/`IsCtor`
+    // term has no datatype-sorted free variable at all, and keying off `vars`
+    // would emit the query with no preamble for it.
     let mut decls: Vec<String> = Vec::new();
     let mut datatype_decls: Vec<String> = Vec::new();
-    for (_, sort) in &vars {
+    visit_datatype_bearing_sorts(formula, &mut |sort| {
         for d in sort.datatype_declarations() {
             if !datatype_decls.contains(&d) {
                 datatype_decls.push(d);
             }
         }
-    }
+    });
     // Record full-datatype names so a name that has a real definition is NOT
     // also emitted as an uninterpreted sort (which would be a redeclaration).
     let mut defined_dt: BTreeSet<String> = BTreeSet::new();
@@ -68,9 +73,9 @@ pub(crate) fn emit_declarations(formula: &Formula) -> Vec<String> {
         }
     }
     let mut uninterpreted_names: BTreeSet<String> = BTreeSet::new();
-    for (_, sort) in &vars {
+    visit_datatype_bearing_sorts(formula, &mut |sort| {
         collect_uninterpreted_datatype_refs(sort, &defined_dt, &mut uninterpreted_names);
-    }
+    });
     for name in &uninterpreted_names {
         decls.push(format!("(declare-sort {} 0)", escape_smtlib_symbol(name)));
     }
@@ -140,8 +145,10 @@ fn collect_uninterpreted_datatype_refs(
 /// - `ALL` as fallback for mixed theories
 #[must_use]
 pub(crate) fn detect_logic(formula: &Formula) -> &'static str {
-    // Lever A: if any free variable carries a datatype (or datatype-back-edge
-    // uninterpreted) sort, the query needs the datatype theory. Rather than
+    // Lever A: if ANY sort the formula carries — a variable's, a constructor
+    // term's result sort, a selector's field sort, a tester's datatype name, a
+    // quantifier binder's — is a datatype (or datatype-back-edge uninterpreted)
+    // sort, the query needs the datatype theory. Rather than
     // enumerate every datatype×theory combination (QF_DT / QF_UFDT / AUFDT / …),
     // select `ALL` — ay accepts it and it admits datatypes alongside the BV/Int/
     // UF scalar fields a recursive ADT's leaves produce. SOUNDNESS: `ALL` only
@@ -197,18 +204,66 @@ pub(crate) fn detect_logic(formula: &Formula) -> &'static str {
 
 // --- Internal helpers ---
 
-/// True iff any `Var`/`SymVar` in `formula` carries a sort that is (or
-/// transitively contains) a datatype sort — including a by-name datatype
-/// back-edge reference. Drives the `ALL`-logic selection in `detect_logic`.
+/// True iff any sort carried anywhere in `formula` is (or transitively
+/// contains) a datatype sort — including a by-name datatype back-edge
+/// reference. Drives the `ALL`-logic selection in `detect_logic`.
 fn formula_has_datatype_sort(formula: &Formula) -> bool {
     let mut found = false;
+    visit_datatype_bearing_sorts(formula, &mut |sort| {
+        found = found || sort.contains_datatype();
+    });
+    found
+}
+
+/// The canonical BY-NAME datatype reference for `name`: a `Sort::Datatype` with
+/// EMPTY constructors, the same shape a recursive back-edge already uses. It
+/// contributes no `declare-datatype` and, unless a full definition of the same
+/// name is also in scope, becomes a `(declare-sort <name> 0)`.
+fn by_name_datatype(name: &str) -> Sort {
+    Sort::Datatype { name: name.to_string(), constructors: Vec::new() }
+}
+
+/// Hand every sort carried anywhere in `formula` that could be datatype-bearing
+/// to `f`, in a deterministic pre-order walk of the whole tree.
+///
+/// `Var`/`SymVar` sorts are the classic source, but they are NOT the whole
+/// datatype surface of `Formula`: `Ctor` carries its result (datatype) sort,
+/// `Sel` carries the selected field's sort, `FnApp` carries its application
+/// result sort, quantifier bindings carry their bound sorts, and both `Sel` and
+/// `IsCtor` name the datatype they range over. A formula whose only datatype
+/// content is a GROUND constructor term reaches none of that through a `Var`,
+/// so a `Var`/`SymVar`-only rule would pick a non-`ALL` logic AND emit no
+/// datatype preamble — a malformed query on the text lane and an undeclared
+/// datatype on the in-process lane.
+///
+/// `Sel`/`IsCtor` know their datatype only BY NAME, so a by-name reference is
+/// synthesized for it (see [`by_name_datatype`]); a full definition of the same
+/// name found elsewhere in the formula still wins, because the caller records
+/// defined names before it collects the uninterpreted ones.
+///
+/// Both SMT lanes walk through this one function so the canonical text
+/// transcript and the native AY program cannot disagree about which datatype
+/// sorts the query mentions.
+pub(crate) fn visit_datatype_bearing_sorts(formula: &Formula, f: &mut impl FnMut(&Sort)) {
     formula.visit(&mut |node| match node {
-        Formula::Var(_, sort) | Formula::SymVar(_, sort) if sort.contains_datatype() => {
-            found = true;
+        Formula::Var(_, sort) | Formula::SymVar(_, sort) => f(sort),
+        Formula::Ctor { sort, .. } | Formula::FnApp { sort, .. } => f(sort),
+        Formula::Sel { datatype, field_sort, .. } => {
+            f(field_sort);
+            f(&by_name_datatype(datatype));
+        }
+        Formula::IsCtor { datatype, .. } => f(&by_name_datatype(datatype)),
+        // A quantifier's bound sorts appear in the `(forall ((e Expr)) …)`
+        // binder itself, which is a sort position like any other — and the
+        // binder's sorts are NOT `children()`, so the recursive walk misses
+        // them even when the body mentions the bound variable.
+        Formula::Forall(bindings, _) | Formula::Exists(bindings, _) => {
+            for (_, sort) in bindings {
+                f(sort);
+            }
         }
         _ => {}
     });
-    found
 }
 
 /// Formula features relevant to logic detection.
@@ -453,6 +508,112 @@ mod tests {
         let fun_pos = decls.iter().position(|d| d.contains("(declare-fun e () Expr)"));
         assert!(fun_pos.is_some(), "e must be declared with sort Expr: {decls:?}");
         assert!(dt_pos < fun_pos, "declare-datatype must precede its uses: {decls:?}");
+    }
+
+    /// The recursive `Expr` shape used by the `Ctor`/`Sel`/`IsCtor` tests: a
+    /// `Const(c: bv32)` leaf and a binary `App(f: Expr, x: Expr)` node whose
+    /// children are by-name back-edges.
+    fn expr_dt_sort() -> Sort {
+        let r = Sort::Datatype { name: "Expr".into(), constructors: Vec::new() };
+        Sort::Datatype {
+            name: "Expr".into(),
+            constructors: vec![
+                ("Const".into(), vec![("c".into(), Sort::BitVec(32))]),
+                ("App".into(), vec![("f".into(), r.clone()), ("x".into(), r)]),
+            ],
+        }
+    }
+
+    /// A GROUND constructor term — the datatype sort is carried by
+    /// `Formula::Ctor`, and NO free variable has a datatype sort anywhere in the
+    /// formula. It must still (i) select the datatype-capable `ALL` logic and
+    /// (ii) emit its `declare-datatype` BEFORE the `declare-fun`s. Keying
+    /// detection off `Var`/`SymVar` alone silently produced a non-`ALL` logic
+    /// and no preamble at all, i.e. a malformed SMT2 script.
+    #[test]
+    fn ground_ctor_only_datatype_declares_before_declare_funs() {
+        let ground = Formula::Ctor {
+            ctor: "Const".into(),
+            args: vec![Formula::BitVec { value: 1, width: 32 }],
+            sort: expr_dt_sort(),
+        };
+        // `n == 0 AND (Const 1) == (Const 1)`: the Int var forces a declare-fun
+        // to order the datatype declaration against, and is not datatype-sorted.
+        let f = Formula::And(vec![
+            Formula::Eq(Box::new(int_var("n")), Box::new(Formula::Int(0))),
+            Formula::Eq(Box::new(ground.clone()), Box::new(ground)),
+        ]);
+
+        // Precondition of the regression: nothing datatype-sorted is reachable
+        // through a free variable, so the old Var-only rule saw no datatype.
+        assert!(
+            collect_free_vars(&f).iter().all(|(_, s)| !s.contains_datatype()),
+            "this test is only meaningful when no FREE VAR carries a datatype sort"
+        );
+
+        assert_eq!(detect_logic(&f), "ALL", "a ground Ctor term still needs the datatype theory");
+
+        let decls = emit_declarations(&f);
+        let dt_pos = decls.iter().position(|d| d.contains("(declare-datatype Expr"));
+        let fun_pos = decls.iter().position(|d| d.starts_with("(declare-fun "));
+        assert!(dt_pos.is_some(), "the Ctor's datatype must be declared: {decls:?}");
+        assert!(fun_pos.is_some(), "n must still be declared: {decls:?}");
+        assert!(dt_pos < fun_pos, "declare-datatype must precede every declare-fun: {decls:?}");
+        assert!(
+            !decls.iter().any(|d| d.contains("(declare-sort Expr 0)")),
+            "a fully-defined datatype must not also be an uninterpreted sort: {decls:?}"
+        );
+    }
+
+    /// A selector application and a constructor tester name their datatype only
+    /// BY NAME. With no full definition in scope they must still select `ALL`
+    /// and emit `(declare-sort Expr 0)` ahead of the `declare-fun`s, so the
+    /// sort identifier the query mentions is in scope.
+    #[test]
+    fn sel_and_is_ctor_only_datatype_emits_declare_sort_before_declare_funs() {
+        let e = Formula::Var("e".into(), Sort::Int); // deliberately NOT datatype-sorted
+        for f in [
+            Formula::Eq(
+                Box::new(Formula::Sel {
+                    datatype: "Expr".into(),
+                    field: "c".into(),
+                    field_sort: Sort::BitVec(32),
+                    arg: Box::new(e.clone()),
+                }),
+                Box::new(Formula::BitVec { value: 0, width: 32 }),
+            ),
+            Formula::IsCtor { datatype: "Expr".into(), ctor: "Const".into(), arg: Box::new(e) },
+        ] {
+            assert!(
+                collect_free_vars(&f).iter().all(|(_, s)| !s.contains_datatype()),
+                "this test is only meaningful when no FREE VAR carries a datatype sort"
+            );
+            assert_eq!(detect_logic(&f), "ALL", "Sel/IsCtor range over a datatype: {f:?}");
+
+            let decls = emit_declarations(&f);
+            let sort_pos = decls.iter().position(|d| d.contains("(declare-sort Expr 0)"));
+            let fun_pos = decls.iter().position(|d| d.starts_with("(declare-fun "));
+            assert!(sort_pos.is_some(), "Expr must be declared as a sort: {decls:?}");
+            assert!(fun_pos.is_some(), "e must still be declared: {decls:?}");
+            assert!(sort_pos < fun_pos, "declare-sort must precede every declare-fun: {decls:?}");
+        }
+    }
+
+    /// A datatype reached ONLY through a quantifier binder — the sort lives in
+    /// the `(forall ((e Expr)) …)` binding list, which is not a `children()`
+    /// edge — must still be declared before it is used.
+    #[test]
+    fn quantifier_bound_datatype_sort_is_declared() {
+        let f = Formula::Forall(
+            vec![("e".into(), expr_dt_sort())],
+            Box::new(Formula::Eq(Box::new(int_var("n")), Box::new(Formula::Int(0)))),
+        );
+        assert_eq!(detect_logic(&f), "ALL", "a datatype binder needs the datatype theory");
+        let decls = emit_declarations(&f);
+        let dt_pos = decls.iter().position(|d| d.contains("(declare-datatype Expr"));
+        let fun_pos = decls.iter().position(|d| d.starts_with("(declare-fun "));
+        assert!(dt_pos.is_some(), "the bound sort's datatype must be declared: {decls:?}");
+        assert!(dt_pos < fun_pos, "declare-datatype must precede every declare-fun: {decls:?}");
     }
 
     /// A formula with NO datatype content keeps its precise (non-`ALL`) logic and

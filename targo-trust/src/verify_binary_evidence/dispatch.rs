@@ -31,7 +31,7 @@ use super::{
     EXACT_REPLAY_WITNESS_EXECUTED_RANGE_DIAGNOSTIC,
     EXACT_REPLAY_WITNESS_INSTRUCTION_BYTES_DIAGNOSTIC,
     EXACT_REPLAY_WITNESS_MEMORY_EFFECT_DIAGNOSTIC, EXACT_REPLAY_WITNESS_SELECTED_IMAGE_DIAGNOSTIC,
-    is_canonical_sha256_hex, stable_json_sha256,
+    canonical_vc_bytes, is_canonical_sha256_hex, stable_json_sha256,
 };
 use crate::vc_kind_key;
 #[cfg(test)]
@@ -43,7 +43,7 @@ use crate::{
 pub(super) fn dispatch_canonical_binding(
     dispatch: &SolverDispatchRecord,
 ) -> Option<DispatchCanonicalBinding> {
-    let canonical_vc_bytes = serde_json::to_vec(dispatch.vc.as_ref()?).ok()?;
+    let canonical_vc_bytes = canonical_vc_bytes(dispatch.vc.as_ref()?)?;
     let origin_sha256 = digest_binary_origin(dispatch.origin.as_ref()?).ok()?;
     let vc_sha256 = trust_types::digest::stable_sha256_hex(&canonical_vc_bytes);
     Some(DispatchCanonicalBinding::new(canonical_vc_bytes, vc_sha256, origin_sha256))

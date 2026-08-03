@@ -178,6 +178,7 @@ fn test_full_pipeline_with_proved_trivial_vc() {
         },
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     let router = mock_router();
@@ -376,6 +377,7 @@ fn test_multi_backend_dispatch_selects_appropriate_backend() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     let plan = router.backend_plan(&safety_vc);
@@ -388,6 +390,7 @@ fn test_multi_backend_dispatch_selects_appropriate_backend() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     let plan = router.backend_plan(&functional_vc);
@@ -400,6 +403,7 @@ fn test_multi_backend_dispatch_selects_appropriate_backend() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     let plan = router.backend_plan(&domain_vc);
@@ -453,6 +457,7 @@ fn test_symex_path_constraint_to_formula() {
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation: None,
     };
 
     let router = mock_router();
@@ -643,6 +648,7 @@ fn test_query_cache_hit_miss() {
             Box::new(Formula::Int(42)),
         ),
         contract_metadata: None,
+        obligation: None,
     };
 
     // Miss

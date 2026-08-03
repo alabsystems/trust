@@ -36,6 +36,7 @@ fn test_router_with_constant_folder() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     let result = router.verify_one(&vc);
@@ -53,6 +54,7 @@ fn test_unsupported_mir_is_unknown_even_with_trivial_formula() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     let router = Router::with_backends(vec![Box::new(constant_folder::ConstantFolderBackend)]);
@@ -78,6 +80,7 @@ fn test_aarch64_atomic_unsupported_mir_is_classified_and_reported() {
         location: SourceSpan::binary_address(0x2230),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     let router = Router::with_backends(vec![Box::new(constant_folder::ConstantFolderBackend)]);
@@ -131,6 +134,7 @@ fn test_source_backpropagation_gate_blockers_are_classified_and_reported() {
             location: SourceSpan::binary_address(0x401000 + (idx as u64) * 4),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         })
         .collect::<Vec<_>>();
 
@@ -211,6 +215,7 @@ fn test_source_backpropagation_gate_hyphenated_disabled_reasons_are_classified()
             location: SourceSpan::binary_address(0x401100 + (idx as u64) * 4),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         })
         .collect::<Vec<_>>();
 
@@ -280,6 +285,7 @@ fn test_source_backpropagation_missing_contract_consumers_remain_blocked() {
             location: SourceSpan::binary_address(0x401200 + (idx as u64) * 4),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         })
         .collect::<Vec<_>>();
 
@@ -335,6 +341,7 @@ fn test_symbolic_formula_consumer_blocker_is_classified_and_reported() {
         location: SourceSpan::binary_address(0x401030),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     let router = Router::with_backends(vec![Box::new(constant_folder::ConstantFolderBackend)]);
@@ -378,6 +385,7 @@ fn test_router_verify_all() {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationCondition {
             kind: VcKind::ArithmeticOverflow {
@@ -388,6 +396,7 @@ fn test_router_verify_all() {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         },
     ];
 
@@ -406,6 +415,7 @@ fn test_router_verify_all_parallel() {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         })
         .collect();
 
@@ -425,6 +435,7 @@ fn test_router_verify_all_parallel_fallback_single() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     }];
 
     // Single VC should use sequential path
@@ -458,6 +469,7 @@ fn test_router_verify_all_parallel_panics_preserve_one_result_per_vc() {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         })
         .collect();
 
@@ -488,6 +500,7 @@ fn test_router_with_arc_backends() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
     assert!(router.verify_one(&vc).is_proved());
 }
@@ -564,6 +577,7 @@ fn test_backend_plan_prefers_solver_family_before_fallback() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     let plan = router.backend_plan(&vc);
@@ -639,6 +653,7 @@ fn test_verify_one_falls_back_after_unknown() {
         location: SourceSpan::default(),
         formula: Formula::Var("x".into(), Sort::Bool),
         contract_metadata: None,
+        obligation: None,
     };
 
     let result = router.verify_one(&vc);
@@ -707,6 +722,7 @@ fn test_verify_one_falls_back_after_timeout() {
         location: SourceSpan::default(),
         formula: Formula::Var("x".into(), Sort::Bool),
         contract_metadata: None,
+        obligation: None,
     };
 
     let result = router.verify_one(&vc);
@@ -779,6 +795,7 @@ fn test_verify_one_stops_after_failed() {
         location: SourceSpan::default(),
         formula: Formula::Var("x".into(), Sort::Bool),
         contract_metadata: None,
+        obligation: None,
     };
 
     let result = router.verify_one(&vc);
@@ -841,6 +858,7 @@ fn test_fallback_proof_artifacts_survive_materialized_dispatch_paths() {
             location: SourceSpan::default(),
             formula: Formula::Var("x".into(), Sort::Bool),
             contract_metadata: None,
+            obligation: None,
         })
         .collect();
 
@@ -911,6 +929,7 @@ fn test_validate_dispatch_blocks_safety_solver_for_termination_vc() {
         location: SourceSpan::default(),
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     };
 
     // PDR can_handle returns true, but validate_dispatch should block it.
@@ -966,6 +985,7 @@ fn test_validate_dispatch_allows_valid_solver_for_safety_vc() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     // PDR is valid for safety VCs — validate_dispatch should allow it.
@@ -1016,6 +1036,7 @@ fn test_validate_dispatch_blocks_all_safety_only_solvers_for_liveness() {
         location: SourceSpan::default(),
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     };
 
     let result = router.verify_one(&vc);
@@ -1060,6 +1081,7 @@ fn test_select_backend_returns_none_when_all_invalid() {
         location: SourceSpan::default(),
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     };
 
     let result = router.verify_one(&vc);
@@ -1137,6 +1159,7 @@ fn test_router_memory_guard_unlimited_passes() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     // With unlimited guard, dispatch should proceed normally.
@@ -1159,6 +1182,7 @@ fn test_router_memory_guard_high_limit_passes() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     let result = router.verify_one(&vc);
@@ -1181,6 +1205,7 @@ fn test_router_memory_guard_low_limit_blocks_dispatch() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     let result = router.verify_one(&vc);
@@ -1211,6 +1236,7 @@ fn test_router_memory_guard_blocks_verify_all() {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationCondition {
             kind: VcKind::DivisionByZero,
@@ -1218,6 +1244,7 @@ fn test_router_memory_guard_blocks_verify_all() {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         },
     ];
 
@@ -1247,6 +1274,7 @@ fn test_router_memory_guard_blocks_verify_all_parallel() {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         })
         .collect();
 
@@ -1278,6 +1306,7 @@ fn test_router_memory_guard_peak_tracked_after_dispatch() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     let _ = router.verify_one(&vc);
@@ -1341,6 +1370,7 @@ fn probe_vc(function: &str) -> VerificationCondition {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -1406,6 +1436,7 @@ fn sole_non_batch_backend_uses_per_vc_path() {
         location: SourceSpan::default(),
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     };
     let vcs = vec![probe_vc("f"), probe_vc("f"), distinct];
     let results = router.verify_all(&vcs);
@@ -1435,6 +1466,7 @@ fn batch_path_skips_unsupported_mir_vcs() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
     let vcs = vec![probe_vc("f"), unsupported, probe_vc("f")];
     let results = router.verify_all(&vcs);

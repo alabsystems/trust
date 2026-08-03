@@ -357,6 +357,7 @@ fn spec_to_vc(spec: &SpecProposal, function_path: &str) -> VerificationCondition
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -496,6 +497,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
 
         let (failed_spec, reason) =

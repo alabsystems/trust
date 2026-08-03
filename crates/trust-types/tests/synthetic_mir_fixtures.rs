@@ -31,6 +31,7 @@ fn make_vc(kind: VcKind, function: &str, formula: Formula) -> VerificationCondit
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation: None,
     }
 }
 

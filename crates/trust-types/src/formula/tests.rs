@@ -30,6 +30,7 @@ fn test_overflow_formula_construction() {
         location: SourceSpan::default(),
         formula: violation,
         contract_metadata: None,
+        obligation: None,
     };
 
     assert_eq!(vc.kind.description(), "arithmetic overflow (Add)");

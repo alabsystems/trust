@@ -1027,9 +1027,9 @@ impl TrustMcVerifierApiAdapter {
     /// This is the Trust native-bundle entry point for callers that already have
     /// a `trust_ir::NativeVerificationBundle` from `trust-ir-bridge`. It selects
     /// typed trust_mc CHC/PDR requests from the bundle, runs the native proof-grade
-    /// typed solver, and retains the live opaque producer authority through the
-    /// private consumer admission path. Exported transport records are never
-    /// capabilities.
+    /// typed solver. This compatibility entry point deliberately carries no
+    /// source-generation authority, so source-only semantic shortcuts remain
+    /// fail-closed. Exported transport records are never capabilities.
     #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
     #[must_use]
     pub fn evidence_from_native_trust_ir_bundle(
@@ -1083,6 +1083,49 @@ impl TrustMcVerifierApiAdapter {
         bundle: &TrustContractBundle,
         obligations: &[TrustObligation],
         native_bundle: &trust_ir::NativeVerificationBundle,
+        deadline: Option<Instant>,
+    ) -> NativeTrustIrBundleEvidenceWithFreshReceipts {
+        self.evidence_from_native_trust_ir_bundle_with_optional_source_authority_and_deadline_and_fresh_receipts(
+            bundle,
+            obligations,
+            native_bundle,
+            None,
+            deadline,
+        )
+    }
+
+    /// Run the native-bundle path with live source-generation authority.
+    ///
+    /// This is the sole TrustBMC adapter entry point that may ask TrustMC to
+    /// admit source-only semantic shortcuts. The affine authority remains
+    /// borrowed and must authorize this exact native bundle instance; ordinary,
+    /// decoded, cloned, and hand-built bundles use the compatibility entry
+    /// points above and remain fail-closed.
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    pub fn evidence_from_native_trust_ir_bundle_with_source_authority_and_deadline_and_fresh_receipts(
+        &self,
+        bundle: &TrustContractBundle,
+        obligations: &[TrustObligation],
+        native_bundle: &trust_ir::NativeVerificationBundle,
+        source_generation_authority: &trust_ir::SourceGenerationAuthority,
+        deadline: Option<Instant>,
+    ) -> NativeTrustIrBundleEvidenceWithFreshReceipts {
+        self.evidence_from_native_trust_ir_bundle_with_optional_source_authority_and_deadline_and_fresh_receipts(
+            bundle,
+            obligations,
+            native_bundle,
+            Some(source_generation_authority),
+            deadline,
+        )
+    }
+
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn evidence_from_native_trust_ir_bundle_with_optional_source_authority_and_deadline_and_fresh_receipts(
+        &self,
+        bundle: &TrustContractBundle,
+        obligations: &[TrustObligation],
+        native_bundle: &trust_ir::NativeVerificationBundle,
+        source_generation_authority: Option<&trust_ir::SourceGenerationAuthority>,
         deadline: Option<Instant>,
     ) -> NativeTrustIrBundleEvidenceWithFreshReceipts {
         // Trust: ownership is a property of the authenticated public VC, not
@@ -1507,8 +1550,11 @@ impl TrustMcVerifierApiAdapter {
         }
 
         let (transports, transport_not_proved) = match self
-            .native_trust_ir_chc_pdr_proof_transports(native_bundle, deadline)
-        {
+            .native_trust_ir_chc_pdr_proof_transports_with_optional_source_authority(
+                native_bundle,
+                source_generation_authority,
+                deadline,
+            ) {
             Ok(transports) => transports,
             Err(reason) => {
                 let evidence = obligations
@@ -1675,10 +1721,24 @@ impl TrustMcVerifierApiAdapter {
         }
     }
 
-    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    #[cfg(all(feature = "trust-mc-native-trust-ir-bundle", test))]
     fn native_trust_ir_chc_pdr_proof_transports(
         &self,
         native_bundle: &trust_ir::NativeVerificationBundle,
+        deadline: Option<Instant>,
+    ) -> Result<(Vec<NativeTrustIrChcPdrAuthorizedProof>, BTreeMap<String, String>), String> {
+        self.native_trust_ir_chc_pdr_proof_transports_with_optional_source_authority(
+            native_bundle,
+            None,
+            deadline,
+        )
+    }
+
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_trust_ir_chc_pdr_proof_transports_with_optional_source_authority(
+        &self,
+        native_bundle: &trust_ir::NativeVerificationBundle,
+        source_generation_authority: Option<&trust_ir::SourceGenerationAuthority>,
         deadline: Option<Instant>,
     ) -> Result<(Vec<NativeTrustIrChcPdrAuthorizedProof>, BTreeMap<String, String>), String> {
         validate_trust_mc_native_admission_contract(native_bundle)?;
@@ -1690,9 +1750,15 @@ impl TrustMcVerifierApiAdapter {
                 ))
                 .with_proof_certificate(self.config.produce_proofs),
         );
-        let bundle_evidence = runner
-            .solve_bundle_native_proof_grade(native_bundle)
-            .map_err(native_typed_chc_pdr_error_reason)?;
+        let bundle_evidence = match source_generation_authority {
+            Some(source_generation_authority) => runner
+                .solve_bundle_native_proof_grade_with_source_authority(
+                    native_bundle,
+                    source_generation_authority,
+                ),
+            None => runner.solve_bundle_native_proof_grade(native_bundle),
+        }
+        .map_err(native_typed_chc_pdr_error_reason)?;
         // Requests whose solve ran but did not produce proof-grade evidence are
         // returned as typed, evidence-free rows. Preserve their exact per-row
         // reason so a failed request cannot be hidden behind a generic missing
@@ -8747,6 +8813,34 @@ mod tests {
     }
 
     #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn compiler_style_source_assume_tmir_bundle() -> trust_ir::NativeVerificationBundle {
+        let mut bundle = compiler_style_safe_tmir_bundle();
+        let function = bundle
+            .module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "tmir_native_checked_branch")
+            .expect("fixture includes requested TrustMC function");
+        let entry = function.entry;
+        let block = function.block_mut(entry).expect("fixture entry block");
+        let condition = block
+            .body
+            .iter()
+            .find_map(|node| {
+                matches!(&node.inst, trust_ir::Inst::ICmp { .. })
+                    .then(|| node.results.first().copied())
+                    .flatten()
+            })
+            .expect("fixture entry computes its branch condition");
+        let terminator = block.body.len().checked_sub(1).expect("fixture entry terminator");
+        block.body.insert(
+            terminator,
+            trust_ir::InstrNode::new(trust_ir::Inst::Assume { cond: condition }),
+        );
+        bundle
+    }
+
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
     fn compiler_style_proof_grade_target() -> trust_ir::TargetInfo {
         trust_ir::TargetInfo {
             triple: "x86_64-unknown-linux-gnu".to_string(),
@@ -14759,6 +14853,136 @@ mod tests {
             not_proved.is_empty(),
             "fully proved bundle must not report not-proved rows: {not_proved:?}"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn root_adapter_threads_only_exact_source_authority_to_trust_mc() {
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        let public_bundle = compiler_style_safe_public_bundle();
+        let mut native_bundle = bind_compiler_style_native_bundle_to_public(
+            compiler_style_source_assume_tmir_bundle(),
+            &public_bundle,
+        );
+        assert!(native_bundle.module.functions.iter().any(|function| {
+            function.instructions().any(|node| matches!(&node.inst, trust_ir::Inst::Assume { .. }))
+        }));
+
+        let ordinary = adapter
+            .native_trust_ir_chc_pdr_proof_transports_with_optional_source_authority(
+                &native_bundle,
+                None,
+                None,
+            )
+            .expect_err("the ordinary root adapter route must default-deny source Assume");
+        assert!(ordinary.contains("unauthenticated Assume"), "unexpected rejection: {ordinary}");
+
+        let authority =
+            trust_ir::SourceGenerationAuthority::mint_from_live_lowering(&mut native_bundle)
+                .expect("fresh root adapter fixture must mint source authority");
+        adapter
+            .native_trust_ir_chc_pdr_proof_transports_with_optional_source_authority(
+                &native_bundle,
+                Some(&authority),
+                None,
+            )
+            .expect("the explicit root adapter route must admit exact source authority");
+
+        let cloned_bundle = native_bundle.clone();
+        let clone_error = adapter
+            .native_trust_ir_chc_pdr_proof_transports_with_optional_source_authority(
+                &cloned_bundle,
+                Some(&authority),
+                None,
+            )
+            .expect_err("a cloned bundle must lose source authority");
+        assert!(
+            clone_error.contains("unauthenticated Assume"),
+            "unexpected clone rejection: {clone_error}"
+        );
+
+        let mut foreign_bundle = bind_compiler_style_native_bundle_to_public(
+            compiler_style_source_assume_tmir_bundle(),
+            &public_bundle,
+        );
+        let foreign_authority =
+            trust_ir::SourceGenerationAuthority::mint_from_live_lowering(&mut foreign_bundle)
+                .expect("independent root adapter fixture must mint its own authority");
+        let mismatch = adapter
+            .native_trust_ir_chc_pdr_proof_transports_with_optional_source_authority(
+                &native_bundle,
+                Some(&foreign_authority),
+                None,
+            )
+            .expect_err("cross-bundle source authority must fail closed");
+        assert!(
+            mismatch.contains("unauthenticated Assume"),
+            "unexpected mismatch rejection: {mismatch}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn root_source_authority_issuer_is_unique_and_legacy_marker_is_absent() {
+        fn count_rust_source_occurrences(
+            root: &std::path::Path,
+            needle: &str,
+            production_only: bool,
+        ) -> usize {
+            let mut pending = vec![root.to_path_buf()];
+            let mut count = 0;
+            while let Some(path) = pending.pop() {
+                let entries = std::fs::read_dir(&path)
+                    .unwrap_or_else(|error| panic!("failed to scan {}: {error}", path.display()));
+                for entry in entries {
+                    let entry = entry.expect("source-tree directory entry");
+                    let path = entry.path();
+                    let file_type = entry.file_type().expect("source-tree entry type");
+                    if file_type.is_dir() {
+                        if !matches!(
+                            path.file_name().and_then(|name| name.to_str()),
+                            Some("target" | ".git")
+                        ) {
+                            pending.push(path);
+                        }
+                    } else if file_type.is_file()
+                        && path.extension().and_then(|extension| extension.to_str()) == Some("rs")
+                        && !(production_only
+                            && path.file_name().and_then(|name| name.to_str()) == Some("tests.rs"))
+                    {
+                        let source = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                            panic!("failed to read {}: {error}", path.display())
+                        });
+                        let source = if production_only {
+                            source
+                                .find("#[cfg(test)]\nmod tests")
+                                .map_or(source.as_str(), |test_module| &source[..test_module])
+                        } else {
+                            source.as_str()
+                        };
+                        count += source.match_indices(needle).count();
+                    }
+                }
+            }
+            count
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let issuer = ["mint", "_from_live_lowering", "("].concat();
+        let legacy_marker = ["mark", "_source_generation_live"].concat();
+        let issuer_count = [root.join("compiler"), root.join("crates")]
+            .iter()
+            .map(|path| count_rust_source_occurrences(path, &issuer, true))
+            .sum::<usize>();
+        let legacy_count = [root.join("compiler"), root.join("crates")]
+            .iter()
+            .map(|path| count_rust_source_occurrences(path, &legacy_marker, false))
+            .sum::<usize>();
+
+        assert_eq!(issuer_count, 1, "live source authority must have one audited root issuer");
+        assert_eq!(legacy_count, 0, "the legacy forgeable marker must remain absent");
     }
 
     #[test]

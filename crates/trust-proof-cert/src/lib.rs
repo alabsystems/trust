@@ -206,6 +206,7 @@ mod tests {
             },
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         }
     }
 

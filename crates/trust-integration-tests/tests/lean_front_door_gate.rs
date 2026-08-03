@@ -118,3 +118,90 @@ fn lean_front_door_fails_closed() {
         assert!(outcome.is_rejected(), "front door accepted `{source}`");
     }
 }
+
+/// Projection-certificate-specific non-vacuity control. Dropping the checked
+/// conclusion would let an accepted certificate claim that `true -> false` is
+/// satisfied. Keep the red proof as a named fixture so edits to the green
+/// semantic theorem cannot silently weaken or delete the load-bearing check.
+#[test]
+fn quantified_projection_red_control_is_rejected() {
+    let green_path = corpus_dir("trust-soundness").join("quantified_projection_certificate.lean");
+    let green = std::fs::read_to_string(&green_path)
+        .unwrap_or_else(|e| panic!("read projection proof {}: {e}", green_path.display()));
+    let negative_dir = corpus_dir("trust-soundness-negative");
+    let controls = [
+        ("quantified_projection_accept_without_conclusion.lean", 1usize),
+        ("quantified_projection_source_binding_bypass.lean", 14),
+        ("quantified_projection_query_identity_bypass.lean", 16),
+        ("quantified_projection_query_feature_bypass.lean", 4),
+        ("quantified_projection_dispatch_bypass.lean", 3),
+        ("quantified_projection_missing_semantic_evidence.lean", 3),
+        ("quantified_projection_literal_true_substitution.lean", 1),
+        ("quantified_projection_map_shape_bypass.lean", 2),
+    ];
+
+    for (file, expected_failures) in controls {
+        let red_path = negative_dir.join(file);
+        let fragment = std::fs::read_to_string(&red_path)
+            .unwrap_or_else(|e| panic!("read projection red control {}: {e}", red_path.display()));
+        let fragment_offset = green.len() + 1;
+        let mut source = green.clone();
+        source.push('\n');
+        source.push_str(&fragment);
+
+        let mut declarations = Vec::new();
+        let mut offset = 0usize;
+        for line in fragment.split_inclusive('\n') {
+            if let Some(rest) = line.strip_prefix("def ") {
+                let name = rest
+                    .split(|ch: char| ch.is_whitespace() || ch == ':')
+                    .next()
+                    .expect("red declaration has a name");
+                declarations.push((name.to_owned(), fragment_offset + offset));
+            }
+            offset += line.len();
+        }
+        assert_eq!(
+            declarations.len(),
+            expected_failures,
+            "projection red declaration inventory changed: {}",
+            red_path.display()
+        );
+
+        let outcome = check_clean_island(&source);
+        assert!(
+            outcome.is_rejected(),
+            "projection checker red control unexpectedly kernel-checked: {}",
+            red_path.display()
+        );
+        assert_eq!(
+            outcome.errors.len(),
+            expected_failures,
+            "projection checker red control did not produce its exact rejection count ({}): {:?}",
+            red_path.display(),
+            outcome.errors
+        );
+        assert!(
+            outcome.errors.iter().all(|error| !error.message.contains("UnknownIdent")
+                && !error.message.contains("unknown identifier")),
+            "projection checker red control was vacuously rejected by an unknown name ({}): {:?}",
+            red_path.display(),
+            outcome.errors
+        );
+
+        for (index, (name, start)) in declarations.iter().enumerate() {
+            let end =
+                declarations.get(index + 1).map_or(source.len(), |(_, next_start)| *next_start);
+            assert!(
+                !outcome.registered.iter().any(|registered| registered == name),
+                "projection bypass declaration unexpectedly registered: {name} ({})",
+                red_path.display()
+            );
+            assert!(
+                outcome.errors.iter().any(|error| error.start < end && error.end >= *start),
+                "projection bypass declaration lacked its own rejection: {name} ({})",
+                red_path.display()
+            );
+        }
+    }
+}

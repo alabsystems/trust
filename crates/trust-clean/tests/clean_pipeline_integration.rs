@@ -59,6 +59,7 @@ fn overflow_vc() -> VerificationCondition {
             ),
         ]))),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -73,6 +74,7 @@ fn divzero_vc() -> VerificationCondition {
             Box::new(Formula::Int(0)),
         ))),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -93,6 +95,7 @@ fn bounds_check_vc() -> VerificationCondition {
             Box::new(Formula::Var("array_len".into(), Sort::Int)),
         ),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -435,6 +438,7 @@ fn test_stale_certificate_detection_after_formula_change() {
             Box::new(Formula::Int(0)),
         ),
         contract_metadata: None,
+        obligation: None,
     };
 
     assert!(
@@ -477,6 +481,7 @@ fn test_two_proofs_composed_in_store() {
             Box::new(Formula::Var("len".into(), Sort::Int)),
         ),
         contract_metadata: None,
+        obligation: None,
     };
 
     let result = proved_result("ay");

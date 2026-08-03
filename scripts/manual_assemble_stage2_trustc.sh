@@ -43,27 +43,63 @@ for rec in data.split(b'\0'):
 print(f"  copied {n} rustc artifacts")
 PY
 
-echo "== 3. also copy the release/ top-level rustc dylibs (unhashed + hashed) -> lib/"
-for d in "$RUSTC_REL"/*.dylib "$RUSTC_REL"/deps/librustc_driver-*.dylib "$RUSTC_REL"/deps/librustc_*.dylib; do
+echo "== 3. also copy the release/ top-level rustc dylib aliases -> lib/"
+# Do not sweep release/deps here. That directory is shared across incremental
+# compiler builds and can contain stale, mutually incompatible driver hashes.
+# Step 2 already copied the exact hashed driver selected by .librustc-stamp;
+# only the current top-level aliases belong beside it in the assembled sysroot.
+for d in "$RUSTC_REL"/*.dylib; do
   [ -f "$d" ] && cp -f "$d" "$LIB/$(basename "$d")" 2>/dev/null || true
 done
 
+set -- "$LIB"/librustc_driver-*.dylib
+[ "$#" -eq 1 ] && [ -f "$1" ] || {
+  echo "expected exactly one stamped librustc_driver under $LIB" >&2
+  exit 1
+}
+
 echo "== 4. std (uplifted) -> rustlib/<host>/lib"
-if [ -d "$STD_DIST/deps" ]; then
-  cp -f "$STD_DIST"/deps/*.rlib "$RUSTLIB/" 2>/dev/null || true
-  cp -f "$STD_DIST"/deps/*.rmeta "$RUSTLIB/" 2>/dev/null || true
-  cp -f "$STD_DIST"/deps/*.dylib "$RUSTLIB/" 2>/dev/null || true
-  cp -f "$STD_DIST"/deps/libstd-*.dylib "$LIB/" 2>/dev/null || true
+if [ -f "$STD_DIST/.libstd-stamp" ]; then
+  python3 - "$STD_DIST/.libstd-stamp" "$LIB" "$RUSTLIB" <<'PY'
+import os, sys, shutil
+stamp, libdir, rustlib = sys.argv[1], sys.argv[2], sys.argv[3]
+n = 0
+for rec in open(stamp, 'rb').read().split(b'\0'):
+    if not rec:
+        continue
+    path = rec[1:].decode('utf-8', 'replace')
+    if not os.path.isfile(path):
+        continue
+    base = os.path.basename(path)
+    if base.endswith(('.rlib', '.rmeta', '.dylib', '.so')):
+        shutil.copy2(path, os.path.join(rustlib, base))
+        if base.startswith('libstd-') and base.endswith(('.dylib', '.so')):
+            shutil.copy2(path, os.path.join(libdir, base))
+        n += 1
+print(f"  copied {n} stamped std artifacts")
+PY
 fi
 # also try the standard std libdir locations
 for cand in "$ROOT/build/$HOST/stage2-std/$HOST/release/deps" "$ROOT/build/$HOST/stage1/lib/rustlib/$HOST/lib"; do
   [ -d "$cand" ] && { cp -f "$cand"/*.rlib "$RUSTLIB/" 2>/dev/null || true; cp -f "$cand"/*.dylib "$RUSTLIB/" 2>/dev/null || true; cp -f "$cand"/*.rmeta "$RUSTLIB/" 2>/dev/null || true; }
 done
+set -- "$RUSTLIB"/libstd-*.rlib
+[ "$#" -eq 1 ] && [ -f "$1" ] || {
+  echo "expected exactly one stamped libstd under $RUSTLIB" >&2
+  exit 1
+}
 
-echo "== 5. ad-hoc codesign (macOS: copied Mach-O loses signature -> SIGKILL without this)"
-codesign --force --sign - "$BIN/trustc" 2>/dev/null || true
-codesign --force --sign - "$BIN/rustc" 2>/dev/null || true
-for f in "$LIB"/*.dylib "$RUSTLIB"/*.dylib; do [ -f "$f" ] && codesign --force --sign - "$f" 2>/dev/null || true; done
+echo "== 5. preserve valid signatures; ad-hoc sign only unsigned Mach-O files"
+# `cp` preserves an embedded signature. Re-signing an already linker-signed
+# compiler dylib changes its bytes and breaks the exact driver identity shared
+# with the prepared rustc-private sysroot. Only repair files whose copied
+# signature does not verify.
+for f in "$BIN/trustc" "$BIN/rustc" "$LIB"/*.dylib "$RUSTLIB"/*.dylib; do
+  [ -f "$f" ] || continue
+  codesign --verify --strict "$f" 2>/dev/null \
+    || codesign --force --sign - "$f" 2>/dev/null \
+    || true
+done
 
 echo "== 6. rustc-dev (rustc_private) rlibs/rmetas from .librustc-stamp -> rustlib"
 # Inlined (formerly scripts/restore-rustc-dev.sh, retired). For a normal

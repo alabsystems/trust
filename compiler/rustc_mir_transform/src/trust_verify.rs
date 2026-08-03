@@ -8084,18 +8084,20 @@ fn transport_row_is_authenticated_assumed_total_assumption(
 /// Trust (completeness-gap ruling B): may this function's residual gap be
 /// tolerated by the DEFAULT policy?
 ///
-/// Only when BOTH hold:
-///   * nothing was refuted and nothing was skipped/unaccounted — a refutation is
-///     a found bug and an unaccounted row is not evidence; and
-///   * EVERY obligation in the function is of a kind that keeps a runtime check
-///     (`VcKind::has_runtime_fallback`, the single-sourced classification the L0
-///     tally already uses).
+/// Only when every row is either:
+///   * unresolved but protected by the exact Rust runtime check; or
+///   * the explicitly classified IEEE-754 defined-behavior advisory. Reaching
+///     infinity is neither a panic nor UB, so its refutation is useful numerical
+///     information but cannot reject otherwise-valid Rust under the default
+///     policy. `certify` still requires that advisory to be discharged.
 ///
-/// The second condition is deliberately whole-function and therefore CONSERVATIVE:
-/// one row without a fallback makes the whole function fatal, even if the actual
-/// gap was on a different, fallback-bearing row. Over-restrictive is the safe
-/// direction here — the failure mode to avoid is tolerating a gap on an
-/// obligation that nothing checks at runtime, which is the UB class.
+/// Every other refutation, skip, or no-fallback row remains fatal.
+///
+/// The scan is deliberately whole-function and therefore conservative: one row
+/// outside those two exact classes makes the whole function fatal, even if the
+/// original coverage gap was on a different fallback-bearing row. The failure
+/// mode to avoid is tolerating an unverified safety or authored-contract claim
+/// that has neither a proof nor a runtime check.
 /// Why `residual_gap_tolerance_denial` said no. Reported to the user, so a
 /// build that fails where the ruling says it should pass explains itself instead
 /// of leaving the reader to guess between four different causes.
@@ -8107,8 +8109,8 @@ enum GapToleranceDenial {
     /// A row carries a raw `Failed` verdict even though the aggregate summary may
     /// report it otherwise.
     RowRefuted,
-    /// A row's kind has no runtime check, so accepting it would ship unverified
-    /// behaviour with nothing beneath it.
+    /// A non-advisory row's kind has no runtime check, so accepting it would ship
+    /// unverified behaviour with nothing beneath it.
     RowHasNoFallback,
 }
 
@@ -8124,11 +8126,19 @@ impl GapToleranceDenial {
                  reports it differently)"
             }
             Self::RowHasNoFallback => {
-                "at least one obligation has no runtime fallback, so accepting it would ship \
-                 behaviour with nothing checking it"
+                "at least one non-advisory obligation has no runtime fallback, so accepting it \
+                 would ship behaviour with nothing checking it"
             }
         }
     }
+}
+
+/// Defined IEEE-754 outcomes that Trust reports for numerical hygiene but which
+/// are not Rust safety or authored-contract violations. This exception is kept
+/// exact rather than proof-level-wide: an L1 postcondition/refinement refutation
+/// is still a real contract failure and remains fatal under the default policy.
+fn is_defined_float_advisory(kind: &VcKind) -> bool {
+    matches!(kind, VcKind::FloatOverflowToInfinity { .. } | VcKind::FloatDivisionByZero)
 }
 
 /// `None` when the residual gap MAY be tolerated; `Some(reason)` when it may not.
@@ -8156,6 +8166,9 @@ fn residual_gap_tolerance_denial(
         return Some(GapToleranceDenial::NoRows);
     }
     for (vc, result) in results {
+        if is_defined_float_advisory(&vc.kind) {
+            continue;
+        }
         if matches!(result, VerificationResult::Failed { .. }) {
             return Some(GapToleranceDenial::RowRefuted);
         }
@@ -10003,11 +10016,12 @@ fn abort_on_full_verification_failure<'tcx>(
         .max(u32::from(has_unproved_assumption_panic));
 
     // Trust (completeness-gap ruling B): under the DEFAULT policy a residual gap
-    // whose every obligation keeps its runtime check is reported, not fatal — the
-    // emitted program is bit-for-bit vanilla Rust, so failing the build on it buys
-    // no safety and costs drop-in. `certify` still demands full static discharge.
-    // A refutation, an unaccounted row, or any obligation with no runtime fallback
-    // keeps the function fail-closed.
+    // whose every obligation either keeps its runtime check or is an explicitly
+    // classified defined-IEEE advisory is reported, not fatal — the emitted
+    // program is bit-for-bit vanilla Rust, so failing the build on it buys no
+    // safety and costs drop-in. `certify` still demands full static discharge.
+    // Any other refutation, unaccounted row, or no-fallback obligation keeps the
+    // function fail-closed.
     // Trust (completeness-gap ruling B). Two different things share the
     // `native_authority_validation_failures` list and they must NOT share a fate:
     //
@@ -10039,11 +10053,11 @@ fn abort_on_full_verification_failure<'tcx>(
     let requires_full_discharge =
         tcx.sess.opts.unstable_opts.trust_policy.requires_full_discharge();
     let gap_denial = residual_gap_tolerance_denial(&artifacts.results, tcx.sess.overflow_checks());
-    let gap_is_runtime_checked = gap_denial.is_none();
-    let tolerate_runtime_checked_gap = !requires_full_discharge
+    let gap_is_default_nonfatal = gap_denial.is_none();
+    let tolerate_default_gap = !requires_full_discharge
         && !has_unproved_assumption_panic
         && native_structurally_sound
-        && gap_is_runtime_checked;
+        && gap_is_default_nonfatal;
 
     // Trust: when the default policy COULD have tolerated this gap but did not,
     // say which condition withheld it. A build that fails where the ruling says
@@ -10066,9 +10080,15 @@ fn abort_on_full_verification_failure<'tcx>(
     // actually withheld — record it so the crate-level R1 scan-poison warning may
     // state its cause (see `r1_scan_gap_warning_applies`).
     with_crate_verification_state(tcx.sess, |state| state.l0_verdict_withheld = true);
-    let header = format!(
-        "Trust strict verification failed for `{func_path}`: {unique_failure_count} obligation(s) were not fully verified",
-    );
+    let header = if tolerate_default_gap {
+        format!(
+            "Trust verification advisory for `{func_path}`: {unique_failure_count} obligation(s) were not fully verified"
+        )
+    } else {
+        format!(
+            "Trust strict verification failed for `{func_path}`: {unique_failure_count} obligation(s) were not fully verified"
+        )
+    };
     // Trust: collect the notes once, then emit them on an error (aborting) or a
     // warning (coverage gap) diagnostic — the two `Diag` levels are distinct
     // types and cannot share a binding, so the notes are level-agnostic here.
@@ -10098,12 +10118,23 @@ fn abort_on_full_verification_failure<'tcx>(
         notes.push(format!("native proof-authority validation failed: {validation_failure}"));
     }
     if failure.failed > 0 {
-        notes.push(
-            "failed obligations, including declared contract panics, are refutations and are not \
-             permitted under strict verification; select \
-             -Ztrust-policy=advisory to record contract-panic conditional evidence"
-                .to_string(),
-        );
+        if tolerate_default_gap
+            && artifacts.results.iter().any(|(vc, _)| is_defined_float_advisory(&vc.kind))
+        {
+            notes.push(
+                "the refuted float row is an L1 numerical-hygiene advisory about a defined \
+                 IEEE-754 result; it carries no proof credit and remains fatal under \
+                 `-Z trust-policy=certify`, but it is not a Rust safety violation"
+                    .to_string(),
+            );
+        } else {
+            notes.push(
+                "failed obligations, including declared contract panics, are refutations and are \
+                 not permitted under strict verification; select -Ztrust-policy=advisory to \
+                 record contract-panic conditional evidence"
+                    .to_string(),
+            );
+        }
     }
     if has_unproved_assumption_panic {
         notes.push(
@@ -10156,16 +10187,17 @@ fn abort_on_full_verification_failure<'tcx>(
         }
     }
     // Trust (completeness-gap ruling B): report the gap without failing the build
-    // when every obligation keeps its runtime check. The LABEL is unchanged — the
-    // rows are still reported unproved and are never relabelled `Proved`, which is
-    // what fail-closed requires; only the exit code differs.
+    // when every obligation keeps its runtime check or is the exact defined-IEEE
+    // advisory. The LABEL is unchanged — the rows are still reported unproved and
+    // are never relabelled `Proved`; only the exit code differs.
     // `struct_span_warn` and `struct_span_err` yield different `Diag` payload types
     // (`()` vs `ErrorGuaranteed`), so the two levels are emitted separately rather
     // than unified into one binding — the same shape the L0 gate above uses.
-    if tolerate_runtime_checked_gap {
+    if tolerate_default_gap {
         let mut diag = tcx.dcx().struct_span_warn(body.span, header);
         diag.note(
-            "every unproved obligation here keeps the runtime check rustc already emits, so the \
+            "every unproved obligation here either keeps the runtime check rustc already emits \
+             or reports a defined IEEE-754 outcome (infinity/NaN, never panic or UB), so the \
              compiled program has vanilla Rust semantics; reported rather than failed under the \
              default policy. `-Z trust-policy=certify` demands full static discharge and fails \
              on these",
@@ -11752,6 +11784,12 @@ pub fn trust_ensure_whole_crate_verification(tcx: TyCtxt<'_>) {
             continue;
         }
         eligible_bodies.insert(local);
+    }
+    // The panic-free callee registry is consumed while a caller's one-shot
+    // verdict is built, so populate it in callee-first order. This is only a
+    // permutation of the same eligible body set; cycles cannot bootstrap a proof
+    // because at least one member is still visited before a sibling it calls.
+    for local in trust_callee_first_demand_order(tcx, &eligible_bodies) {
         tcx.ensure_done().optimized_mir(local.to_def_id());
     }
     // E6 kernel-import: the walk above populated the facet table + body
@@ -14114,6 +14152,8 @@ fn try_harvest_recursive_flip<'tcx>(
                 location: vc.location.clone(),
                 formula: ind_formula.clone(),
                 contract_metadata: None,
+                // Not a contract-derived VC: no obligation to back-reference.
+                obligation: None,
             };
             // THE inductive discharge — a REAL kernel-certified UNSAT of
             // `P_M ∧ guards ∧ ¬P_N[σ]`. Not assumed. Not structural. Evidence KEPT.
@@ -14758,6 +14798,8 @@ fn unsupported_contract_artifacts(
         location: source_span_from_rustc_span(tcx, body.span),
         formula: trust_types::Formula::Bool(false),
         contract_metadata: None,
+        // Not a contract-derived VC: no obligation to back-reference.
+        obligation: None,
     };
     let result = VerificationResult::Unknown {
         solver: trust_types::Symbol::intern("trust-contract-query"),
@@ -14812,6 +14854,8 @@ fn dump_only_artifacts(tcx: TyCtxt<'_>, body: &Body<'_>, def_path: &str) -> Veri
         location: source_span_from_rustc_span(tcx, body.span),
         formula: trust_types::Formula::Bool(false),
         contract_metadata: None,
+        // Not a contract-derived VC: no obligation to back-reference.
+        obligation: None,
     };
     let result = VerificationResult::Unknown {
         solver: trust_types::Symbol::intern("trust-dump-mir-only"),
@@ -14860,6 +14904,8 @@ fn memory_admission_artifacts(
         location: source_span_from_rustc_span(tcx, body.span),
         formula: trust_types::Formula::Bool(false),
         contract_metadata: None,
+        // Not a contract-derived VC: no obligation to back-reference.
+        obligation: None,
     };
     let result = VerificationResult::Unknown {
         solver: trust_types::Symbol::intern("trust-memory-coordinator"),
@@ -15077,6 +15123,8 @@ fn synthetic_unmodeled_unsafe_call_vcs<'tcx>(
             // Always SAT = always a finding: no model of this call's effects.
             formula: trust_types::Formula::Bool(true),
             contract_metadata: None,
+            // Not a contract-derived VC: no obligation to back-reference.
+            obligation: None,
         });
     }
     vcs
@@ -15207,6 +15255,8 @@ fn synthetic_nonmodeled_unsafe_op_vcs<'tcx>(
             location: source_span_from_rustc_span(tcx, span),
             formula: trust_types::Formula::Bool(true),
             contract_metadata: None,
+            // Not a contract-derived VC: no obligation to back-reference.
+            obligation: None,
         })
         .collect()
 }
@@ -19275,11 +19325,16 @@ fn collect_full_verification_artifacts<'tcx>(
     // The first pass is deliberately side-effect-free with respect to this
     // function's interprocedural panic registry. Publish at most once, and only
     // from the finally-selected, fully-revalidated carrier.
-    if results_establish_unconditional_panic_freedom(
-        &selected.results,
-        &selected.result_bindings,
-        &selected.proof_authorities,
-    ) {
+    let established =
+        results_establish_unconditional_panic_freedom(
+            &selected.results,
+            &selected.result_bindings,
+            &selected.proof_authorities,
+        ) || zero_obligation_run_establishes_unconditional_panic_freedom(tcx.sess, &selected);
+    // Coroutine resume-state safety is published as an explicit protocol
+    // assumption after artifact collection. It is therefore never unconditional
+    // registry authority, even when all data-safety rows are independently proved.
+    if established && !body_has_coroutine_protocol_assert(body) {
         register_proven_panic_free(tcx.sess, &func.def_path);
     }
     selected
@@ -19306,7 +19361,7 @@ fn collect_full_verification_artifacts_once<'tcx>(
 
     let mut all_vcs = solver_vcs.to_vec();
     all_vcs.extend(discharged.iter().map(|(vc, _)| vc.clone()));
-    let (bundle, native_trust_ir_bundle, body_bound_carriers, definition_entry_markers) =
+    let (bundle, mut native_trust_ir_bundle, mut body_bound_carriers, definition_entry_markers) =
         build_full_verification_input(
             tcx,
             body,
@@ -19317,6 +19372,21 @@ fn collect_full_verification_artifacts_once<'tcx>(
             policy,
             context.deadline,
         );
+    // This is the one audited semantic-TCB issuer in the root constellation:
+    // the native bundle has just returned from the final live MIR lowering and
+    // all compiler-owned rewrites are complete. A mint failure poisons the
+    // native result and clears its private carriers, so no ordinary or replayed
+    // bundle can silently fall through to the source-authorized TrustMC lane.
+    let source_generation_authority = match mint_source_generation_authority_for_live_native_bundle(
+        &mut native_trust_ir_bundle,
+    ) {
+        Ok(authority) => authority,
+        Err(reason) => {
+            body_bound_carriers.clear();
+            native_trust_ir_bundle = Err(reason);
+            None
+        }
+    };
     // A definition-site `requires(P)` is the callee's modular entry
     // assumption, not a proposition to prove for arbitrary inputs. Keep its
     // exact compiler-authored row in `bundle` for catalog/transport reporting,
@@ -19371,6 +19441,7 @@ fn collect_full_verification_artifacts_once<'tcx>(
             &bundle,
             &dispatched_obligations,
             native_trust_ir_bundle.as_ref(),
+            source_generation_authority.as_ref(),
             &body_bound_carriers,
             &context,
             vc_timeout_ms(tcx.sess),
@@ -19835,6 +19906,42 @@ fn results_establish_unconditional_panic_freedom(
                 )
             )
         })
+}
+
+fn zero_obligation_registry_gate(
+    summary_is_empty: bool,
+    assumption_panic_free: bool,
+    native_authority_valid: bool,
+    native_run_vacuously_clean: bool,
+) -> bool {
+    summary_is_empty
+        && assumption_panic_free
+        && native_authority_valid
+        && native_run_vacuously_clean
+}
+
+/// Register the genuinely empty case accepted by the strict verifier. The
+/// nonempty result-row gate above deliberately rejects `[]`; without this twin,
+/// a clean leaf function could pass strict verification but never become usable
+/// as panic-freedom authority for a caller.
+fn zero_obligation_run_establishes_unconditional_panic_freedom(
+    sess: &Session,
+    artifacts: &VerificationArtifacts,
+) -> bool {
+    let native_authority_valid = native_proved_authority_validation_failures(
+        sess,
+        artifacts.full_verification.as_ref(),
+        &artifacts.results,
+        &artifacts.result_bindings,
+        &artifacts.proof_authorities,
+    )
+    .is_empty();
+    zero_obligation_registry_gate(
+        artifacts.proof_results.summary.total == 0,
+        !artifacts_have_unproved_assumption_panic(artifacts),
+        native_authority_valid,
+        artifacts.full_verification.as_ref().is_some_and(native_run_is_vacuously_clean),
+    )
 }
 
 /// Trust (hardened evidence gate): per-obligation proof evidence for the
@@ -21145,6 +21252,23 @@ fn build_full_verification_input<'tcx>(
     (bundle, native_trust_ir_bundle, body_bound_carriers, definition_entry_markers)
 }
 
+/// Mint source-generation authority only for the exact live native bundle
+/// returned by the final compiler lowering seam.
+///
+/// Keeping the issuer in this small helper lets the static call-site gate count
+/// one production mint while focused tests exercise one-shot and clone-erasure
+/// behavior without introducing a second authority issuer.
+fn mint_source_generation_authority_for_live_native_bundle(
+    native_bundle: &mut Result<Option<trust_ir_bridge::NativeVerificationBundle>, String>,
+) -> Result<Option<trust_ir_bridge::SourceGenerationAuthority>, String> {
+    let Ok(Some(native_bundle)) = native_bundle else { return Ok(None) };
+    trust_ir_bridge::SourceGenerationAuthority::mint_from_live_lowering(native_bundle)
+        .map(Some)
+        .map_err(|error| {
+            format!("live compiler source-generation authority mint failed closed: {error}")
+        })
+}
+
 #[cfg(test)]
 fn build_full_verification_input_for_tests(
     func: &trust_types::VerifiableFunction,
@@ -21308,6 +21432,7 @@ fn verify_full_bundle_with_body_bound_receipts(
     bundle: &trust_verifier_api::TrustContractBundle,
     obligations: &[trust_verifier_api::TrustObligation],
     native_bundle: Option<&trust_ir_bridge::NativeVerificationBundle>,
+    source_generation_authority: Option<&trust_ir_bridge::SourceGenerationAuthority>,
     body_bound_carriers: &[CompilerFinalizedBodyBoundCarrier],
     context: &trust_router::VerifierExecutionContext,
     per_obligation_timeout_ms: u64,
@@ -21330,14 +21455,23 @@ fn verify_full_bundle_with_body_bound_receipts(
     // Always use the optional-native live API, including when no native bundle
     // exists: the dedicated direct TrustVC lane is precisely the no-native-
     // identity route, while S3 still requires a typed native CHC/PDR request.
-    let (result, live_receipts) = engine
-        .verify_obligations_with_optional_native_trust_ir_bundle_and_live_receipts(
+    let live_run = match (native_bundle, source_generation_authority) {
+        (Some(native_bundle), Some(source_generation_authority)) => engine
+            .verify_obligations_with_native_trust_ir_bundle_and_source_authority_and_live_receipts(
+                bundle,
+                obligations,
+                native_bundle,
+                source_generation_authority,
+                context,
+            ),
+        _ => engine.verify_obligations_with_optional_native_trust_ir_bundle_and_live_receipts(
             bundle,
             obligations,
             native_bundle,
             context,
-        )
-        .into_parts();
+        ),
+    };
+    let (result, live_receipts) = live_run.into_parts();
     // Keep receipt construction lexically inside the live-call wrapper. There
     // is intentionally no helper that accepts an arbitrary/deserialized run
     // and returns receipts (including under `cfg(test)`).
@@ -24312,6 +24446,66 @@ pub(crate) fn trust_mir_direct_local_callees<'tcx>(
     tcx.arena.alloc_from_iter(callees)
 }
 
+/// Deterministic DFS post-order for a caller-to-callee adjacency list. On a DAG,
+/// every callee precedes every caller. In a cycle no such order exists; the
+/// traversal still emits every node once, and the first cycle member verified
+/// cannot use an as-yet-unregistered sibling to bootstrap a proof.
+fn callee_first_node_order(adjacency: &[Vec<usize>]) -> Vec<usize> {
+    let mut visited = vec![false; adjacency.len()];
+    let mut order = Vec::with_capacity(adjacency.len());
+    let mut dfs_stack: Vec<(usize, usize)> = Vec::new();
+
+    for start in 0..adjacency.len() {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        dfs_stack.push((start, 0));
+        while let Some(&(node, cursor)) = dfs_stack.last() {
+            if cursor < adjacency[node].len() {
+                dfs_stack.last_mut().expect("nonempty DFS stack").1 += 1;
+                let successor = adjacency[node][cursor];
+                // Production adjacency is dense and valid. Keep this pure helper
+                // fail-closed and total for malformed test/future callers.
+                if successor < adjacency.len() && !visited[successor] {
+                    visited[successor] = true;
+                    dfs_stack.push((successor, 0));
+                }
+            } else {
+                order.push(node);
+                dfs_stack.pop();
+            }
+        }
+    }
+    order
+}
+
+/// Return the eligible runtime bodies in deterministic, best-effort callee-first
+/// demand order. The graph is read entirely from the pre-steal, disk-cached MIR
+/// adjacency query before any `optimized_mir` demand is issued.
+fn trust_callee_first_demand_order(
+    tcx: TyCtxt<'_>,
+    eligible: &FxHashSet<LocalDefId>,
+) -> Vec<LocalDefId> {
+    let mut nodes: Vec<LocalDefId> =
+        tcx.mir_keys(()).iter().copied().filter(|local| eligible.contains(local)).collect();
+    nodes.sort_unstable_by_key(|def_id| def_id.local_def_index.as_u32());
+
+    let index_of: FxHashMap<LocalDefId, usize> =
+        nodes.iter().enumerate().map(|(index, &def_id)| (def_id, index)).collect();
+    let adjacency: Vec<Vec<usize>> = nodes
+        .iter()
+        .map(|&def_id| {
+            tcx.trust_mir_direct_local_callees(def_id)
+                .iter()
+                .filter_map(|callee| index_of.get(callee).copied())
+                .collect()
+        })
+        .collect();
+
+    callee_first_node_order(&adjacency).into_iter().map(|index| nodes[index]).collect()
+}
+
 /// Compute every mutual-recursion SCC once for the crate. The result is sorted
 /// by `DefIndex`, making the disk-cached value deterministic and membership a
 /// binary search. This replaces the old per-root transitive BFS, whose aggregate
@@ -25899,8 +26093,8 @@ fn trust_mc_typed_chc_contract_for_native_trust_ir_obligation(
     };
     // The enriched whole-function CFG-CHC backs the structurally-routed
     // obligations OR a loop-carried arithmetic obligation.
-    let dataflow_eligible =
-        (trust_mc_dataflow_chc_enabled() && routed_to_structural_chc) || redirect_safety_to_dataflow;
+    let dataflow_eligible = (trust_mc_dataflow_chc_enabled() && routed_to_structural_chc)
+        || redirect_safety_to_dataflow;
     let enriched = if dataflow_eligible {
         trust_mc_dataflow_function_chc_from_trust_ir(native_trust_ir_bundle, request, error_mode)?
     } else {
@@ -25956,9 +26150,8 @@ fn trust_mc_typed_chc_contract_for_native_trust_ir_obligation(
     // reachability proof and leave it runtime-checked forever. The same holds for
     // an arithmetic-safety obligation REDIRECTED to the env-gated data-flow CHC:
     // it too now carries a genuine MIR-derived proof input, not a placeholder.
-    if let Some(reason) = unsupported_reason
-        .as_ref()
-        .filter(|_| !routed_to_structural_chc && !redirected_to_dataflow)
+    if let Some(reason) =
+        unsupported_reason.as_ref().filter(|_| !routed_to_structural_chc && !redirected_to_dataflow)
     {
         if let serde_json::Value::Object(object) = &mut value {
             object.insert("origin".to_string(), serde_json::json!("router_placeholder"));
@@ -26287,7 +26480,43 @@ fn trust_mc_default_instruction_requires_fail_closed_admission(
 // GATING. The whole lane is opt-in via `TRUST_MC_DATAFLOW_CHC` and defaults OFF,
 // so the shipped default corpus is byte-identical to the structural encoder
 // unless a caller explicitly asks for enrichment. This is deliberate: the
-// encoder is WIP and low-yield; do not enable it without validation.
+// encoder is WIP and low-yield; do not enable it without validation. The gate is
+// VALUE-aware, not presence-based: `TRUST_MC_DATAFLOW_CHC=0` is OFF, not ON (see
+// [`trust_mc_env_flag_value_enabled`]).
+//
+// KNOWN GATE-ON UNSOUNDNESS CAVEATS. These are the reasons "do not enable"
+// is not boilerplate. Each must be closed before this lane may carry a verdict:
+//
+//   1. WRAPPING ARITHMETIC vs. THE UNBOUNDED-`int` FOLD (open). A plain
+//      `BinOp{Add,Sub,Mul}` on an integer type is folded into the equality
+//      `dest = lhs op rhs` over MATHEMATICAL `int` (see `chc_fold_block_body` /
+//      [`chc_map_int_binop`]). Rust's unchecked (release-mode) semantics are
+//      WRAPPING, so on a wrapping execution the real state has
+//      `dest = (lhs op rhs) mod 2^W` and the emitted equality is NOT entailed —
+//      it EXCLUDES a genuinely reachable state. Excluding reachable states is
+//      precisely the direction that produces a FALSE SAFE, and in
+//      `ChcErrorMode::Structural` — which backs the whole-function default /
+//      panic-freedom AGGREGATE obligation — there is no compensating violation
+//      edge to catch it. (`ArithmeticSafetyOnly` is not exposed to this via a
+//      plain `BinOp`: a checked-arithmetic site is an `Overflow` inst, whose
+//      fold is paired with its own `error` edge.) Closing this means either
+//      modeling the wrap explicitly or havocing plain `BinOp` folds outright.
+//
+//   2. ARITHMETIC-SAFETY SURFACE COVERAGE (fixed; keep it that way).
+//      `ArithmeticSafetyOnly` conflates every arithmetic obligation of a
+//      function into ONE `error` query, so an arithmetic hazard with no `error`
+//      edge could be "discharged" by a CHC that never modeled it. The gate
+//      [`function_overflow_surface_fully_modeled`] rejects such functions.
+//      Originally it caught only unmodeled-width `Overflow` and integer
+//      div/rem, and LET THROUGH the shift-amount (`Shl`/`LShr`/`AShr`), signed
+//      negation (`UnOp::Neg`), lossy-cast and float hazards — every one of them
+//      a real `ObligationKind::ArithmeticSafety` producer in trust-vcgen. It is
+//      now an ALLOWLIST keyed on [`chc_inst_arithmetic_surface_modeled`]: an op
+//      must be named hazard-free to pass, so a NEW `trust_ir` op variant gates
+//      the function out by default instead of silently joining the false-SAFE
+//      surface. When a new arithmetic hazard IS modeled with its own `error`
+//      edge, add it to that allowlist deliberately — never widen the allowlist
+//      to make a function encode.
 //
 // Soundness discipline (this is a reachability proof — `error` unreachable ⇒
 // SAFE, so we must OVER-approximate the reachable set and never emit a false
@@ -26323,20 +26552,53 @@ fn trust_mc_default_instruction_requires_fail_closed_admission(
 //     untouched structural encoder. Purely additive.
 // ---------------------------------------------------------------------------
 
-/// Runtime gate for the data-flow-enriched CFG-CHC encoder. Reads the
-/// `TRUST_MC_DATAFLOW_CHC` environment variable (present ⇒ enabled) so the
-/// frozen driver can toggle enrichment without a recompile. Defaults OFF, which
-/// is what keeps the default verification lane byte-identical to the structural
-/// encoder.
-fn trust_mc_dataflow_chc_enabled() -> bool {
-    std::env::var_os("TRUST_MC_DATAFLOW_CHC").is_some()
+/// Whether a data-flow-lane environment flag's raw VALUE means "on".
+///
+/// VALUE-aware, deliberately NOT a presence check. Unset, non-UTF-8, empty,
+/// `0`, `false`, `off` and `no` — ASCII-case-insensitive, surrounding whitespace
+/// trimmed — all mean DISABLED; any other value enables. A presence check
+/// (`var_os(..).is_some()`) turns the universal "off" spelling
+/// `TRUST_MC_DATAFLOW_CHC=0` into an ENABLE, i.e. exactly the opposite of what
+/// the operator asked for, on a WIP lane whose whole safety story is that it
+/// stays off. Every ambiguous case resolves to OFF, matching the lane's
+/// fail-closed discipline.
+///
+/// Split from [`trust_mc_env_flag_enabled`] so the spelling table is testable
+/// without mutating the process environment (which would race every other test
+/// thread and, since edition 2024, needs `unsafe`).
+fn trust_mc_env_flag_value_enabled(raw: Option<&std::ffi::OsStr>) -> bool {
+    let Some(raw) = raw else {
+        return false;
+    };
+    // A non-UTF-8 value is not one of the "off" spellings, but it is not a
+    // deliberate opt-in either — keep the lane off rather than guess.
+    let Some(text) = raw.to_str() else {
+        return false;
+    };
+    !matches!(text.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "off" | "no")
 }
 
-/// Debug gate: when `TRUST_MC_DATAFLOW_CHC_DEBUG` is set, the enriched encoder
-/// prints one `[DATAFLOW-FIRED]` / `[DATAFLOW-FALLBACK]` line per function so a
-/// rebuild can confirm at runtime whether enrichment actually engaged.
+/// Whether a data-flow-lane environment flag is switched ON. Reads `name` once
+/// and applies [`trust_mc_env_flag_value_enabled`]'s spelling table.
+fn trust_mc_env_flag_enabled(name: &str) -> bool {
+    trust_mc_env_flag_value_enabled(std::env::var_os(name).as_deref())
+}
+
+/// Runtime gate for the data-flow-enriched CFG-CHC encoder. Reads the
+/// `TRUST_MC_DATAFLOW_CHC` environment variable (see
+/// [`trust_mc_env_flag_value_enabled`] for the accepted spellings) so the frozen
+/// driver can toggle enrichment without a recompile. Defaults OFF, which is what
+/// keeps the default verification lane byte-identical to the structural encoder.
+fn trust_mc_dataflow_chc_enabled() -> bool {
+    trust_mc_env_flag_enabled("TRUST_MC_DATAFLOW_CHC")
+}
+
+/// Debug gate: when `TRUST_MC_DATAFLOW_CHC_DEBUG` is switched on, the enriched
+/// encoder prints one `[DATAFLOW-FIRED]` / `[DATAFLOW-FALLBACK]` line per
+/// function so a rebuild can confirm at runtime whether enrichment actually
+/// engaged. Same value-aware spelling as the lane gate above.
 fn trust_mc_dataflow_chc_debug_enabled() -> bool {
-    std::env::var_os("TRUST_MC_DATAFLOW_CHC_DEBUG").is_some()
+    trust_mc_env_flag_enabled("TRUST_MC_DATAFLOW_CHC_DEBUG")
 }
 
 /// Which family of `error` edges the enriched CHC emits. Relations and
@@ -26433,13 +26695,11 @@ fn function_has_back_edge(function: &trust_ir::Function) -> bool {
 /// SOUNDNESS gate for `ArithmeticSafetyOnly` mode. The whole-function CHC
 /// conflates every arithmetic-safety obligation into one `error` query but only
 /// models the `Overflow` widths [`chc_overflow_width_modeled`] accepts. If the
-/// function contains an arithmetic-safety op we DON'T model — a 128-bit or
-/// pointer-width `Overflow` (wrap not expressible as a fixed bound in `int`), or
-/// an integer `UDiv`/`SDiv`/`URem`/`SRem` (div/rem-by-zero) — proving `error`
-/// unreachable would NOT cover that op, so discharging its obligation from this
-/// CHC would be a FALSE SAFE. Conservative: any such op ⇒ the surface is not
-/// fully modeled ⇒ the encoder falls back to the single-formula path for this
-/// function's safety obligations.
+/// function contains ANY arithmetic-safety hazard we do not model, proving
+/// `error` unreachable would NOT cover that hazard, so discharging its
+/// obligation from this CHC would be a FALSE SAFE. Conservative: any such op ⇒
+/// the surface is not fully modeled ⇒ the encoder falls back to the
+/// single-formula path for this function's safety obligations.
 ///
 /// NOTE the standing assumption: arithmetic_safety obligations arise from CHECKED
 /// arithmetic (`Overflow` insts) + div/rem, as in trust's verified configuration.
@@ -26447,23 +26707,84 @@ fn function_has_back_edge(function: &trust_ir::Function) -> bool {
 /// obligation is NOT caught here — flagged for the corpus to be checked-mode, and
 /// one of the reasons this lane stays env-gated OFF.
 fn function_overflow_surface_fully_modeled(function: &trust_ir::Function) -> bool {
-    function.blocks.iter().all(|block| {
-        block.body.iter().all(|node| match &node.inst {
-            // Signed i8..i64 AND unsigned u8..u64 overflow are modeled; 128-bit
-            // and pointer-width (`Isize`/`Usize`) `Overflow` are not.
-            trust_ir::Inst::Overflow { ty, .. } => chc_overflow_width_modeled(ty),
-            // Integer div/rem-by-zero is still unmodeled (float div is not an
-            // arithmetic-safety violation).
-            trust_ir::Inst::BinOp { op, .. } => !matches!(
-                op,
-                trust_ir::BinOp::UDiv
-                    | trust_ir::BinOp::SDiv
-                    | trust_ir::BinOp::URem
-                    | trust_ir::BinOp::SRem
-            ),
-            _ => true,
-        })
-    })
+    function
+        .blocks
+        .iter()
+        .all(|block| block.body.iter().all(|node| chc_inst_arithmetic_surface_modeled(&node.inst)))
+}
+
+/// Whether ONE instruction's arithmetic-safety surface is covered by the enriched
+/// CHC's `error` edges, for [`function_overflow_surface_fully_modeled`].
+///
+/// This is an ALLOWLIST, not a denylist: an arithmetic op passes only if it is
+/// named here as hazard-free (or is an `Overflow` at a modeled width). A denylist
+/// silently admits every op nobody thought of — which is exactly how the shift,
+/// negation, lossy-cast and float hazards below were let through — and it also
+/// admits every op a FUTURE trust-ir version adds. With an allowlist an unknown
+/// op gates the function out, which only ever costs enrichment yield.
+///
+/// REJECTED, with the `ObligationKind::ArithmeticSafety` VC each one raises in
+/// trust-vcgen (`VcKind`, `crates/trust-types/src/formula/vc_kind.rs`) and which
+/// this CHC has NO `error` edge for:
+///   * `UDiv`/`SDiv`/`URem`/`SRem` — division / remainder by zero.
+///   * `Shl`/`LShr`/`AShr` — `shift overflow`: Rust panics when the shift AMOUNT
+///     is >= the result width. It is not the shifted value that is the hazard.
+///   * `UnOp::Neg` — `negation overflow`: `-x` panics at `x == iN::MIN`.
+///   * lossy `Cast`s (`Trunc`/`FPTrunc`/raw `FPToUI`/`FPToSI`) — `cast overflow`.
+///     Widening (`ZExt`/`SExt`/`FPExt`) and the SATURATING Rust-`as` float→int
+///     forms provably cannot overflow and raise no obligation, so they pass.
+///   * float arithmetic (`FAdd`/`FSub`/`FMul`/`FDiv`/`FRem`) — `float overflow
+///     to infinity` and `float division by zero`. `FMin`/`FMax` are total.
+///
+/// ALLOWED: a modeled-width `Overflow` (it HAS its own violation edge), the
+/// plain integer `Add`/`Sub`/`Mul` covered by the standing checked-arithmetic
+/// assumption above, the total bitwise/float-unary ops, and every non-arithmetic
+/// instruction.
+fn chc_inst_arithmetic_surface_modeled(inst: &trust_ir::Inst) -> bool {
+    match inst {
+        // Signed i8..i64 AND unsigned u8..u64 overflow are modeled; 128-bit
+        // and pointer-width (`Isize`/`Usize`) `Overflow` are not.
+        trust_ir::Inst::Overflow { ty, .. } => chc_overflow_width_modeled(ty),
+        trust_ir::Inst::BinOp { op, .. } => matches!(
+            op,
+            trust_ir::BinOp::Add
+                | trust_ir::BinOp::Sub
+                | trust_ir::BinOp::Mul
+                | trust_ir::BinOp::And
+                | trust_ir::BinOp::Or
+                | trust_ir::BinOp::Xor
+                | trust_ir::BinOp::FMin
+                | trust_ir::BinOp::FMax
+        ),
+        trust_ir::Inst::UnOp { op, .. } => matches!(
+            op,
+            trust_ir::UnOp::Not
+                | trust_ir::UnOp::CtPop
+                | trust_ir::UnOp::FNeg
+                | trust_ir::UnOp::FAbs
+                | trust_ir::UnOp::FSqrt
+                | trust_ir::UnOp::FFloor
+                | trust_ir::UnOp::FCeil
+                | trust_ir::UnOp::FTrunc
+        ),
+        trust_ir::Inst::Cast { op, .. } => matches!(
+            op,
+            trust_ir::CastOp::ZExt
+                | trust_ir::CastOp::SExt
+                | trust_ir::CastOp::FPExt
+                | trust_ir::CastOp::UIToFP
+                | trust_ir::CastOp::SIToFP
+                | trust_ir::CastOp::FPToUISat
+                | trust_ir::CastOp::FPToSISat
+                | trust_ir::CastOp::PtrToInt
+                | trust_ir::CastOp::IntToPtr
+                | trust_ir::CastOp::PtrToPtr
+                | trust_ir::CastOp::Bitcast
+                | trust_ir::CastOp::Transmute
+                | trust_ir::CastOp::ReifyFnPointer
+        ),
+        _ => true,
+    }
 }
 
 /// Stable CHC variable name for an SSA value (`v{index}`).
@@ -26704,8 +27025,7 @@ fn chc_fold_block_body(
                     trust_ir::OverflowOp::SubOverflow => "sub",
                     trust_ir::OverflowOp::MulOverflow => "mul",
                 };
-                let sum =
-                    chc_binary(op_string, chc_var_expr(*lhs, &int), chc_var_expr(*rhs, &int));
+                let sum = chc_binary(op_string, chc_var_expr(*lhs, &int), chc_var_expr(*rhs, &int));
                 // On the ¬overflow branch this equality is exact; on the overflow
                 // branch the guard (`overflow_bit` true) routes control to the panic
                 // split, so the unbounded value is never used to conclude SAFE.
@@ -26729,8 +27049,11 @@ fn chc_fold_block_body(
                 if let trust_ir::Constant::Int(literal) = value {
                     let Some(dest) = node.results.first() else { continue };
                     chc_declare_var(var_decls, *dest, &int);
-                    constraints
-                        .push(chc_binary("eq", chc_var_expr(*dest, &int), chc_int_const(*literal)));
+                    constraints.push(chc_binary(
+                        "eq",
+                        chc_var_expr(*dest, &int),
+                        chc_int_const(*literal),
+                    ));
                 }
             }
             trust_ir::Inst::Copy { ty, operand } if ty.is_integer() => {
@@ -26952,8 +27275,7 @@ fn trust_mc_dataflow_chc_for_function_impl(
     }
 
     let bool_sort = serde_json::json!({ "kind": "bool" });
-    let mut var_decls: BTreeMap<u32, serde_json::Value> =
-        BTreeMap::new();
+    let mut var_decls: BTreeMap<u32, serde_json::Value> = BTreeMap::new();
     // Set when an `ArithmeticSafetyOnly` overflow `error` edge is emitted; if none
     // are, the CHC would prove `error` unreachable vacuously (a false SAFE), so we
     // fall back below.
@@ -32042,6 +32364,8 @@ fn fresh_vc_rekey_integrity_failure_vc(
         // UNSAT/structural promotion from erasing the integrity failure.
         formula: Formula::Bool(true),
         contract_metadata: None,
+        // Not a contract-derived VC: no obligation to back-reference.
+        obligation: None,
     }
 }
 
@@ -33387,6 +33711,8 @@ fn legacy_vc_from_api_obligation(
                 trust_types::Sort::Bool,
             ),
             contract_metadata: None,
+            // Not a contract-derived VC: no obligation to back-reference.
+            obligation: None,
         };
     }
     let kind = native_contract_vc_kind(obligation)
@@ -33418,6 +33744,8 @@ fn legacy_vc_from_api_obligation(
             location: source_span_from_api_location(&obligation.source),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            // Not a contract-derived VC: no obligation to back-reference.
+            obligation: None,
         };
     }
     // Trust (#35): reconstruct this obligation's REAL violation formula from its
@@ -33441,6 +33769,8 @@ fn legacy_vc_from_api_obligation(
         location: source_span_from_api_location(&obligation.source),
         formula,
         contract_metadata: None,
+        // Not a contract-derived VC: no obligation to back-reference.
+        obligation: None,
     }
 }
 

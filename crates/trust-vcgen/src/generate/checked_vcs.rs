@@ -49,6 +49,7 @@ pub(crate) fn v2_build_assert_overflow_vc(
                     v2_assert_failure_formula(func, cond, expected),
                 ),
                 contract_metadata: None,
+                obligation: None,
             })
         }
     }
@@ -99,11 +100,20 @@ pub(super) fn v2_build_assert_negation_vc(
                     &mut terms,
                 );
             }
-            let formula = if terms.is_empty() {
-                bv_formula
+            // Trust (slice ARM 2, BV-128 path): the body IS the raw BV neg-overflow
+            // violation (`operand == INT_MIN`); any collected shift block-defs are a
+            // ConjoinFactsLast wrapper (the body is pushed LAST, so
+            // `And([defs.., body])` reconstructs the formula). No construction-time
+            // version rename here — the formula is built directly — so body and
+            // subject stay bare; the shared loop's rename/normalize mirrors apply.
+            let obligation_body = bv_formula.clone();
+            let (formula, ob_wrappers) = if terms.is_empty() {
+                (bv_formula, Vec::new())
             } else {
+                let wrappers =
+                    vec![ObligationWrapper::ConjoinFactsLast { facts: terms.clone() }];
                 terms.push(bv_formula);
-                Formula::And(terms)
+                (Formula::And(terms), wrappers)
             };
             return Some(VerificationCondition {
                 kind: VcKind::NegationOverflow { ty },
@@ -111,22 +121,46 @@ pub(super) fn v2_build_assert_negation_vc(
                 location: span.clone(),
                 formula,
                 contract_metadata: None,
+                obligation: Some(ObligationRecord {
+                    body: obligation_body,
+                    wrappers: ob_wrappers,
+                    subject: Some(operand_to_formula(func, operand)),
+                    width: Some(width),
+                }),
             });
         }
         // Symbolic operand: fall through to the Int cond path (sound; UNKNOWN on
         // the native lane, as before).
     }
 
+    // Trust (slice ARM 2, Int assert path): seed the obligation from what the
+    // emitter builds — the raw assert-failure violation, the kept block-defs (as a
+    // ConjoinFactsLast wrapper), the negated operand as SUBJECT and `ty.int_width()`
+    // as WIDTH (the [10]-class authority, cross-checked against MIR at consumption).
+    // The subject is renamed with the SAME construction-point rename the body gets,
+    // so it stays byte-identical to the operand's occurrence inside the formula.
+    let raw = v2_assert_failure_formula(func, cond, expected);
+    let (formula, body, kept) =
+        v2_formula_with_block_defs_at_point_recorded(func, block, block.stmts.len(), raw);
+    let sv = StmtVersionCtx::build(func);
+    let subject =
+        version_rename_at(&operand_to_formula(func, operand), &sv, func, block.id, block.stmts.len());
+    let mut wrappers = Vec::new();
+    if !kept.is_empty() {
+        wrappers.push(ObligationWrapper::ConjoinFactsLast { facts: kept });
+    }
     Some(VerificationCondition {
         kind: VcKind::NegationOverflow { ty },
         function: func.name.clone().into(),
         location: span.clone(),
-        formula: v2_formula_with_block_defs(
-            func,
-            block,
-            v2_assert_failure_formula(func, cond, expected),
-        ),
+        formula,
         contract_metadata: None,
+        obligation: Some(ObligationRecord {
+            body,
+            wrappers,
+            subject: Some(subject),
+            width: Some(width),
+        }),
     })
 }
 
@@ -250,29 +284,44 @@ pub(super) fn v2_build_bounds_assert_vc(
     span: &SourceSpan,
 ) -> Option<VerificationCondition> {
     let kind = v2_infer_bounds_kind(func, target)?;
-    let direct_formula = if let Some((BinOp::Lt, lhs, rhs)) =
-        v2_find_condition_binary_operands(block, cond)
-    {
+    // Trust (bounds ARM): the RAW violation the emitter is already building — the atomic
+    // bounds core (`Ge(i, len)` unsigned, or `Or([Lt(i,0), Ge(i,len)])` signed) from the
+    // `i < len` assert condition, or the bare assert-failure condition otherwise.
+    let raw = if let Some((BinOp::Lt, lhs, rhs)) = v2_find_condition_binary_operands(block, cond) {
         let lhs_f = operand_to_formula(func, lhs);
         let rhs_f = operand_to_formula(func, rhs);
-        let violation = if crate::operand_ty_cow(func, lhs).as_deref().is_some_and(Ty::is_signed) {
+        if crate::operand_ty_cow(func, lhs).as_deref().is_some_and(Ty::is_signed) {
             Formula::Or(vec![
                 Formula::Lt(Box::new(lhs_f.clone()), Box::new(Formula::Int(0))),
                 Formula::Ge(Box::new(lhs_f.clone()), Box::new(rhs_f.clone())),
             ])
         } else {
             Formula::Ge(Box::new(lhs_f.clone()), Box::new(rhs_f.clone()))
-        };
-        v2_formula_with_block_defs(func, block, violation)
+        }
     } else {
-        v2_formula_with_block_defs(func, block, v2_assert_failure_formula(func, cond, expected))
+        v2_assert_failure_formula(func, cond, expected)
     };
+    // Trust (bounds ARM): seed the authenticated-obligation record from the raw violation
+    // and the block-defs it conjoins — EXACTLY as `v2_build_divrem_vc_raw` does for the
+    // div/rem twin (this VC rides the SAME shared wrapping loop in `generate_v2_safety_vcs`,
+    // which appends every later wrapper — path-defs, yield facts, preconditions, path
+    // guards, semantic guards — and the final token-collapse). `end = block.stmts.len()`
+    // makes `v2_formula_with_block_defs_at_point_recorded(..).0` byte-identical to the
+    // previous `v2_formula_with_block_defs`, so `formula` is unchanged. Payload-free:
+    // subject/width are `None` (the consumer reads index+len structurally from the body).
+    let (formula, body, kept) =
+        v2_formula_with_block_defs_at_point_recorded(func, block, block.stmts.len(), raw);
+    let mut wrappers = Vec::new();
+    if !kept.is_empty() {
+        wrappers.push(ObligationWrapper::ConjoinFactsLast { facts: kept });
+    }
     Some(VerificationCondition {
         kind,
         function: func.name.clone().into(),
         location: span.clone(),
-        formula: direct_formula,
+        formula,
         contract_metadata: None,
+        obligation: Some(ObligationRecord { body, wrappers, subject: None, width: None }),
     })
 }
 
@@ -384,6 +433,7 @@ pub(super) fn v2_build_signed_div_overflow_vc(
         location: span.clone(),
         formula,
         contract_metadata: None,
+        obligation: None,
     })
 }
 
@@ -498,7 +548,7 @@ pub(super) fn v2_shift_violation_formula(
     lhs: &Operand,
     rhs: &Operand,
     stmt_index: Option<usize>,
-) -> Option<(Formula, Ty, Ty)> {
+) -> Option<(Formula, Ty, Ty, u32)> {
     let operand_ty = crate::operand_ty(func, lhs)?;
     let shift_ty = crate::operand_ty(func, rhs)?;
     // Trust #soundness (round-19): the shifted-value width drives the
@@ -542,7 +592,10 @@ pub(super) fn v2_shift_violation_formula(
         Formula::Ge(Box::new(shift_f), Box::new(Formula::Int(bit_width)))
     };
 
-    Some((Formula::And(vec![shift_range, invalid_shift]), operand_ty, shift_ty))
+    // `shifted_width` is the TRUE shifted-operand width from MIR (the shift-RESULT
+    // type), NOT the `Formula::Int(bit_width)` threshold inside `invalid_shift` — the
+    // [10]-class width authority the shift obligation records.
+    Some((Formula::And(vec![shift_range, invalid_shift]), operand_ty, shift_ty, shifted_width))
 }
 
 /// Assert-driven UNWRAPPED shift-overflow violation, for the hardened MIR-assert
@@ -580,7 +633,7 @@ pub(crate) fn v2_assert_shift_violation_formula(
     if matches!(rhs, Operand::Constant(_)) {
         return None;
     }
-    let (violation, _operand_ty, _shift_ty) =
+    let (violation, _operand_ty, _shift_ty, _shifted_width) =
         v2_shift_violation_formula(func, block, op, lhs, rhs, None)?;
     Some(violation)
 }
@@ -594,14 +647,74 @@ pub(super) fn v2_build_shift_overflow_vc(
     span: &SourceSpan,
     stmt_index: Option<usize>,
 ) -> Option<VerificationCondition> {
-    let (violation, operand_ty, shift_ty) =
+    let (violation, operand_ty, shift_ty, shifted_width) =
         v2_shift_violation_formula(func, block, op, lhs, rhs, stmt_index)?;
+    // Trust (shift ARM, 2026-07-31): seed the authenticated-obligation record from what
+    // the emitter is ALREADY building. `violation = And([shift_range, invalid_shift])`;
+    // record the ATOMIC `invalid_shift` core the consumer's `is_core` accepts (unsigned
+    // `Ge(n, W)`; signed `Or([Lt(n, 0), Ge(n, W)])`) and DEMOTE `shift_range` (the
+    // `And([Le, Le])` amount-type bound) to a `ConjoinFactsLast` fact. subject = the shift
+    // amount `n` (renamed at the same use-point the body is); width = the TRUE shifted-
+    // operand width from MIR (`shifted_width`, NOT the formula threshold — the [10] fix).
+    // `.0` of the recorded block-defs helper is byte-identical to the previous
+    // `v2_formula_with_block_defs_at`, so `formula` is UNCHANGED. The shared safety loop
+    // appends every later wrapper (path-defs / yield / semantic guards / path guards /
+    // token-collapse); shift is not `ArithmeticOverflow`/bounds, so the four range
+    // conjoins do NOT apply to it.
+    let end = stmt_index.unwrap_or(block.stmts.len());
+    let (formula, rec_body, kept) =
+        v2_formula_with_block_defs_at_point_recorded(func, block, end, violation);
+    let obligation = v2_shift_overflow_seed_record(func, block, rhs, &rec_body, kept, end, shifted_width);
     Some(VerificationCondition {
         kind: VcKind::ShiftOverflow { op, operand_ty, shift_ty },
         function: func.name.clone().into(),
         location: span.clone(),
-        formula: v2_formula_with_block_defs_at(func, block, stmt_index, violation),
+        formula,
         contract_metadata: None,
+        obligation,
+    })
+}
+
+/// Trust (shift ARM, 2026-07-31): split a block-def-versioned shift-overflow violation
+/// body `And([shift_range, invalid_shift])` into the authenticated obligation. `rec_body`
+/// is the version-renamed body inside the emitted formula; `kept` the block-defs conjoined
+/// around it; `end` the use-point the body was renamed at (so the subject renames to match
+/// its occurrence inside the body); `shifted_width` the TRUE MIR shifted-operand width.
+///
+/// The RECORDED `body` is the ATOMIC `invalid_shift` core (`Ge(n, W)` unsigned, or
+/// `Or([Lt(n, 0), Ge(n, W)])` signed); `shift_range` is DEMOTED to a `ConjoinFactsLast`
+/// wrapper and the block-defs to a second, ordered innermost-first so
+/// `reconstruct(body, wrappers)` reproduces `formula` BIT-FOR-BIT. `subject` is the shift
+/// amount `n`; `width` the shifted-operand width. FAILS CLOSED (`None`) if `rec_body` is
+/// not the canonical 2-conjunct `And`.
+fn v2_shift_overflow_seed_record(
+    func: &VerifiableFunction,
+    block: &trust_types::BasicBlock,
+    rhs: &Operand,
+    rec_body: &Formula,
+    kept: Vec<Formula>,
+    end: usize,
+    shifted_width: u32,
+) -> Option<ObligationRecord> {
+    let Formula::And(conjuncts) = rec_body else {
+        return None;
+    };
+    if conjuncts.len() != 2 {
+        return None;
+    }
+    let shift_range = conjuncts[0].clone();
+    let atomic_core = conjuncts[1].clone();
+    let sv = StmtVersionCtx::build(func);
+    let subject = version_rename_at(&operand_to_formula(func, rhs), &sv, func, block.id, end);
+    let mut wrappers = vec![ObligationWrapper::ConjoinFactsLast { facts: vec![shift_range] }];
+    if !kept.is_empty() {
+        wrappers.push(ObligationWrapper::ConjoinFactsLast { facts: kept });
+    }
+    Some(ObligationRecord {
+        body: atomic_core,
+        wrappers,
+        subject: Some(subject),
+        width: Some(shifted_width),
     })
 }
 
@@ -807,11 +920,20 @@ pub(super) fn v2_build_negation_raw_vc(
                     func, block, stmt_index, p.local, &bv_name, width, &mut terms,
                 );
             }
-            let formula = if terms.is_empty() {
-                bv_formula
+            // Trust (slice ARM 2, BV-128 path): the body IS the raw BV neg-overflow
+            // violation (`operand == INT_MIN`); any collected shift block-defs are a
+            // ConjoinFactsLast wrapper (the body is pushed LAST, so
+            // `And([defs.., body])` reconstructs the formula). No construction-time
+            // version rename here — the formula is built directly — so body and
+            // subject stay bare; the shared loop's rename/normalize mirrors apply.
+            let obligation_body = bv_formula.clone();
+            let (formula, ob_wrappers) = if terms.is_empty() {
+                (bv_formula, Vec::new())
             } else {
+                let wrappers =
+                    vec![ObligationWrapper::ConjoinFactsLast { facts: terms.clone() }];
                 terms.push(bv_formula);
-                Formula::And(terms)
+                (Formula::And(terms), wrappers)
             };
             return Some(VerificationCondition {
                 kind: VcKind::NegationOverflow { ty },
@@ -819,6 +941,12 @@ pub(super) fn v2_build_negation_raw_vc(
                 location: span.clone(),
                 formula,
                 contract_metadata: None,
+                obligation: Some(ObligationRecord {
+                    body: obligation_body,
+                    wrappers: ob_wrappers,
+                    subject: Some(operand_to_formula(func, operand)),
+                    width: Some(width),
+                }),
             });
         }
         // Symbolic operand: fall through to the Int path (sound; stays UNKNOWN on
@@ -827,16 +955,86 @@ pub(super) fn v2_build_negation_raw_vc(
 
     let value = operand_to_formula(func, operand);
     let int_min = crate::range::type_min_formula(width, true);
-    let formula = Formula::And(vec![
+    let raw = Formula::And(vec![
         crate::range::input_range_constraint(&value, width, true),
-        Formula::Eq(Box::new(value), Box::new(int_min)),
+        Formula::Eq(Box::new(value.clone()), Box::new(int_min)),
     ]);
 
+    // Trust (slice ARM 2, Int raw-Neg path): the body `And([range, value == INT_MIN])`
+    // directly carries the negated operand, so SUBJECT is that operand and WIDTH is
+    // `ty.int_width()`. Body/subject are renamed with the SAME mid-block use-point
+    // (`stmt_index`) `v2_formula_with_block_defs_before_stmt` uses, keeping them
+    // byte-identical to the formula. Kept block-defs form a ConjoinFactsLast wrapper.
+    let (formula, body, kept) =
+        v2_formula_with_block_defs_at_point_recorded(func, block, stmt_index, raw);
+    let sv = StmtVersionCtx::build(func);
+    let subject = version_rename_at(&value, &sv, func, block.id, stmt_index);
+
+    // Trust (slice ARM 2, Int raw-Neg path — ATOMIC-CORE recording, 2026-07-31).
+    // `v2_formula_with_block_defs_at_point_recorded` renames the raw `And([range,
+    // Eq])` STRUCTURALLY (`version_rename_at` maps node-by-node, no flatten and no
+    // single-conjunct collapse), so `body` is exactly `And([range_r, Eq_r])` — the
+    // renamed input-range constraint first, the renamed atomic overflow core
+    // `Eq(value, INT_MIN)` second. The consumer's negation `is_core` accepts ONLY
+    // the ATOMIC `Eq(var, INT_MIN)` (mirsem/vc_faithful.rs, `K::NegationOverflow`),
+    // NOT the composite And. So RECORD the atom as `body` and demote the renamed
+    // range constraint to a `ConjoinFactsLast` FACT.
+    //
+    // The `formula` the lane VERIFIES is UNCHANGED — only what is RECORDED changes —
+    // so the wrappers must reconstruct it BIT-FOR-BIT (`#token` stamps included):
+    //   * `kept` empty   ⇒ `formula` = And([range_r, Eq_r])
+    //   * `kept` present ⇒ `formula` = And([kept.., And([range_r, Eq_r])])
+    //     (`combine_relevant_block_defs_recorded` pushes the whole `body` And as ONE
+    //     conjunct — it does NOT flatten it — so the range/Eq pair stays nested one
+    //     level in).
+    // `reconstruct_obligation` replays each `ConjoinFactsLast` as `And([facts.., cur])`,
+    // so the two nesting levels are replayed by two wrappers IN ORDER: the INNER
+    // conjoins the range onto the atom (→ `And([range_r, Eq_r])`), and the OUTER
+    // conjoins the kept block-defs around that (→ `And([kept.., And([range_r, Eq_r])])`).
+    // For empty `kept` only the inner wrapper is recorded, giving `And([range_r, Eq_r])`.
+    // Either way `reconstruct_obligation(rec) == formula` exactly.
+    let Formula::And(body_conjuncts) = &body else {
+        // Unreachable — `raw` is literally a 2-conjunct `And` and the rename is
+        // structural. Fail closed if that ever changes: emit the VC with NO
+        // recorded obligation so the consumer takes the legacy peel route rather
+        // than authenticating an unfaithful record.
+        return Some(VerificationCondition {
+            kind: VcKind::NegationOverflow { ty },
+            function: func.name.clone().into(),
+            location: span.clone(),
+            formula,
+            contract_metadata: None,
+            obligation: None,
+        });
+    };
+    if body_conjuncts.len() != 2 {
+        return Some(VerificationCondition {
+            kind: VcKind::NegationOverflow { ty },
+            function: func.name.clone().into(),
+            location: span.clone(),
+            formula,
+            contract_metadata: None,
+            obligation: None,
+        });
+    }
+    let range_fact = body_conjuncts[0].clone();
+    let atomic_core = body_conjuncts[1].clone();
+    let mut wrappers =
+        vec![ObligationWrapper::ConjoinFactsLast { facts: vec![range_fact] }];
+    if !kept.is_empty() {
+        wrappers.push(ObligationWrapper::ConjoinFactsLast { facts: kept });
+    }
     Some(VerificationCondition {
         kind: VcKind::NegationOverflow { ty },
         function: func.name.clone().into(),
         location: span.clone(),
-        formula: v2_formula_with_block_defs_before_stmt(func, block, stmt_index, formula),
+        formula,
         contract_metadata: None,
+        obligation: Some(ObligationRecord {
+            body: atomic_core,
+            wrappers,
+            subject: Some(subject),
+            width: Some(width),
+        }),
     })
 }

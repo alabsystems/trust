@@ -150,12 +150,133 @@ pub fn normalize_ty(ty: &Ty) -> Option<Ty> {
     })
 }
 
-/// Normalize every local type and the return type of `f` in place.
-fn normalize_function_tys(f: &mut VerifiableFunction) -> Option<()> {
-    for l in &mut f.body.locals {
-        l.ty = normalize_ty(&l.ty)?;
+/// The defining occurrence of every datatype the cluster's signatures mention,
+/// keyed by sort name.
+type DatatypeDefs = BTreeMap<String, Vec<(String, Vec<(String, Ty)>)>>;
+
+/// RC-1 (canonical recursive-type lowering): a recursive type that is a canonical
+/// CUT POINT is emitted as a by-name `Ty::Datatype { variants: [] }` at every
+/// occurrence except the one where it is the root of its own lowering walk. So
+/// `Res = Mk(Fuel, E)` now carries by-name `Fuel`/`E` rather than a one-level
+/// unrolling of each, and this transform — which reads the fuel's nat shape out
+/// of that nested position — has to resolve the reference.
+///
+/// That is exactly the contract `Ty::Datatype` documents: "an empty `variants`
+/// vector means a back-reference to the datatype named `name`, whose full
+/// definition appears at its defining occurrence". The definitions are collected
+/// from the cluster's own extracted signatures — a local declared `*const Fuel`
+/// lowers `Fuel` at the root of its walk and therefore still carries the full
+/// variant list — so nothing is invented here.
+///
+/// FAIL-CLOSED: if one sort name carries two DIFFERENT definitions, this returns
+/// `None` rather than picking one. Two definitions under one name is the
+/// generics-erased-name collision (`Foo<u8>` and `Foo<i32>` both printing
+/// `Foo`); resolving it by guessing would merge two genuinely different types,
+/// which is worse than declining.
+fn cluster_datatype_definitions(functions: &BTreeMap<String, VerifiableFunction>) -> Option<DatatypeDefs> {
+    let mut defs = DatatypeDefs::new();
+    let mut conflict = false;
+    for f in functions.values() {
+        let tys = f.body.locals.iter().map(|l| &l.ty).chain(std::iter::once(&f.body.return_ty));
+        for ty in tys {
+            let Some(normalized) = normalize_ty(ty) else {
+                continue;
+            };
+            collect_datatype_definitions(&normalized, &mut defs, &mut conflict);
+        }
     }
-    f.body.return_ty = normalize_ty(&f.body.return_ty)?;
+    if conflict {
+        return None;
+    }
+    Some(defs)
+}
+
+/// Record every DEFINING datatype occurrence (non-empty variant list) in `ty`.
+/// Coverage mirrors `normalize_ty` exactly — the positions this transform reads.
+fn collect_datatype_definitions(ty: &Ty, defs: &mut DatatypeDefs, conflict: &mut bool) {
+    match ty {
+        Ty::Datatype { name, variants } => {
+            if !variants.is_empty() {
+                match defs.get(name) {
+                    Some(existing) if existing != variants => *conflict = true,
+                    Some(_) => {}
+                    None => {
+                        defs.insert(name.clone(), variants.clone());
+                    }
+                }
+            }
+            for (_, fields) in variants {
+                for (_, fty) in fields {
+                    collect_datatype_definitions(fty, defs, conflict);
+                }
+            }
+        }
+        Ty::Ref { inner, .. } => collect_datatype_definitions(inner, defs, conflict),
+        Ty::RawPtr { pointee, .. } => collect_datatype_definitions(pointee, defs, conflict),
+        _ => {}
+    }
+}
+
+/// Replace a by-name `Ty::Datatype` reference with its defining occurrence.
+///
+/// A name is bound AT MOST ONCE on any path (`expanding`): a recursive
+/// datatype's own back-edge has to stay a by-name reference or the tree is not
+/// finite. An unknown name is left exactly as it is — never invented.
+///
+/// IDEMPOTENT, which matters because the threading transform installs an
+/// already-resolved type and then normalizes the whole body again: a datatype
+/// occurrence that ALREADY carries its variant list binds the name for its own
+/// subtree, so the back-edges inside it are left alone instead of being expanded
+/// one level deeper on every pass.
+fn resolve_datatype_refs(ty: &Ty, defs: &DatatypeDefs, expanding: &mut Vec<String>) -> Ty {
+    match ty {
+        Ty::Datatype { name, variants } => {
+            let already_binding = expanding.iter().any(|n| n == name);
+            let source = match defs.get(name) {
+                Some(definition) if variants.is_empty() && !already_binding => definition,
+                _ => variants,
+            };
+            let pushed = !source.is_empty() && !already_binding;
+            if pushed {
+                expanding.push(name.clone());
+            }
+            let resolved = source
+                .iter()
+                .map(|(ctor, fields)| {
+                    let fields = fields
+                        .iter()
+                        .map(|(fname, fty)| {
+                            (fname.clone(), resolve_datatype_refs(fty, defs, expanding))
+                        })
+                        .collect();
+                    (ctor.clone(), fields)
+                })
+                .collect();
+            if pushed {
+                expanding.pop();
+            }
+            Ty::Datatype { name: name.clone(), variants: resolved }
+        }
+        Ty::Ref { mutable, inner } => Ty::Ref {
+            mutable: *mutable,
+            inner: Box::new(resolve_datatype_refs(inner, defs, expanding)),
+        },
+        Ty::RawPtr { mutable, pointee } => Ty::RawPtr {
+            mutable: *mutable,
+            pointee: Box::new(resolve_datatype_refs(pointee, defs, expanding)),
+        },
+        other => other.clone(),
+    }
+}
+
+/// Normalize every local type and the return type of `f` in place, resolving the
+/// RC-1 by-name datatype references against `defs` (see
+/// `cluster_datatype_definitions`).
+fn normalize_function_tys(f: &mut VerifiableFunction, defs: &DatatypeDefs) -> Option<()> {
+    for l in &mut f.body.locals {
+        l.ty = resolve_datatype_refs(&normalize_ty(&l.ty)?, defs, &mut Vec::new());
+    }
+    f.body.return_ty = resolve_datatype_refs(&normalize_ty(&f.body.return_ty)?, defs, &mut Vec::new());
     Some(())
 }
 
@@ -361,6 +482,7 @@ fn transform_member(
     fuel_dt: &Ty,
     payload_dt: &Ty,
     res_dt: &Ty,
+    defs: &DatatypeDefs,
 ) -> Option<VerifiableFunction> {
     let mut f = func.clone();
     if f.body.arg_count != 2 {
@@ -668,7 +790,7 @@ fn transform_member(
     f.body.return_ty = fx.res_dt.clone();
     f.body.blocks = fx.blocks;
     f.body.locals = fx.locals;
-    normalize_function_tys(&mut f)?;
+    normalize_function_tys(&mut f, defs)?;
 
     // Final audit: `_1` may remain only as a Deref-rooted READ (the fuel
     // parameter) — never an assignment destination.
@@ -694,9 +816,14 @@ pub fn thread_cell_state(
     spec: &CellThreadingSpec,
 ) -> Option<BTreeMap<String, VerifiableFunction>> {
     // Derive the canonical datatypes from the FIRST reference's signature —
-    // extraction-derived, never hand-declared.
+    // extraction-derived, never hand-declared. RC-1: the nested `Fuel`/`E` inside
+    // the result pair now arrive as by-name references, so resolve them against
+    // their defining occurrences elsewhere in the same cluster before reading
+    // their variant shape (see `cluster_datatype_definitions`).
+    let defs = cluster_datatype_definitions(functions)?;
     let first_ref = functions.get(spec.references.first()?)?;
-    let res_dt = normalize_ty(&first_ref.body.return_ty)?;
+    let res_dt =
+        resolve_datatype_refs(&normalize_ty(&first_ref.body.return_ty)?, &defs, &mut Vec::new());
     let Ty::Datatype { variants, .. } = &res_dt else {
         return None;
     };
@@ -711,14 +838,14 @@ pub fn thread_cell_state(
     let mut out = BTreeMap::new();
     for name in &spec.members {
         let f = functions.get(name)?;
-        out.insert(name.clone(), transform_member(f, spec, &fuel_dt, &payload_dt, &res_dt)?);
+        out.insert(name.clone(), transform_member(f, spec, &fuel_dt, &payload_dt, &res_dt, &defs)?);
     }
     for name in &spec.references {
         let mut f = functions.get(name)?.clone();
         if f.body.arg_count != 2 {
             return None;
         }
-        normalize_function_tys(&mut f)?;
+        normalize_function_tys(&mut f, &defs)?;
         out.insert(name.clone(), f);
     }
     Some(out)

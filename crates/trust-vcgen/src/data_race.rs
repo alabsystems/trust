@@ -351,6 +351,7 @@ pub fn generate_race_vcs(
                 location: span,
                 formula,
                 contract_metadata: None,
+                obligation: None,
             }
         })
         .collect()
@@ -406,6 +407,7 @@ pub fn generate_ordering_vcs(
                 location: access.span.clone(),
                 formula: reach,
                 contract_metadata: None,
+                obligation: None,
             })
         })
         .collect()

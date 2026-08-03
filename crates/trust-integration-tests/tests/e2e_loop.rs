@@ -692,6 +692,7 @@ fn make_vc(function: &str, kind: VcKind, formula_name: &str) -> VerificationCond
         location: SourceSpan::default(),
         formula: Formula::Var(formula_name.to_string(), Sort::Bool),
         contract_metadata: None,
+        obligation: None,
     }
 }
 

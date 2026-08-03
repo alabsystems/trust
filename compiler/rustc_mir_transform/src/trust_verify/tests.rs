@@ -555,6 +555,7 @@ fn test_vc(line_start: u32) -> VerificationCondition {
         },
         formula: trust_types::Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -1160,6 +1161,7 @@ fn unsupported_mir_transport_fails_closed_even_with_kernel_authority() {
             Formula::BvULt(bv(7), bv(3), 8),
         ]),
         contract_metadata: None,
+        obligation: None,
     };
     let results = vec![(
         vc,
@@ -1236,6 +1238,7 @@ fn certified_row_carries_clean_cic_artifact_and_constructive_certified_metadata(
             trust_types::Formula::BvULt(bv(7), bv(3), 8),
         ]),
         contract_metadata: None,
+        obligation: None,
     };
     let proved = VerificationResult::Proved {
         solver: trust_types::Symbol::intern("ay"),
@@ -1303,6 +1306,7 @@ fn precomputed_certification_matches_fallback_clean_cic_artifact() {
             trust_types::Formula::BvULt(bv(7), bv(3), 8),
         ]),
         contract_metadata: None,
+        obligation: None,
     };
     let make_proved = || VerificationResult::Proved {
         solver: trust_types::Symbol::intern("ay"),
@@ -1383,6 +1387,7 @@ fn kernel_authority_certifies_sound_summand_bounded_proved_without_mutating_solv
             ]),
         ]),
         contract_metadata: None,
+        obligation: None,
     };
 
     let original_solver = trust_types::Symbol::intern("trust-mc-chc");
@@ -1466,6 +1471,7 @@ fn certify_all_stops_after_deadline_elapsed() {
             trust_types::Formula::BvULt(bv(7), bv(3), 8),
         ]),
         contract_metadata: None,
+        obligation: None,
     };
     let make_proved = || VerificationResult::Proved {
         solver: trust_types::Symbol::intern("ay"),
@@ -1510,6 +1516,7 @@ fn promote_kernel_certifiable_stops_after_deadline_elapsed() {
             trust_types::Formula::BvULt(bv(7), bv(3), 8),
         ]),
         contract_metadata: None,
+        obligation: None,
     };
     let unknown = VerificationResult::Unknown {
         solver: trust_types::Symbol::intern("ay"),
@@ -1987,6 +1994,7 @@ fn hardened_obligation_fingerprint_includes_detail_and_formula() {
         },
         formula: trust_types::Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
     let mut changed_detail = base.clone();
     changed_detail.kind = VcKind::HardenedBoundary {
@@ -3283,6 +3291,7 @@ fn native_trust_ir_compiler_function() -> (
                 ),
             ]),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationCondition {
             kind: VcKind::AliasingViolation { mutable: true },
@@ -3310,10 +3319,37 @@ fn native_trust_ir_compiler_function() -> (
                 ),
             ]),
             contract_metadata: None,
+            obligation: None,
         },
     ];
 
     (function, compiler_contracts, vcs)
+}
+
+#[test]
+fn live_native_bundle_source_authority_is_exact_affine_and_one_shot() {
+    let (function, compiler_contracts, vcs) = native_trust_ir_compiler_function();
+    let (_, mut native_bundle) =
+        build_full_verification_input_for_tests(&function, &compiler_contracts, &vcs);
+
+    let authority = mint_source_generation_authority_for_live_native_bundle(&mut native_bundle)
+        .expect("the final compiler-built native bundle must admit live authority")
+        .expect("the fixture must produce a native bundle");
+    let exact_bundle = native_bundle
+        .as_ref()
+        .expect("native construction must succeed")
+        .as_ref()
+        .expect("the fixture must produce a native bundle");
+    assert!(authority.authorizes_bundle(exact_bundle));
+
+    let cloned_bundle = exact_bundle.clone();
+    assert!(
+        !authority.authorizes_bundle(&cloned_bundle),
+        "cloning must erase the transient live-source identity"
+    );
+    let second = mint_source_generation_authority_for_live_native_bundle(&mut native_bundle)
+        .expect_err("one exact live bundle may mint authority only once");
+    assert!(second.contains("already minted"), "unexpected rejection: {second}");
 }
 
 fn fresh_nonlegacy_vc_binding_fixture() -> (
@@ -3337,6 +3373,7 @@ fn fresh_nonlegacy_vc_binding_fixture() -> (
             Box::new(Formula::BitVec { value: 1, width: 64 }),
         ),
         contract_metadata: None,
+        obligation: None,
     }];
     let bundle =
         trust_mir_extract::function_to_verifier_api_bundle(&function, &compiler_contracts, &vcs);
@@ -3376,6 +3413,7 @@ fn single_fresh_vc_binding_fixture(
         location: native_trust_ir_test_span(line),
         formula,
         contract_metadata: None,
+        obligation: None,
     }];
     let bundle =
         trust_mir_extract::function_to_verifier_api_bundle(&function, &compiler_contracts, &vcs);
@@ -3843,6 +3881,7 @@ fn impl_method_fresh_rekey_binds_exact_compiler_crate_identity() {
         location: native_trust_ir_test_span(30),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     }];
     let bundle = trust_mir_extract::function_to_verifier_api_bundle_with_crate_name(
         &function,
@@ -7062,6 +7101,7 @@ fn loop_vcs_do_not_suppress_unbounded_allocation_obligations() {
         // A false violation formula is enough to exercise routing/binding.
         formula: trust_types::Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
     let allocation = vc(
         VcKind::UnboundedAllocation {
@@ -7174,6 +7214,7 @@ fn partial_or_forged_e4_e5_envelopes_keep_the_legacy_trust_wp_route() {
             location: native_trust_ir_test_span(25),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationCondition {
             kind: VcKind::NonTermination {
@@ -7184,6 +7225,7 @@ fn partial_or_forged_e4_e5_envelopes_keep_the_legacy_trust_wp_route() {
             location: native_trust_ir_test_span(26),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         },
     ];
     let (bundle, _) = build_full_verification_input_for_tests(&function, &compiler_contracts, &vcs);
@@ -7294,6 +7336,7 @@ fn direct_trust_vc_live_fixture(run_id: &str) -> DirectTrustVcCompilerFixture {
         &bundle,
         &dispatched,
         Some(&native_bundle),
+        None,
         &[],
         &context,
         SESSION_DEFAULT_VC_TIMEOUT_MS,
@@ -7801,6 +7844,7 @@ fn direct_trust_vc_receipt_survives_exact_unrelated_bridge_publication() {
         &bundle,
         &dispatched,
         Some(&native_bundle),
+        None,
         &[],
         &context,
         SESSION_DEFAULT_VC_TIMEOUT_MS,
@@ -7924,6 +7968,7 @@ fn fresh_exact_direct_fixture_for(
             &bundle,
             &dispatched,
             Some(&native_bundle),
+            None,
             &[],
             &context,
             SESSION_DEFAULT_VC_TIMEOUT_MS,
@@ -7970,6 +8015,7 @@ fn fresh_exact_direct_e4_fixture(run_id: &str) -> FreshExactDirectCompilerFixtur
             location: native_trust_ir_test_span(27),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationCondition {
             kind: VcKind::LoopInvariantConsecution {
@@ -7980,6 +8026,7 @@ fn fresh_exact_direct_e4_fixture(run_id: &str) -> FreshExactDirectCompilerFixtur
             location: native_trust_ir_test_span(28),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         },
     ];
     fresh_exact_direct_fixture_for(&function, &compiler_contracts, &vcs, &[], run_id)
@@ -8002,6 +8049,7 @@ fn fresh_exact_direct_same_span_e4_fixture(run_id: &str) -> FreshExactDirectComp
             location: shared_span.clone(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationCondition {
             kind: VcKind::LoopInvariantConsecution {
@@ -8012,6 +8060,7 @@ fn fresh_exact_direct_same_span_e4_fixture(run_id: &str) -> FreshExactDirectComp
             location: shared_span,
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         },
     ];
     fresh_exact_direct_fixture_for(&function, &compiler_contracts, &vcs, &[], run_id)
@@ -8974,6 +9023,7 @@ fn loop_vcs_do_not_suppress_no_return_panic_call_obligation() {
         location: native_trust_ir_test_span(line),
         formula: trust_types::Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
     let baseline_vcs = vec![vc(
         VcKind::UnboundedAllocation {
@@ -9284,6 +9334,7 @@ fn kernel_certified_trust_vc_fixture(
         location: native_trust_ir_test_span(12),
         formula,
         contract_metadata: None,
+        obligation: None,
     };
     let bundle = trust_mir_extract::function_to_verifier_api_bundle_with_compiler_identity(
         &function,
@@ -10390,6 +10441,7 @@ fn body_bound_monitor_stamped_ge_and_gt_preserve_exact_compiler_carriers() {
             &ExactDefinitionEntryMarkerSet::default(),
         ),
         Some(&ge_native),
+        None,
         &ge_carriers,
         &trust_router::VerifierExecutionContext::new("body-bound-monitor-ge"),
         SESSION_DEFAULT_VC_TIMEOUT_MS,
@@ -10419,6 +10471,7 @@ fn body_bound_monitor_stamped_ge_and_gt_preserve_exact_compiler_carriers() {
             &ExactDefinitionEntryMarkerSet::default(),
         ),
         Some(&gt_native),
+        None,
         &gt_carriers,
         &trust_router::VerifierExecutionContext::new("body-bound-monitor-gt"),
         SESSION_DEFAULT_VC_TIMEOUT_MS,
@@ -10541,6 +10594,7 @@ fn body_bound_live_trust_wp_receipt_is_exact_private_authority() {
         &bundle,
         &dispatched,
         Some(&native_bundle),
+        None,
         &carriers,
         &context,
         SESSION_DEFAULT_VC_TIMEOUT_MS,
@@ -10864,6 +10918,7 @@ fn body_bound_forged_claim_is_rejected_by_the_kernel() {
         &bundle,
         &dispatched,
         Some(&native_bundle),
+        None,
         &carriers,
         &context,
         SESSION_DEFAULT_VC_TIMEOUT_MS,
@@ -11196,6 +11251,7 @@ fn generated_precondition_vc_gets_typed_chc_contract_and_native_replay_formula()
             Box::new(trust_types::Formula::Int(0)),
         ),
         contract_metadata: None,
+        obligation: None,
     }];
 
     let (bundle, native_trust_ir_bundle) =
@@ -12209,6 +12265,52 @@ fn strict_scope_bucket_fatality_follows_the_discharge_policy() {
 }
 
 #[test]
+fn default_gap_policy_tolerates_only_the_exact_defined_float_advisory_exception() {
+    let failed = || VerificationResult::Failed {
+        solver: trust_types::Symbol::intern("float-policy-test"),
+        time_ms: 1,
+        counterexample: None,
+    };
+
+    for width in [32, 64] {
+        let mut vc = test_vc(width);
+        vc.kind = VcKind::FloatOverflowToInfinity {
+            op: BinOp::Add,
+            operand_ty: trust_types::Ty::Float { width },
+        };
+        assert_eq!(
+            residual_gap_tolerance_denial(&[(vc, failed())], true),
+            None,
+            "defined binary{width} infinity is a nonfatal default-policy advisory"
+        );
+    }
+
+    let mut contract = test_vc(70);
+    contract.kind = VcKind::Postcondition;
+    assert_eq!(
+        residual_gap_tolerance_denial(&[(contract, failed())], true),
+        Some(GapToleranceDenial::RowRefuted),
+        "the exception must never widen to arbitrary L1 contract failures"
+    );
+
+    let mut unsupported = test_vc(71);
+    unsupported.kind = VcKind::UnsupportedMir {
+        kind: "float-policy-negative".to_string(),
+        detail: "unmodeled construct".to_string(),
+    };
+    let unknown = VerificationResult::Unknown {
+        solver: trust_types::Symbol::intern("float-policy-test"),
+        reason: "unsupported".to_string(),
+        time_ms: 1,
+    };
+    assert_eq!(
+        residual_gap_tolerance_denial(&[(unsupported, unknown)], true),
+        Some(GapToleranceDenial::RowHasNoFallback),
+        "a genuine no-fallback modeling gap must stay fail-closed"
+    );
+}
+
+#[test]
 fn full_verification_flags_skipped_transport_artifacts() {
     let summary = TrustFunctionSummary {
         total: 1,
@@ -12929,6 +13031,7 @@ fn exact_source_clause_discharge_preserves_public_private_carrier_parity() {
             source_contract_index: Some(0),
             ..trust_types::ContractMetadata::default()
         }),
+        obligation: None,
     };
     let compiler_contracts = trust_types::CompilerContractBundle::new(contracts);
     let (bundle, _) = build_full_verification_input_for_tests(
@@ -16465,6 +16568,7 @@ fn unsafe_sep_assertion_vc(function: &str) -> VerificationCondition {
             Box::new(trust_types::Formula::Int(0)),
         ),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -17238,6 +17342,7 @@ fn transport_rows_carry_compiler_design_mandate_bit() {
         location: native_trust_ir_test_span(3),
         formula: trust_types::Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     };
     let real_vc = unsafe_sep_assertion_vc("demo::m");
     let results = vec![
@@ -19110,6 +19215,16 @@ fn entry_assumption_never_authorizes_unconditional_panic_freedom() {
 }
 
 #[test]
+fn zero_obligation_registry_requires_the_complete_strict_acceptance_shape() {
+    assert!(zero_obligation_registry_gate(true, true, true, true));
+    for rejected in 0..4 {
+        let mut gates = [true; 4];
+        gates[rejected] = false;
+        assert!(!zero_obligation_registry_gate(gates[0], gates[1], gates[2], gates[3]));
+    }
+}
+
+#[test]
 fn contract_assumed_disposition_cannot_seed_dynamic_static_summary() {
     let mut dispositions = IndexVec::new();
     dispositions.push(TrustDisposition {
@@ -19320,6 +19435,15 @@ fn dataflow_arithmetic_safety_only_gates_out_unmodeled_arithmetic() {
     // overflow), or integer div/rem (div-by-zero) — must fall back to Ok(None), so
     // a redirected obligation can never be discharged from a CHC that lacks its
     // violation edge (false-proof guard).
+    //
+    // The shift / negation / lossy-cast / float rows below are the REGRESSION for
+    // the review finding that the original gate was a denylist covering only
+    // overflow-width and div/rem: each of them is a real
+    // `ObligationKind::ArithmeticSafety` producer in trust-vcgen (`shift
+    // overflow`, `negation overflow`, `cast overflow`, `float division by zero` /
+    // `float overflow to infinity`) with NO `error` edge in this CHC, so a
+    // redirected obligation about one of them could have been discharged from a
+    // CHC that never modeled it — a FALSE SAFE.
     use trust_ir::{
         BinOp, Block, BlockId, FuncId, FuncTyId, Function, Inst, InstrNode, OverflowOp, Ty, ValueId,
     };
@@ -19370,6 +19494,60 @@ fn dataflow_arithmetic_safety_only_gates_out_unmodeled_arithmetic() {
                 vec![ValueId::new(2)],
             ),
         ),
+        (
+            "left shift (shift-amount overflow)",
+            build(
+                Inst::BinOp { op: BinOp::Shl, ty: Ty::U64, lhs: x, rhs: x },
+                vec![ValueId::new(2)],
+            ),
+        ),
+        (
+            "logical right shift (shift-amount overflow)",
+            build(
+                Inst::BinOp { op: BinOp::LShr, ty: Ty::U64, lhs: x, rhs: x },
+                vec![ValueId::new(2)],
+            ),
+        ),
+        (
+            "arithmetic right shift (shift-amount overflow)",
+            build(
+                Inst::BinOp { op: BinOp::AShr, ty: Ty::I64, lhs: x, rhs: x },
+                vec![ValueId::new(2)],
+            ),
+        ),
+        (
+            "signed negation (negation overflow at iN::MIN)",
+            build(
+                Inst::UnOp { op: trust_ir::UnOp::Neg, ty: Ty::I64, operand: x },
+                vec![ValueId::new(2)],
+            ),
+        ),
+        (
+            "narrowing cast (cast overflow)",
+            build(
+                Inst::Cast {
+                    op: trust_ir::CastOp::Trunc,
+                    src_ty: Ty::U64,
+                    dst_ty: Ty::U32,
+                    operand: x,
+                },
+                vec![ValueId::new(2)],
+            ),
+        ),
+        (
+            "float division (float division by zero)",
+            build(
+                Inst::BinOp { op: BinOp::FDiv, ty: Ty::F64, lhs: x, rhs: x },
+                vec![ValueId::new(2)],
+            ),
+        ),
+        (
+            "float add (float overflow to infinity)",
+            build(
+                Inst::BinOp { op: BinOp::FAdd, ty: Ty::F64, lhs: x, rhs: x },
+                vec![ValueId::new(2)],
+            ),
+        ),
     ] {
         assert!(
             super::trust_mc_dataflow_chc_for_function(
@@ -19391,9 +19569,30 @@ fn dataflow_chc_is_env_gated_and_structural_mode_keeps_the_structural_error_edge
     // so the emitted CHC is byte-identical to today's structural encoding.
     assert_eq!(
         super::trust_mc_dataflow_chc_enabled(),
-        std::env::var_os("TRUST_MC_DATAFLOW_CHC").is_some(),
+        super::trust_mc_env_flag_enabled("TRUST_MC_DATAFLOW_CHC"),
         "the data-flow encoder must be gated on TRUST_MC_DATAFLOW_CHC and nothing else"
     );
+    // ...and the gate reads the variable's VALUE, not its mere presence. A
+    // presence check makes `TRUST_MC_DATAFLOW_CHC=0` — the universal "off"
+    // spelling — ENABLE the lane, the exact opposite of the operator's intent, on
+    // a WIP encoder whose safety story is that it stays off. Asserted on the
+    // value-level helper so no test thread has to mutate the process environment.
+    for off in ["", "0", "false", "FALSE", "Off", "off", "no", "NO", "  0  "] {
+        assert!(
+            !super::trust_mc_env_flag_value_enabled(Some(std::ffi::OsStr::new(off))),
+            "{off:?} must leave the data-flow lane DISABLED"
+        );
+    }
+    assert!(
+        !super::trust_mc_env_flag_value_enabled(None),
+        "an unset variable must leave the data-flow lane DISABLED"
+    );
+    for on in ["1", "true", "yes", "on", "enabled"] {
+        assert!(
+            super::trust_mc_env_flag_value_enabled(Some(std::ffi::OsStr::new(on))),
+            "{on:?} must enable the data-flow lane"
+        );
+    }
 
     // (2) When it IS opted into, `Structural` mode must reproduce every structural
     // `error` edge byte-for-byte (same `reachable` flag, same `reason` text as
@@ -19514,6 +19713,32 @@ fn mutual_scc_oracle_is_linear_and_stack_safe_on_a_long_acyclic_chain() {
         successors.push(node + 1);
     }
     assert!(mutually_recursive_node_indices(&adjacency).is_empty());
+}
+
+#[test]
+fn callee_first_order_is_a_permutation_and_respects_acyclic_edges() {
+    // 0 calls 1 and 2; both call 3. Node 4 is independent.
+    let adjacency = vec![vec![1, 2], vec![3], vec![3], vec![], vec![]];
+    let order = callee_first_node_order(&adjacency);
+    let position = |node| order.iter().position(|&candidate| candidate == node).unwrap();
+
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, vec![0, 1, 2, 3, 4]);
+    for (caller, callees) in adjacency.iter().enumerate() {
+        for &callee in callees {
+            assert!(position(callee) < position(caller));
+        }
+    }
+}
+
+#[test]
+fn callee_first_order_terminates_without_coinductive_cycle_credit() {
+    let adjacency = vec![vec![1], vec![2], vec![0], vec![99]];
+    let order = callee_first_node_order(&adjacency);
+    let mut sorted = order;
+    sorted.sort_unstable();
+    assert_eq!(sorted, vec![0, 1, 2, 3]);
 }
 
 #[test]

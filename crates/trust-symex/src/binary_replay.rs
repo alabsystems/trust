@@ -8666,6 +8666,7 @@ mod tests {
             location: function.span.clone(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         }
     }
 

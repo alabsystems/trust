@@ -1358,8 +1358,19 @@ pub(super) fn unwrap_panic_freedom_modeled(func: &VerifiableFunction, callee: &s
 pub(super) fn unwrap_panic_freedom_vcs_with_blocks(
     func: &VerifiableFunction,
 ) -> Vec<(BlockId, VerificationCondition)> {
-    let mut sites: Vec<(&trust_types::BasicBlock, &str, &SourceSpan, Formula, Option<VcKind>)> =
-        Vec::new();
+    // Trust (slice ARM 2): the trailing `Option<(Formula, u32)>` carries the abs
+    // receiver as SUBJECT and its `int_width()` as WIDTH — the payload the
+    // authenticated-obligation recorder cross-checks against MIR. `None` for the
+    // unwrap family (payload-free panic-freedom, not in the slice).
+    #[allow(clippy::type_complexity)]
+    let mut sites: Vec<(
+        &trust_types::BasicBlock,
+        &str,
+        &SourceSpan,
+        Formula,
+        Option<VcKind>,
+        Option<(Formula, u32)>,
+    )> = Vec::new();
     for block in &func.body.blocks {
         let Terminator::Call { func: callee, args, dest, target, span, .. } = &block.terminator
         else {
@@ -1379,11 +1390,25 @@ pub(super) fn unwrap_panic_freedom_vcs_with_blocks(
         // `(body, kind_override)`: abs carries an explicit `NegationOverflow { ty }`
         // kind (routes like `-x`, BV-capable discharge); unwrap uses the default
         // `Assertion` panic-freedom kind computed at the tail (`None`).
-        let (body, kind_override): (Option<Formula>, Option<VcKind>) = if is_signed_abs_call(callee)
-        {
+        let (body, kind_override, subj_width): (
+            Option<Formula>,
+            Option<VcKind>,
+            Option<(Formula, u32)>,
+        ) = if is_signed_abs_call(callee) {
             match signed_abs_panic_body(func, args) {
-                Some((body, ty)) => (Some(body), Some(VcKind::NegationOverflow { ty })),
-                None => (None, None),
+                Some((body, ty)) => {
+                    // Seed SUBJECT = the abs receiver, WIDTH = its signed-int width,
+                    // at the point the emitter KNOWS them (before `ty` is moved into
+                    // the kind). `None` if either is unavailable → no obligation.
+                    let width = ty.int_width();
+                    let subject = args.first().map(|a| operand_to_formula(func, a));
+                    let sw = match (subject, width) {
+                        (Some(s), Some(w)) => Some((s, w)),
+                        _ => None,
+                    };
+                    (Some(body), Some(VcKind::NegationOverflow { ty }), sw)
+                }
+                None => (None, None, None),
             }
         } else if is_known_panicking_method(callee)
                 && !unwrap_is_infallible_slice_to_array(func, callee, args, dest)
@@ -1392,14 +1417,14 @@ pub(super) fn unwrap_panic_freedom_vcs_with_blocks(
                 // UnsupportedMir twin's suppression for the rationale).
                 && expect_infallible_const_int_conversion(func, callee, args, dest).is_none()
         {
-            (unwrap_panic_freedom_body(func, callee, args), None)
+            (unwrap_panic_freedom_body(func, callee, args), None, None)
         } else {
-            (None, None)
+            (None, None, None)
         };
         let Some(body) = body else {
             continue;
         };
-        sites.push((block, callee, span, body, kind_override));
+        sites.push((block, callee, span, body, kind_override, subj_width));
     }
     if sites.is_empty() {
         return Vec::new();
@@ -1413,8 +1438,65 @@ pub(super) fn unwrap_panic_freedom_vcs_with_blocks(
     let global_facts = build_global_invariant_facts(func);
     let empty = FxHashSet::default();
     let mut vcs = Vec::new();
-    for (block, callee, span, body, kind_override) in sites {
-        let mut formula = v2_formula_with_block_defs(func, block, body);
+    for (block, callee, span, body, kind_override, subj_width) in sites {
+        let m = method_tail(callee);
+        let kind = kind_override
+            .unwrap_or_else(|| VcKind::Assertion { message: format!("Call::{m}::panic-freedom") });
+
+        // Step 1 (block-defs): record the terminal-versioned body + kept defs so the
+        // obligation reconstructs. Seed the record ONLY for the slice kind (abs →
+        // NegationOverflow, carrying SUBJECT/WIDTH); the unwrap family stays None.
+        let (formula0, ob_body, kept) =
+            v2_formula_with_block_defs_at_point_recorded(func, block, block.stmts.len(), body);
+        let obligation = if matches!(kind, VcKind::NegationOverflow { .. }) {
+            // Trust (slice ARM 2, abs lane — ATOMIC-CORE recording, 2026-07-31).
+            // `ob_body` is the renamed composite `And([range_r, Eq_r])`
+            // (`signed_abs_panic_body` builds the raw as `And([input_range,
+            // Eq(v, MIN)])`, renamed STRUCTURALLY by the block-def recorder). The
+            // consumer's negation `is_core` accepts ONLY the ATOMIC `Eq(v, MIN)`, so
+            // seed the record with that atom as `body` and demote the input-range
+            // constraint to a `ConjoinFactsLast` FACT — exactly as the raw-`Neg`
+            // path in `checked_vcs.rs` does. Two seed wrappers reconstruct `formula0`
+            // BIT-FOR-BIT: the INNER conjoins the range onto the atom
+            // (→ `And([range_r, Eq_r])`), the OUTER conjoins the kept block-defs
+            // around it (→ `And([kept.., And([range_r, Eq_r])])`, the combine's
+            // nesting — it pushes the whole body `And` as one conjunct). The
+            // downstream `ob_record_*` mirror helpers then wrap this atomic body
+            // identically to the composite it replaced (both `version_rename_at` and
+            // `normalize_ssa_version_tokens` are per-variable maps that distribute
+            // over `And`), so the fully-assembled record still reconstructs to
+            // `vc.formula`. `formula0` — what the lane VERIFIES — is UNCHANGED.
+            subj_width.and_then(|(subject, width)| {
+                let Formula::And(cs) = &ob_body else { return None };
+                if cs.len() != 2 {
+                    return None;
+                }
+                let range_fact = cs[0].clone();
+                let atomic_core = cs[1].clone();
+                let mut wrappers =
+                    vec![ObligationWrapper::ConjoinFactsLast { facts: vec![range_fact] }];
+                if !kept.is_empty() {
+                    wrappers.push(ObligationWrapper::ConjoinFactsLast { facts: kept.clone() });
+                }
+                Some(ObligationRecord {
+                    body: atomic_core,
+                    wrappers,
+                    subject: Some(subject),
+                    width: Some(width),
+                })
+            })
+        } else {
+            None
+        };
+        let mut vc = VerificationCondition {
+            kind,
+            function: func.name.clone().into(),
+            location: span.clone(),
+            formula: formula0,
+            contract_metadata: None,
+            obligation,
+        };
+
         // Live path-definition facts (the safety-lane channel): predecessor
         // definitions that made the path reachable (e.g. the bool `is_ok` temp).
         if let Some(path_defs) = path_definition_map.get(&block.id)
@@ -1422,53 +1504,64 @@ pub(super) fn unwrap_panic_freedom_vcs_with_blocks(
         {
             let live = v2_live_path_defs(func, block, path_defs);
             if !live.is_empty() {
+                ob_record_conjoin(&mut vc, &live);
                 let mut conjuncts = live;
-                conjuncts.push(formula);
-                formula = Formula::And(conjuncts);
+                conjuncts.push(vc.formula.clone());
+                vc.formula = Formula::And(conjuncts);
             }
         }
-        formula = conjoin_arg_type_ranges(func, formula);
-        formula = conjoin_local_type_ranges(func, formula);
-        formula = conjoin_datatype_field_ranges(func, formula);
+        for f in [conjoin_arg_type_ranges, conjoin_local_type_ranges, conjoin_datatype_field_ranges]
+        {
+            let before = vc.formula.clone();
+            vc.formula = f(func, vc.formula.clone());
+            let after = vc.formula.clone();
+            ob_record_conjoin_wrap(&mut vc, &before, &after);
+        }
         // Trust S2c: whole-VC version rename FIRST; the threaded facts below
         // (path guards, semantic guards, global facts) are conjoined AFTER,
         // EXEMPT from the rename — same discipline as the allocation lane.
         let killed = may_reassigned.get(&block.id).unwrap_or(&empty);
-        formula =
-            conjoin_preconditions_versioned(func, block.id, &func.preconditions, killed, formula);
+        let (nf, conjoined) = conjoin_preconditions_versioned_recorded(
+            func,
+            block.id,
+            &func.preconditions,
+            killed,
+            vc.formula.clone(),
+        );
+        vc.formula = nf;
+        if vc.obligation.is_some() {
+            ob_record_rename_at(&mut vc, &sv, func, block.id, block.stmts.len());
+            ob_record_conjoin(&mut vc, &conjoined);
+        }
         if let Some(block_guard_paths) = guard_paths_map.get(&block.id) {
-            formula = v2_formula_with_path_guards(func, &sv, block_guard_paths, formula);
+            let (nf, path_terms) =
+                v2_formula_with_path_guards_recorded(func, &sv, block_guard_paths, vc.formula.clone());
+            vc.formula = nf;
+            if let Some(ob) = vc.obligation.as_mut() {
+                ob.wrappers.push(ObligationWrapper::PathGuardOr { paths: path_terms });
+            }
         }
         if let Some(sem_guards) = semantic_guards.get(&block.id)
             && !sem_guards.is_empty()
         {
+            ob_record_conjoin(&mut vc, sem_guards);
             let mut conjuncts = sem_guards.clone();
-            conjuncts.push(formula);
-            formula = Formula::And(conjuncts);
+            conjuncts.push(vc.formula.clone());
+            vc.formula = Formula::And(conjuncts);
         }
         // Function-wide invariant facts — notably the discriminant variant-range
         // fact `d ∈ {variant tags}` (a true type invariant: it deletes phantom-tag
         // counterexamples but can never exclude the real panic tag, which is a
         // member of the set — the refutation stays reachable).
         if !global_facts.is_empty() {
+            ob_record_conjoin(&mut vc, &global_facts);
             let mut conjuncts = global_facts.clone();
-            conjuncts.push(formula);
-            formula = Formula::And(conjuncts);
+            conjuncts.push(vc.formula.clone());
+            vc.formula = Formula::And(conjuncts);
         }
-        formula = normalize_ssa_version_tokens(func, &formula);
-        let m = method_tail(callee);
-        let kind = kind_override
-            .unwrap_or_else(|| VcKind::Assertion { message: format!("Call::{m}::panic-freedom") });
-        vcs.push((
-            block.id,
-            VerificationCondition {
-                kind,
-                function: func.name.clone().into(),
-                location: span.clone(),
-                formula,
-                contract_metadata: None,
-            },
-        ));
+        vc.formula = normalize_ssa_version_tokens(func, &vc.formula);
+        ob_record_normalize(&mut vc, func);
+        vcs.push((block.id, vc));
     }
     vcs
 }

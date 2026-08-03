@@ -39,6 +39,7 @@ pub fn deref_vc(func_name: &str, ptr_name: &str, span: &SourceSpan) -> Vec<Verif
         location: span.clone(),
         formula: Formula::Eq(Box::new(ptr.clone()), Box::new(Formula::Int(0))),
         contract_metadata: None,
+        obligation: None,
     });
 
     // VC 2: Valid allocation check -- the heap must have an entry at ptr.
@@ -57,6 +58,7 @@ pub fn deref_vc(func_name: &str, ptr_name: &str, span: &SourceSpan) -> Vec<Verif
             Box::new(unalloc_sentinel),
         ),
         contract_metadata: None,
+        obligation: None,
     });
 
     // VC 3: Alignment check -- ptr % align != 0 is a violation.
@@ -89,6 +91,7 @@ pub fn deref_vc(func_name: &str, ptr_name: &str, span: &SourceSpan) -> Vec<Verif
             ))),
         ]),
         contract_metadata: None,
+        obligation: None,
     });
 
     vcs
@@ -123,6 +126,7 @@ pub fn raw_write_vc(
         location: span.clone(),
         formula: Formula::Not(Box::new(writable)),
         contract_metadata: None,
+        obligation: None,
     });
 
     // (No post-write heap-consistency VC.) Read-over-write — "after `*ptr = value`,
@@ -175,6 +179,7 @@ pub fn transmute_vc(
         location: span.clone(),
         formula: Formula::Not(Box::new(Formula::Eq(Box::new(src_size), Box::new(dst_size)))),
         contract_metadata: None,
+        obligation: None,
     });
 
     // VC 2: Validity invariant -- the bit pattern must be valid for Dst.
@@ -193,6 +198,7 @@ pub fn transmute_vc(
         location: span.clone(),
         formula: Formula::Not(Box::new(valid_bits)),
         contract_metadata: None,
+        obligation: None,
     });
 
     // VC 3: Alignment compatibility -- align_of::<Dst>() > align_of::<Src>()
@@ -205,6 +211,7 @@ pub fn transmute_vc(
         location: span.clone(),
         formula: Formula::Gt(Box::new(dst_align), Box::new(src_align)),
         contract_metadata: None,
+        obligation: None,
     });
 
     vcs

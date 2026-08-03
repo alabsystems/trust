@@ -376,6 +376,9 @@ pub(super) fn build_intrinsic_bound_facts(func: &VerifiableFunction) -> Vec<Form
         let ge0 = |facts: &mut Vec<Formula>| {
             facts.push(Formula::Ge(Box::new(dest_var()), Box::new(Formula::Int(0))));
         };
+        if !is_std_num_intrinsic(callee) {
+            continue;
+        }
         match method_tail(callee) {
             // `rem_euclid(c)` (receiver + divisor): result in `[0, |c|-1]` for `|c| >= 1`.
             "rem_euclid" if args.len() == 2 => {
@@ -598,7 +601,10 @@ pub(super) fn cast_source_const_upper_nonneg(func: &VerifiableFunction, local: u
                 let hi = operand_const_int(&args[2])?;
                 return (0 <= lo && lo <= hi).then_some(hi);
             }
-            if method_tail(callee) == "rem_euclid" && args.len() == 2 {
+            if is_std_num_intrinsic(callee)
+                && method_tail(callee) == "rem_euclid"
+                && args.len() == 2
+            {
                 let c = operand_const_int(&args[1])?;
                 let m = i128::try_from(c.unsigned_abs()).ok()?;
                 return (m >= 1).then_some(m - 1);
@@ -607,6 +613,7 @@ pub(super) fn cast_source_const_upper_nonneg(func: &VerifiableFunction, local: u
                 method_tail(callee),
                 "trailing_zeros" | "leading_zeros" | "count_ones" | "count_zeros"
             ) && args.len() == 1
+                && is_std_num_intrinsic(callee)
             {
                 return match crate::operand_ty_cow(func, &args[0]).as_deref() {
                     Some(Ty::Int { width, .. }) => Some(*width as i128),
@@ -793,7 +800,10 @@ pub(super) fn ret_call_const_lower_bound(func: &VerifiableFunction, local: usize
                 let hi = operand_const_int(&args[2])?;
                 return (0 <= lo && lo <= hi).then_some(lo);
             }
-            if method_tail(callee) == "rem_euclid" && args.len() == 2 {
+            if is_std_num_intrinsic(callee)
+                && method_tail(callee) == "rem_euclid"
+                && args.len() == 2
+            {
                 let c = operand_const_int(&args[1])?;
                 return (c != 0).then_some(0);
             }
@@ -801,6 +811,7 @@ pub(super) fn ret_call_const_lower_bound(func: &VerifiableFunction, local: usize
                 method_tail(callee),
                 "trailing_zeros" | "leading_zeros" | "count_ones" | "count_zeros"
             ) && args.len() == 1
+                && is_std_num_intrinsic(callee)
             {
                 return match crate::operand_ty_cow(func, &args[0]).as_deref() {
                     Some(Ty::Int { .. }) => Some(0),

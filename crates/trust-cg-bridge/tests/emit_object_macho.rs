@@ -141,6 +141,7 @@ fn make_checked_div_option() -> VerifiableFunction {
                                 name: "Option".into(),
                                 variant: 0,
                                 active_field: None,
+                                args: None,
                             },
                             vec![],
                         ),
@@ -167,6 +168,7 @@ fn make_checked_div_option() -> VerifiableFunction {
                                     name: "Option".into(),
                                     variant: 1,
                                     active_field: None,
+                                    args: None,
                                 },
                                 vec![Operand::Copy(Place::local(3))],
                             ),
@@ -214,7 +216,7 @@ fn make_pair_helper() -> VerifiableFunction {
                 stmts: vec![Statement::Assign {
                     place: Place::local(0),
                     rvalue: Rvalue::Aggregate(
-                        AggregateKind::Adt { name: "Pair".into(), variant: 0, active_field: None },
+                        AggregateKind::Adt { name: "Pair".into(), variant: 0, active_field: None, args: None },
                         vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
                     ),
                     span: SourceSpan::default(),

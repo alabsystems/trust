@@ -4558,17 +4558,21 @@ pub const INSTANTIATOR_ORD_LEAF_DEF_PATH: &str =
 // already reflects the unwind-carrying schema. The value is the live
 // `load_instantiator_ordering_leaf().content_hash()` and is asserted exactly by
 // `instantiator_ordering_leaf_exact_vc_hash_and_discharge`.
-// Re-pinned 2026-07-28 for the SECOND hash-visible schema extension, by the same
-// argument as the unwind one above: `AggregateKind::Adt` gained a serde-defaulted
-// `args: Option<String>` discriminator (the C1 generic-args change, 701d94eccc7),
-// which IS hash-visible; the fixture bytes are untouched in git and decode with
-// `args: None`, so the audited SEMANTICS are unchanged. NOTE the failure mode this
-// re-pin ends: the stale hash did not merely fail its test — `adt_shapes.rs` gates
-// the `sem_adt_return_opaque_ord_shape_of` recognizer on this constant, so the
-// recognizer had been silently DEAD since the schema change (its own test could not
-// compile over the same period, for the same incomplete sync, so nothing noticed).
+// C1 GENERIC-ARGS NOTE (2026-07-31): `AggregateKind::Adt` gained a
+// serde-defaulted `args: Option<String>` discriminator (701d94eccc7). `12307d51d1`
+// briefly re-pinned this constant to the post-C1 observed value
+// (`c83cbee1...`); that re-pin is REVERTED and the audited pre-C1 golden below is
+// restored, because the correct repair was to canonicalize the hash domain, not to
+// move a shipped pin. `stable_model_json` now omits `,"args":null` by the same
+// documented rule as `faithful_enum_repr` / `layout` / `enum_layout` / `adt_kind`:
+// a `None` is exactly the pre-C1 semantics and must not perturb audited pins,
+// while a `Some(args)` IS hash-visible and remains in identity (the generic-arg
+// discriminator is intact — 186 fixture files in this tree carry a real `Some`).
+// The failure mode `12307d51d1` correctly identified still ends: `adt_shapes.rs`
+// gates the `sem_adt_return_opaque_ord_shape_of` recognizer on this constant, so a
+// stale hash silently KILLS that recognizer rather than merely failing a test.
 pub const INSTANTIATOR_ORD_LEAF_CONTENT_HASH: &str =
-    "c83cbee15c718d99bb64d2343c64e0da26efc729bdf950ae5f4c2d0af55cee3f";
+    "b278bfb4d47462acaacc8863d4262cf43b536dd3881b74c69f5a8944c08c1c10";
 
 /// Kernel-witness input for the exact ordering-dispatch leaf.
 #[derive(Debug, Clone, PartialEq, Eq)]

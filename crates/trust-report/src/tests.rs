@@ -106,6 +106,7 @@ fn midpoint_results() -> Vec<(VerificationCondition, VerificationResult)> {
                 },
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Failed {
                 solver: "ay".into(),
@@ -129,6 +130,7 @@ fn midpoint_results() -> Vec<(VerificationCondition, VerificationResult)> {
                 },
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Proved {
                 solver: "ay".into(),
@@ -152,6 +154,7 @@ fn multi_function_results() -> Vec<(VerificationCondition, VerificationResult)> 
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationResult::Unknown {
             solver: "ay".into(),
@@ -166,6 +169,7 @@ fn multi_function_results() -> Vec<(VerificationCondition, VerificationResult)> 
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationResult::Timeout { solver: "ay".into(), timeout_ms: 5000 },
     ));
@@ -179,6 +183,7 @@ fn multi_function_results() -> Vec<(VerificationCondition, VerificationResult)> 
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationResult::Proved {
             solver: "ay".into(),
@@ -400,6 +405,7 @@ fn test_json_report_binary_copy_sink_kind_is_not_unknown() {
             location: SourceSpan::binary_address(0x401040),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationResult::Failed { solver: "ay".into(), time_ms: 7, counterexample: None },
     )];
@@ -447,6 +453,7 @@ fn test_json_report_empty_span_no_location() {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationResult::Proved {
             solver: "ay".into(),
@@ -500,6 +507,7 @@ fn test_json_report_raw_proved_statuses_are_not_verified() {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Proved {
                 solver: "ay".into(),
@@ -520,6 +528,7 @@ fn test_json_report_raw_proved_statuses_are_not_verified() {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Proved {
                 solver: "ay".into(),
@@ -726,6 +735,7 @@ fn test_build_json_report_auto_policy_cannot_mint_runtime_check_authority() {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationResult::Unknown {
             solver: "ay".into(),
@@ -758,6 +768,7 @@ fn test_memory_guard_solver_skip_is_reported_as_release_blocking_proof_gap() {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationResult::Unknown {
             solver: "memory-guard".into(),
@@ -793,6 +804,7 @@ fn test_build_json_report_force_static_produces_compile_error_verdict() {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationResult::Unknown {
             solver: "ay".into(),
@@ -1318,6 +1330,7 @@ fn hardened_categories_are_distinct_in_json_and_text_reports() {
         location: SourceSpan::default(),
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     };
     let ordinary = VerificationCondition {
         kind: VcKind::FunctionalCorrectness {
@@ -1328,6 +1341,7 @@ fn hardened_categories_are_distinct_in_json_and_text_reports() {
         location: SourceSpan::default(),
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     };
     let proved = VerificationResult::Proved {
         solver: "ay".into(),
@@ -1381,6 +1395,7 @@ fn test_json_report_classifies_aarch64_atomic_unsupported_vcs() {
                     location: SourceSpan::binary_address(0x2230 + (idx as u64) * 4),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 VerificationResult::Unknown {
                     solver: "router".into(),
@@ -1453,6 +1468,7 @@ fn test_json_report_classifies_source_backpropagation_gate_blockers() {
                     location: SourceSpan::binary_address(0x401000),
                     formula: Formula::Bool(false),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 VerificationResult::Unknown {
                     solver: "router".into(),
@@ -1524,6 +1540,7 @@ fn test_json_report_classifies_recent_source_backpropagation_gate_details() {
                     location: SourceSpan::binary_address(0x401200 + (idx as u64) * 4),
                     formula: Formula::Bool(false),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 VerificationResult::Unknown {
                     solver: "router".into(),
@@ -1565,6 +1582,7 @@ fn test_json_report_classifies_symbolic_formula_consumer_blocker() {
         location: SourceSpan::binary_address(0x401030),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
     let result = VerificationResult::Unknown {
         solver: "router".into(),
@@ -1746,6 +1764,7 @@ fn test_json_summary_raw_proved_is_inconclusive() {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationResult::Proved {
             solver: "ay".into(),
@@ -1774,6 +1793,7 @@ fn test_json_summary_timeout() {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationResult::Timeout { solver: "ay".into(), timeout_ms: 10000 },
     )];
@@ -1845,6 +1865,7 @@ fn test_obligation_proof_levels() {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Proved {
                 solver: "ay".into(),
@@ -1862,6 +1883,7 @@ fn test_obligation_proof_levels() {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Proved {
                 solver: "trust-wp".into(),
@@ -1879,6 +1901,7 @@ fn test_obligation_proof_levels() {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Proved {
                 solver: "ty".into(),
@@ -2045,6 +2068,7 @@ fn test_format_crate_verification_summary_with_specs() {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Proved {
                 solver: "ay".into(),
@@ -2125,6 +2149,7 @@ fn caller_constructed_proof_shaped_result_cannot_mint_proof_credit() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
     let result = VerificationResult::Proved {
         solver: "ay".into(),

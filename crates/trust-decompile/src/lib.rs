@@ -15180,6 +15180,7 @@ bb0(%0: bool):
             location: SourceSpan::binary_address(address),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -15198,6 +15199,7 @@ bb0(%0: bool):
             },
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         }
     }
 

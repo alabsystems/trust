@@ -147,6 +147,7 @@ pub fn recursive_datatype_functional_vcs(func: &VerifiableFunction) -> Vec<Verif
             location: func.span.clone(),
             formula: arm.formula.clone(),
             contract_metadata: None,
+            obligation: None,
         })
         .collect();
 
@@ -167,6 +168,7 @@ pub fn recursive_datatype_functional_vcs(func: &VerifiableFunction) -> Vec<Verif
         location: func.span.clone(),
         formula: conclusion,
         contract_metadata: None,
+        obligation: None,
     });
     // Only this point establishes that the function is in this lane's COMPLETE
     // one-match/self-recursive shape.  Outside that shape the documented result

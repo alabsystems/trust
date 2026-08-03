@@ -678,6 +678,7 @@ impl SepEngine {
                         location: span.clone(),
                         formula: Formula::Lt(Box::new(size), Box::new(len)),
                         contract_metadata: None,
+                        obligation: None,
                     });
                 }
             }
@@ -1064,7 +1065,14 @@ impl SepEngine {
         } else if is_layout_passthrough_call(&lower) {
             // `Result/Option::unwrap`/`expect` over a tracked `Layout`: thread
             // its size through (no-op for any unwrap whose source is untracked).
-            if let Some(src) = args.first().and_then(operand_local)
+            // CRATE-ANCHORED: only a genuine sysroot-rooted unwrap/expect
+            // (`core::result::Result::<Layout, _>::unwrap`) may RELOCATE the tracked
+            // size — a forged / orphan-trait `unwrap` on a `Layout` must not move the
+            // size fact onto an unrelated `dest` (which a later alloc would size,
+            // FALSELY discharging its from_raw_parts bound). The threaded value is a
+            // now-anchored genuine `is_layout_size_call` size; fail-closed on a miss.
+            if callee_is_std_crate_rooted(&lower)
+                && let Some(src) = args.first().and_then(operand_local)
                 && let Some(&n) = self.layout_sizes.get(&src)
             {
                 self.layout_sizes.insert(dest.local, n);
@@ -1095,6 +1103,7 @@ impl SepEngine {
                         Sort::Bool,
                     ),
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
         } else if is_alloc_call(&lower) {
@@ -1148,6 +1157,7 @@ impl SepEngine {
                     null_violation
                 },
                 contract_metadata: None,
+                obligation: None,
             });
 
             // VC: allocation size must be positive. SKIP for an infallible box
@@ -1170,6 +1180,7 @@ impl SepEngine {
                         Box::new(Formula::Int(0)),
                     ),
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
         } else if is_dealloc_call(&lower) {
@@ -1211,6 +1222,7 @@ impl SepEngine {
                     // Violation (prove UNSAT): the argument is zero.
                     formula: Formula::Eq(Box::new(value), Box::new(Formula::Int(0))),
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
         } else if lower.contains("from_u32_unchecked") {
@@ -1240,6 +1252,7 @@ impl SepEngine {
                         ]),
                     ]),
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
         } else if lower.contains("set_len") {
@@ -1269,6 +1282,7 @@ impl SepEngine {
                     // Violation (prove UNSAT): the new length exceeds capacity.
                     formula: Formula::Gt(Box::new(new_len), Box::new(capacity)),
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
         } else if let Some((tag, condition)) = unsafe_assertion_op(&lower) {
@@ -1287,8 +1301,17 @@ impl SepEngine {
             // A user `MaybeUninit::assume_init` is NOT this call, so it stays fail-closed.
             let unjustified =
                 generated_sep_var(format!("unsafe_{tag}_unjustified_{}", dest.local), Sort::Bool);
+            // CRATE-ANCHORED: only the genuine std `vec!`-machinery
+            // `std::boxed::box_assume_init_into_vec_unsafe` (crate-rooted, no ` as ` —
+            // extractor fixtures) is discharged. A forged free fn / orphan-trait
+            // `mycrate::…::box_assume_init_into_vec_unsafe` (bare `contains` matched it)
+            // must NOT discharge the `assume_init` obligation — that would falsely prove
+            // a read of uninitialized memory as safe. Fail-closed to the unjustified var.
             let formula =
-                if tag == "assume_init" && lower.contains("box_assume_init_into_vec_unsafe") {
+                if tag == "assume_init"
+                    && callee_is_std_crate_rooted(&lower)
+                    && lower.contains("box_assume_init_into_vec_unsafe")
+                {
                     // justified ∧ unjustified ⇒ UNSAT (proved). Sound by the std `vec!`
                     // contract (full write precedes); references the real obligation var, so
                     // it is not vacuous (the `Var` atom is opaque to the vacuity gate).
@@ -1306,6 +1329,7 @@ impl SepEngine {
                 location: span.clone(),
                 formula,
                 contract_metadata: None,
+                obligation: None,
             });
         } else if is_raw_read_write_call(&lower) {
             // `core::ptr::read(p)` / `write(p, v)` (incl. volatile/unaligned):
@@ -1332,6 +1356,7 @@ impl SepEngine {
                             location: span.clone(),
                             formula: Formula::Gt(Box::new(extent), Box::new(size)),
                             contract_metadata: None,
+                            obligation: None,
                         });
                     }
                     _ => {
@@ -1361,6 +1386,7 @@ impl SepEngine {
                     // Violation (prove UNSAT): index past the container length.
                     formula: Formula::Ge(Box::new(index), Box::new(len)),
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
         } else if lower.contains("ptr::copy") || lower.contains("ptr::copy_nonoverlapping") {
@@ -1436,6 +1462,7 @@ impl SepEngine {
                     location: span.clone(),
                     formula: Formula::Gt(Box::new(extent), Box::new(size)),
                     contract_metadata: None,
+                    obligation: None,
                 });
                 Some(())
             })();
@@ -1518,6 +1545,7 @@ impl SepEngine {
             location: span.clone(),
             formula,
             contract_metadata: None,
+            obligation: None,
         });
         true
     }
@@ -1575,6 +1603,7 @@ impl SepEngine {
                 Box::new(Formula::Int(0)),
             ),
             contract_metadata: None,
+            obligation: None,
         });
 
         // Obligation: the length captured at map time must not exceed the live
@@ -1603,6 +1632,7 @@ impl SepEngine {
             location: span.clone(),
             formula: Formula::Gt(Box::new(mapped_len), Box::new(live_size)),
             contract_metadata: None,
+            obligation: None,
         });
 
         // Opt-in: also model the temporal hazard for `ty`. The `Truncate` env
@@ -1648,6 +1678,7 @@ impl SepEngine {
                     Sort::Bool,
                 ),
                 contract_metadata: None,
+                obligation: None,
             });
         }
     }
@@ -1683,6 +1714,7 @@ impl SepEngine {
                     location: span.clone(),
                     formula: Formula::Bool(true), // definite violation
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
 
@@ -1708,6 +1740,7 @@ impl SepEngine {
                     location: span.clone(),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
             self.heap.free(prov);
@@ -1771,6 +1804,7 @@ impl SepEngine {
                     // Violation (prove UNSAT): offset + count > backing size.
                     formula: Formula::Gt(Box::new(extent), Box::new(size)),
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
             {
@@ -1802,6 +1836,7 @@ impl SepEngine {
                             ),
                         ]),
                         contract_metadata: None,
+                        obligation: None,
                     });
                 }
                 return;
@@ -1853,6 +1888,7 @@ impl SepEngine {
                     Box::new(Formula::Add(Box::new(base), Box::new(size))),
                 ),
                 contract_metadata: None,
+                obligation: None,
             });
         }
 
@@ -1883,6 +1919,7 @@ impl SepEngine {
                     ),
                 ]),
                 contract_metadata: None,
+                obligation: None,
             });
         }
     }
@@ -2092,6 +2129,7 @@ impl SepEngine {
                 location: span.clone(),
                 formula,
                 contract_metadata: None,
+                obligation: None,
             });
         } else if prov.is_concrete() {
             let base = Formula::Var(prov.base_var(), Sort::Int);
@@ -2117,6 +2155,7 @@ impl SepEngine {
                     ))),
                 ]),
                 contract_metadata: None,
+                obligation: None,
             });
         }
     }
@@ -2151,6 +2190,7 @@ impl SepEngine {
                 Box::new(Formula::Int(0)),
             ),
             contract_metadata: None,
+            obligation: None,
         });
 
         // VC: new size must be positive
@@ -2168,6 +2208,7 @@ impl SepEngine {
                 Box::new(Formula::Int(0)),
             ),
             contract_metadata: None,
+            obligation: None,
         });
     }
 
@@ -3278,11 +3319,21 @@ fn is_known_good_box_alloc(lower: &str) -> bool {
     // check is SKIPPED for an infallible box alloc (the box is type-sized), and the
     // use-after-free is fixed at the root (cleanup-block `Drop`s no longer free — see
     // `interpret_drop` + `reachable_block_ids`).
-    let std_origin = lower.contains("boxed")
-        || lower.starts_with("std::")
-        || lower.starts_with("alloc::")
-        || lower.starts_with("core::");
-    if !std_origin {
+    // CRATE-ANCHORED std origin (round-4 discipline): the box allocator's def-path
+    // must be rooted at a genuine sysroot crate (`std::`/`alloc::`/`core::`), incl. a
+    // UFCS-wrapped inherent header, and must NOT be trait-qualified (`<T as …>`). The
+    // old `contains("boxed")` disjunct was FORGEABLE — a user module
+    // `mycrate::boxed::box_new_uninit`, or an orphan trait impl
+    // `<Vec<T> as mycrate::Boxed>::box_new_uninit`, matched, then received the
+    // infallible-allocator non-null/writable postcondition + the SKIPPED size check
+    // (see the `is_known_good_box_alloc` call in `interpret_call` + `discharge_box_good`),
+    // FALSELY discharging a genuine null-deref. Every genuine box allocator renders
+    // crate-rooted (`alloc::boxed::box_new_uninit`, `std::boxed::Box::<T>::new` —
+    // verified against the extractor fixtures), so the anchor keeps them. The
+    // extractor additionally DefId-authenticates the identity (`owned_box` lang item /
+    // sysroot `StableCrateId` — trust-mir-extract `is_infallible_box_allocator`); this
+    // string gate is the sep-engine's own fail-closed backstop.
+    if !callee_is_std_crate_rooted(lower) {
         return false;
     }
     let mut without_generics = String::with_capacity(lower.len());
@@ -3324,11 +3375,106 @@ fn box_alloc_nonnull_fact(ptr_name: &str) -> Formula {
 // nonlinear `ptr % align` would degrade the query; alignment stays soundly caught
 // until the concrete pointee alignment is available from tcx layout.
 
+/// True when `lower` (a LOWERCASED callee def-path) is rooted at a genuine sysroot
+/// crate — `std::`/`alloc::`/`core::` — either directly or as a UFCS-wrapped
+/// inherent header (`<std::…>::method`), and is NOT a trait-qualified `<T as …>`
+/// path. This is the round-4 anchoring discipline (mirrors generate.rs's
+/// `callee_is_std_vec_inherent`): a user cannot shadow the sysroot crate roots (the
+/// `--crate-name` literal attack is the accepted doctrine boundary), and the ` as `
+/// reject rules out an orphan trait impl on a foreign std type. Consumed by the
+/// memory-safety DISCHARGE producers below so a same-named user free fn / method /
+/// trait impl cannot forge a fact that clears a null/OOB/init obligation.
+fn callee_is_std_crate_rooted(lower: &str) -> bool {
+    if lower.contains(" as ") {
+        return false;
+    }
+    let c = lower.strip_prefix('<').unwrap_or(lower);
+    c.starts_with("std::") || c.starts_with("alloc::") || c.starts_with("core::")
+}
+
+/// True when `lower` is an INHERENT method on a genuine raw pointer — the
+/// `{core,std}::ptr::const_ptr` / `::mut_ptr` inherent-impl modules (`<impl *const
+/// T>` / `<impl *mut T>`), or the bare inherent UFCS header `<*const …>` / `<*mut
+/// …>`. A user cannot add an inherent method to the primitive raw-pointer types, and
+/// the ` as ` reject rules out an orphan trait impl `<*mut T as mycrate::Ptr>::cast`.
+/// The old `contains("const_ptr") || contains("mut_ptr")` was FORGEABLE via a nested
+/// user module named `const_ptr`/`mut_ptr` (`mycrate::const_ptr::cast`). Every
+/// genuine raw-ptr method renders `core::ptr::const_ptr::<impl *const T>::cast` /
+/// `std::ptr::mut_ptr::<impl *mut u8>::add` (verified against the extractor fixtures).
+fn callee_is_std_raw_ptr_inherent(lower: &str) -> bool {
+    if lower.contains(" as ") {
+        return false;
+    }
+    let c = lower.strip_prefix('<').unwrap_or(lower);
+    c.starts_with("core::ptr::const_ptr")
+        || c.starts_with("std::ptr::const_ptr")
+        || c.starts_with("core::ptr::mut_ptr")
+        || c.starts_with("std::ptr::mut_ptr")
+        || c.starts_with("*const ")
+        || c.starts_with("*mut ")
+}
+
+/// The compiler-generated `core::fmt::Arguments::{new_v1,new_const,new_v1_formatted}`
+/// constructors (`format_args!` machinery). CRATE-ANCHORED: the bare
+/// `contains("fmt::arguments::")` this replaces was FORGEABLE by a nested user module
+/// `mycrate::fmt::arguments::…`, which would SUPPRESS the `[unsafe:unmodeled-call]`
+/// completeness VC (via `call_is_modeled`). Genuine renders
+/// `core::fmt::Arguments::new_v1` (lowercased `core::fmt::arguments::…`) — crate-rooted.
+fn is_std_fmt_arguments_ctor(lower: &str) -> bool {
+    if lower.contains(" as ") {
+        return false;
+    }
+    let c = lower.strip_prefix('<').unwrap_or(lower);
+    (c.starts_with("core::fmt::arguments") || c.starts_with("std::fmt::arguments"))
+        && matches!(
+            c.rsplit("::").next(),
+            Some("new_v1" | "new_const" | "new_v1_formatted")
+        )
+}
+
+/// A genuine `std::os::…::FromRawFd::from_raw_fd` (the trait method, its inherent
+/// `<std::fs::File as std::os::fd::FromRawFd>::from_raw_fd` impl, or the
+/// `std::os::unix::io::…` forms — ALL carry a `std::os::` segment). Anchored so the
+/// bare `contains("from_raw_fd")` cannot be forged by a free fn `mycrate::from_raw_fd`
+/// or a user-trait `<T as mycrate::FromRawFd>::from_raw_fd` to SUPPRESS the
+/// `[unsafe:unmodeled-call]` completeness VC. Lower soundness weight than the discharge
+/// sites: this only suppresses that completeness finding, and a user `from_raw_fd`'s
+/// body is verified separately (so its own obligations still apply). The ` as ` form
+/// is intrinsic here (the trait-impl spelling), so accept either a path rooted at
+/// `std::os::` or a qualified trait rooted there. A nested user module such as
+/// `mycrate::std::os` matches neither form.
+fn is_std_from_raw_fd(lower: &str) -> bool {
+    lower.ends_with("::from_raw_fd")
+        && (lower.starts_with("std::os::") || lower.contains(" as std::os::"))
+}
+
 /// Check if a callee is a container-to-raw-pointer accessor (`as_ptr` /
 /// `as_mut_ptr` on a slice, array, `Vec`, etc.). The result aliases the
 /// receiver's buffer, so provenance/offset propagate through it.
+///
+/// CRATE-ANCHORED (round-4 discipline). The bare `contains("::as_ptr")` was
+/// FORGEABLE: a free fn `mycrate::as_ptr(slice)` (its `::as_ptr` substring matches)
+/// or an orphan trait impl on a slice `<[T] as mycrate::Buf>::as_ptr` would (a) make
+/// the engine treat `dest` as ALIASING the receiver's tracked allocation and (b) bind
+/// `dest`'s provenance size to the receiver's `container_byte_len` — either FALSELY
+/// discharging a later `from_raw_parts(dest, n)` byte-bounds obligation → OOB. Reject
+/// trait-qualified (`<T as …>`) paths and require a genuine sysroot-crate root (or the
+/// un-forgeable bare inherent slice header `<[…]>::as_ptr`). Every genuine container
+/// `as_ptr` renders crate-rooted (`core::slice::<impl [T]>::as_ptr`,
+/// `std::ptr::NonNull::<T>::as_ptr`, `alloc::vec::Vec::<T>::as_ptr` — extractor
+/// fixtures). Fail-closed on a miss (untracked `dest` ⇒ symbolic from_raw_parts).
 fn is_container_as_ptr_call(lower: &str) -> bool {
-    lower.contains("::as_ptr") || lower.contains("::as_mut_ptr")
+    if !(lower.contains("::as_ptr") || lower.contains("::as_mut_ptr")) {
+        return false;
+    }
+    if lower.contains(" as ") {
+        return false;
+    }
+    let c = lower.strip_prefix('<').unwrap_or(lower);
+    c.starts_with("core::")
+        || c.starts_with("std::")
+        || c.starts_with("alloc::")
+        || c.starts_with("[")
 }
 
 /// Whether the separation engine MODELS this call (lowercased name) — i.e. some
@@ -3360,7 +3506,9 @@ pub(crate) fn call_is_modeled(lower: &str) -> bool {
         // only safety precondition (`pieces.len() == args.len() + 1`). They construct a value with
         // no UB and no panic, so the hardened unsafe-call boundary treats them as covered. (Actual
         // formatting — and any user `Display`/`Debug` panic — happens later in `write_fmt`.)
-        || lower.contains("fmt::arguments::")
+        // CRATE-ANCHORED (see `is_std_fmt_arguments_ctor`): a nested `mycrate::fmt::arguments`
+        // module cannot forge coverage to suppress the completeness VC.
+        || is_std_fmt_arguments_ctor(lower)
         // `from_raw_fd` (`FromRawFd::from_raw_fd` and the inherent forms on
         // `OwnedFd`/`File`/sockets): wraps an integer fd into an owning type —
         // NO memory access, no panic. Its safety precondition (fd validity +
@@ -3369,7 +3517,10 @@ pub(crate) fn call_is_modeled(lower: &str) -> bool {
         // precedent above. A non-std user fn that happens to be named
         // `from_raw_fd` is still verified independently in its own body, so
         // covering the CALL cannot false-prove any memory operation.
-        || lower.contains("from_raw_fd")
+        // CRATE-ANCHORED (see `is_std_from_raw_fd`): require a `std::os::` segment so a
+        // free fn `mycrate::from_raw_fd` / user-trait `<T as mycrate::FromRawFd>` cannot
+        // forge coverage to suppress the completeness VC.
+        || is_std_from_raw_fd(lower)
         // Native-TLS lazy-init `get_or_init` — the compiler-generated, doc(hidden)
         // `thread_local!` machinery. Same compiler-generated-unsafe tier as the
         // `fmt::arguments::` precedent above (see the helper for the full argument).
@@ -3406,7 +3557,13 @@ pub(crate) fn call_is_modeled(lower: &str) -> bool {
 /// no bracket-balanced normalization survives — the `LazyStorage::…::get_or_init`
 /// head is stable, so the anchored substrings are exact.
 fn is_native_tls_lazy_init_call(lower: &str) -> bool {
-    let hit = lower.contains("thread::local_impl::lazystorage") && lower.contains("::get_or_init");
+    // CRATE-ANCHORED: require the `std::`-ROOTED module path, not a bare
+    // `contains("thread::local_impl::lazystorage")` (which a nested user module
+    // `mycrate::…::thread::local_impl::lazystorage::…::get_or_init` could forge to
+    // SUPPRESS the `[unsafe:unmodeled-call]` completeness VC on a genuinely-unmodeled
+    // unsafe call). The genuine machinery renders `std::thread::local_impl::LazyStorage…`.
+    let hit = lower.starts_with("std::thread::local_impl::lazystorage")
+        && lower.contains("::get_or_init");
     if hit && std::env::var_os("TRUST_TLS_DISCHARGE_DEBUG").is_some() {
         eprintln!(
             "TRUST_TLS_DISCHARGE_DEBUG: call_is_modeled covers native-TLS lazy-init \
@@ -3420,11 +3577,13 @@ fn is_native_tls_lazy_init_call(lower: &str) -> bool {
 /// Check if a callee is a raw-pointer pointee-cast METHOD (`<*mut T>::cast`,
 /// `<*const T>::cast`, `cast_mut`, `cast_const`). These change only the pointee
 /// type while PRESERVING the address and provenance, so tracking must survive
-/// them exactly as it does an `as` pointer cast. Scoped to the raw-pointer
-/// inherent-impl paths (`const_ptr`/`mut_ptr`) so it never matches unrelated
-/// `cast`-named methods (e.g. enum `downcast`, `NonNull` is handled separately).
+/// them exactly as it does an `as` pointer cast. Scoped to the CRATE-ANCHORED
+/// raw-pointer inherent-impl paths (`{core,std}::ptr::const_ptr`/`mut_ptr`) so it
+/// never matches unrelated `cast`-named methods (e.g. enum `downcast`) NOR a forged
+/// `mycrate::const_ptr::cast` — which would propagate the receiver's tracked
+/// allocation onto an unrelated `dest`, FALSELY discharging a later `from_raw_parts`.
 fn is_ptr_cast_call(lower: &str) -> bool {
-    (lower.contains("const_ptr") || lower.contains("mut_ptr")) && lower.contains("::cast")
+    callee_is_std_raw_ptr_inherent(lower) && lower.contains("::cast")
 }
 
 /// Check if a callee is unchecked indexing (`<[T]>::get_unchecked`,
@@ -3498,8 +3657,16 @@ fn is_raw_read_write_call(lower: &str) -> bool {
 /// Check if a callee constructs a `Layout` from an explicit byte size
 /// (`Layout::from_size_align` / `…_unchecked`). The first argument is the size,
 /// which — when constant — bounds any allocation made from the layout.
+///
+/// CRATE-ANCHORED (round-4 discipline): the recorded concrete size is a DISCHARGE —
+/// an allocation built from this layout carries it as `concrete_sizes[prov]`, which a
+/// later `from_raw_parts(p, n)` bound (`offset + n <= size`) discharges against. A
+/// forged `mycrate::layout::from_size_align(BIG, _)` (its `layout::from_size_align`
+/// substring matches) would over-state the allocation size → FALSE OOB proof. Genuine
+/// renders `core::alloc::layout::Layout::from_size_align[_unchecked]` (crate-rooted,
+/// no ` as ` — extractor fixtures), which the anchor keeps.
 fn is_layout_size_call(lower: &str) -> bool {
-    lower.contains("layout::from_size_align")
+    callee_is_std_crate_rooted(lower) && lower.contains("layout::from_size_align")
 }
 
 /// Check if a callee is a transparent unwrap of a `Result`/`Option`
@@ -3525,8 +3692,14 @@ fn is_realloc_call(lower: &str) -> bool {
 /// not a `BinaryOp`, so the engine must route them to the offset interpreter to
 /// preserve provenance and accumulate the byte offset. `::sub`/`::wrapping_sub`
 /// are intentionally excluded (their operand would need negating).
+///
+/// CRATE-ANCHORED (round-4 discipline): the offset interpreter PROPAGATES the
+/// receiver's tracked provenance + byte offset to `dest`; a forged
+/// `mycrate::mut_ptr::add` would carry the receiver's allocation size onto an
+/// unrelated `dest`, FALSELY discharging a later `from_raw_parts`. Genuine renders
+/// `{core,std}::ptr::const_ptr`/`mut_ptr::<impl *…>::add` (extractor fixtures).
 fn is_ptr_offset_call(lower: &str) -> bool {
-    (lower.contains("const_ptr") || lower.contains("mut_ptr"))
+    callee_is_std_raw_ptr_inherent(lower)
         && (lower.contains("::add")
             || lower.contains("::offset")
             || lower.contains("::wrapping_add")
@@ -7395,6 +7568,9 @@ mod tests {
             "core::slice::<impl [t]>::get_unchecked",
             "core::mem::transmute",
             "core::mem::maybeuninit::<t>::assume_init",
+            "core::fmt::arguments::new_v1",
+            "std::os::fd::fromrawfd::from_raw_fd",
+            "<std::fs::file as std::os::fd::fromrawfd>::from_raw_fd",
             // Native-TLS lazy-init `get_or_init` (LOWERCASED, as `call_has_unsafe_model`
             // passes it) — the compiler-generated `thread_local!` machinery, covered.
             "std::thread::local_impl::lazystorage::<std::cell::refcell<rational::arena>, ()>::get_or_init::<fn() -> std::cell::refcell<rational::arena> {rational::arena::__rust_std_internal_init_fn}>",
@@ -7410,6 +7586,12 @@ mod tests {
             "core::num::<impl u64>::wrapping_add",
             "mycrate::do_thing",
             "std::sync::oncelock::<u32>::get_or_init::<{closure@x.rs}>",
+            "mycrate::fmt::arguments::new_v1",
+            "<core::fmt::arguments as mycrate::evil>::new_v1",
+            "core::fmt::arguments::forged_ctor",
+            "mycrate::std::os::fd::fromrawfd::from_raw_fd",
+            "<mycrate::file as mycrate::std::os::fd::fromrawfd>::from_raw_fd",
+            "mycrate::from_raw_fd_wrapper",
         ] {
             assert!(!call_is_modeled(unmodeled), "should NOT be modeled: {unmodeled}");
         }

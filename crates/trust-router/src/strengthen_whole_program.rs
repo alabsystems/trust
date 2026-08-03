@@ -1366,6 +1366,7 @@ mod tests {
                 five(),
             ]),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -1395,6 +1396,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: not(p_sigma()),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -1733,6 +1735,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::And(vec![p_r1(), not(p_r1())]),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -1809,6 +1812,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             ),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -2114,6 +2118,7 @@ mod tests {
                 five(),
             ]),
             contract_metadata: None,
+            obligation: None,
         }
     }
     fn p_of(dv: &str) -> Formula {
@@ -2138,6 +2143,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::And(vec![p_of(caller_dv), not(p_of(caller_dv))]),
             contract_metadata: None,
+            obligation: None,
         }
     }
     fn ind_proof_between<'a>(
@@ -2162,6 +2168,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: not(p_sigma()),
             contract_metadata: None,
+            obligation: None,
         }
     }
     #[allow(clippy::too_many_arguments)]

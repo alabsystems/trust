@@ -442,6 +442,7 @@ fn test_full_pipeline_multi_backend_routing_by_proof_level() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
     let pre_vc = VerificationCondition {
         kind: VcKind::Precondition { callee: "callee".into() },
@@ -449,6 +450,7 @@ fn test_full_pipeline_multi_backend_routing_by_proof_level() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
     let domain_vc = VerificationCondition {
         kind: VcKind::Deadlock,
@@ -456,6 +458,7 @@ fn test_full_pipeline_multi_backend_routing_by_proof_level() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
     let fallback_vc = VerificationCondition {
         kind: VcKind::ResilienceViolation {
@@ -467,6 +470,7 @@ fn test_full_pipeline_multi_backend_routing_by_proof_level() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     let router = Router::with_backends(vec![

@@ -702,6 +702,7 @@ mod tests {
             location: SourceSpan::default(),
             formula,
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -715,6 +716,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         }
     }
 

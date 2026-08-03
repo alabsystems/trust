@@ -8,7 +8,7 @@ use std::{
 };
 
 use rayon::prelude::*;
-use trust_ir_bridge::NativeVerificationBundle;
+use trust_ir_bridge::{NativeVerificationBundle, SourceGenerationAuthority};
 use trust_verifier_api::{
     API_VERSION, Counterexample, EngineKind, EngineManifest, EvidencePublicationMetadata,
     EvidenceStatus, ObligationEvidence, ProofStrength, ReasoningKind, SupportLevel,
@@ -333,6 +333,7 @@ impl FullVerificationEngine {
             &bundle.obligations,
             context,
             Some(native_bundle),
+            None,
         )
         .into_result()
     }
@@ -352,6 +353,7 @@ impl FullVerificationEngine {
             &bundle.obligations,
             context,
             Some(native_bundle),
+            None,
         )
     }
 
@@ -377,6 +379,7 @@ impl FullVerificationEngine {
             obligations,
             context,
             Some(native_bundle),
+            None,
         )
         .into_result()
     }
@@ -421,6 +424,31 @@ impl FullVerificationEngine {
             obligations,
             context,
             native_bundle,
+            None,
+        )
+    }
+
+    /// Verify an exact canonical subset with live source-generation authority.
+    ///
+    /// Unlike the ordinary native-bundle entry points, this explicit compiler
+    /// seam may admit TrustMC source-only semantic shortcuts. The affine token
+    /// is borrowed, never cloned, and remains subject to TrustMC's exact-bundle
+    /// identity and digest checks.
+    #[must_use]
+    pub fn verify_obligations_with_native_trust_ir_bundle_and_source_authority_and_live_receipts(
+        &self,
+        bundle: &TrustContractBundle,
+        obligations: &[TrustObligation],
+        native_bundle: &NativeVerificationBundle,
+        source_generation_authority: &SourceGenerationAuthority,
+        context: &VerifierExecutionContext,
+    ) -> FullVerificationRunWithFreshReceipts {
+        self.verify_with_context_and_native_trust_ir_bundle_with_fresh_receipts(
+            bundle,
+            obligations,
+            context,
+            Some(native_bundle),
+            Some(source_generation_authority),
         )
     }
 
@@ -431,6 +459,7 @@ impl FullVerificationEngine {
         context: Option<&VerifierExecutionContext>,
         native_trust_ir: Option<&NativeTrustIrEvidenceIndex>,
         native_bundle: Option<&NativeVerificationBundle>,
+        source_generation_authority: Option<&SourceGenerationAuthority>,
     ) -> FullVerificationBatchResult {
         let mut results = vec![None; obligations.len()];
         if let Err(error) = bundle.validate_requested_obligations(obligations) {
@@ -600,8 +629,13 @@ impl FullVerificationEngine {
         let mut diagnostics = Vec::new();
         let mut direct_trust_vc_receipts = BTreeMap::new();
         let mut fresh_exact_direct_chc_pdr_receipts = BTreeMap::new();
-        for completed in self.execute_engine_batches(bundle, engine_batches, context, native_bundle)
-        {
+        for completed in self.execute_engine_batches(
+            bundle,
+            engine_batches,
+            context,
+            native_bundle,
+            source_generation_authority,
+        ) {
             diagnostics.push(engine_batch_diagnostic(&completed, context));
             let CompletedEngineBatch {
                 batch,
@@ -718,6 +752,7 @@ impl FullVerificationEngine {
         engine_batches: Vec<EngineBatch>,
         context: Option<&VerifierExecutionContext>,
         native_bundle: Option<&NativeVerificationBundle>,
+        source_generation_authority: Option<&SourceGenerationAuthority>,
     ) -> Vec<CompletedEngineBatch> {
         if engine_batches.len() <= 1 || worker_threads(context).is_some_and(|limit| limit <= 1) {
             return self.execute_engine_batches_serial(
@@ -725,6 +760,7 @@ impl FullVerificationEngine {
                 engine_batches,
                 context,
                 native_bundle,
+                source_generation_authority,
             );
         }
 
@@ -737,6 +773,7 @@ impl FullVerificationEngine {
                         engine_batches,
                         context,
                         native_bundle,
+                        source_generation_authority,
                     )
                 });
             }
@@ -745,10 +782,17 @@ impl FullVerificationEngine {
                 engine_batches,
                 context,
                 native_bundle,
+                source_generation_authority,
             );
         }
 
-        self.execute_engine_batches_parallel(bundle, engine_batches, context, native_bundle)
+        self.execute_engine_batches_parallel(
+            bundle,
+            engine_batches,
+            context,
+            native_bundle,
+            source_generation_authority,
+        )
     }
 
     fn execute_engine_batches_serial(
@@ -757,11 +801,18 @@ impl FullVerificationEngine {
         engine_batches: Vec<EngineBatch>,
         context: Option<&VerifierExecutionContext>,
         native_bundle: Option<&NativeVerificationBundle>,
+        source_generation_authority: Option<&SourceGenerationAuthority>,
     ) -> Vec<CompletedEngineBatch> {
         engine_batches
             .into_iter()
             .map(|engine_batch| {
-                self.execute_engine_batch(bundle, engine_batch, context, native_bundle)
+                self.execute_engine_batch(
+                    bundle,
+                    engine_batch,
+                    context,
+                    native_bundle,
+                    source_generation_authority,
+                )
             })
             .collect()
     }
@@ -772,11 +823,18 @@ impl FullVerificationEngine {
         engine_batches: Vec<EngineBatch>,
         context: Option<&VerifierExecutionContext>,
         native_bundle: Option<&NativeVerificationBundle>,
+        source_generation_authority: Option<&SourceGenerationAuthority>,
     ) -> Vec<CompletedEngineBatch> {
         engine_batches
             .into_par_iter()
             .map(|engine_batch| {
-                self.execute_engine_batch(bundle, engine_batch, context, native_bundle)
+                self.execute_engine_batch(
+                    bundle,
+                    engine_batch,
+                    context,
+                    native_bundle,
+                    source_generation_authority,
+                )
             })
             .collect()
     }
@@ -787,6 +845,7 @@ impl FullVerificationEngine {
         engine_batch: EngineBatch,
         context: Option<&VerifierExecutionContext>,
         native_bundle: Option<&NativeVerificationBundle>,
+        source_generation_authority: Option<&SourceGenerationAuthority>,
     ) -> CompletedEngineBatch {
         let primary = self.engines[engine_batch.engine_index].as_ref();
         let requested =
@@ -811,6 +870,7 @@ impl FullVerificationEngine {
                 bundle,
                 &requested,
                 native_bundle,
+                source_generation_authority,
                 deadline,
             )
         }))
@@ -1128,6 +1188,7 @@ impl FullVerificationEngine {
         obligations: &[TrustObligation],
         context: &VerifierExecutionContext,
         native_bundle: Option<&NativeVerificationBundle>,
+        source_generation_authority: Option<&SourceGenerationAuthority>,
     ) -> FullVerificationRunWithFreshReceipts {
         let effective_context = context_with_wall_time_deadline(context);
         let context = &effective_context;
@@ -1143,6 +1204,7 @@ impl FullVerificationEngine {
                 Some(context),
                 native_trust_ir.as_ref(),
                 native_bundle,
+                source_generation_authority,
             )
         };
 
@@ -1793,6 +1855,7 @@ impl VerificationEngine for FullVerificationEngine {
             bundle,
             obligations,
             context,
+            None,
             None,
         )
         .into_result()

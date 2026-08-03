@@ -9,12 +9,13 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 TRUSTC=build/host/stage2/bin/trustc
+TARGO=build/host/stage2/bin/targo
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 echo "== 1. Unit tests (includes the previously-rotted trust_verify tests module)"
-RUSTC_BOOTSTRAP=1 cargo test --manifest-path crates/Cargo.toml -p trust-types -p trust-report
-RUSTC_BOOTSTRAP=1 cargo test --manifest-path targo-trust/Cargo.toml
+"$TARGO" --unverified test --manifest-path crates/Cargo.toml -p trust-types -p trust-report
+"$TARGO" --unverified test --manifest-path targo-trust/Cargo.toml
 python3 x.py test --stage 2 compiler/rustc_mir_transform
 
 echo "== 2. Compiletest suites"

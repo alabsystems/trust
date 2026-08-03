@@ -37,6 +37,7 @@ use crate::{
 ///     location: SourceSpan::default(),
 ///     formula: Formula::Bool(false),
 ///     contract_metadata: None,
+/// obligation: None,
 /// };
 ///
 /// let result = router.verify_one(&vc);
@@ -767,6 +768,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -813,6 +815,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -907,6 +910,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             ),
             contract_metadata: None,
+            obligation: None,
         }
     }
 

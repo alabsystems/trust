@@ -29,9 +29,15 @@ fn supervisor_args(root: &Path, checker_source: &[u8]) -> Vec<String> {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
     let serializable_vc = SerializableVc::from_vc(&vc);
-    let canonical_vc = serde_json::to_vec(&serializable_vc).expect("serialize VC");
+    // Same canonical form the supervisor's production path uses
+    // (`verify_binary_evidence::canonical_vc_bytes`): an additive
+    // `#[serde(default)] Option<_>` VC field must not move a certificate digest,
+    // and a raw `serde_json::to_vec` here would drift from the binding under test.
+    let canonical_vc =
+        trust_types::stable_model_json_bytes(&serializable_vc).expect("serialize VC");
     let dispatch = SolverDispatchRecord {
         id: "external-checker-integration:vc0".to_string(),
         function: Some("main".to_string()),

@@ -1682,6 +1682,12 @@ fn parse_cargo_proof_inventory(
             "Targo proof and excluded inventories did not form one complete Cargo Unit index domain (expected={expected_indices:?}, actual={all_indices:?})"
         ));
     }
+    validate_dependency_policy_never_scopes_out_a_selected_package(
+        &proof_targets,
+        &excluded_targets,
+        &excluded_reasons,
+        selected_packages,
+    )?;
     Ok(CargoProofInventory {
         include_dependencies,
         proof_targets,
@@ -1690,6 +1696,58 @@ fn parse_cargo_proof_inventory(
         excluded_graph_roles,
         unit_semantics,
     })
+}
+
+/// The dependency off-switch must never be the reason a package the user
+/// explicitly selected went unverified.
+///
+/// Targo scopes verification per compilation Unit: a resolved root Unit is
+/// compiled with verification on, and every other graph Unit gets the explicit
+/// `-Ztrust-verify=off` compiler off-switch plus a `dependency-policy`
+/// exclusion row. A selected package can legitimately own such rows — the same
+/// package is frequently built twice (host proc-macro/build-dependency copy
+/// beside the target copy), and only the root copy is a proof unit — so a
+/// per-Unit rule would over-reject. The invariant that actually protects the
+/// user is per PACKAGE: if the dependency policy scoped out a Unit of a
+/// selected package, that package must still have contributed at least one Unit
+/// to the proof frontier.
+///
+/// Without this, an inventory that labels a selected package's own root Unit
+/// `graph_role="dependency"` passes every other check (the graph-role scope
+/// check only rejects the converse, an *unselected* package claiming a selected
+/// role), and `dep_tcb` then blesses it as an ordinary `dependency-scope`
+/// assumption — so the crate the user asked to verify is silently reported as a
+/// trusted third-party dependency instead. Fail closed instead.
+///
+/// Deliberately keyed on `dependency-policy` alone: the doc, doctest and
+/// `--compile-time-deps` exclusion reasons legitimately empty a selected
+/// package's proof frontier and are gated separately (they are never
+/// dep-TCB-admitted).
+fn validate_dependency_policy_never_scopes_out_a_selected_package(
+    proof_targets: &BTreeSet<CargoTargetIdentity>,
+    excluded_targets: &BTreeSet<CargoTargetIdentity>,
+    excluded_reasons: &BTreeMap<CargoTargetIdentity, String>,
+    selected_packages: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    for target in excluded_targets {
+        if excluded_reasons.get(target).map(String::as_str)
+            != Some(TARGO_TRUST_EXCLUSION_DEPENDENCY_POLICY)
+        {
+            continue;
+        }
+        if selected_packages.get(&target.package_id) != Some(&target.package_name) {
+            continue;
+        }
+        if proof_targets.iter().any(|proof| proof.package_id == target.package_id) {
+            continue;
+        }
+        return Err(format!(
+            "Targo dependency policy scoped out selected package {:?} without leaving any of its Units in the proof frontier: {}",
+            target.package_name,
+            target.report_label()
+        ));
+    }
+    Ok(())
 }
 
 fn parse_cargo_unit_semantics(
@@ -4831,6 +4889,142 @@ mod tests {
             .err()
             .expect("include-dependencies=true cannot retain a policy-excluded compiler unit");
         assert!(error.contains("despite include-dependencies=true"), "{error}");
+    }
+
+    /// The per-compilation-unit scoping contract, as observed from a real
+    /// stage2 `targo` run (workspace lib, third-party dependency lib, build
+    /// script, proc macro):
+    ///
+    /// * the selected workspace unit is a PROOF unit — Targo appended no
+    ///   `-Ztrust-verify=off`, and its transport rows must carry this run's
+    ///   session nonce (any other session is rejected by the parser);
+    /// * the third-party dependency lib, the build-script compile unit, and the
+    ///   proc-macro lib are all EXCLUDED with the `dependency-policy` reason,
+    ///   which is exactly the partition Targo compiles with the off-switch;
+    /// * a selected package may own `dependency-policy` rows (its own build
+    ///   script always does), but it must still have left a Unit in the proof
+    ///   frontier — otherwise the off-switch silently unverified the crate the
+    ///   user asked about, and the run fails closed.
+    #[test]
+    fn dependency_policy_scopes_off_deps_and_host_units_but_never_the_selected_package() {
+        let package_id = "path+file:///fixture#demo@0.1.0";
+        let selected: BTreeMap<String, String> =
+            [(package_id.to_string(), "demo".to_string())].into_iter().collect();
+        let mut lines = Vec::new();
+        append_complete_proof_unit(
+            &mut lines, package_id, "demo", "demo", "lib", 0, "build", "primary", true,
+        );
+        let mut values = successful_cargo_input(lines)
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        let scoped_off = |index: u64,
+                          package_id: &str,
+                          package_name: &str,
+                          target_name: &str,
+                          target_kind: &str| {
+            let mut unit = serde_json::json!({
+                "index": index,
+                "mode": "build",
+                "package_id": package_id,
+                "package_name": package_name,
+                "target_name": target_name,
+                "target_kinds": [target_kind],
+                "compile_target": TEST_COMPILE_TARGET,
+                "exclusion_reason": TARGO_TRUST_EXCLUSION_DEPENDENCY_POLICY,
+                "graph_role": "dependency",
+            });
+            set_excluded_unit_semantics(&mut unit, "build");
+            unit
+        };
+        let dependency_lib = scoped_off(
+            1,
+            "registry+https://example.invalid/index#thirdparty@1.2.3",
+            "thirdparty",
+            "thirdparty",
+            "lib",
+        );
+        // Targo's own graph role for a build-script COMPILE unit is
+        // `dependency`, and it belongs to the SELECTED package.
+        let build_script = scoped_off(2, package_id, "demo", "build-script-build", "custom-build");
+        let proc_macro = scoped_off(
+            3,
+            "registry+https://example.invalid/index#fixture-pm@0.1.0",
+            "fixture-pm",
+            "fixture-pm",
+            "lib",
+        );
+        values[0]["excluded_units"] =
+            serde_json::json!([dependency_lib, build_script.clone(), proc_macro]);
+        let input = values.iter().map(|line| format!("{line}\n")).collect::<String>();
+        let evidence = parse_cargo_json_stdout(Cursor::new(&input), &selected, TEST_SESSION, true)
+            .expect("scoped-off dependency, build-script and proc-macro units are admitted");
+        let inventory = evidence.declared_inventory.expect("declared inventory");
+
+        // Workspace unit: verification ON.
+        assert_eq!(inventory.proof_targets.len(), 1);
+        let verified = inventory.proof_targets.iter().next().unwrap();
+        assert_eq!(verified.package_name, "demo");
+        assert_eq!(verified.proof_unit_role, "primary");
+        assert!(
+            !inventory.excluded_targets.iter().any(|target| target.target_name == "demo"),
+            "the selected workspace lib must never carry an exclusion row"
+        );
+
+        // Dependency / host units: verification OFF via the dependency policy.
+        let mut scoped_out = inventory
+            .excluded_targets
+            .iter()
+            .map(|target| {
+                (
+                    target.target_name.as_str(),
+                    inventory.excluded_reasons.get(target).map(String::as_str),
+                    inventory.excluded_graph_roles.get(target).map(String::as_str),
+                )
+            })
+            .collect::<Vec<_>>();
+        scoped_out.sort_unstable();
+        assert_eq!(
+            scoped_out,
+            [
+                (
+                    "build-script-build",
+                    Some(TARGO_TRUST_EXCLUSION_DEPENDENCY_POLICY),
+                    Some("dependency")
+                ),
+                ("fixture-pm", Some(TARGO_TRUST_EXCLUSION_DEPENDENCY_POLICY), Some("dependency")),
+                ("thirdparty", Some(TARGO_TRUST_EXCLUSION_DEPENDENCY_POLICY), Some("dependency")),
+            ]
+        );
+
+        // The session nonce reached the authenticated primary target: the
+        // parser accepts only `TEST_SESSION`, so re-parsing under a different
+        // expected session must reject this same authenticated stream.
+        let stale = parse_cargo_json_stdout(Cursor::new(&input), &selected, "other-session", true)
+            .err()
+            .expect("primary-target evidence is bound to this run's session nonce");
+        assert!(stale.contains("session"), "{stale}");
+
+        // Fail closed: the dependency off-switch must not be the reason the
+        // selected package itself went unverified.
+        let mut orphaned = values.clone();
+        let mut selected_lib = build_script;
+        selected_lib["target_name"] = serde_json::json!("demo");
+        selected_lib["target_kinds"] = serde_json::json!(["lib"]);
+        orphaned[0]["excluded_units"] = serde_json::json!([selected_lib]);
+        orphaned[0]["units"] = serde_json::json!([]);
+        orphaned.retain(|line| line.get("trust_proof_unit").is_none());
+        orphaned[0]["excluded_units"][0]["index"] = serde_json::json!(0);
+        let input = orphaned.iter().map(|line| format!("{line}\n")).collect::<String>();
+        let error = parse_cargo_json_stdout(Cursor::new(input), &selected, TEST_SESSION, true)
+            .err()
+            .expect("dependency policy cannot leave a selected package unverified");
+        assert!(
+            error.contains("scoped out selected package \"demo\"")
+                && error.contains("without leaving any of its Units in the proof frontier"),
+            "{error}"
+        );
     }
 
     #[test]

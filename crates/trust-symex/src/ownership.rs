@@ -99,6 +99,7 @@ impl OwnershipConstraint {
             location: self.location.clone(),
             formula: self.violation_formula.clone(),
             contract_metadata: None,
+            obligation: None,
         }
     }
 }

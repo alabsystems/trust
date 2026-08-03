@@ -136,6 +136,7 @@ mod tests {
             location: SourceSpan::default(),
             formula,
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -146,6 +147,7 @@ mod tests {
             location: SourceSpan::default(),
             formula,
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -197,6 +199,7 @@ mod tests {
             },
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let vc2 = VerificationCondition {
             kind: VcKind::DivisionByZero,
@@ -210,6 +213,7 @@ mod tests {
             },
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         assert_eq!(
             compute_vc_fingerprint(&vc1),

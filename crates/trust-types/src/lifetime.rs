@@ -435,6 +435,7 @@ fn generate_block_borrow_vcs(
                         location: span.clone(),
                         formula: Formula::Bool(false), // always violated
                         contract_metadata: None,
+                        obligation: None,
                     });
                 }
             }
@@ -449,6 +450,7 @@ fn generate_block_borrow_vcs(
                         location: span.clone(),
                         formula: Formula::Bool(false),
                         contract_metadata: None,
+                        obligation: None,
                     });
                 }
             }

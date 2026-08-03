@@ -498,6 +498,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             ),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -519,6 +520,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             ),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -540,6 +542,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             ),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -567,6 +570,7 @@ mod tests {
                 ),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -589,6 +593,7 @@ mod tests {
                 Box::new(Formula::Var("len".into(), Sort::Int)),
             ),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -611,6 +616,7 @@ mod tests {
                 Box::new(Formula::Var("len".into(), Sort::Int)),
             ),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -633,6 +639,7 @@ mod tests {
                 Box::new(Formula::Int(100)),
             ),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -651,6 +658,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -672,6 +680,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         }];
 
         let report = try_discharge_batch(&vcs, &env);
@@ -697,6 +706,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             ),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -717,6 +727,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             ),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -742,6 +753,7 @@ mod tests {
                     Box::new(Formula::Int(0)),
                 ),
                 contract_metadata: None,
+                obligation: None,
             },
             // Not dischargeable: z could be 0
             VerificationCondition {
@@ -753,6 +765,7 @@ mod tests {
                     Box::new(Formula::Int(0)),
                 ),
                 contract_metadata: None,
+                obligation: None,
             },
         ];
 
@@ -779,6 +792,7 @@ mod tests {
                     Box::new(Formula::Int(0)),
                 ),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationCondition {
                 kind: VcKind::DivisionByZero,
@@ -789,6 +803,7 @@ mod tests {
                     Box::new(Formula::Int(0)),
                 ),
                 contract_metadata: None,
+                obligation: None,
             },
         ];
 
@@ -810,6 +825,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             ),
             contract_metadata: None,
+            obligation: None,
         }];
 
         let report = try_discharge_batch(&vcs, &env);
@@ -2096,6 +2112,7 @@ mod tests {
                     Box::new(Formula::Int(1000)),
                 ),
                 contract_metadata: None,
+                obligation: None,
             },
             // z + y = [TOP] — cannot determine => not dischargeable
             VerificationCondition {
@@ -2110,6 +2127,7 @@ mod tests {
                     Box::new(Formula::Int(1000)),
                 ),
                 contract_metadata: None,
+                obligation: None,
             },
         ];
 
@@ -2181,6 +2199,7 @@ mod tests {
                 ),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -2218,6 +2237,7 @@ mod tests {
                 ),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -2253,6 +2273,7 @@ mod tests {
                 ),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -2288,6 +2309,7 @@ mod tests {
                 ),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -2327,6 +2349,7 @@ mod tests {
                 ),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -2364,6 +2387,7 @@ mod tests {
                 ),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -2401,6 +2425,7 @@ mod tests {
                 ),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -2445,6 +2470,7 @@ mod tests {
                 ]),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -2483,6 +2509,7 @@ mod tests {
                 ),
             ]),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -2584,6 +2611,7 @@ mod tests {
                 ]),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
         let result = try_discharge_vc(&vc, &env);
         assert!(result.is_discharged(), "signed shift amt in [2,10] is safe for a 128-bit value");
@@ -2606,6 +2634,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             ),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -2626,6 +2655,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             ),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -2647,6 +2677,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             ),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -2691,6 +2722,7 @@ mod tests {
                 ]),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -2733,6 +2765,7 @@ mod tests {
                 ]),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -2775,6 +2808,7 @@ mod tests {
                 ]),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -2817,6 +2851,7 @@ mod tests {
                 ]),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -2862,6 +2897,7 @@ mod tests {
                     ),
                 ]),
                 contract_metadata: None,
+                obligation: None,
             },
             // Shift: amt in [0, 40] — NOT safe
             VerificationCondition {
@@ -2889,6 +2925,7 @@ mod tests {
                     ),
                 ]),
                 contract_metadata: None,
+                obligation: None,
             },
             // Float div: fd in [1, 10] — safe
             VerificationCondition {
@@ -2900,6 +2937,7 @@ mod tests {
                     Box::new(Formula::Int(0)),
                 ),
                 contract_metadata: None,
+                obligation: None,
             },
         ];
 
@@ -2938,6 +2976,7 @@ mod tests {
                 ),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -2975,6 +3014,7 @@ mod tests {
                 ),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -3017,6 +3057,7 @@ mod tests {
                 ]),
             ]),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = try_discharge_vc(&vc, &env);
@@ -3482,6 +3523,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Var("original".into(), Sort::Bool),
             contract_metadata: None,
+            obligation: None,
         };
 
         let augmented = augment_vc_with_abstract_state(&vc, &env);
@@ -3506,6 +3548,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Var("phi".into(), Sort::Bool),
             contract_metadata: None,
+            obligation: None,
         };
 
         let augmented = augment_vc_with_abstract_state(&vc, &env);
@@ -3536,6 +3579,7 @@ mod tests {
                 64,
             ),
             contract_metadata: None,
+            obligation: None,
         };
         let augmented = augment_vc_with_abstract_state(&vc, &env);
         assert_eq!(augmented.formula, vc.formula, "BV rows must not grow Int-sorted conjuncts");
@@ -3565,6 +3609,7 @@ mod tests {
                 64,
             ),
             contract_metadata: None,
+            obligation: None,
         };
         assert!(
             matches!(try_discharge_vc(&vc, &env), AbstractInterpResult::Undetermined),
@@ -3584,6 +3629,7 @@ mod tests {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationCondition {
                 kind: VcKind::IndexOutOfBounds,
@@ -3591,6 +3637,7 @@ mod tests {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             },
         ];
 
@@ -3630,6 +3677,7 @@ mod tests {
                 Box::new(Formula::Int(127)),
             ),
             contract_metadata: None,
+            obligation: None,
         };
 
         let augmented = augment_vc_with_abstract_state(&vc, &env);
@@ -3661,6 +3709,7 @@ mod tests {
             location: SourceSpan::default(),
             formula,
             contract_metadata: None,
+            obligation: None,
         }
     }
 

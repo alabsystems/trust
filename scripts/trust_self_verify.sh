@@ -68,14 +68,11 @@ SCORECARD="$REPO/reports/self-verification-scorecard.md"
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/trust_self_verify.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
 
-# z3 / link-shim paths the stage2 trustc needs for the SMT backend (mirrors the
-# fuzzer + oracle scripts). Harmless if the dirs are absent.
-# The shims dir must EXIST: a missing LIBRARY_PATH entry makes ld warn
-# "search path not found", which leaks into diagnostics-sensitive tests.
-mkdir -p /tmp/trust_link_shims
-export LIBRARY_PATH="/tmp/trust_link_shims:/opt/homebrew/opt/z3/lib:${LIBRARY_PATH:-}"
-export LD_LIBRARY_PATH="/opt/homebrew/opt/z3/lib:${LD_LIBRARY_PATH:-}"
-export DYLD_LIBRARY_PATH="/opt/homebrew/opt/z3/lib:${DYLD_LIBRARY_PATH:-}"
+# No z3 link/runtime paths: the stage2 `trustc` SMT backend is the pure-Rust
+# `ay` solver — it links no libz3 and dlopens none at runtime (verified
+# 2026-08-01: no z3-sys/links="z3" in any Cargo.lock; `otool -L trustc` is
+# z3-clean). The old comment claiming trustc "needs" z3 for the SMT backend was
+# stale. Re-adding these would resurrect a dead knob.
 
 # ---------------------------------------------------------------------------
 # Graceful skip when no built compiler is present.
@@ -277,8 +274,8 @@ done
 
 if [ "$compiled_any" -eq 0 ]; then
     echo "ERROR: no corpus sample produced any verification output."
-    echo "       The stage2 trustc at $TRUSTC may be broken or missing its SMT lib."
-    echo "       (Check that z3 is on the library path.)"
+    echo "       The stage2 trustc at $TRUSTC may be broken (its SMT backend is"
+    echo "       the in-tree pure-Rust \`ay\` solver — no external z3/library path)."
     exit 2
 fi
 

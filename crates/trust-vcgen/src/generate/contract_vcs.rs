@@ -76,8 +76,16 @@ pub(super) fn generate_v2_contract_vcs_impl(
             .body
             .strip_prefix(contracts::LOWERED_CONTRACT_PREFIX)
             .unwrap_or(&contract.body);
+        // Sort-exact equality here made every `bool` clause fail to recognize
+        // its own typed lowering, appending a SECOND, ill-sorted copy of the
+        // same postcondition. That copy cannot lower to typed TrustIr, so it
+        // carries no `trust.vc.formula.payload` and lands as a fail-closed
+        // Unknown that also denies the whole function native evidence. Match
+        // modulo the parser's `Sort::Int` sentinel so the typed clause — the
+        // type-faithful reading, and the one that actually gets solved — is
+        // recognized as already present.
         if let Some(parsed) = trust_types::parse_spec_expr(body)
-            && !seen_posts.iter().any(|f| f == &parsed)
+            && !seen_posts.iter().any(|f| parsed_clause_matches_typed(&parsed, f))
         {
             seen_posts.push(parsed.clone());
             posts.push((parsed, body.to_string(), contract.span.clone(), Some(contract_index)));
@@ -285,6 +293,7 @@ pub(super) fn generate_v2_contract_vcs_impl(
                     location: func.span.clone(),
                     formula,
                     contract_metadata: clause_metadata,
+                    obligation: None,
                 });
                 continue;
             }
@@ -425,6 +434,30 @@ pub(super) fn generate_v2_contract_vcs_impl(
                         }
                     }
                 }
+
+                // Trust (OUT-PARAMETER pin): a postcondition over a place written
+                // THROUGH a `&mut` PARAMETER (`ensures *x == 0`, `ensures self.n
+                // == 0`) had NO antecedent at all and was decided by havoc.
+                //
+                // The block-def extraction DOES produce the fact
+                // (`Eq(Var("x*"), Int(0))` for `(*_1) = 0`), but
+                // `version_block_def_at_establish` cannot stamp it: it looks for
+                // the establish point of the `*`-STRIPPED base (`x`), and a `&mut`
+                // PARAMETER is never assigned in-body, so `block_def_establish_stmt`
+                // returns `None` and the fact is left BARE. Meanwhile the
+                // obligation body IS versioned (`x*#s0_0`), so the bare fact is
+                // name-disjoint and `combine_relevant_block_defs` prunes it as
+                // irrelevant. The VC collapses to `Not(Eq(Var("x*#s0_0"), Int(0)))`
+                // — a query about a free variable, which the solver "refutes"
+                // regardless of the body. TRUE and FALSE twins came back
+                // identically Failed.
+                //
+                // Pin it explicitly here, exactly as the return slot above is
+                // pinned for the same reason ("block-def extraction does not
+                // surface a `_0 = Use(..)` ... so `_0` stays havoc'd").
+                let (with_pins, unpinned_out_params) =
+                    with_out_param_pins(func, &sv, block, &[vc_block, &block], &post, formula);
+                formula = with_pins;
 
                 // Trust (Option/Result-return discriminant/value pin): ground the
                 // synthetic spec-model terms `_0_discr` / `_0_value` that the
@@ -893,6 +926,51 @@ pub(super) fn generate_v2_contract_vcs_impl(
                     continue;
                 }
 
+                // Trust (P0 multi-write postcondition false-refutation, 2026-08-01)
+                // — the OUT-PARAMETER twin of the return-slot tripwire above.
+                //
+                // A clause-mentioned `&mut`-parameter place that the body STORES TO
+                // but that NO conjunct constrains at the token the obligation body
+                // reads makes `Not(post)` satisfiable BY HAVOC: the row degenerates
+                // into a refutable query over a free post-state and the full verifier
+                // mints `verified_counterexample = true` against CORRECT code. That is
+                // the worst failure mode a verifier has — it fails closed, so nothing
+                // unsound ships, but it tells you your correct code is wrong. Fail to
+                // the VISIBLE unsupported row instead of refuting.
+                //
+                // The pin lane's own ledger (`unpinned_out_params`) is necessary but
+                // not sufficient to fire: another conjunct — a block def, a semantic
+                // guard — may already constrain the place, in which case the VC is
+                // still meaningful and must proceed. So each residue name is checked
+                // against the ASSEMBLED formula under the exact version token the
+                // obligation body carries, mirroring `formula_has_return_slot_pin`.
+                let unconstrained_out_param = unpinned_out_params.iter().find(|subject| {
+                    let versioned = match sv.version_token_at(
+                        func,
+                        block.id,
+                        block.stmts.len(),
+                        subject,
+                    ) {
+                        Some(tok) => format!("{subject}#{tok}"),
+                        None => (*subject).clone(),
+                    };
+                    !formula_pins_var_name(&formula, &versioned)
+                });
+                if let Some(subject) = unconstrained_out_param {
+                    vcs.push(contracts::spec_unverifiable_vc(
+                        func,
+                        v2_block_span(func, vc_block),
+                        &format!(
+                            "postcondition references `&mut`-parameter place `{subject}`, which the \
+                             body writes but no conjunct pins at the obligation's read version; \
+                             refusing a refutable query over a free post-state"
+                        ),
+                        &format!("{post:?}"),
+                        clause_metadata,
+                    ));
+                    continue;
+                }
+
                 // Machine{w} lane: the clause was admitted CONDITIONALLY on the
                 // fully assembled VC — negated clause, block defs, return pins,
                 // versioned hypotheses, guards — translating wholesale into
@@ -928,12 +1006,102 @@ pub(super) fn generate_v2_contract_vcs_impl(
                     location: v2_block_span(func, vc_block),
                     formula,
                     contract_metadata: clause_metadata,
+                    obligation: None,
                 });
             }
         }
     }
 
     vcs
+}
+
+/// Structural match between a TEXT-PARSED spec clause and the compiler's own
+/// TYPED lowering of that same clause, forgiving ONLY the parser's
+/// missing-type sentinel on a variable leaf.
+///
+/// WHY THIS EXISTS. `trust_types::parse_spec_expr` takes a bare `&str` and so
+/// has no type environment at all: `Parser::variable` stamps every leaf it
+/// cannot resolve from a quantifier binder with the default `Sort::Int`
+/// (`trust-types/src/spec_parse.rs:793-802`). The compiler's contract lowering
+/// carries the REAL sort. `Formula` derives structural `PartialEq`, and its
+/// `Var(String, Sort)` / `SymVar(Symbol, Sort)` variants COMPARE THE SORT, so a
+/// clause over a `bool` place can never equal a re-parse of its own source
+/// text:
+///
+/// ```text
+/// ensures !self.storage.f
+///   typed lowering : Not(Var("self*.0.0", Bool))
+///   re-parsed text : Not(Var("self*.0.0", Int))   <- differs ONLY in sort
+/// ```
+///
+/// An integer clause matches by coincidence — the sentinel IS `Int` — which is
+/// why the integer lane already proves and refutes at projection depth 1, 2 and
+/// 3, while EVERY `bool` clause fails, at depth 1 exactly as much as at depth 2.
+/// The mismatch is a sort bug, not a nesting bug.
+///
+/// SOUNDNESS. Everything except a variable's sort must match EXACTLY:
+/// constructor, arity, every constant, every bitvector width, every quantifier
+/// binder list, every predicate/constructor name, and every variable NAME. The
+/// single relaxation is a leaf whose PARSED side carries `Sort::Int`, the
+/// no-information default, which is allowed to meet any sort on the typed side.
+/// A different place spells a different NAME and is still refused, so this can
+/// never bind a clause to some other clause's place; it only lets a clause
+/// recognize the text it was itself lowered from. Quantifier-bound leaves
+/// cannot be mis-forgiven either: a binder list is non-child payload and is
+/// compared exactly, and a binder declaring a non-`Int` sort is precisely what
+/// makes the parser resolve that same sort instead of the sentinel.
+///
+/// The shape test is written against `Formula::map_children`/`Formula::children`
+/// so it stays TOTAL over this `#[non_exhaustive]` enum: a variant added later
+/// is compared exactly by construction, rather than silently falling into a
+/// permissive catch-all arm.
+pub(super) fn parsed_clause_matches_typed(parsed: &Formula, typed: &Formula) -> bool {
+    // The one and only relaxation, and only on a variable leaf.
+    if let (Some((parsed_name, parsed_sort)), Some((typed_name, typed_sort))) =
+        (formula_var_leaf(parsed), formula_var_leaf(typed))
+    {
+        return parsed_name == typed_name
+            && (parsed_sort == typed_sort || *parsed_sort == Sort::Int);
+    }
+    // Identical constructor and identical non-formula payload, then identical
+    // children pairwise.
+    if !same_formula_shape(parsed, typed) {
+        return false;
+    }
+    let parsed_children = parsed.children();
+    let typed_children = typed.children();
+    parsed_children.len() == typed_children.len()
+        && parsed_children
+            .iter()
+            .zip(typed_children.iter())
+            .all(|(p, t)| parsed_clause_matches_typed(p, t))
+}
+
+/// `Var` and `SymVar` viewed uniformly as `(name, sort)`. `SymVar` is
+/// documented as the interned spelling of `Var` and semantically identical to
+/// it, so a clause is allowed to match across the two spellings.
+fn formula_var_leaf(formula: &Formula) -> Option<(&str, &Sort)> {
+    match formula {
+        Formula::Var(name, sort) => Some((name.as_str(), sort)),
+        Formula::SymVar(symbol, sort) => Some((symbol.as_str(), sort)),
+        _ => None,
+    }
+}
+
+/// True iff two nodes share a constructor AND identical non-formula payload
+/// (widths, binder lists, constants, interned names), ignoring their
+/// sub-formulas.
+///
+/// Implemented by erasing every DIRECT child to one fixed sentinel and then
+/// comparing structurally. This needs no per-variant match arm, so unlike a
+/// hand-written enumeration it cannot go stale as `Formula` grows. A child that
+/// happens to BE the sentinel is harmless: erasure decides the shape only, and
+/// the caller still compares every child pairwise afterwards.
+fn same_formula_shape(a: &Formula, b: &Formula) -> bool {
+    fn erase(formula: &Formula) -> Formula {
+        formula.clone().map_children(&mut |_| Formula::Bool(false))
+    }
+    erase(a) == erase(b)
 }
 
 /// Resolve one parsed formula to exactly one authored clause in the canonical
@@ -953,7 +1121,17 @@ pub(super) fn unique_source_contract_index_for_formula(
             .body
             .strip_prefix(contracts::LOWERED_CONTRACT_PREFIX)
             .unwrap_or(&contract.body);
-        trust_types::parse_spec_expr(body).filter(|parsed| parsed == formula).map(|_| index)
+        // `formula` is the compiler's TYPED clause (this helper's only callers
+        // pass `func.postconditions`); `parsed` is the re-parse of the authored
+        // text. Sort-exact equality here silently denied every `bool` clause a
+        // `source_contract_index`, and `trust_verify.rs:32245` needs that index
+        // (`fresh_vc.contract_metadata?.source_contract_index?`) to build the
+        // body link, without which the source-clause marker stays pending.
+        // Ambiguity handling below is untouched: two matching clauses still
+        // yield `None`.
+        trust_types::parse_spec_expr(body)
+            .filter(|parsed| parsed_clause_matches_typed(parsed, formula))
+            .map(|_| index)
     });
     let index = matches.next()?;
     matches.next().is_none().then_some(index)
@@ -991,6 +1169,24 @@ pub(super) fn formula_has_return_slot_pin(formula: &Formula) -> bool {
         Formula::Eq(lhs, _) => {
             matches!(&**lhs, Formula::Var(name, _) if is_return_slot_name(name))
         }
+        _ => false,
+    }
+}
+
+/// Whether `formula`'s POSITIVE `And` spine defines `name` — an `Eq(Var(name), _)`
+/// conjunct. The generic counterpart to [`formula_has_return_slot_pin`], used by the
+/// out-parameter silent-weakening tripwire to ask "is this post-state place actually
+/// constrained by SOME conjunct?" without caring which lane supplied it (the pin
+/// loop, a block def, a semantic guard).
+///
+/// Deliberately spine-only, exactly as the return-slot twin: an equality buried
+/// under `Not`/`Or`/`Implies` is a CLAIM, not a definition, and crediting it would
+/// let the negated postcondition appear to constrain the very variable it is
+/// interrogating — re-opening the free-variable hole this tripwire exists to close.
+pub(super) fn formula_pins_var_name(formula: &Formula, name: &str) -> bool {
+    match formula {
+        Formula::And(conjuncts) => conjuncts.iter().any(|c| formula_pins_var_name(c, name)),
+        Formula::Eq(lhs, _) => matches!(&**lhs, Formula::Var(n, _) if n == name),
         _ => false,
     }
 }
@@ -1157,4 +1353,194 @@ pub(super) fn unconditional_and_spine_contains(formula: &Formula, expected: &For
             if conjuncts
                 .iter()
                 .any(|conjunct| unconditional_and_spine_contains(conjunct, expected)))
+}
+
+// =========================================================================
+// OUT-PARAMETER PIN
+// =========================================================================
+//
+// `ensures` over a place reached through a `&mut` PARAMETER — `*x`,
+// `(*self).0`, `(*self).0.3` — names a place the CALLER can observe at return,
+// so the clause legitimately talks about the place's FINAL value. (This is the
+// exact opposite of the hunt-6 by-value-parameter hazard above, where the
+// clause snapshots the ENTRY value and the body-aware lane must therefore stay
+// fail-closed. A by-value parameter is not reachable through a `Deref`, so the
+// two lanes cannot overlap.)
+//
+// SOUNDNESS. The pin asserts one thing: "immediately after statement `k`, the
+// place named `subject` holds the value statement `k` stored there". That is
+// the definition of the assignment, so the fact is true by construction. Three
+// properties keep it from ever admitting a false proof:
+//
+//   1. THE VALUE COMES FROM THE BODY, NEVER FROM THE CLAUSE. The rhs is the
+//      statement's own lowered rvalue. A FALSE postcondition therefore stays
+//      refutable: the place is pinned to its genuine value and `Not(clause)`
+//      remains satisfiable. A pin can never be minted from what the clause
+//      asserts, so it cannot vacuously discharge anything.
+//
+//   2. LIVENESS IS DECIDED BY THE SAME ORACLE THAT RENAMES THE OBLIGATION.
+//      The pin is emitted ONLY when the defining statement's own version token
+//      `s{block}_{k}` is byte-equal to the token `StmtVersionCtx` mints for the
+//      body's read of `subject` at the use point. `version_token_at` already
+//      accounts for later same-block writes, opaque-deref havoc
+//      (`deref_store_havoc_names`), and inter-block call havoc (the entry map's
+//      `s{pred}_t` tokens). If ANY of those intervene the tokens differ and no
+//      pin is emitted — the VC degrades to exactly today's fail-closed
+//      behaviour. We never re-derive liveness with a second, forkable rule.
+//
+//   3. ALIASING IS NOT ASSUMED AWAY. The pin claims nothing about any name
+//      other than the one the statement literally writes. A store through some
+//      other opaque pointer that could alias `subject` is reported by
+//      `stmt_writes_name` as a write of `subject`, which moves the body's token
+//      and suppresses the pin by (2).
+//
+// Reads inside the pinned rvalue are versioned at the read-point `k` (the values
+// BEFORE the defining write), mirroring `version_block_def_at_establish`, so a
+// self-referential store (`*x = *x + 1`) pins `x*_new == x*_old + 1` rather than
+// the unsatisfiable `x* == x* + 1`.
+
+/// Collect `(name, sort)` for every `Var` in `formula`.
+fn formula_var_sorts(formula: &Formula) -> Vec<(String, Sort)> {
+    let mut out: Vec<(String, Sort)> = Vec::new();
+    let _ = formula.clone().map(&mut |node| {
+        if let Formula::Var(name, sort) = &node {
+            out.push((name.clone(), sort.clone()));
+        }
+        node
+    });
+    out
+}
+
+/// True iff `place` is an OUT-PARAMETER place: the pointee of a `&mut`
+/// reference PARAMETER, followed by zero or more FIELD projections.
+///
+/// Deliberately narrow. `Index`/`ConstantIndex`/`Subslice` are excluded (an
+/// element name can alias a sibling under a symbolic index); `Downcast` is
+/// excluded (an enum field's place is variant-dependent); raw pointers are
+/// excluded (provenance is not tracked here); a SHARED `&` is excluded (nothing
+/// can be stored through it, so there is nothing to pin). Anything excluded
+/// simply yields no pin, which is the current behaviour.
+fn is_out_param_place(func: &VerifiableFunction, place: &Place) -> bool {
+    let Some((Projection::Deref, rest)) = place.projections.split_first() else {
+        return false;
+    };
+    if !rest.iter().all(|p| matches!(p, Projection::Field(_))) {
+        return false;
+    }
+    if !is_parameter(func, place.local) {
+        return false;
+    }
+    let mut decls = func.body.locals.iter().filter(|d| d.index == place.local);
+    let Some(decl) = decls.next() else { return false };
+    // A duplicated declaration index makes the type ambiguous; refuse.
+    if decls.next().is_some() {
+        return false;
+    }
+    matches!(decl.ty, Ty::Ref { mutable: true, .. })
+}
+
+/// Conjoin out-parameter pins onto `formula`.
+///
+/// `use_block` is the block whose end-of-statements point the obligation body was
+/// versioned at; `def_blocks` are the blocks scanned for the defining store (the
+/// VC's predecessor and the return block, matching the return-slot pin above).
+fn with_out_param_pins(
+    func: &VerifiableFunction,
+    sv: &StmtVersionCtx,
+    use_block: &trust_types::BasicBlock,
+    def_blocks: &[&trust_types::BasicBlock],
+    post: &Formula,
+    mut formula: Formula,
+) -> (Formula, Vec<String>) {
+    // Sorts the CLAUSE uses, keyed by base (unversioned) name. A name the clause
+    // spells at two different sorts is ambiguous and gets no pin.
+    let mut clause_sorts: FxHashMap<String, Option<Sort>> = FxHashMap::default();
+    for (name, sort) in formula_var_sorts(post) {
+        let base = name.split('#').next().unwrap_or(&name).to_string();
+        clause_sorts
+            .entry(base)
+            .and_modify(|slot| {
+                if slot.as_ref() != Some(&sort) {
+                    *slot = None;
+                }
+            })
+            .or_insert(Some(sort));
+    }
+    if clause_sorts.is_empty() {
+        return (formula, Vec::new());
+    }
+
+    let use_point = use_block.stmts.len();
+    let mut pinned: FxHashSet<String> = FxHashSet::default();
+    // Trust (P0 multi-write postcondition false-refutation, 2026-08-01) — the
+    // SILENT-WEAKENING ledger. `required` is every clause-mentioned out-param place
+    // the body ACTUALLY STORES TO (recorded BEFORE the liveness gate below);
+    // `pinned_bases` is the subset that ended up constrained. The difference is a
+    // post-state this lane failed to capture, which the caller must fail CLOSED on
+    // rather than emit as a refutable query over a free variable. Deliberately keyed
+    // on "the body stores to it": a clause-mentioned place the body NEVER writes
+    // (`ensures self.n == 0` over an empty body) is GENUINELY refutable and must
+    // stay so.
+    let mut required: FxHashSet<String> = FxHashSet::default();
+    let mut pinned_bases: FxHashSet<String> = FxHashSet::default();
+
+    for def_block in def_blocks {
+        for (k, stmt) in def_block.stmts.iter().enumerate() {
+            let Statement::Assign { place, rvalue, .. } = stmt else { continue };
+            if !is_out_param_place(func, place) {
+                continue;
+            }
+            // Leave the lanes that own their own encoding alone: a
+            // CheckedBinaryOp's value is pinned by its assert-passed semantic
+            // guard, and an array-theory element store is modeled as a `Store`
+            // term under its own version scheme.
+            if matches!(rvalue, Rvalue::CheckedBinaryOp(..))
+                || crate::is_array_theory_element_store(func, place.local, stmt)
+            {
+                continue;
+            }
+            let subject = crate::place_to_var_name(func, place);
+            // The clause must actually mention this place, at a sort that agrees
+            // with the place's own sort — otherwise the pin could not unify with
+            // the obligation body anyway.
+            let Some(Some(clause_sort)) = clause_sorts.get(&subject) else { continue };
+            let Some(place_sort) = crate::place_sort(func, place) else { continue };
+            if &place_sort != clause_sort {
+                continue;
+            }
+            // Recorded BEFORE the liveness gate, so a pin the gate suppresses is
+            // VISIBLE to the caller's tripwire instead of silently weakening the VC.
+            required.insert(subject.clone());
+            // (2) LIVENESS: the defining statement's own token must be exactly the
+            // token the obligation body's read of `subject` carries. Any later
+            // write, havoc, or inter-block join moves the body's token and
+            // suppresses the pin.
+            let Some(use_tok) = sv.version_token_at(func, use_block.id, use_point, &subject) else {
+                continue;
+            };
+            if use_tok != format!("s{}_{k}", def_block.id.0) {
+                continue;
+            }
+            // (1) VALUE FROM THE BODY: the statement's own rvalue, with its reads
+            // taken at the read-point `k` (values BEFORE this write).
+            let Ok(value) = crate::chc::rvalue_to_formula(func, rvalue) else { continue };
+            let value = version_rename_at(&value, sv, func, def_block.id, k);
+            let versioned = format!("{subject}#{use_tok}");
+            if !pinned.insert(versioned.clone()) {
+                continue;
+            }
+            let pin = Formula::Eq(
+                Box::new(Formula::var_owned(versioned, place_sort)),
+                Box::new(value),
+            );
+            formula = Formula::And(vec![pin, formula]);
+            pinned_bases.insert(subject.clone());
+        }
+    }
+    // The ledger's residue: clause-mentioned places the body writes but this lane
+    // left unconstrained. Sorted for a deterministic diagnostic.
+    let mut unpinned: Vec<String> =
+        required.into_iter().filter(|s| !pinned_bases.contains(s)).collect();
+    unpinned.sort();
+    (formula, unpinned)
 }

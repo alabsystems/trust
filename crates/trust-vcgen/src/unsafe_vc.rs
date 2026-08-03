@@ -204,6 +204,7 @@ mod tests {
                 // unsafe operations that need manual review.
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             })
             .collect()
     }

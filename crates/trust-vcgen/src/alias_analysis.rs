@@ -719,6 +719,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             ),
             contract_metadata: None,
+            obligation: None,
         }];
         let refined = refine_vc_with_alias(&func, vcs);
         assert_eq!(refined.len(), 1, "refinement must preserve VC count");

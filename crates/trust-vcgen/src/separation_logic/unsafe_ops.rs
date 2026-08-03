@@ -117,6 +117,7 @@ pub fn ffi_call_sep_vc(
         location: span.clone(),
         formula: Formula::Eq(Box::new(ffi_ptr), Box::new(Formula::Int(0))),
         contract_metadata: None,
+        obligation: None,
     });
 
     // VC 2: FFI may invalidate heap assumptions (conservative)
@@ -128,6 +129,7 @@ pub fn ffi_call_sep_vc(
         location: span.clone(),
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     });
 
     vcs
@@ -180,6 +182,7 @@ pub fn unsafe_fn_call_sep_vc(
             // len > alloc_size
             formula: Formula::Gt(Box::new(len), Box::new(alloc_size)),
             contract_metadata: None,
+            obligation: None,
         });
     } else {
         // Generic unsafe fn: conservative flag.
@@ -191,6 +194,7 @@ pub fn unsafe_fn_call_sep_vc(
             location: span.clone(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         });
     }
 
@@ -223,5 +227,6 @@ pub fn address_of_sep_vc(
         // full lifetime analysis at this layer.
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     }]
 }

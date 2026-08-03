@@ -196,6 +196,7 @@ fn div_zero_analysis(file: &str) -> FailureAnalysis {
         },
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     };
     let verdict = SolverVerdict::Failed {
         solver: "ay-smtlib".into(),

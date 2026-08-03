@@ -195,6 +195,46 @@ pub(super) fn v2_signed_mul_corners_fit(a: (i128, i128), b: (i128, i128)) -> boo
     [(la, lb), (la, hb), (ha, lb), (ha, hb)].into_iter().all(|(x, y)| x.checked_mul(y).is_some())
 }
 
+/// Trust (arith ARM, 2026-07-31): split a block-def-versioned arithmetic-overflow
+/// violation body `And([lhs_range, rhs_range, out_of_range])` into the authenticated
+/// obligation. `rec_body` is the version-renamed body as it appears INSIDE the emitted
+/// formula (from `v2_formula_with_block_defs_at_point_recorded`), `kept` the block-defs
+/// conjoined around it.
+///
+/// The RECORDED `body` is the ATOMIC out-of-range core the consumer's `is_core` accepts —
+/// `Or([Lt(a∘b, MIN), Gt(a∘b, MAX)])` for uadd / signed add,sub,mul / umul, or the bare
+/// `Lt(a-b, 0)` unsigned-sub underflow — and the two operand ranges are DEMOTED to a
+/// `ConjoinFactsLast` wrapper (they are premises, not the violation). A second
+/// `ConjoinFactsLast` carries the kept block-defs. Ordered innermost-first so
+/// `reconstruct(body, wrappers)` reproduces the emitted formula BIT-FOR-BIT:
+/// the range wrapper rebuilds `And([r0, r1, core]) == rec_body`, then the block-def
+/// wrapper rebuilds `And([kept.., rec_body])`.
+///
+/// `subject = None` (arithmetic overflow is payload-free); `width` is the REAL operand
+/// width from `int_op_type` (the non-constant operand's type, NOT `min(wa, wb)`), the
+/// [10]-class width authority. FAILS CLOSED (`None`) when `rec_body` is not the canonical
+/// 3-conjunct `And` — which excludes the Pow bodies (`Bool(true)`, or a 2-conjunct
+/// `And([base_range, out_of_range])`), leaving those genuinely-unmodeled shapes to peel.
+pub(super) fn v2_arith_overflow_seed_record(
+    rec_body: &Formula,
+    kept: &[Formula],
+    width: u32,
+) -> Option<ObligationRecord> {
+    let Formula::And(conjuncts) = rec_body else {
+        return None;
+    };
+    if conjuncts.len() != 3 {
+        return None;
+    }
+    let atomic_core = conjuncts[2].clone();
+    let ranges = vec![conjuncts[0].clone(), conjuncts[1].clone()];
+    let mut wrappers = vec![ObligationWrapper::ConjoinFactsLast { facts: ranges }];
+    if !kept.is_empty() {
+        wrappers.push(ObligationWrapper::ConjoinFactsLast { facts: kept.to_vec() });
+    }
+    Some(ObligationRecord { body: atomic_core, wrappers, subject: None, width: Some(width) })
+}
+
 pub(super) fn v2_build_overflow_vc_for_operands(
     func: &VerifiableFunction,
     block: &trust_types::BasicBlock,
@@ -260,6 +300,7 @@ pub(super) fn v2_build_overflow_vc_for_operands(
                 // obligation the provably-overflowing const-pow path emits).
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             });
         }
         return Some(unsupported_mir_vc(
@@ -316,6 +357,7 @@ pub(super) fn v2_build_overflow_vc_for_operands(
                 location: span.clone(),
                 formula,
                 contract_metadata: None,
+                obligation: None,
             });
         }
         // Operands not BV-encodable (symbolic): fall through to the Int path (sound;
@@ -418,6 +460,7 @@ pub(super) fn v2_build_overflow_vc_for_operands(
                 location: span.clone(),
                 formula,
                 contract_metadata: None,
+                obligation: None,
             });
         }
         // Operands could not be encoded as BV terms (e.g. symbolic), or the
@@ -468,39 +511,58 @@ pub(super) fn v2_build_overflow_vc_for_operands(
     // Direct-BinaryOp callers pass the statement index so defs are taken BEFORE
     // the operation (not the whole block, which would include the op's own
     // result definition); the checked path conjoins whole-block defs.
-    let formula = match stmt_index {
-        Some(idx) => v2_formula_with_block_defs_before_stmt(func, block, idx, body),
-        None => v2_formula_with_block_defs(func, block, body),
-    };
-    // Bound any parameter that entered the VC only via a conjoined block
-    // definition (sound — parameters are always within their type range; see
-    // `conjoin_arg_type_ranges`). Closes spurious-overflow false-FAILs such as
-    // `safe_midpoint`'s `lo + (hi - lo) / 2` without ever masking a real one.
-    let formula = conjoin_arg_type_ranges(func, formula);
-    // Trust (unsigned-sub vacuous-UNSAT false-accept fix): this builder's VC IS
-    // the checked op's own overflow/underflow check, so the result copy closure's
-    // type-ranges are circular premises here — exclude them (see
-    // `checked_arith_result_value_vars`).
-    let excl = checked_arith_result_value_vars(func);
-    // verifier-precision: bound NON-parameter integer locals/temps too (the sibling
-    // of arg ranges) — closes spurious-overflow false-FAILs over an unbounded-Int
-    // temp. SOUNDNESS: DROP-ONLY (a true in-type-range fact).
-    let formula = conjoin_local_type_ranges_excluding(func, formula, &excl);
-    // Lever A: bound fixed-width-integer datatype FIELDS too (same sound bound) so the
-    // direct overflow-VC callers (incl. the CheckedBinaryOp `Assert{Overflow}` path)
-    // carry the field bound, not only the funnel passes. SOUNDNESS: DROP-ONLY.
-    let formula = conjoin_datatype_field_ranges_excluding(func, formula, &excl);
-    // Bound any slice/array length term by `isize::MAX` so a `i < s.len()`-guarded
-    // increment cannot false-fail with an impossible `s.len() = 2^64` cex.
-    let formula = conjoin_slice_len_bounds(func, formula);
-
-    Some(VerificationCondition {
+    //
+    // Trust (arith ARM, 2026-07-31): use the RECORDED block-defs helper — its `.0` is
+    // byte-identical to the previous `v2_formula_with_block_defs{_before_stmt}` (both are
+    // `v2_formula_with_block_defs_at_point(..end..)`, `end = stmt_index.unwrap_or(len)`),
+    // so `formula` is UNCHANGED, and its `rec_body`/`kept` seed the authenticated
+    // obligation (atomic out-of-range core, operand ranges + block-defs demoted to
+    // ConjoinFactsLast wrappers). `width` from `int_op_type` (real operand width).
+    let end = stmt_index.unwrap_or(block.stmts.len());
+    let (formula, rec_body, kept) =
+        v2_formula_with_block_defs_at_point_recorded(func, block, end, body);
+    let mut vc = VerificationCondition {
         kind: VcKind::ArithmeticOverflow { op, operand_tys: (lhs_ty, rhs_ty) },
         function: func.name.clone().into(),
         location: span.clone(),
         formula,
         contract_metadata: None,
-    })
+        obligation: v2_arith_overflow_seed_record(&rec_body, &kept, width),
+    };
+    // The four construction-time conjoins the direct/checked BinaryOp Int path applies.
+    // Each is a pure `And([facts.., formula])` push (facts LAST) or identity, so mirror
+    // each onto the recorded obligation as a `ConjoinFactsLast` via `ob_record_conjoin_wrap`
+    // — the SAME mechanism the shared safety loop uses for bounds VCs — keeping
+    // `reconstruct(record)` byte-identical to `formula`. The shared loop later applies +
+    // mirrors its OWN copy of the same four onto the returned VC (the pre-existing double
+    // application; the emitted formula is UNCHANGED here). No-op when the seed is `None`.
+    //
+    // Bound any parameter that entered the VC only via a conjoined block definition
+    // (sound — parameters are always within their type range; see `conjoin_arg_type_ranges`).
+    let before = vc.formula.clone();
+    vc.formula = conjoin_arg_type_ranges(func, vc.formula.clone());
+    let after = vc.formula.clone();
+    ob_record_conjoin_wrap(&mut vc, &before, &after);
+    // Trust (unsigned-sub vacuous-UNSAT false-accept fix): this builder's VC IS the
+    // checked op's own overflow/underflow check, so the result copy closure's type-ranges
+    // are circular premises here — exclude them (see `checked_arith_result_value_vars`).
+    let excl = checked_arith_result_value_vars(func);
+    // verifier-precision: bound NON-parameter integer locals/temps too. DROP-ONLY.
+    let before = vc.formula.clone();
+    vc.formula = conjoin_local_type_ranges_excluding(func, vc.formula.clone(), &excl);
+    let after = vc.formula.clone();
+    ob_record_conjoin_wrap(&mut vc, &before, &after);
+    // Lever A: bound fixed-width-integer datatype FIELDS too. DROP-ONLY.
+    let before = vc.formula.clone();
+    vc.formula = conjoin_datatype_field_ranges_excluding(func, vc.formula.clone(), &excl);
+    let after = vc.formula.clone();
+    ob_record_conjoin_wrap(&mut vc, &before, &after);
+    // Bound any slice/array length term by `isize::MAX`.
+    let before = vc.formula.clone();
+    vc.formula = conjoin_slice_len_bounds(func, vc.formula.clone());
+    let after = vc.formula.clone();
+    ob_record_conjoin_wrap(&mut vc, &before, &after);
+    Some(vc)
 }
 
 /// Build the fixed-width bitvector OVERFLOW (failure) condition for an
@@ -2019,5 +2081,6 @@ pub(super) fn v2_build_terminator_vc(
         location: span,
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     })
 }

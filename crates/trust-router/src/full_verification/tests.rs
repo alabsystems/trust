@@ -2701,6 +2701,12 @@ fn native_trust_ir_unreplayed_trust_vc_bundle() -> NativeVerificationBundle {
         options: trust_ir::TrustVcRequestOptions::default(),
         diagnostics: trust_ir::NativeDiagnosticsPolicy::default(),
         provenance,
+        // Stays None. This is a hand-built negative fixture that does NOT go
+        // through `obligation_sources_for_module`, so a Some(_) here would trip
+        // `RequestObligationFunctionMismatch` unless the bundle's matching
+        // obligation source were given the same function — changing what this
+        // test is actually testing.
+        function: None,
     });
 
     rebind_native_bundle_module_digest(&mut bundle);

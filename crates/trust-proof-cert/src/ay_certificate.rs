@@ -938,6 +938,7 @@ asserted q";
             },
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let snapshot = VcSnapshot::from_vc(&vc).expect("snapshot");
         let solver = SolverInfo {
@@ -995,6 +996,7 @@ asserted q";
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let snapshot = VcSnapshot::from_vc(&vc).expect("snapshot");
         let solver = SolverInfo {

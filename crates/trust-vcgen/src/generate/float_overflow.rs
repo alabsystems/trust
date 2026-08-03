@@ -176,6 +176,7 @@ pub(super) fn v2_build_float_overflow_vc(
             formula,
         ),
         contract_metadata: None,
+        obligation: None,
     })
 }
 
@@ -326,18 +327,23 @@ pub(super) fn v2_float_overflow_witness_formula(
         // AT LEAST ONE operand above MAX/2 (not both: `MAX/4 + MAX` overflows
         // with one small operand). Sub mirrors with OPPOSITE signs
         // (`a − b = a + (−b)`).
-        (BinOp::Add | BinOp::Sub, 64) => {
+        (BinOp::Add | BinOp::Sub, width @ (32 | 64)) => {
             let lhs_value = operand_to_formula(func, lhs);
             let rhs_value = operand_to_formula(func, rhs);
             let sign_width = 1;
             let mag_width = width - sign_width;
-            let exp_width = 11;
-            let frac_width = 52;
+            let (exp_width, frac_width, threshold_bits, finite_exponent_value) = match width {
+                32 => (8, 23, (f32::MAX / 2.0).to_bits() as u128, 0xff),
+                64 => (11, 52, (f64::MAX / 2.0).to_bits() as u128, 0x7ff),
+                _ => unreachable!("the match arm admits only binary32/binary64"),
+            };
+            let magnitude_mask = (1u128 << mag_width) - 1;
             let threshold = Formula::BitVec {
-                value: ((f64::MAX / 2.0).to_bits() & ((1u64 << 63) - 1)) as i128,
+                value: (threshold_bits & magnitude_mask) as i128,
                 width: mag_width,
             };
-            let finite_exponent = Formula::BitVec { value: 0x7ff, width: exp_width };
+            let finite_exponent =
+                Formula::BitVec { value: finite_exponent_value, width: exp_width };
 
             let sign_eq = Formula::Eq(
                 Box::new(Formula::BvExtract {
@@ -390,10 +396,16 @@ pub(super) fn v2_float_overflow_witness_formula(
         // Mul: `|a · b| > MAX` forces `max(|a|, |b|) > sqrt(MAX)` — AT LEAST
         // ONE operand above sqrt(MAX) (not both: `2 · MAX` overflows with one
         // small operand).
-        (BinOp::Mul, 64) => {
+        (BinOp::Mul, width @ (32 | 64)) => {
             let mag_width = width - 1;
+            let threshold_bits = match width {
+                32 => f32::MAX.sqrt().to_bits() as u128,
+                64 => f64::MAX.sqrt().to_bits() as u128,
+                _ => unreachable!("the match arm admits only binary32/binary64"),
+            };
+            let magnitude_mask = (1u128 << mag_width) - 1;
             let threshold = Formula::BitVec {
-                value: ((f64::MAX.sqrt()).to_bits() & ((1u64 << 63) - 1)) as i128,
+                value: (threshold_bits & magnitude_mask) as i128,
                 width: mag_width,
             };
 
@@ -418,16 +430,20 @@ pub(super) fn v2_float_overflow_witness_formula(
         // threshold, which is why no numerator-magnitude conjunct may appear).
         // `|b| >= 1` with finite `a` bounds the quotient by `|a| <= MAX` —
         // never an overflow — so the shape over-approximates exactly.
-        (BinOp::Div, 64) => {
+        (BinOp::Div, width @ (32 | 64)) => {
             let mag_width = width - 1;
-            let exp_width = 11;
-            let frac_width = 52;
-            let mag_mask = (1u64 << 63) - 1;
+            let (exp_width, frac_width, one_bits, finite_exponent_value) = match width {
+                32 => (8, 23, 1.0f32.to_bits() as u128, 0xff),
+                64 => (11, 52, 1.0f64.to_bits() as u128, 0x7ff),
+                _ => unreachable!("the match arm admits only binary32/binary64"),
+            };
+            let magnitude_mask = (1u128 << mag_width) - 1;
             let divisor_threshold = Formula::BitVec {
-                value: ((1.0f64).to_bits() & mag_mask) as i128,
+                value: (one_bits & magnitude_mask) as i128,
                 width: mag_width,
             };
-            let finite_exponent = Formula::BitVec { value: 0x7ff, width: exp_width };
+            let finite_exponent =
+                Formula::BitVec { value: finite_exponent_value, width: exp_width };
             let lhs_value = operand_to_formula(func, lhs);
             Some(Formula::And(vec![
                 Formula::BvULt(

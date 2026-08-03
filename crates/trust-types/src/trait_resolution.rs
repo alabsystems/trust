@@ -368,6 +368,7 @@ pub fn generate_trait_vcs(
             location: unresolved.span.clone(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         });
     }
 
@@ -385,6 +386,7 @@ pub fn generate_trait_vcs(
             location: span,
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         });
     }
 
@@ -405,6 +407,7 @@ pub fn generate_trait_vcs(
                 // This is satisfiable — the VC records the dispatch enumeration.
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             });
         }
     }

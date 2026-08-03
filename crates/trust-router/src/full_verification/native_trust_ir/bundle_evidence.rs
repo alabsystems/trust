@@ -8,7 +8,9 @@ use std::{
 
 #[cfg(feature = "trust-build")]
 use trust_bmc::TrustMcVerifierApiAdapter;
-use trust_ir_bridge::{NativeVerificationBundle, NativeVerificationRequest};
+use trust_ir_bridge::{
+    NativeVerificationBundle, NativeVerificationRequest, SourceGenerationAuthority,
+};
 #[cfg(feature = "trust-vc-native")]
 use trust_vc_bridge::TrustVcVerificationEngine;
 #[cfg(feature = "trust-vc-native")]
@@ -533,6 +535,7 @@ pub(crate) fn native_trust_ir_bundle_evidence(
     bundle: &TrustContractBundle,
     obligations: &[TrustObligation],
     native_bundle: Option<&NativeVerificationBundle>,
+    source_generation_authority: Option<&SourceGenerationAuthority>,
     deadline: Option<Instant>,
 ) -> Option<NativeTrustIrBundleEvidence> {
     if is_native_trust_wp_trust_ir_engine(manifest) {
@@ -557,6 +560,7 @@ pub(crate) fn native_trust_ir_bundle_evidence(
             bundle,
             obligations,
             native_bundle,
+            source_generation_authority,
             deadline,
         );
     }
@@ -934,6 +938,7 @@ fn trust_mc_native_trust_ir_bundle_evidence(
     bundle: &TrustContractBundle,
     obligations: &[TrustObligation],
     native_bundle: Option<&NativeVerificationBundle>,
+    source_generation_authority: Option<&SourceGenerationAuthority>,
     deadline: Option<Instant>,
 ) -> Option<NativeTrustIrBundleEvidence> {
     let native_bundle = native_bundle?;
@@ -969,12 +974,22 @@ fn trust_mc_native_trust_ir_bundle_evidence(
                 .collect::<Vec<_>>(),
         );
     }
-    let outcome = adapter.evidence_from_native_trust_ir_bundle_with_deadline_and_fresh_receipts(
-        bundle,
-        obligations,
-        native_bundle,
-        deadline,
-    );
+    let outcome = match source_generation_authority {
+        Some(source_generation_authority) => adapter
+            .evidence_from_native_trust_ir_bundle_with_source_authority_and_deadline_and_fresh_receipts(
+                bundle,
+                obligations,
+                native_bundle,
+                source_generation_authority,
+                deadline,
+            ),
+        None => adapter.evidence_from_native_trust_ir_bundle_with_deadline_and_fresh_receipts(
+            bundle,
+            obligations,
+            native_bundle,
+            deadline,
+        ),
+    };
     Some(NativeTrustIrBundleEvidence {
         evidence: outcome.evidence,
         direct_trust_vc_receipts: BTreeMap::new(),
@@ -994,6 +1009,7 @@ fn trust_mc_native_trust_ir_bundle_evidence(
     _bundle: &TrustContractBundle,
     _obligations: &[TrustObligation],
     _native_bundle: Option<&NativeVerificationBundle>,
+    _source_generation_authority: Option<&SourceGenerationAuthority>,
     _deadline: Option<Instant>,
 ) -> Option<NativeTrustIrBundleEvidence> {
     None

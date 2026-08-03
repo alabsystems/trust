@@ -410,6 +410,7 @@ fn emit_provenance_vcs(
             location: violation.span.clone(),
             formula: Formula::Bool(true), // definite violation
             contract_metadata: None,
+            obligation: None,
         });
     }
 }

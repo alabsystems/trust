@@ -21,6 +21,7 @@ fn sample_vc() -> VerificationCondition {
             Box::new(Formula::Int(0)),
         ))),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -53,6 +54,7 @@ fn direct_contradiction_vc_is_kernel_certified_end_to_end() {
         location: SourceSpan::default(),
         formula: Formula::And(vec![p.clone(), Formula::Not(Box::new(p))]),
         contract_metadata: None,
+        obligation: None,
     };
     let result = proved_result();
     // Any non-empty solver proof; the genuine-kernel fast path keys on vc.formula.
@@ -92,6 +94,7 @@ fn multi_clause_resolution_vc_is_kernel_certified_end_to_end() {
             Formula::Not(Box::new(q)),
         ]),
         contract_metadata: None,
+        obligation: None,
     };
     let result = proved_result();
     let solver_proof = simple_axiom_proof("resolution", Formula::Bool(true));
@@ -124,6 +127,7 @@ fn euf_transitivity_vc_is_kernel_certified_end_to_end() {
             Formula::Not(Box::new(eq(a, c))),
         ]),
         contract_metadata: None,
+        obligation: None,
     };
     let result = proved_result();
     let solver_proof = simple_axiom_proof("euf", Formula::Bool(true));
@@ -152,6 +156,7 @@ fn qf_lia_overflow_vc() -> VerificationCondition {
             Box::new(Formula::Int((1i128 << 64) - 1)),
         ),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -166,6 +171,7 @@ fn qf_uf_equality_vc() -> VerificationCondition {
             Box::new(Formula::Var("b".into(), Sort::Bool)),
         ),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -403,6 +409,7 @@ fn test_verify_existing_detects_stale() {
         location: SourceSpan::default(),
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     };
 
     let err =
@@ -508,6 +515,7 @@ fn test_classify_vc_qf_bv_not_certifiable() {
             32,
         ),
         contract_metadata: None,
+        obligation: None,
     };
     let (logic, certifiable) = classify_vc_for_certification(&vc);
     assert_eq!(logic, SmtLogic::QfBv);
@@ -584,6 +592,7 @@ fn test_generate_proof_term_unsupported_qf_bv() {
             32,
         ),
         contract_metadata: None,
+        obligation: None,
     };
     let solver_proof = simple_axiom_proof("bv_axiom", Formula::Bool(true));
 
@@ -772,6 +781,7 @@ fn test_certify_from_solver_proof_multi_step_qf_lia() {
             Box::new(Formula::Int(0)),
         ))),
         contract_metadata: None,
+        obligation: None,
     };
     let result = proved_result();
 
@@ -831,6 +841,7 @@ fn test_certify_from_solver_proof_qf_uf_congruence() {
             Box::new(Formula::Var("b".into(), Sort::Bool)),
         ),
         contract_metadata: None,
+        obligation: None,
     };
     let result = proved_result();
 
@@ -956,6 +967,7 @@ fn test_certify_from_solver_proof_skips_quantified() {
             )),
         ),
         contract_metadata: None,
+        obligation: None,
     };
     let result = proved_result();
     let solver_proof = simple_axiom_proof("forall_axiom", Formula::Bool(true));
@@ -1074,6 +1086,7 @@ fn test_classify_vc_scope_qf_lia_uf() {
             Formula::Var("flag".into(), Sort::Bool),
         ]),
         contract_metadata: None,
+        obligation: None,
     };
     let (logic, scope) = classify_vc_scope(&vc);
     assert_eq!(logic, SmtLogic::QfLiaUf);
@@ -1099,6 +1112,7 @@ fn test_classify_vc_scope_qf_bv_partially_certified() {
             32,
         ),
         contract_metadata: None,
+        obligation: None,
     };
     let (logic, scope) = classify_vc_scope(&vc);
     assert_eq!(logic, SmtLogic::QfBv);
@@ -1123,6 +1137,7 @@ fn test_classify_vc_scope_full_uncertified() {
             )),
         ),
         contract_metadata: None,
+        obligation: None,
     };
     let (logic, scope) = classify_vc_scope(&vc);
     assert_eq!(logic, SmtLogic::Full);
@@ -1144,6 +1159,7 @@ fn test_generate_proof_term_qf_lia_uf() {
             Formula::Var("valid".into(), Sort::Bool),
         ]),
         contract_metadata: None,
+        obligation: None,
     };
     let solver_proof = simple_axiom_proof(
         "guard_axiom",
@@ -1177,6 +1193,7 @@ fn test_classify_vc_for_certification_qf_lia_uf() {
             Formula::Var("enabled".into(), Sort::Bool),
         ]),
         contract_metadata: None,
+        obligation: None,
     };
     let (logic, certifiable) = classify_vc_for_certification(&vc);
     assert_eq!(logic, SmtLogic::QfLiaUf);
@@ -1229,6 +1246,7 @@ fn test_certify_with_scope_fully_certified_qf_lia_uf() {
             Formula::Var("flag".into(), Sort::Bool),
         ]),
         contract_metadata: None,
+        obligation: None,
     };
     let result = proved_result();
     let solver_proof = simple_axiom_proof(
@@ -1267,6 +1285,7 @@ fn test_certify_with_scope_uncertified_quantified() {
             )),
         ),
         contract_metadata: None,
+        obligation: None,
     };
     let result = proved_result();
     let solver_proof = simple_axiom_proof("forall_axiom", Formula::Bool(true));
@@ -1301,6 +1320,7 @@ fn test_certify_with_scope_partially_certified_qf_bv() {
             32,
         ),
         contract_metadata: None,
+        obligation: None,
     };
     let result = proved_result();
     let solver_proof = simple_axiom_proof("bv_axiom", Formula::Bool(true));
@@ -1391,6 +1411,7 @@ fn test_certify_from_solver_proof_qf_lia_uf() {
             Formula::Var("enabled".into(), Sort::Bool),
         ]),
         contract_metadata: None,
+        obligation: None,
     };
     let result = proved_result();
     let solver_proof = simple_axiom_proof(
@@ -1453,6 +1474,7 @@ fn test_certify_with_scope_graceful_degradation_no_panic() {
             location: SourceSpan::default(),
             formula,
             contract_metadata: None,
+            obligation: None,
         };
 
         let (cert_result, scope) = pipeline.certify_with_scope(&vc, &result, &solver_proof);

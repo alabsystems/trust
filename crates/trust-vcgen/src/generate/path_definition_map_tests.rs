@@ -12,7 +12,7 @@ use super::{
     StmtVersionCtx, VersionCtx, accumulator_init_const, block_def_establish_subsumes_kill,
     build_semantic_guard_map, flip_matches_kill_stmt, flip_token_distinctness_violations,
     formula_survives_redefs, generate_full_assert_refutation_vcs, reaching_def_versions,
-    shadow_parity_disagreements, shadow_parity_disagreements_overlap,
+    shadow_parity_disagreements, shadow_parity_disagreements_overlap, stmt_writes_name,
     v2_build_path_definition_map, v2_live_path_defs, v2_may_reassigned_per_block,
     version_rename_at,
 };
@@ -3787,4 +3787,185 @@ fn overlap_parity_holds_on_corpus_and_battery() {
         }
     }
     assert!(total >= 100, "battery too small: {total}");
+}
+
+// =========================================================================
+// P0 (2026-08-01) — THE VERSION ORACLE AT THE EXACT LAYER THE BUG LIVES IN.
+//
+// `stmt_writes_name` answers "does statement k ITSELF write `name`", and
+// `StmtVersionCtx::version_token_at` uses it to pick WHICH statement stamps a
+// name's version token. Its opaque-deref branch consulted the block-level
+// `deref_store_havoc_names`, a whole-function list of BASE LOCAL names — a `&mut`
+// parameter contributes the bare `self` — and `place_names_overlap` treats `*` as
+// a projection separator, so `place_names_overlap("self", "self*.0")` is TRUE.
+// A store to `(*self).1` was therefore reported as a write of its own SIBLING
+// `(*self).0`, moving that field's token to the wrong statement and severing it
+// from the exact-token out-parameter pin. Downstream, the postcondition read a
+// FREE variable and the solver minted a verified counterexample against correct
+// code.
+//
+// These assert the ORACLE directly, so a regression is caught here rather than as
+// a mysterious contract-lane verdict.
+// =========================================================================
+
+/// `fn d(&mut self) { (*self).0 = 0; (*self).1 = 0; }` with `self: &mut S`, `S`
+/// carrying the real rustc-derived `AdtKind` (`None` = un-migrated/unknown).
+fn two_field_store_fn(kind: Option<trust_types::AdtKind>) -> VerifiableFunction {
+    let adt = match Ty::adt("S", vec![("n".into(), Ty::u64()), ("m".into(), Ty::u64())]) {
+        Ty::Adt {
+            name,
+            fields,
+            variants,
+            disc_index_safe,
+            faithful_enum_repr,
+            layout,
+            enum_layout,
+            ..
+        } => Ty::Adt {
+            name,
+            fields,
+            variants,
+            disc_index_safe,
+            faithful_enum_repr,
+            layout,
+            enum_layout,
+            adt_kind: kind,
+        },
+        other => other,
+    };
+    let store = |field: usize, v: u128| Statement::Assign {
+        place: Place { local: 1, projections: vec![Projection::Deref, Projection::Field(field)] },
+        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(v, 64))),
+        span: SourceSpan::default(),
+    };
+    VerifiableFunction {
+        name: "d".into(),
+        def_path: "d".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Tuple(vec![]), name: None },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::Ref { mutable: true, inner: Box::new(adt) },
+                    name: Some("self".into()),
+                },
+            ],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![store(0, 0), store(1, 0)],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: Ty::Tuple(vec![]),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+/// THE ORACLE-LEVEL ASSERTION THE P0 DEFECT VIOLATED. Each field must carry the
+/// token of the statement that ACTUALLY wrote it — `s0_0` for field 0, `s0_1` for
+/// field 1. Pre-fix BOTH came back `s0_1`.
+#[test]
+fn sibling_field_store_does_not_version_its_neighbour() {
+    let f = two_field_store_fn(Some(trust_types::AdtKind::Struct));
+    let bb = &f.body.blocks[0];
+
+    assert!(
+        stmt_writes_name(&f, bb, 0, "self*.0"),
+        "statement 0 writes field 0 — the exact-place branch"
+    );
+    assert!(
+        !stmt_writes_name(&f, bb, 1, "self*.0"),
+        "statement 1 stores the SIBLING field 1 and CANNOT write field 0; \
+         reporting it as a write is the P0 defect"
+    );
+    assert!(stmt_writes_name(&f, bb, 1, "self*.1"), "statement 1 writes field 1");
+
+    // Ancestors and the whole pointee must STILL report written — the exclusion
+    // only removes SIBLING-disjoint paths, never the containing value.
+    assert!(stmt_writes_name(&f, bb, 1, "self*"), "the whole pointee is still written");
+    assert!(stmt_writes_name(&f, bb, 1, "self"), "the base local is still written");
+    assert!(
+        stmt_writes_name(&f, bb, 1, "self*.1.0"),
+        "a DESCENDANT of the written place is still written"
+    );
+
+    let sv = StmtVersionCtx::build(&f);
+    let at_end = bb.stmts.len();
+    assert_eq!(
+        sv.version_token_at(&f, BlockId(0), at_end, "self*.0").as_deref(),
+        Some("s0_0"),
+        "field 0's post-state is established by statement 0, not by its sibling's store"
+    );
+    assert_eq!(
+        sv.version_token_at(&f, BlockId(0), at_end, "self*.1").as_deref(),
+        Some("s0_1"),
+        "field 1's post-state is established by statement 1"
+    );
+}
+
+/// FAIL-CLOSED, UNION. Union fields OVERLAP at byte offset 0, so a store to field
+/// 1 genuinely CAN change field 0. The oracle must keep the whole-pointee havoc —
+/// this is the direct soundness witness that the precision fix is gated, not
+/// blanket. (`AdtKind::Union` is stamped by `trust-mir-extract::ty_convert` from
+/// rustc's `AdtDef::is_union`.)
+#[test]
+fn union_sibling_store_still_versions_its_neighbour() {
+    let f = two_field_store_fn(Some(trust_types::AdtKind::Union));
+    let bb = &f.body.blocks[0];
+    assert!(
+        stmt_writes_name(&f, bb, 1, "self*.0"),
+        "a UNION's fields overlap; the store to field 1 MUST still havoc field 0"
+    );
+    let sv = StmtVersionCtx::build(&f);
+    assert_eq!(
+        sv.version_token_at(&f, BlockId(0), bb.stmts.len(), "self*.0").as_deref(),
+        Some("s0_1"),
+        "a union field read must stay versioned at the LAST overlapping store"
+    );
+}
+
+/// FAIL-CLOSED, UN-MIGRATED ADT. `adt_kind: None` means the kind was never read
+/// from a rustc `AdtDef`. Unknown is not struct: keep the conservative havoc.
+#[test]
+fn unkinded_adt_sibling_store_still_versions_its_neighbour() {
+    let f = two_field_store_fn(None);
+    let bb = &f.body.blocks[0];
+    assert!(
+        stmt_writes_name(&f, bb, 1, "self*.0"),
+        "an ADT of unconfirmed kind must keep the whole-pointee havoc"
+    );
+}
+
+/// CROSS-POINTER ALIASING IS PRESERVED — the property the out-parameter pin's
+/// soundness argument rests on ("ALIASING IS NOT ASSUMED AWAY", contract_vcs.rs).
+/// A store through `q` must still havoc every name under a DIFFERENT pointer `p`,
+/// because the two may denote the same object. Only the storing pointer's OWN
+/// tree is subtracted.
+#[test]
+fn store_through_one_pointer_still_havocs_another() {
+    let adt = Ty::adt("S", vec![("n".into(), Ty::u64())]);
+    let mut f = two_field_store_fn(Some(trust_types::AdtKind::Struct));
+    f.body.locals.push(LocalDecl {
+        index: 2,
+        ty: Ty::Ref { mutable: true, inner: Box::new(adt) },
+        name: Some("q".into()),
+    });
+    f.body.arg_count = 2;
+    // Statement 1 now stores through `q`, not through `self`.
+    f.body.blocks[0].stmts[1] = Statement::Assign {
+        place: Place { local: 2, projections: vec![Projection::Deref, Projection::Field(0)] },
+        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(7, 64))),
+        span: SourceSpan::default(),
+    };
+    let bb = &f.body.blocks[0];
+    assert!(
+        stmt_writes_name(&f, bb, 1, "self*.0"),
+        "a store through `q` may alias `self`'s pointee and MUST still havoc it; \
+         subtracting anything but the STORING pointer's own tree would be unsound"
+    );
 }

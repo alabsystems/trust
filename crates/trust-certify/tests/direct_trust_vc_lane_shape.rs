@@ -61,6 +61,7 @@ fn ownership_vc(formula: Formula) -> VerificationCondition {
         location: span(),
         formula,
         contract_metadata: None,
+        obligation: None,
     }
 }
 

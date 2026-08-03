@@ -1,4 +1,7 @@
 mod common_metadata;
+// Trust: `trust_external_dependency_source` joins this family because it reads
+// the same `cargo metadata` the with-deps lane already fetches.
+mod external_dependency_source;
 mod feature_name;
 mod lint_groups_priority;
 mod multiple_crate_versions;
@@ -184,6 +187,61 @@ declare_clippy_lint! {
     "usage of a redundant feature name"
 }
 
+// Trust: lint added by Trust; see docs/DESIGN_PHILOSOPHY.md §7 "we own the
+// supply chain" and the lint/proof boundary in docs/TIPPY_REBRAND.md.
+declare_clippy_lint! {
+    /// ### What it does
+    /// Reports each direct dependency that cargo resolves from outside this
+    /// tree — from a registry or from a git repository — rather than from a
+    /// directory in it.
+    ///
+    /// ### Why is this bad?
+    /// Trust verifies what it compiles, and it compiles what is in the tree. A
+    /// dependency fetched from a registry or a git URL arrives as a finished
+    /// artifact: nothing in it states an obligation you chose, its source is
+    /// not yours to annotate, and when something in it is wrong the repairs
+    /// available are a version bump, a fork, or a patch section — never an edit
+    /// where the defect is. The same code brought in-tree — a path dependency,
+    /// a workspace member, or a vendored copy — compiles under `trustc`
+    /// alongside the code you wrote, so it can carry contracts and be fixed in
+    /// place.
+    ///
+    /// The report is a structural fact and nothing more: cargo resolves this
+    /// package from a source that is not in this tree. It is not a verification
+    /// result, and it is not evidence of one. A lint may report what the
+    /// verifier found; a lint may never be proof authority — and lint passes
+    /// run long before `TrustVerify`, so this pass cannot know whether anything
+    /// about this dependency was proved, failed, or was never attempted. Read
+    /// the output as an inventory of what your build pulls in from elsewhere.
+    ///
+    /// ### Known problems
+    /// Only the direct dependencies of the package being compiled are reported.
+    /// The transitive graph is usually hundreds of packages, none of which can
+    /// be brought in-tree before the direct dependency that pulls it in.
+    ///
+    /// The package is matched to a workspace member by crate name, so a target
+    /// whose crate name differs from its package name — a renamed `[[bin]]`, or
+    /// a build script — reports nothing at all.
+    ///
+    /// A vendored directory kept outside the workspace root is still reported,
+    /// because the manifest cargo reads for it is then not in this tree.
+    ///
+    /// ### Example
+    /// ```toml
+    /// [dependencies]
+    /// regex = "1"
+    /// ```
+    /// Use instead:
+    /// ```toml
+    /// [dependencies]
+    /// regex = { path = "vendor/regex" }
+    /// ```
+    #[clippy::version = "1.99.0"]
+    pub TRUST_EXTERNAL_DEPENDENCY_SOURCE,
+    restriction,
+    "a dependency resolved from a registry or a git repository rather than from this tree"
+}
+
 declare_clippy_lint! {
     /// ### What it does
     /// Checks for wildcard dependencies in the `Cargo.toml`.
@@ -219,6 +277,8 @@ impl_lint_pass!(Cargo => [
     MULTIPLE_CRATE_VERSIONS,
     NEGATIVE_FEATURE_NAMES,
     REDUNDANT_FEATURE_NAMES,
+    // Trust: added with `trust_external_dependency_source`.
+    TRUST_EXTERNAL_DEPENDENCY_SOURCE,
     WILDCARD_DEPENDENCIES,
 ]);
 
@@ -244,7 +304,12 @@ impl LateLintPass<'_> for Cargo {
             NEGATIVE_FEATURE_NAMES,
             WILDCARD_DEPENDENCIES,
         ];
-        static WITH_DEPS_LINTS: &[&Lint] = &[MULTIPLE_CRATE_VERSIONS];
+        // Trust: `trust_external_dependency_source` needs the resolved graph, not
+        // the declared dependency list. A `[patch]` pointing at a local path, and
+        // a `cargo vendor` source replacement, both leave the declared source
+        // naming the registry they replaced; only the resolved package says where
+        // cargo reads the code from.
+        static WITH_DEPS_LINTS: &[&Lint] = &[MULTIPLE_CRATE_VERSIONS, TRUST_EXTERNAL_DEPENDENCY_SOURCE];
 
         lint_groups_priority::check(cx);
 
@@ -273,6 +338,8 @@ impl LateLintPass<'_> for Cargo {
             match MetadataCommand::new().exec() {
                 Ok(metadata) => {
                     multiple_crate_versions::check(cx, &metadata, &self.allowed_duplicate_crates);
+                    // Trust: see `WITH_DEPS_LINTS` above.
+                    external_dependency_source::check(cx, &metadata);
                 },
                 Err(e) => {
                     for lint in WITH_DEPS_LINTS {

@@ -148,6 +148,7 @@ mod tests {
             location: SourceSpan::binary_address(0x401010),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
         SolverDispatchRecord {
             id: id.to_string(),
@@ -214,7 +215,7 @@ mod tests {
         producer.binary_artifact_digest_identity = None;
         derive_test_dispatch_binary_identity(&mut producer);
         let canonical_vc_bytes =
-            serde_json::to_vec(producer.vc.as_ref().expect("fixture dispatch has VC"))
+            canonical_vc_bytes(producer.vc.as_ref().expect("fixture dispatch has VC"))
                 .expect("fixture VC should serialize");
         let artifact = checked_artifact_for_dispatch(&producer, &canonical_vc_bytes);
 
@@ -282,7 +283,7 @@ mod tests {
             reason: Some("checked artifact not imported yet".to_string()),
         };
         let canonical_vc_bytes =
-            serde_json::to_vec(certificate_dispatch.vc.as_ref().expect("fixture dispatch has VC"))
+            canonical_vc_bytes(certificate_dispatch.vc.as_ref().expect("fixture dispatch has VC"))
                 .expect("fixture VC should serialize");
         let export = SolverProofExport::new(
             &certificate_dispatch,
@@ -487,6 +488,7 @@ mod tests {
                 location: SourceSpan::binary_address(0x401010),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             }),
             solver: "ay-incremental".to_string(),
             backend: Some("ay-incremental".to_string()),
@@ -676,7 +678,7 @@ mod tests {
         dispatch.binary_artifact_digest_identity = None;
         derive_test_dispatch_binary_identity(&mut dispatch);
         let canonical_vc_bytes =
-            serde_json::to_vec(dispatch.vc.as_ref().expect("fixture dispatch has canonical VC"))
+            canonical_vc_bytes(dispatch.vc.as_ref().expect("fixture dispatch has canonical VC"))
                 .expect("fixture VC should serialize");
         let source_backpropagation_gate =
             CheckedBinaryCertificateSourceBackpropagationGate::default();
@@ -884,7 +886,7 @@ mod tests {
             },
         );
         let canonical_vc_bytes =
-            serde_json::to_vec(dispatch.vc.as_ref().expect("fixture dispatch has canonical VC"))
+            canonical_vc_bytes(dispatch.vc.as_ref().expect("fixture dispatch has canonical VC"))
                 .expect("fixture VC should serialize");
         let export = SolverProofExport::new(
             &dispatch,

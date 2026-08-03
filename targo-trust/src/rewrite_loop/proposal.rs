@@ -140,6 +140,8 @@ pub(super) fn to_trust_pair(result: &VerificationResult) -> (VerificationConditi
         location: result.location.clone().unwrap_or_default(),
         formula: trust_types::Formula::Bool(true),
         contract_metadata: None,
+        // Not a contract-derived VC: no obligation to back-reference.
+        obligation: None,
     };
     let vr = match result.outcome {
         VerificationOutcome::Proved => TrustVr::Proved {

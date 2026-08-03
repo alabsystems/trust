@@ -48,6 +48,7 @@ fn binary_search_oob_vc() -> VerificationCondition {
             Box::new(Formula::Var("len".into(), Sort::Int)),
         ),
         contract_metadata: None,
+        obligation: None,
     }
 }
 

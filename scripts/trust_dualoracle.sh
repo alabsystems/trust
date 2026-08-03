@@ -24,11 +24,10 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TRUSTC="${TRUSTC:-$REPO_ROOT/build/host/stage2/bin/trustc}"
-# ay's host LLVM links z3; keep the local link/runtime shims on the path (mirrors the gates).
-# The shims dir must EXIST: a missing LIBRARY_PATH entry makes ld warn
-# "search path not found", which leaks into diagnostics-sensitive tests.
-mkdir -p /tmp/trust_link_shims
-export LIBRARY_PATH="/tmp/trust_link_shims:/opt/homebrew/opt/z3/lib:${LIBRARY_PATH:-}"
+# No z3/LIBRARY_PATH export: the `ay` SMT solver is pure-Rust and stage2 `trustc`
+# links no libz3 (verified 2026-08-01: no z3-sys/links="z3" in any Cargo.lock;
+# `otool -L trustc` is z3-clean). The old "ay's host LLVM links z3" note was
+# stale — ay has no llvm-sys/z3-sys dep. Re-adding this would resurrect a dead knob.
 
 if [ "$#" -ne 3 ]; then
   echo "usage: $0 <name> <lib.rs> <driver_main.rs>" >&2

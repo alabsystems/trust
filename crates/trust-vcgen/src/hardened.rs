@@ -990,6 +990,7 @@ fn hardened_vc_with_formula(
         // assert-failure condition so solvers can prove the panic path absent.
         formula,
         contract_metadata: None,
+        obligation: None,
     }
 }
 

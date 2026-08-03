@@ -473,6 +473,7 @@ fn test_real_ay_direct_overflow_formula() {
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation: None,
     };
 
     let result = ay.verify(&vc);
@@ -501,6 +502,7 @@ fn test_real_ay_direct_divzero_constant_safe() {
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation: None,
     };
 
     let result = ay.verify(&vc);

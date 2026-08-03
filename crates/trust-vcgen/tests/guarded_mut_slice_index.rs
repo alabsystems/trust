@@ -84,7 +84,7 @@ fn guarded_mut_index_proves_without_spurious_unsafe_vc() {
 
 /// Collect every `Var` name in `f` (recursing through all sub-formulas).
 fn collect_var_names(f: &Formula, out: &mut std::collections::BTreeSet<String>) {
-    f.clone().map(&mut |node| {
+    let _ = f.clone().map(&mut |node| {
         if let Formula::Var(name, _) = &node {
             out.insert(name.clone());
         }
@@ -96,7 +96,7 @@ fn collect_var_names(f: &Formula, out: &mut std::collections::BTreeSet<String>) 
 /// OTHER side's version-stripped base is `stable`: the names that ARE tied to
 /// the stable parameter length (directly or through its own versioned copies).
 fn collect_slice_len_ties(f: &Formula, stable: &str, out: &mut std::collections::BTreeSet<String>) {
-    f.clone().map(&mut |node| {
+    let _ = f.clone().map(&mut |node| {
         if let Formula::Eq(l, r) = &node
             && let (Formula::Var(a, _), Formula::Var(b, _)) = (l.as_ref(), r.as_ref())
         {

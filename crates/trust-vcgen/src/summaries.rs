@@ -522,6 +522,7 @@ mod tests {
             location: span(),
             formula: original.clone(),
             contract_metadata: None,
+            obligation: None,
         };
 
         let post =
@@ -545,6 +546,7 @@ mod tests {
             location: span(),
             formula: original.clone(),
             contract_metadata: None,
+            obligation: None,
         };
 
         let summary = FunctionSummary::new("callee", "crate::callee");
@@ -565,6 +567,7 @@ mod tests {
             location: span(),
             formula: original.clone(),
             contract_metadata: None,
+            obligation: None,
         };
 
         let post1 =

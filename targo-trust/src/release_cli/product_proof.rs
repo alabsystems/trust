@@ -4140,8 +4140,11 @@ fn live_trustd_protocol_smoke_defect(
     let mut child = ProductProofTrustdChild { child, pid };
 
     let result = (|| -> Result<(), String> {
+        // Same wall-clock/contention hazard as a bounded probe deadline, so it
+        // is resolved through the same helper.
+        let ready_timeout = crate::bounded_process::resolve_probe_deadline(Duration::from_secs(5));
         let ready_deadline = std::time::Instant::now()
-            .checked_add(Duration::from_secs(5))
+            .checked_add(ready_timeout)
             .ok_or_else(|| "trustd readiness deadline overflowed".to_string())?;
         loop {
             match crate::bounded_process::exited_without_reaping(&mut child.child) {
@@ -4153,9 +4156,9 @@ fn live_trustd_protocol_smoke_defect(
                 break;
             }
             if std::time::Instant::now() >= ready_deadline {
-                return Err(
-                    "canonical trustd did not become identity/status ready within 5s".to_string()
-                );
+                return Err(format!(
+                    "canonical trustd did not become identity/status ready within {ready_timeout:?}"
+                ));
             }
             std::thread::sleep(Duration::from_millis(20));
         }

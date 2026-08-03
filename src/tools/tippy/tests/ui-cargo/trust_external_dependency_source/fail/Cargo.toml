@@ -1,0 +1,10 @@
+[package]
+name = "trust_external_dependency_source"
+version = "0.1.0"
+publish = false
+
+[workspace]
+
+# Pinned exactly so the reported version is the same on every run.
+[dependencies]
+itoa = "=1.0.11"

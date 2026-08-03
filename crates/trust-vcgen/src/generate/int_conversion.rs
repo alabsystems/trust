@@ -27,10 +27,14 @@ use super::*;
 /// is load-bearing).
 pub(super) fn is_int_try_from_callee(callee: &str) -> bool {
     matches!(method_tail(callee), "try_from" | "try_into")
-        && (callee.contains("core::convert::")
-            || callee.contains("std::convert::")
+        && (((callee.starts_with("core::") || callee.starts_with("std::"))
+            && callee.contains("::convert::"))
             || callee.contains("as TryFrom<")
-            || callee.contains("as TryInto<"))
+            || callee.contains("as TryInto<")
+            || callee.contains("as core::convert::TryFrom<")
+            || callee.contains("as std::convert::TryFrom<")
+            || callee.contains("as core::convert::TryInto<")
+            || callee.contains("as std::convert::TryInto<"))
 }
 
 /// The std TOTAL `unwrap_or` (`Result::unwrap_or(default)` /
@@ -43,10 +47,8 @@ pub(super) fn is_int_try_from_callee(callee: &str) -> bool {
 /// `mymod::Thing::unwrap_or` is never modeled.
 pub(super) fn is_std_unwrap_or_call(callee: &str) -> bool {
     method_tail(callee) == "unwrap_or"
-        && (callee.contains("core::result::Result")
-            || callee.contains("std::result::Result")
-            || callee.contains("core::option::Option")
-            || callee.contains("std::option::Option"))
+        && (callee.starts_with("core::") || callee.starts_with("std::"))
+        && (callee.contains("::result::Result") || callee.contains("::option::Option"))
 }
 
 /// `true` iff `ty` (transitively) contains an ADT named

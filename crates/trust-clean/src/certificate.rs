@@ -231,6 +231,7 @@ mod tests {
                 ),
             ]))),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -333,6 +334,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
         assert!(!cert.is_valid_for(&vc2), "changed formula must invalidate certificate");
     }
@@ -351,6 +353,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let err = verify_certificate(&vc2, &cert).expect_err("should detect staleness");
         assert!(

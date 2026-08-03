@@ -353,6 +353,7 @@ pub(crate) fn generate_safety_vcs(
                     // strengthen this into a real check.
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 });
 
                 // If the justification references nullability, generate
@@ -381,6 +382,7 @@ pub(crate) fn generate_safety_vcs(
                             Box::new(Formula::Int(0)),
                         ),
                         contract_metadata: None,
+                        obligation: None,
                     });
                 }
 
@@ -398,6 +400,7 @@ pub(crate) fn generate_safety_vcs(
                         location: block.span.clone(),
                         formula: Formula::Bool(true),
                         contract_metadata: None,
+                        obligation: None,
                     });
                 }
             }
@@ -443,6 +446,7 @@ pub(crate) fn generate_safety_vcs(
                     location: block.span.clone(),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
         }
@@ -478,6 +482,7 @@ pub(crate) fn generate_inline_asm_vcs(func: &VerifiableFunction) -> Vec<Verifica
                 // Always SAT = always a finding: no model of asm semantics exists.
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             });
         }
     }

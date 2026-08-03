@@ -60,6 +60,7 @@ fn nonlinear_relaxation_proves_symbolic_modulo_bound() {
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation: None,
     };
     let result = IncrementalAYSession::with_solver_path(ay).verify_vc(&vc);
     assert!(
@@ -85,6 +86,7 @@ fn nonlinear_relaxation_proves_symbolic_modulo_bound() {
             Formula::Ge(Box::new(k()), Box::new(slen())),
         ]),
         contract_metadata: None,
+        obligation: None,
     };
     let r2 =
         IncrementalAYSession::with_solver_path(locate_ay().unwrap()).verify_vc(&unsat_should_not);

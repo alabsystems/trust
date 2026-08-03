@@ -170,7 +170,7 @@ use verify_binary_evidence::{
     EXACT_REPLAY_SLICE_ATTESTATION_ACCEPTED_DIAGNOSTIC,
     EXACT_REPLAY_SLICE_ATTESTATION_REJECTED_PREFIX,
     EXACT_REPLAY_TRANSCRIPT_ARTIFACT_DIGEST_DIAGNOSTIC_PREFIX, LoadedCheckedCertificateArtifact,
-    VerifyBinaryEvidence, checked_certificate_replay_digest_identity_record,
+    VerifyBinaryEvidence, canonical_vc_bytes, checked_certificate_replay_digest_identity_record,
     dispatch_has_exact_replay_slice_attestation, load_checked_certificate_artifact_rows,
     load_normalized_solver_proof_export_artifact,
 };
@@ -7264,7 +7264,7 @@ fn dispatch_proves_binary_certificate_candidate(dispatch: &SolverDispatchRecord)
 }
 
 fn canonical_vc_bytes_for_dispatch(dispatch: &SolverDispatchRecord) -> Option<Vec<u8>> {
-    serde_json::to_vec(dispatch.vc.as_ref()?).ok()
+    canonical_vc_bytes(dispatch.vc.as_ref()?)
 }
 
 fn dispatch_has_raw_solver_proof_bytes_for_convert(dispatch: &SolverDispatchRecord) -> bool {

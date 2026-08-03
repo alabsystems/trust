@@ -238,6 +238,7 @@ impl VtableModel {
             location: SourceSpan::default(),
             formula,
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -377,6 +378,7 @@ impl<'a> DynDispatchVc<'a> {
                 location,
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             });
             return vcs;
         }
@@ -411,6 +413,7 @@ impl<'a> DynDispatchVc<'a> {
                     location: location.clone(),
                     formula: Formula::Not(Box::new(implication)),
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
 
@@ -436,6 +439,7 @@ impl<'a> DynDispatchVc<'a> {
                     location: location.clone(),
                     formula: Formula::Not(Box::new(implication)),
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
         }
@@ -460,6 +464,7 @@ impl<'a> DynDispatchVc<'a> {
                 location,
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             });
         }
 
@@ -552,6 +557,7 @@ impl TraitBoundPropagation {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             })
             .collect()
     }
@@ -719,6 +725,7 @@ impl ObjectSafetyChecker {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             })
             .collect()
     }
@@ -808,6 +815,7 @@ impl WitnessType {
                 // Witness found: no violation exists.
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             },
             None => VerificationCondition {
                 kind: VcKind::Assertion {
@@ -820,6 +828,7 @@ impl WitnessType {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             },
         }
     }

@@ -527,6 +527,7 @@ mod tests {
                     location: SourceSpan::default(),
                     formula: Formula::Not(Box::new(requirement)),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 disposition: VcDisposition::SatisfiedFromNotes { fact_id, source },
             },
@@ -540,6 +541,7 @@ mod tests {
                     location: SourceSpan::default(),
                     formula: Formula::Bool(false),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 disposition: VcDisposition::RequiresSolver,
             },
@@ -566,6 +568,7 @@ mod tests {
                     location: SourceSpan::default(),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 disposition: VcDisposition::SatisfiedFromNotes {
                     fact_id: FactId(0),
@@ -582,6 +585,7 @@ mod tests {
                     location: SourceSpan::default(),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 disposition: VcDisposition::SatisfiedFromNotes {
                     fact_id: FactId(1),
@@ -608,6 +612,7 @@ mod tests {
                     location: SourceSpan::default(),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 disposition: VcDisposition::SatisfiedFromNotes {
                     fact_id: FactId(0),
@@ -621,6 +626,7 @@ mod tests {
                     location: SourceSpan::default(),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 disposition: VcDisposition::RequiresSolver,
             },
@@ -631,6 +637,7 @@ mod tests {
                     location: SourceSpan::default(),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 disposition: VcDisposition::SolverWithAssumption {
                     fact_id: FactId(1),

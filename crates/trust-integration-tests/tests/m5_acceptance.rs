@@ -543,6 +543,7 @@ fn test_m5_acceptance_trust_loop_converges() {
         location: SourceSpan::default(),
         formula: Formula::Var("overflow_check".into(), Sort::Bool),
         contract_metadata: None,
+        obligation: None,
     };
 
     let bounds_vc = VerificationCondition {
@@ -551,6 +552,7 @@ fn test_m5_acceptance_trust_loop_converges() {
         location: SourceSpan::default(),
         formula: Formula::Var("bounds_check".into(), Sort::Bool),
         contract_metadata: None,
+        obligation: None,
     };
 
     // After strengthening: overflow is fixed (replaced with safe arithmetic),
@@ -581,6 +583,7 @@ fn test_m5_acceptance_trust_loop_converges() {
                 location: SourceSpan::default(),
                 formula: Formula::Var("overflow_check".into(), Sort::Bool),
                 contract_metadata: None,
+                obligation: None,
             };
             let bounds_vc = VerificationCondition {
                 function: "binary_search".into(),
@@ -588,6 +591,7 @@ fn test_m5_acceptance_trust_loop_converges() {
                 location: SourceSpan::default(),
                 formula: Formula::Var("bounds_check".into(), Sort::Bool),
                 contract_metadata: None,
+                obligation: None,
             };
 
             if idx == 0 {
@@ -671,6 +675,7 @@ fn test_m5_acceptance_trust_loop_converges() {
                         Sort::Bool,
                     ),
                     contract_metadata: None,
+                    obligation: None,
                 })
                 .collect()
         }

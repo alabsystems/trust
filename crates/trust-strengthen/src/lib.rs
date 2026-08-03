@@ -249,6 +249,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let result =
             VerificationResult::Failed { solver: "ay".into(), time_ms: 1, counterexample: None };
@@ -262,6 +263,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let result =
             VerificationResult::Failed { solver: "ay".into(), time_ms: 1, counterexample: None };
@@ -275,6 +277,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let result =
             VerificationResult::Failed { solver: "ay".into(), time_ms: 1, counterexample: None };
@@ -362,6 +365,7 @@ mod tests {
                         location: SourceSpan::default(),
                         formula: Formula::Bool(true),
                         contract_metadata: None,
+                        obligation: None,
                     },
                     VerificationResult::Proved {
                         solver: "ay".into(),

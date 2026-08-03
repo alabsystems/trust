@@ -1417,6 +1417,7 @@ mod tests {
             location: SourceSpan::default(),
             formula,
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -1468,6 +1469,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
         let result = backend.verify(&vc);
         assert!(result.is_proved());
@@ -1482,6 +1484,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let result = backend.verify(&vc);
         assert!(result.is_failed());
@@ -1496,6 +1499,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Var("x".into(), Sort::Int),
             contract_metadata: None,
+            obligation: None,
         };
         let result = backend.verify(&vc);
         assert!(matches!(result, VerificationResult::Unknown { .. }));
@@ -1514,6 +1518,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Eq(Box::new(divisor), Box::new(Formula::Int(0))),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = backend.verify(&vc);
@@ -1532,6 +1537,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::And(vec![Formula::Not(Box::new(p.clone())), p]),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = backend.verify(&vc);
@@ -1553,6 +1559,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Ge(Box::new(amount), Box::new(Formula::Int(32))),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = backend.verify(&vc);

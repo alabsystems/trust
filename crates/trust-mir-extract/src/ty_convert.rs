@@ -141,6 +141,411 @@ fn recursive_datatype_ref(name: &str) -> TrustTy {
     TrustTy::Datatype { name: name.to_string(), variants: Vec::new() }
 }
 
+// ─── RC-1: CANONICAL recursive-type lowering ────────────────────────────────
+//
+// THE DEFECT. Every `convert_ty` call starts with an EMPTY `adt_stack`, and the
+// back-edge guards (`lower_adt_as_datatype`, `lower_enum_adt`, the struct arm)
+// cut at the first re-entry of a type ALREADY ON THAT PATH. The cut point is
+// therefore a property of the ROOT the type was reached from, not of the type.
+// One rustc type reaches the dump as two different finite unrollings. Measured
+// in `trust-clean/fixtures/structural-fold-corpus/xor_all.json`:
+//
+//     _1 : &Tree        →  Tree(full) → Arc(full) → …ArcInner.data = BY-NAME Tree
+//     _6 : &Arc<Tree>   →  Arc(full)  → …ArcInner.data = Tree(full) → BY-NAME Arc
+//
+// so `(*_1 as Two).0`'s field type and `_6`'s declared type are the SAME rustc
+// type at two different cut depths. `trust_clean::assignment_types::ty_eq` is
+// strict structural equality, so `all_assignments_match` rejects the body and
+// every lane gated on it (`prove::diagnose_fully_faithful_gate`, the fold
+// recognizers) declines before it runs. The defect is in this producer; the
+// consumer is right to be strict.
+//
+// THE CANONICAL RULE. Cut at a deterministic FEEDBACK VERTEX SET of the type's
+// own reachability graph, exempting only the root of the current `convert_ty`
+// call:
+//
+//   1. Discover the ADT reachability graph from the root: nodes are interned
+//      `ty::Ty<'tcx>` (so `Vec<u8>` and `Vec<i32>` are DISTINCT nodes — the cut
+//      set is never keyed on a generics-erased name), edges are field types
+//      peeled through `&`/`*`/`[T]`/`[T; N]`/tuple/closure-upvar.
+//   2. Compute its SCCs and the deterministic greedy feedback vertex set: while
+//      a non-trivial SCC remains, delete its `canonical_cut_key`-least node.
+//   3. Lower normally, but emit the by-name reference at every occurrence of a
+//      cut-set member that is not this call's root.
+//
+// WHY THE RESULT IS UNIQUE (a function of the type alone). Two types in one SCC
+// reach exactly the same node set (each reaches the other), so they discover the
+// SAME graph and hence the same FVS. A type OUTSIDE that SCC discovers a subgraph
+// that contains each SCC either wholly or not at all — and the greedy FVS is
+// decided independently inside each SCC — so the FVS it computes is exactly the
+// global FVS restricted to what it can reach. Therefore, for any type `C` reached
+// below any root, the subtree emitted for `C` is byte-identical to the tree
+// emitted for `C` as a root, UNLESS `C` is itself in the cut set. The residual is
+// irreducible: a finite representation of a cyclic type must cut each cycle at
+// least once. What changes is that the cut is now at a FIXED, canonically chosen
+// type instead of wherever the root happened to enter the cycle.
+//
+// WHY IT CANNOT MERGE TWO GENUINELY DIFFERENT TYPES. The only lossy element is
+// the by-name marker. The first draft of this change named the marker with the
+// GENERICS-ERASED def path (`recursive_datatype_ref(&safe_def_path_str(..))`,
+// the same string the legacy back-edge guards use) and argued that this could
+// not merge anything the status quo did not already merge. THAT ARGUMENT WAS
+// WRONG, and the counterexample is exactly the one to worry about:
+//
+//     enum Foo<T> { Nil, Cons(T, Box<Foo<T>>) }
+//     struct Pair { a: Foo<u8>, b: Foo<i32> }
+//
+// `Foo<u8>` and `Foo<i32>` are two DISTINCT interned types, each on its own
+// cycle, so BOTH are cut points. Lowering `Pair`, each field is a non-root
+// occurrence of a cut point, so with an erased marker BOTH fields emit
+// `Datatype { name: "…::Foo", variants: [] }` and `Pair`'s two genuinely
+// different fields compare EQUAL under `assignment_types::ty_eq`. The status quo
+// does NOT do this: it expands each field one level (`__v1_0: u8` vs
+// `__v1_1: i32`) before taking its back-edge, so the two stay distinguishable.
+// That is a fail-OPEN regression — the original defect only made `ty_eq` decline
+// (fail-closed), which is strictly the safer direction. An over-merging
+// canonicalization is worse than the bug it fixes.
+//
+// So the marker emitted at a cut point is IDENTITY-BEARING: `canonical_cut_ref`
+// names it with the CONCRETE instantiated path (`…::Foo<u8>` vs `…::Foo<i32>`)
+// whenever the type has non-lifetime generic arguments, and with the plain
+// erased path when it has none. A non-generic cut point (`Tree`, `Level`,
+// `Expr`, `ExprKind` — every type the Lever A datatype lowering names) therefore
+// keeps BYTE-IDENTICAL markers, so nothing that resolves a by-name datatype
+// reference against a defining occurrence (`Sort::from_ty`'s
+// `datatype_sort_from_ty`) changes at all; and a generic cut point gets one
+// distinct sort name per instantiation, which is strictly MORE discriminating
+// than both the status quo and the erased-marker draft.
+//
+// This is also why option (a) — "by-name for EVERY occurrence of a recursive
+// ADT" — was rejected: even with instantiated names it would drop the structure
+// of every nominal position, and the whole point of the root exemption is that
+// the defining occurrence still carries the real variant list.
+//
+// FAIL-SAFE. Discovery is bounded by `MAX_CANONICAL_CUT_NODES`. If the bound is
+// hit — the EXPANDING-generic recursion (`List<Box<List<T>>>`), whose node set is
+// genuinely infinite and which `is_expanding_recursive_adt` deliberately leaves
+// `Unsupported` — the cut set is EMPTY and lowering is byte-identical to today's.
+// An empty cut set is also what a non-recursive type gets, so the overwhelming
+// majority of types are untouched.
+//
+// KNOWN RESIDUALS (recorded, not hidden — none of them can merge two types, they
+// can only cost canonicity, whose failure mode is a fail-closed `ty_eq` decline):
+//
+//   R1. The budget fallback is root-relative: a root whose graph exceeds
+//       `MAX_CANONICAL_CUT_NODES` gets an EMPTY cut set and therefore the legacy
+//       root-relative lowering, while a smaller root reaching the same cycle
+//       still cuts canonically.
+//   R2. `nominal_frontier` does not peel `TyKind::Alias`, but `convert_ty_in_env`
+//       DOES normalize opaque aliases before descending. A cycle that closes only
+//       through an alias is invisible to discovery, so it is cut by the legacy
+//       `adt_stack` guard instead.
+//   R3. The `cap_fields` compaction gates in the struct arm and `lower_enum_adt`
+//       are still keyed on `!adt_stack.is_empty()`, i.e. still root-relative.
+//       RC-1 shrinks the subtrees they see (a cut point is one node) but does not
+//       remove that root dependence.
+//   R4. `canonical_cut_key` is total only up to the injectivity of
+//       `(def-path depth, instantiated path, CrateNum, DefIndex)`. Two distinct
+//       interned `Ty` sharing all four would tie, and the tie is then broken by
+//       discovery order, which is root-relative. MIR types reach this code with
+//       erased regions, so lifetimes cannot produce such a pair; it would take a
+//       printer collision between two different concrete argument lists on one
+//       `DefId`.
+
+/// Node bound for the canonical-cut discovery walk. Reaching it yields an EMPTY
+/// cut set (i.e. exactly today's root-relative lowering) — never a partial cut
+/// set, which would not be canonical.
+const MAX_CANONICAL_CUT_NODES: usize = MAX_TYPE_LOWERING_NODES;
+
+/// The ordering key the greedy feedback vertex set picks its cut points with.
+/// EVERY component must be a function of the TYPE ALONE — anything derived from
+/// the walk (discovery index, insertion order, the root) would make the cut set
+/// root-relative again, which is the very defect RC-1 exists to remove.
+type CanonicalCutKey = (usize, String, u32, u32);
+
+/// The deterministic total order the greedy feedback vertex set picks its cut
+/// points with: the SHALLOWEST def path in the cycle first (so a cycle through
+/// `Tree`/`std::sync::Arc`/`std::ptr::NonNull`/`alloc::sync::ArcInner` is cut at
+/// `Tree`, the type the cycle is ABOUT, not at an `std` container internal),
+/// then the fully-instantiated path, then the type's `DefId` (`CrateNum`,
+/// `DefIndex`) so two distinct types that happen to PRINT the same still order
+/// deterministically rather than falling back on discovery order. See residual
+/// R4 on the block comment above for what is left.
+fn canonical_cut_key<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> CanonicalCutKey {
+    let TyKind::Adt(def, args) = ty.kind() else {
+        return (usize::MAX, String::new(), u32::MAX, u32::MAX);
+    };
+    let did = def.did();
+    let erased = crate::safe_def_path_str(tcx, did);
+    let segments = erased.matches("::").count();
+    (
+        segments,
+        crate::safe_def_path_str_with_args(tcx, did, *args),
+        did.krate.as_u32(),
+        did.index.as_u32(),
+    )
+}
+
+/// The by-name reference a CUT POINT lowers to.
+///
+/// IDENTITY-BEARING, and that is the whole point (see "WHY IT CANNOT MERGE TWO
+/// GENUINELY DIFFERENT TYPES" above): a cut point is emitted with no structure at
+/// all, so its name is the ONLY thing distinguishing it from another instantiation
+/// of the same generic ADT. `Foo<u8>` and `Foo<i32>` are two distinct cut points
+/// and must not collapse to one marker.
+///
+/// A type with no non-lifetime generic arguments keeps the EXACT erased def path
+/// the legacy back-edge guards emit (`recursive_datatype_ref(&safe_def_path_str)`),
+/// so every marker in the Lever A `Level`/`Expr`/`ExprKind` cluster — and `Tree`
+/// in the structural-fold corpus — is byte-identical to today's. Only a generic
+/// cut point gains the `<args>` suffix, and there the alternative is a merge.
+fn canonical_cut_ref<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> TrustTy {
+    let TyKind::Adt(def, args) = ty.kind() else {
+        // Unreachable: `nominal_frontier` only ever admits `TyKind::Adt` nodes,
+        // so only an ADT can be in the cut set. Fail closed rather than invent a
+        // name if that ever stops holding.
+        return unsupported_ty("TyKind", "canonical cut point was not a nominal ADT");
+    };
+    let did = def.did();
+    let erased = crate::safe_def_path_str(tcx, did);
+    let has_non_lifetime_args = args.types().next().is_some() || args.consts().next().is_some();
+    if has_non_lifetime_args {
+        recursive_datatype_ref(&crate::safe_def_path_str_with_args(tcx, did, *args))
+    } else {
+        recursive_datatype_ref(&erased)
+    }
+}
+
+/// Collect the FIRST nominal ADT on every path below `ty`, peeling exactly the
+/// type constructors the lowering itself descends through. This is the edge
+/// relation of the reachability graph; it is a SUPERSET of the relation the
+/// datatype lowering uses (`datatype_child_field_ty` cuts at every nominal child
+/// unconditionally), so a feedback vertex set computed here breaks every cycle
+/// the lowering can actually walk.
+fn nominal_frontier<'tcx>(
+    ty: ty::Ty<'tcx>,
+    depth: usize,
+    out: &mut Vec<ty::Ty<'tcx>>,
+) {
+    if depth >= MAX_TYPE_LOWERING_DEPTH {
+        return;
+    }
+    match ty.kind() {
+        TyKind::Adt(..) => out.push(ty),
+        TyKind::Ref(_, inner, _) => nominal_frontier(*inner, depth + 1, out),
+        TyKind::RawPtr(pointee, _) => nominal_frontier(*pointee, depth + 1, out),
+        TyKind::Slice(elem) => nominal_frontier(*elem, depth + 1, out),
+        TyKind::Array(elem, _) => nominal_frontier(*elem, depth + 1, out),
+        TyKind::Tuple(fields) => {
+            for field in fields.iter() {
+                nominal_frontier(field, depth + 1, out);
+            }
+        }
+        TyKind::Closure(_, args) => {
+            for upvar in args.as_closure().upvar_tys().iter() {
+                nominal_frontier(upvar, depth + 1, out);
+            }
+        }
+        TyKind::Coroutine(_, args) => {
+            for upvar in args.as_coroutine().upvar_tys().iter() {
+                nominal_frontier(upvar, depth + 1, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The nominal ADTs directly reachable from `ty`'s own fields (every variant of
+/// an enum, `all_fields` of a struct/union).
+fn adt_field_successors<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Vec<ty::Ty<'tcx>> {
+    let TyKind::Adt(adt_def, args) = ty.kind() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for variant in adt_def.variants().iter() {
+        for field in variant.fields.iter() {
+            nominal_frontier(field.ty(tcx, *args).skip_normalization(), 0, &mut out);
+        }
+    }
+    out
+}
+
+/// The canonical feedback vertex set of the ADT reachability graph rooted at
+/// `root`. Empty when the graph is acyclic or when discovery hit its bound.
+fn canonical_cut_set<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    root: ty::Ty<'tcx>,
+) -> trust_types::fx::FxHashSet<ty::Ty<'tcx>> {
+    // ── discovery (bounded) ────────────────────────────────────────────────
+    let mut order: Vec<ty::Ty<'tcx>> = Vec::new();
+    let mut index: FxHashMap<ty::Ty<'tcx>, usize> = FxHashMap::default();
+    let mut seeds = Vec::new();
+    nominal_frontier(root, 0, &mut seeds);
+    for seed in seeds {
+        if index.insert(seed, order.len()).is_none() {
+            order.push(seed);
+        }
+    }
+    let mut edges: Vec<Vec<usize>> = Vec::new();
+    let mut head = 0usize;
+    while head < order.len() {
+        if order.len() > MAX_CANONICAL_CUT_NODES {
+            return trust_types::fx::FxHashSet::default();
+        }
+        let node = order[head];
+        let mut succ = Vec::new();
+        for child in adt_field_successors(tcx, node) {
+            let id = match index.get(&child) {
+                Some(id) => *id,
+                None => {
+                    if order.len() > MAX_CANONICAL_CUT_NODES {
+                        return trust_types::fx::FxHashSet::default();
+                    }
+                    let id = order.len();
+                    index.insert(child, id);
+                    order.push(child);
+                    id
+                }
+            };
+            if !succ.contains(&id) {
+                succ.push(id);
+            }
+        }
+        edges.push(succ);
+        head += 1;
+    }
+    debug_assert_eq!(edges.len(), order.len());
+
+    // ── deterministic greedy feedback vertex set ───────────────────────────
+    // Keys are computed LAZILY. `canonical_cut_key` renders two rustc def paths
+    // per node, and `canonical_cut_set` runs once per `convert_ty` call — i.e.
+    // once per local, per place, per body. The overwhelmingly common graph is
+    // ACYCLIC, and an acyclic graph needs no key at all: the first SCC pass finds
+    // no non-trivial component and the loop exits before any key is rendered.
+    let mut keys: Vec<Option<CanonicalCutKey>> = vec![None; order.len()];
+    let mut cut: trust_types::fx::FxHashSet<ty::Ty<'tcx>> = trust_types::fx::FxHashSet::default();
+    for pick in greedy_feedback_vertex_set(&edges, &mut |node| {
+        keys[node].get_or_insert_with(|| canonical_cut_key(tcx, order[node])).clone()
+    }) {
+        cut.insert(order[pick]);
+    }
+    cut
+}
+
+/// The deterministic greedy feedback vertex set of `edges`: while a non-trivial
+/// strongly connected component remains, delete its `key_of`-least node.
+///
+/// Split out from `canonical_cut_set` — and taking no `TyCtxt` — because THIS is
+/// the function root-independence rests on, and it is the part that can be tested
+/// without a compiler session. The property it must have (see
+/// `greedy_fvs_is_root_independent`) is:
+///
+///   for every successor-closed subset `S` of the nodes, and every re-indexing of
+///   `S`, the cut computed on the induced subgraph equals the global cut ∩ `S`.
+///
+/// It holds because (i) a successor-closed subset contains each SCC wholly or not
+/// at all, (ii) a path leaving an SCC never returns, so an SCC's internal SCC
+/// structure after deletions depends only on its own induced subgraph, and (iii)
+/// the pick is by `key_of` alone, never by node index or iteration order. Point
+/// (iii) is why `key_of` must be a function of the underlying type only.
+fn greedy_feedback_vertex_set(
+    edges: &[Vec<usize>],
+    key_of: &mut dyn FnMut(usize) -> CanonicalCutKey,
+) -> Vec<usize> {
+    let mut alive: Vec<bool> = vec![true; edges.len()];
+    let mut cut: Vec<usize> = Vec::new();
+    loop {
+        let components = strongly_connected_components(edges, &alive);
+        let mut progressed = false;
+        for component in components {
+            let self_loop = component.len() == 1 && edges[component[0]].contains(&component[0]);
+            if component.len() < 2 && !self_loop {
+                continue;
+            }
+            let mut best: Option<(usize, CanonicalCutKey)> = None;
+            for node in component.iter().copied() {
+                let key = key_of(node);
+                let better = match &best {
+                    None => true,
+                    Some((_, best_key)) => key < *best_key,
+                };
+                if better {
+                    best = Some((node, key));
+                }
+            }
+            let Some((pick, _)) = best else { continue };
+            alive[pick] = false;
+            cut.push(pick);
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+    cut
+}
+
+/// Tarjan SCCs of the subgraph induced on the `alive` nodes. Iterative, so a
+/// deep type graph cannot overflow the extraction stack.
+fn strongly_connected_components(edges: &[Vec<usize>], alive: &[bool]) -> Vec<Vec<usize>> {
+    let n = edges.len();
+    let mut index = vec![usize::MAX; n];
+    let mut low = vec![0usize; n];
+    let mut on_stack = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    let mut counter = 0usize;
+    for start in 0..n {
+        if !alive[start] || index[start] != usize::MAX {
+            continue;
+        }
+        let mut work: Vec<(usize, usize)> = vec![(start, 0)];
+        while let Some((node, next)) = work.pop() {
+            if next == 0 {
+                index[node] = counter;
+                low[node] = counter;
+                counter += 1;
+                stack.push(node);
+                on_stack[node] = true;
+            }
+            let mut descended = false;
+            let successors = &edges[node];
+            for cursor in next..successors.len() {
+                let child = successors[cursor];
+                if !alive[child] {
+                    continue;
+                }
+                if index[child] == usize::MAX {
+                    work.push((node, cursor + 1));
+                    work.push((child, 0));
+                    descended = true;
+                    break;
+                } else if on_stack[child] {
+                    low[node] = low[node].min(index[child]);
+                }
+            }
+            if descended {
+                continue;
+            }
+            if low[node] == index[node] {
+                let mut component = Vec::new();
+                while let Some(top) = stack.pop() {
+                    on_stack[top] = false;
+                    component.push(top);
+                    if top == node {
+                        break;
+                    }
+                }
+                out.push(component);
+            }
+            if let Some((parent, _)) = work.last().copied() {
+                low[parent] = low[parent].min(low[node]);
+            }
+        }
+    }
+    out
+}
+
 /// Maximum node count for a SINGLE flattened variant/struct-field subtree before
 /// it is compacted (verifier-perf, Lever A). Small recursive enums and ordinary
 /// scalar/pointer payloads stay well under it; the Arc/Atomic/UnsafeCell-laden
@@ -250,6 +655,15 @@ struct TyLoweringCtx<'tcx> {
     /// override is honored without re-parsing per node). `usize::MAX` disables.
     produced_budget: usize,
     adt_stack: Vec<ty::Ty<'tcx>>,
+    /// RC-1 (canonical recursive-type lowering): the deterministic feedback
+    /// vertex set of THIS walk's type-reachability graph. Every occurrence of a
+    /// member that is not this walk's ROOT (`adt_stack.is_empty()`) lowers to
+    /// the by-name reference, so one rustc type has exactly one representation
+    /// regardless of which root it was reached from. Empty for an acyclic type
+    /// and whenever discovery hit its bound — in both cases lowering is
+    /// byte-identical to the pre-RC-1 behavior. See the block comment on
+    /// `canonical_cut_set`.
+    canonical_cut: trust_types::fx::FxHashSet<ty::Ty<'tcx>>,
     /// verifier-coverage: the `TypingEnv` in which alias
     /// normalization is attempted. `None` means "do not normalize
     /// aliases" — every non-`Free` alias stays `Unsupported` (the legacy
@@ -281,6 +695,7 @@ impl<'tcx> Default for TyLoweringCtx<'tcx> {
             produced_nodes: 0,
             produced_budget: produced_node_budget(),
             adt_stack: Vec::new(),
+            canonical_cut: trust_types::fx::FxHashSet::default(),
             typing_env: None,
             cache: FxHashMap::default(),
         }
@@ -484,6 +899,7 @@ fn faithful_scalars() -> bool {
 
 pub(crate) fn convert_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> TrustTy {
     let mut ctx = TyLoweringCtx::default();
+    ctx.canonical_cut = canonical_cut_set(tcx, ty);
     convert_ty_inner(tcx, ty, &mut ctx)
 }
 
@@ -510,6 +926,7 @@ pub(crate) fn convert_ty_in_env<'tcx>(
     ty: ty::Ty<'tcx>,
 ) -> TrustTy {
     let mut ctx = TyLoweringCtx::with_typing_env(typing_env);
+    ctx.canonical_cut = canonical_cut_set(tcx, ty);
     convert_ty_inner(tcx, ty, &mut ctx)
 }
 
@@ -527,12 +944,25 @@ fn convert_ty_inner<'tcx>(
         return produced_budget_degraded_leaf();
     }
 
+    // RC-1: the memo below is keyed on `ty` ALONE, but a cut point's lowering is
+    // NOT a function of `ty` alone — it is the full definition at the walk's root
+    // (`adt_stack` empty) and the by-name marker everywhere else. Caching either
+    // one would serve it in the other position: a root `(Tree, Arc<Tree>)` lowers
+    // `Tree` fully at empty stack, caches it, and then `Arc<Tree>`'s
+    // `ArcInner.data` — which MUST be the cut marker — gets a cache hit and comes
+    // back fully expanded, which is exactly the two-representations defect RC-1
+    // exists to remove. Cut points therefore bypass the memo in both directions.
+    // The cost is bounded: a cut point is either a one-node marker (free) or a
+    // definitional occurrence, which only the tuple/array/ref arms can reach more
+    // than once per walk.
+    let is_canonical_cut_point = ctx.canonical_cut.contains(&ty);
+
     // verifier-perf: memoization. If we've already lowered
     // this exact `Ty` in this walk, reuse the result instead of
     // re-walking the subtree and burning the node budget again.
     // rustc interns `Ty<'tcx>` so pointer-equality is the right key.
     // The cache itself is per-`convert_ty` (no global state).
-    if let Some(cached) = ctx.cache.get(&ty) {
+    if let Some(cached) = ctx.cache.get(&ty).filter(|_| !is_canonical_cut_point) {
         // verifier-perf: a cache hit still MATERIALIZES the cached subtree (the
         // `clone` copies the whole tree into the parent), so charge its produced
         // size against the budget — otherwise the cache lets an unbounded number of
@@ -660,13 +1090,32 @@ fn convert_ty_inner<'tcx>(
 
         TyKind::Adt(adt_def, args) => {
             let name = crate::safe_def_path_str(tcx, adt_def.did());
+            // RC-1 (canonical recursive-type lowering) — THE CUT. This type lies
+            // on a cycle and is the cycle's canonically chosen cut point, and it
+            // is not the ROOT of this walk (`adt_stack` non-empty), so it lowers
+            // to the by-name reference NO MATTER which root reached it. That is
+            // what makes the representation a function of the type alone; see the
+            // block comment on `canonical_cut_set` for why it is unique and why it
+            // narrows, rather than widens, the generics-erased-name surface. An
+            // empty cut set (acyclic type, or discovery over budget) skips this
+            // arm entirely and the lowering is byte-identical to pre-RC-1.
+            //
+            // The marker is IDENTITY-BEARING (`canonical_cut_ref`, not
+            // `recursive_datatype_ref(&name)`): `name` here is the GENERICS-ERASED
+            // def path, and a cut point carries no structure, so an erased marker
+            // would make `Foo<u8>` and `Foo<i32>` — two distinct cut points —
+            // compare EQUAL wherever both appear below a common root. See the
+            // block comment's merge analysis.
+            if !ctx.adt_stack.is_empty() && ctx.canonical_cut.contains(&ty) {
+                canonical_cut_ref(tcx, ty)
+            }
             // Lever A step 2: the kernel universe-`Level` enum lowers to a native
             // recursive `Ty::Datatype` (its `Arc<Level>` children become by-name
             // self-references) instead of degrading to the recursive-ADT
             // `Unsupported` marker. Def-path gated to EXACTLY `Level` (the `Expr`/
             // `ExprKind` datatypes have their own step-5 gates below); `Name` still
             // keeps its existing lowering.
-            if is_level_datatype_target(tcx, adt_def.did()) {
+            else if is_level_datatype_target(tcx, adt_def.did()) {
                 lower_level_datatype(tcx, ty, *adt_def, args, &name, ctx)
             }
             // Lever A step 5: the kernel `ExprKind` ENUM — the structural
@@ -1105,7 +1554,12 @@ fn convert_ty_inner<'tcx>(
     }
     // verifier-perf: cache the result so subsequent walks
     // through the same Ty hit the early-return at the top.
-    ctx.cache.insert(ty, lowered.clone());
+    // RC-1: never memoize a cut point — its lowering depends on whether this
+    // occurrence is the walk's root, which the `ty` key cannot express. See the
+    // matching comment at the memo lookup.
+    if !is_canonical_cut_point {
+        ctx.cache.insert(ty, lowered.clone());
+    }
     lowered
 }
 
@@ -2123,5 +2577,250 @@ mod tests {
             }
             other => panic!("degraded leaf must be the recursive-ADT marker, got {other:?}"),
         }
+    }
+
+    // ─── RC-1: canonical recursive-type lowering ────────────────────────────
+    //
+    // These exercise the two properties the change stands or falls on, WITHOUT a
+    // compiler session: (1) the cut set is a function of the type alone, i.e. the
+    // greedy FVS restricted to what a root can reach equals the global FVS
+    // restricted the same way, for every root and independent of discovery order;
+    // (2) a cut point's by-name marker still tells two instantiations of one
+    // generic ADT apart.
+
+    /// Successor-closure of `roots` in `edges` — exactly the node set
+    /// `canonical_cut_set`'s discovery walk would find from those seeds.
+    fn reachable_from(edges: &[Vec<usize>], roots: &[usize]) -> Vec<usize> {
+        let mut seen = vec![false; edges.len()];
+        let mut work: Vec<usize> = roots.to_vec();
+        while let Some(node) = work.pop() {
+            if seen[node] {
+                continue;
+            }
+            seen[node] = true;
+            work.extend(edges[node].iter().copied());
+        }
+        (0..edges.len()).filter(|n| seen[*n]).collect()
+    }
+
+    /// Induce `edges` on `nodes`, laid out in the given (arbitrary) index order —
+    /// the stand-in for a different root's discovery order.
+    fn induced_subgraph(edges: &[Vec<usize>], nodes: &[usize]) -> Vec<Vec<usize>> {
+        let mut position = vec![usize::MAX; edges.len()];
+        for (slot, node) in nodes.iter().enumerate() {
+            position[*node] = slot;
+        }
+        nodes
+            .iter()
+            .map(|node| {
+                let mut succ: Vec<usize> = Vec::new();
+                for child in edges[*node].iter().copied() {
+                    let slot = position[child];
+                    if slot != usize::MAX && !succ.contains(&slot) {
+                        succ.push(slot);
+                    }
+                }
+                succ
+            })
+            .collect()
+    }
+
+    /// A `CanonicalCutKey` standing for one type. Only the ordering matters, so
+    /// the rendered path carries the whole discriminating weight here.
+    fn test_key(name: &str) -> CanonicalCutKey {
+        (name.matches("::").count(), name.to_string(), 0, 0)
+    }
+
+    fn cut_labels(edges: &[Vec<usize>], names: &[&str], nodes: &[usize]) -> Vec<String> {
+        let mut picked: Vec<String> = greedy_feedback_vertex_set(edges, &mut |node| {
+            test_key(names[nodes[node]])
+        })
+        .into_iter()
+        .map(|slot| names[nodes[slot]].to_string())
+        .collect();
+        picked.sort();
+        picked
+    }
+
+    #[test]
+    fn strongly_connected_components_separates_cycle_from_tail() {
+        // 0 → 1 → 2 → 0, and 2 → 3 (a tail that never returns).
+        let edges = vec![vec![1], vec![2], vec![0, 3], vec![]];
+        let alive = vec![true; 4];
+        let mut components: Vec<Vec<usize>> = strongly_connected_components(&edges, &alive)
+            .into_iter()
+            .map(|mut c| {
+                c.sort();
+                c
+            })
+            .collect();
+        components.sort();
+        assert_eq!(components, vec![vec![0, 1, 2], vec![3]]);
+    }
+
+    #[test]
+    fn strongly_connected_components_skips_dead_nodes() {
+        // Same graph with node 1 deleted: the cycle is broken, so every surviving
+        // component is a singleton. This is the step the greedy FVS iterates on.
+        let edges = vec![vec![1], vec![2], vec![0, 3], vec![]];
+        let alive = vec![true, false, true, true];
+        let mut components: Vec<Vec<usize>> = strongly_connected_components(&edges, &alive)
+            .into_iter()
+            .map(|mut c| {
+                c.sort();
+                c
+            })
+            .collect();
+        components.sort();
+        assert_eq!(components, vec![vec![0], vec![2], vec![3]]);
+    }
+
+    #[test]
+    fn greedy_fvs_leaves_an_acyclic_graph_uncut_and_asks_for_no_keys() {
+        // The overwhelmingly common case. It must cost NOTHING beyond one SCC
+        // pass — no def-path rendering at all, which is why `canonical_cut_set`
+        // computes keys lazily.
+        let edges = vec![vec![1, 2], vec![2], vec![3], vec![]];
+        let mut key_requests = 0usize;
+        let cut = greedy_feedback_vertex_set(&edges, &mut |node| {
+            key_requests += 1;
+            test_key(&format!("n{node}"))
+        });
+        assert!(cut.is_empty(), "acyclic graph must have an empty cut set: {cut:?}");
+        assert_eq!(key_requests, 0, "an acyclic graph must not render a single def path");
+    }
+
+    #[test]
+    fn greedy_fvs_cuts_a_self_loop() {
+        // `struct S { next: Box<S> }` reduces to a single node with a self edge.
+        let edges = vec![vec![0]];
+        let cut = greedy_feedback_vertex_set(&edges, &mut |_| test_key("krate::S"));
+        assert_eq!(cut, vec![0]);
+    }
+
+    #[test]
+    fn greedy_fvs_cuts_the_shallowest_def_path_in_the_cycle() {
+        // The measured `xor_all` cycle: Tree ↔ Arc ↔ NonNull ↔ ArcInner. The cut
+        // must land on `Tree` — the type the cycle is ABOUT — not on an std
+        // container internal, so the marker names something the consumer can
+        // recognize.
+        let names = ["xor_all::Tree", "std::sync::Arc", "std::ptr::NonNull", "alloc::sync::ArcInner"];
+        let edges = vec![vec![1], vec![2], vec![3], vec![0]];
+        let nodes: Vec<usize> = (0..4).collect();
+        assert_eq!(cut_labels(&edges, &names, &nodes), vec!["xor_all::Tree".to_string()]);
+    }
+
+    /// THE root-independence property. Every root's discovery finds a
+    /// successor-closed subset of the global graph, in its own index order; the
+    /// cut it computes must be the global cut restricted to that subset. If this
+    /// fails, one rustc type still reaches the dump as two different unrollings —
+    /// the defect RC-1 exists to remove.
+    #[test]
+    fn greedy_fvs_is_root_independent() {
+        // Two independent cycles plus an entry node that reaches both, plus a
+        // second entry that reaches only one of them, plus a nested cycle so the
+        // greedy loop has to iterate.
+        //   0 entry_both → 1, 5
+        //   1 a::Alpha ↔ 2 zzz::AlphaBox        (cycle A)
+        //   3 entry_alpha → 1
+        //   5 b::Beta → 6 zzz::BetaMid → 7 zzz::BetaTail → 5, and 6 → 6 (nested)
+        let names = [
+            "e::EntryBoth",
+            "a::Alpha",
+            "zzz::AlphaBox",
+            "e::EntryAlpha",
+            "e::EntryBeta",
+            "b::Beta",
+            "zzz::BetaMid",
+            "zzz::BetaTail",
+        ];
+        let edges: Vec<Vec<usize>> = vec![
+            vec![1, 5], // 0
+            vec![2],    // 1
+            vec![1],    // 2
+            vec![1],    // 3
+            vec![5],    // 4
+            vec![6],    // 5
+            vec![7, 6], // 6
+            vec![5],    // 7
+        ];
+
+        let all: Vec<usize> = (0..edges.len()).collect();
+        let global = cut_labels(&edges, &names, &all);
+        assert!(!global.is_empty(), "the fixture must actually contain cycles");
+
+        for root in 0..edges.len() {
+            let nodes = reachable_from(&edges, &[root]);
+            let reachable_names: Vec<String> =
+                nodes.iter().map(|n| names[*n].to_string()).collect();
+            let expected: Vec<String> = global
+                .iter()
+                .filter(|name| reachable_names.contains(name))
+                .cloned()
+                .collect();
+
+            // Discovery order is whatever order the walk happened to meet the
+            // nodes in. Try several, including the reverse, to prove the pick is
+            // decided by the key and never by an index.
+            let mut orders = vec![nodes.clone()];
+            let mut reversed = nodes.clone();
+            reversed.reverse();
+            orders.push(reversed);
+            let mut rotated = nodes.clone();
+            rotated.rotate_left(nodes.len() / 2);
+            orders.push(rotated);
+
+            for order in orders {
+                let sub = induced_subgraph(&edges, &order);
+                let actual = cut_labels(&sub, &names, &order);
+                assert_eq!(
+                    actual, expected,
+                    "root {} ({}) with discovery order {:?} computed a different cut set",
+                    root, names[root], order
+                );
+            }
+        }
+    }
+
+    /// The merge hazard the identity-bearing marker exists to close. A cut point
+    /// is emitted with NO structure, so its name is the only thing that separates
+    /// two instantiations of one generic ADT. With the generics-erased def path
+    /// (the first draft of RC-1) `Foo<u8>` and `Foo<i32>` collapse to one marker
+    /// and the consumer's structural comparator reports two genuinely different
+    /// types as EQUAL — strictly worse than the non-canonicity it was fixing,
+    /// because that direction fails OPEN.
+    #[test]
+    fn canonical_cut_marker_must_carry_the_instantiation() {
+        let erased_u8 = recursive_datatype_ref("krate::Foo");
+        let erased_i32 = recursive_datatype_ref("krate::Foo");
+        assert!(
+            erased_u8.eq_ignoring_disc_index_safe(&erased_i32),
+            "the erased-name draft really does merge the two instantiations"
+        );
+
+        let instantiated_u8 = recursive_datatype_ref("krate::Foo<u8>");
+        let instantiated_i32 = recursive_datatype_ref("krate::Foo<i32>");
+        assert!(
+            !instantiated_u8.eq_ignoring_disc_index_safe(&instantiated_i32),
+            "distinct instantiations of one recursive ADT must not compare equal"
+        );
+
+        // …and a cut point with no generic arguments keeps the EXACT legacy
+        // marker, so the Lever A `Level`/`Expr`/`ExprKind` cluster and `Tree` are
+        // byte-identical to pre-RC-1.
+        assert!(
+            recursive_datatype_ref("clean_kernel::level::Level")
+                .eq_ignoring_disc_index_safe(&recursive_datatype_ref("clean_kernel::level::Level"))
+        );
+    }
+
+    /// A cut point may never be memoized: its lowering is the full definition at
+    /// the walk's root and the by-name marker everywhere else, and the memo is
+    /// keyed on the type alone. `TyLoweringCtx` must therefore start with an empty
+    /// cut set, so an ordinary (acyclic) lowering keeps using the cache.
+    #[test]
+    fn ty_lowering_context_starts_with_an_empty_canonical_cut() {
+        let ctx = TyLoweringCtx::default();
+        assert!(ctx.canonical_cut.is_empty());
     }
 }

@@ -632,6 +632,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             ),
             contract_metadata: None,
+            obligation: None,
         };
 
         let postcond =
@@ -658,6 +659,7 @@ mod tests {
             location: span(),
             formula: original_formula.clone(),
             contract_metadata: None,
+            obligation: None,
         };
 
         let mut summary = InterproceduralSummary::new("callee");
@@ -677,6 +679,7 @@ mod tests {
             location: span(),
             formula: original_formula.clone(),
             contract_metadata: None,
+            obligation: None,
         };
 
         let mut summary = InterproceduralSummary::new("callee");
@@ -698,6 +701,7 @@ mod tests {
             location: span(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
 
         let post1 =

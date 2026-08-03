@@ -194,6 +194,7 @@ fn unsafe_raw_deref_buggy() -> VerificationCondition {
         // this unsafe operation exists and was not proved safe.
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -209,6 +210,7 @@ fn unsafe_safe_formula() -> VerificationCondition {
         // meaning there is no way to violate this VC.
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     }
 }
 

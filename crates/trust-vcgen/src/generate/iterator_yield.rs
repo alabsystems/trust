@@ -154,12 +154,26 @@ pub(super) fn vc_callee_is_std_iter_trait_method(callee: &str, trait_last: &str,
 /// anchored form is authoritative.
 pub(super) fn vc_callee_is_slice_inherent(callee: &str, method: &str) -> bool {
     let suffix = format!("::{method}");
+    if callee.contains(" as ") {
+        return false;
+    }
     if callee.contains("[T]") && callee.ends_with(&suffix) {
         return true;
     }
     let normalized = vc_strip_generics(callee);
     (normalized.starts_with("core::slice::") || normalized.starts_with("std::slice::"))
         && normalized.ends_with(&suffix)
+}
+
+/// Authenticate an inherent method on the canonical `alloc`/`std` `Vec`.
+/// A user free function whose path merely mentions `Vec`, or a user trait impl
+/// on `Vec`, must not mint empty-start/push/length facts.
+pub(super) fn vc_callee_is_std_vec_inherent(callee: &str) -> bool {
+    if callee.contains(" as ") {
+        return false;
+    }
+    let normalized = callee.strip_prefix('<').unwrap_or(callee);
+    normalized.starts_with("alloc::vec::Vec") || normalized.starts_with("std::vec::Vec")
 }
 
 pub(super) fn callee_is_iterator_next(callee: &str) -> bool {

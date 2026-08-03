@@ -456,8 +456,11 @@ fn capture_live_smoke(
     let mut child = TrustdChild { child, pid };
 
     let smoke_result = (|| -> Result<trust_router::coordinator::DaemonSmoke, String> {
+        // Same wall-clock/contention hazard as a bounded probe deadline, so it
+        // is resolved through the same helper.
+        let ready_timeout = bounded_process::resolve_probe_deadline(Duration::from_secs(5));
         let ready_deadline = Instant::now()
-            .checked_add(Duration::from_secs(5))
+            .checked_add(ready_timeout)
             .ok_or_else(|| "trustd readiness deadline overflowed".to_string())?;
         loop {
             if bounded_process::exited_without_reaping(&mut child.child)
@@ -469,8 +472,9 @@ fn capture_live_smoke(
                 break;
             }
             if Instant::now() >= ready_deadline {
-                return Err("canonical candidate trustd was not identity/status ready within 5s"
-                    .to_string());
+                return Err(format!(
+                    "canonical candidate trustd was not identity/status ready within {ready_timeout:?}"
+                ));
             }
             std::thread::sleep(Duration::from_millis(20));
         }

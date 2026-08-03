@@ -19,7 +19,7 @@ use rustc_middle::mir::trust_contract::{
     TrustContractSourceBinding, TrustContractSubject, TrustContractSummary,
     TrustContractVerifierSort, TrustLoopId,
 };
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeckResults};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt, TypeckResults};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{Span, Symbol};
 
@@ -188,6 +188,8 @@ pub(crate) fn trust_contracts<'tcx>(
     let mut opaque = 0usize;
     let typeck_results = tcx.typeck(local_def_id);
     let signature_domains = signature_variable_domains(tcx, def_id, body, typeck_results);
+    let signature_projections =
+        signature_projection_environment(&signature_projection_leaves(tcx, body, typeck_results));
     let function_source_sorts = function_source_sorts(body, typeck_results);
     let function_collection_domains =
         function_collection_element_domains(tcx, body, typeck_results);
@@ -203,6 +205,7 @@ pub(crate) fn trust_contracts<'tcx>(
             authored_clause.kind,
             clause.origin,
             &signature_domains,
+            &signature_projections,
             ContractPayloadContext::Function {
                 source_sorts: &function_source_sorts,
                 variable_domains: &signature_domains,
@@ -269,6 +272,7 @@ pub(crate) fn trust_contracts<'tcx>(
             kind,
             ContractClauseOrigin::Native,
             &signature_domains,
+            &signature_projections,
             ContractPayloadContext::Loop {
                 source_sorts: &loop_source_sorts,
                 variable_domains: &loop_variable_domains,
@@ -338,6 +342,7 @@ fn lower_predicate<'tcx>(
     contract_kind: TrustContractKind,
     origin: ContractClauseOrigin,
     signature_domains: &[LoweredVariableDomain],
+    signature_projections: &ProjectionEnvironment,
     context: ContractPayloadContext<'_>,
 ) -> TrustContractPredicate<'tcx> {
     // First-class native clauses are verifier-language parser islands rather
@@ -445,7 +450,15 @@ fn lower_predicate<'tcx>(
         // origin-exact snippet lane.
         validated_native_clause
             .or_else(|| {
-                lower_contract_snippet(tcx, span, payload, contract_kind, origin, signature_domains)
+                lower_contract_snippet(
+                    tcx,
+                    span,
+                    payload,
+                    contract_kind,
+                    origin,
+                    signature_domains,
+                    signature_projections,
+                )
             })
             .unwrap_or_else(|| TrustContractPredicateKind::Unsupported {
                 reason: unsupported_predicate_reason(tcx, span),
@@ -984,6 +997,7 @@ fn lower_contract_snippet(
     contract_kind: TrustContractKind,
     origin: ContractClauseOrigin,
     signature_domains: &[LoweredVariableDomain],
+    signature_projections: &ProjectionEnvironment,
 ) -> Option<TrustContractPredicateKind> {
     let snippet;
     let payload_text = native_clause_payload_text(span, payload);
@@ -996,7 +1010,13 @@ fn lower_contract_snippet(
             contract_body_from_clause_snippet(&snippet, contract_kind)?
         }
     };
-    lower_contract_snippet_body_with_domains(body, contract_kind, origin, signature_domains)
+    lower_contract_snippet_body_with_domains(
+        body,
+        contract_kind,
+        origin,
+        signature_domains,
+        signature_projections,
+    )
 }
 
 fn contract_body_from_clause_snippet(
@@ -1057,7 +1077,13 @@ fn lower_contract_snippet_body(
     contract_kind: TrustContractKind,
     origin: ContractClauseOrigin,
 ) -> Option<TrustContractPredicateKind> {
-    lower_contract_snippet_body_with_domains(body, contract_kind, origin, &[])
+    lower_contract_snippet_body_with_domains(
+        body,
+        contract_kind,
+        origin,
+        &[],
+        &ProjectionEnvironment::default(),
+    )
 }
 
 fn lower_contract_snippet_body_with_domains(
@@ -1065,6 +1091,7 @@ fn lower_contract_snippet_body_with_domains(
     contract_kind: TrustContractKind,
     origin: ContractClauseOrigin,
     signature_domains: &[LoweredVariableDomain],
+    signature_projections: &ProjectionEnvironment,
 ) -> Option<TrustContractPredicateKind> {
     let body = body.trim();
     // Trust: E4/E5 are verifier expressions in a parser island, not Rust HIR
@@ -1114,7 +1141,8 @@ fn lower_contract_snippet_body_with_domains(
     if primed_identifier_in_contract_snippet(expr.trim()).is_some() {
         return None;
     }
-    let lowered = SnippetParser::parse(expr.trim(), result_binding, syntax)?;
+    let lowered =
+        SnippetParser::parse(expr.trim(), result_binding, syntax, signature_projections)?;
     if let Some(value) = lowered.bool_literal {
         Some(TrustContractPredicateKind::BoolLiteral { value })
     } else if trust_types::parse_spec_expr(&lowered.text).is_some()
@@ -3135,6 +3163,192 @@ fn visible_loop_variable_domains<'tcx>(
     )
 }
 
+/// Bounded depth for the projected-leaf walk. Mirrors
+/// `trust_mir_extract::PROJECTED_LEAF_DEPTH_LIMIT`, whose spelling this
+/// enumeration must agree with byte-for-byte.
+const CONTRACT_PROJECTION_DEPTH_LIMIT: u32 = 8;
+/// Entry budget per parameter. On exhaustion the walk simply stops emitting:
+/// a missing leaf leaves its chain unresolvable, so the clause that projects
+/// it stays `Unsupported` — never admitted under a guessed name.
+const CONTRACT_PROJECTION_ENTRY_BUDGET: u32 = 512;
+
+/// One scalar leaf of an aggregate parameter, in the three spellings the
+/// contract pipeline needs to agree on.
+struct ProjectedLeaf {
+    /// The chain exactly as a contract author writes it in Rust source
+    /// (`self.storage.flag`, `s.0`). Named fields keep their source name;
+    /// tuple fields are already spelled by index.
+    authored: String,
+    /// The contract TEXT to emit. `spec_parse` lowers this to `canonical_var`
+    /// — a leading deref MUST be written `(*self)` because the postfix-star
+    /// var spelling is not itself parseable text.
+    canonical_text: String,
+    /// The var name `canonical_text` parses to, byte-identical to the name
+    /// `trust_vcgen::place_to_var_name` mints for the matching MIR place
+    /// (`(*_1).0.3` with local 1 named `self` renders `self*.0.3`).
+    canonical_var: String,
+    domain: TrustContractPropositionDomain,
+}
+
+/// Authored projection chains resolved to their exact canonical spelling.
+///
+/// A chain is admitted ONLY if every segment resolves to a real field index of
+/// a single-variant, non-enum, non-union aggregate and the leaf has an exact
+/// proposition domain. Anything else is simply absent, and an absent chain
+/// makes the whole clause `Unsupported` — the fix never guesses a name.
+#[derive(Default)]
+struct ProjectionEnvironment {
+    canonical_text: FxHashMap<String, String>,
+}
+
+impl ProjectionEnvironment {
+    fn resolve(&self, authored: &str) -> Option<&str> {
+        self.canonical_text.get(authored).map(String::as_str)
+    }
+}
+
+/// Enumerate the scalar leaves reachable from each parameter through struct
+/// and tuple fields.
+///
+/// This is the compiler-query twin of
+/// `trust_mir_extract::insert_projected_scalar_leaf_sorts`, which already
+/// publishes the identical positional spelling on the extraction side. ENUMS
+/// and UNIONS are never walked (their field view is variant-dependent, so a
+/// chain name would be ambiguous); references below the head, generic
+/// parameters, arrays, and every other shape stop the walk at that node.
+fn signature_projection_leaves<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &'tcx rustc_hir::Body<'tcx>,
+    typeck_results: &TypeckResults<'tcx>,
+) -> Vec<ProjectedLeaf> {
+    let mut leaves = Vec::new();
+    for param in body.params {
+        let PatKind::Binding(_, _, ident, None) = param.pat.kind else { continue };
+        let ty = typeck_results.pat_ty(param.pat);
+        // The head follows `signature_variable_domains`: a reference parameter
+        // is dereferenced, which `place_to_var_name` renders as a POSTFIX star
+        // on the var and which must be written `(*name)` as text.
+        let (head_var, head_text, aggregate_ty) = match ty.kind() {
+            ty::Ref(_, inner, _) => {
+                (format!("{}*", ident.name), format!("(*{})", ident.name), *inner)
+            }
+            _ => (ident.name.to_string(), ident.name.to_string(), ty),
+        };
+        let mut budget = CONTRACT_PROJECTION_ENTRY_BUDGET;
+        push_projected_leaves(
+            tcx,
+            &mut leaves,
+            &ident.name.to_string(),
+            &head_var,
+            &head_text,
+            aggregate_ty,
+            CONTRACT_PROJECTION_DEPTH_LIMIT,
+            &mut budget,
+        );
+    }
+    leaves
+}
+
+fn push_projected_leaves<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    leaves: &mut Vec<ProjectedLeaf>,
+    authored: &str,
+    canonical_var: &str,
+    canonical_text: &str,
+    ty: Ty<'tcx>,
+    depth: u32,
+    budget: &mut u32,
+) {
+    if depth == 0 || *budget == 0 {
+        return;
+    }
+    // A type still carrying generic parameters has no field layout we can pin
+    // here, and normalizing it in this query is not safe. Stop.
+    if ty.has_non_region_param() {
+        return;
+    }
+    let fields: Vec<(String, Ty<'tcx>)> = match ty.kind() {
+        ty::Adt(def, args) => {
+            // Only a single-variant, non-union ADT has an unconditional field
+            // place. An enum field sits behind a discriminant and a union
+            // field aliases its siblings; both must keep failing closed.
+            if def.is_enum() || def.is_union() || def.variants().len() != 1 {
+                return;
+            }
+            def.non_enum_variant()
+                .fields
+                .iter()
+                // `FieldDef::ty` yields an `Unnormalized<_, Ty>` on this
+                // toolchain; the projection walk only ever compares field
+                // SHAPES (scalar vs ADT vs tuple) to decide whether a name is
+                // projectable, and never reasons under an alias, so skipping
+                // normalization here is the same choice `gvn` and
+                // `remove_uninit_drops` make at their equivalent field walks.
+                .map(|field| (field.name.to_string(), field.ty(tcx, *args).skip_normalization()))
+                .collect()
+        }
+        ty::Tuple(items) => {
+            items.iter().enumerate().map(|(index, item)| (index.to_string(), item)).collect()
+        }
+        _ => return,
+    };
+    for (index, (field_name, field_ty)) in fields.into_iter().enumerate() {
+        if *budget == 0 {
+            return;
+        }
+        // AUTHORED keeps the source spelling (`storage`); CANONICAL is always
+        // positional, because `place_to_var_name` renders `Field(i)` as `.i`
+        // and never by name. For a tuple struct the two coincide.
+        let child_authored = format!("{authored}.{field_name}");
+        let child_var = format!("{canonical_var}.{index}");
+        let child_text = format!("{canonical_text}.{index}");
+        match proposition_domain_from_ty(tcx, field_ty) {
+            Some(domain) => {
+                *budget -= 1;
+                leaves.push(ProjectedLeaf {
+                    authored: child_authored,
+                    canonical_text: child_text,
+                    canonical_var: child_var,
+                    domain,
+                });
+            }
+            // No exact domain: recurse in case this is a nested aggregate.
+            // A reference-typed field would need a further deref segment that
+            // this spelling cannot express, so `push_projected_leaves` stops
+            // on it (`ty::Ref` is not an `Adt`/`Tuple`).
+            None => push_projected_leaves(
+                tcx,
+                leaves,
+                &child_authored,
+                &child_var,
+                &child_text,
+                field_ty,
+                depth - 1,
+                budget,
+            ),
+        }
+    }
+}
+
+fn signature_projection_environment(leaves: &[ProjectedLeaf]) -> ProjectionEnvironment {
+    let mut canonical_text: FxHashMap<String, String> = FxHashMap::default();
+    let mut ambiguous: BTreeSet<String> = BTreeSet::new();
+    for leaf in leaves {
+        if let Some(previous) = canonical_text.insert(leaf.authored.clone(), leaf.canonical_text.clone())
+            && previous != leaf.canonical_text
+        {
+            // Two distinct places share one authored spelling. Neither may be
+            // admitted: picking either could bind the clause to the wrong
+            // place. Drop the entry entirely.
+            ambiguous.insert(leaf.authored.clone());
+        }
+    }
+    for name in ambiguous {
+        canonical_text.remove(&name);
+    }
+    ProjectionEnvironment { canonical_text }
+}
+
 fn signature_variable_domains<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: rustc_span::def_id::DefId,
@@ -3152,6 +3366,13 @@ fn signature_variable_domains<'tcx>(
         if let Some(domain) = proposition_domain_from_ty(tcx, scalar_ty) {
             domains.push(LoweredVariableDomain { name, domain });
         }
+    }
+    // Projected scalar leaves of aggregate parameters. Each domain is the
+    // FIELD's own `proposition_domain_from_ty` — no sort is ever invented, so
+    // `projected_chain_sort` in the exact-projection validator is satisfied
+    // with the real layout rather than by weakening the gate.
+    for leaf in signature_projection_leaves(tcx, body, typeck_results) {
+        domains.push(LoweredVariableDomain { name: leaf.canonical_var, domain: leaf.domain });
     }
     let output = tcx.fn_sig(def_id).instantiate_identity().skip_binder().output();
     if let Some(domain) = proposition_domain_from_ty(tcx, output) {
@@ -3443,6 +3664,10 @@ enum SnippetToken<'a> {
     Comma,
     Colon,
     DotDot,
+    /// A single `.`, the projection-segment separator (`self.storage.flag`,
+    /// `s.0`). Distinct from `DotDot`, which the tokenizer matches first, so a
+    /// `Dot` is never part of a range.
+    Dot,
 }
 
 /// The two snippet origins intentionally have different source grammars.
@@ -3461,6 +3686,7 @@ struct SnippetParser<'a> {
     index: usize,
     result_binding: Option<SnippetResultBinding<'a>>,
     syntax: SnippetSyntax,
+    projections: &'a ProjectionEnvironment,
 }
 
 #[derive(Copy, Clone)]
@@ -3477,9 +3703,10 @@ impl<'a> SnippetParser<'a> {
         input: &'a str,
         result_binding: Option<SnippetResultBinding<'a>>,
         syntax: SnippetSyntax,
+        projections: &'a ProjectionEnvironment,
     ) -> Option<SnippetExpr> {
         let tokens = tokenize_contract_snippet(input, syntax)?;
-        let mut parser = Self { tokens, index: 0, result_binding, syntax };
+        let mut parser = Self { tokens, index: 0, result_binding, syntax, projections };
         let expr = parser.parse_implies()?;
         if parser.is_eof() && expr.ty.can_be_bool() { Some(expr.into_bool()) } else { None }
     }
@@ -3622,6 +3849,16 @@ impl<'a> SnippetParser<'a> {
 
     fn parse_atom(&mut self) -> Option<SnippetExpr> {
         match self.bump()? {
+            // A projection chain is resolved as a WHOLE, from a bare-identifier
+            // head, before any other identifier role is considered. Only the
+            // natural Rust source spelling (`self.storage.flag`, `s.0`) is
+            // accepted; it is rewritten to the canonical place text. Note
+            // `parse_ident`'s roles (`old(..)`, quantifiers, `true`/`false`,
+            // the result binding) are never followed by `.`, so this cannot
+            // shadow them.
+            SnippetToken::Ident(name) if self.peek() == Some(&SnippetToken::Dot) => {
+                self.parse_projection_chain(name)
+            }
             SnippetToken::Ident(name) => self.parse_ident(name),
             SnippetToken::Int(value) => Some(SnippetExpr {
                 text: value.to_string(),
@@ -3635,6 +3872,55 @@ impl<'a> SnippetParser<'a> {
             }
             _ => None,
         }
+    }
+
+    /// Parse `head.seg.seg...` and rewrite it to the exact canonical place
+    /// text, or reject the whole clause.
+    ///
+    /// Soundness: this function NEVER invents a name. The chain is looked up
+    /// verbatim in `ProjectionEnvironment`, which was built by walking the
+    /// real field layout of the parameter types, so the emitted text is either
+    /// the byte-exact spelling `place_to_var_name` mints for that MIR place or
+    /// nothing at all. A miss (unknown field, enum/union, reference field,
+    /// generic type, non-scalar leaf, budget exhaustion, ambiguous spelling)
+    /// returns `None`, which fails the entire clause closed.
+    fn parse_projection_chain(&mut self, head: &'a str) -> Option<SnippetExpr> {
+        // A projection off the ensures result binding has no signature entry
+        // and must not be silently reinterpreted as a plain variable.
+        if matches!(
+            self.result_binding,
+            Some(
+                SnippetResultBinding::ClosureReference(binding)
+                    | SnippetResultBinding::NativeValue(binding)
+            ) if head == binding
+        ) {
+            return None;
+        }
+        let mut authored = head.to_string();
+        while self.eat(&SnippetToken::Dot) {
+            let segment = match self.bump()? {
+                // A named struct field (`storage`) or a tuple index (`0`).
+                SnippetToken::Ident(segment) => segment,
+                SnippetToken::Int(segment) => segment,
+                _ => return None,
+            };
+            // `base.method(..)` is a CALL, not a place: it has no stable name
+            // and must keep failing closed.
+            if self.peek() == Some(&SnippetToken::LParen) {
+                return None;
+            }
+            authored.push('.');
+            authored.push_str(segment);
+        }
+        let canonical = self.projections.resolve(&authored)?;
+        Some(SnippetExpr {
+            text: canonical.to_string(),
+            // The leaf's exact sort is enforced downstream from the signature
+            // domains (`native_function_clause_is_source_typed` and
+            // `query_proposition_from_formula`), which are authoritative.
+            ty: SnippetExprTy::Ambiguous,
+            bool_literal: None,
+        })
     }
 
     fn parse_ident(&mut self, name: &'a str) -> Option<SnippetExpr> {
@@ -3942,6 +4228,16 @@ fn tokenize_contract_snippet(input: &str, syntax: SnippetSyntax) -> Option<Vec<S
             (b'.', Some(b'.')) => {
                 index += 2;
                 SnippetToken::DotDot
+            }
+            // A LONE `.` separates projection segments. `DotDot` is matched
+            // above, so nothing reaching here can be a range. Lexing it does
+            // not admit anything on its own: `SnippetParser` accepts a `Dot`
+            // only inside a projection chain whose every segment resolves to
+            // an exact field index through `ProjectionEnvironment`, and an
+            // unresolved chain still returns `None` for the whole clause.
+            (b'.', _) => {
+                index += 1;
+                SnippetToken::Dot
             }
             _ => return None,
         };

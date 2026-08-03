@@ -149,6 +149,7 @@ pub fn encode_unsafe_block(
         location: span.clone(),
         formula: Formula::Not(Box::new(pre_fol.clone())),
         contract_metadata: None,
+        obligation: None,
     });
 
     // VC 2: Postcondition must follow from precondition
@@ -161,6 +162,7 @@ pub fn encode_unsafe_block(
         location: span.clone(),
         formula: Formula::And(vec![pre_fol, Formula::Not(Box::new(post_fol))]),
         contract_metadata: None,
+        obligation: None,
     });
 
     vcs

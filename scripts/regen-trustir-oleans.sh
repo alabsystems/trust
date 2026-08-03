@@ -87,7 +87,7 @@ SHIP_LIB="$WORK/trust_ir-semantics/.lake/build/lib"
 # --- Compute the minimal closure with the in-tree clean-olean --------------
 echo "computing closure of the bridge root module ..."
 CLOSURE="$WORK/closure_modules.txt"
-(cd "$ROOT" && RUSTC_BOOTSTRAP=1 cargo run --quiet --manifest-path crates/Cargo.toml \
+(cd "$ROOT" && "$ROOT/build/host/stage2/bin/targo" --unverified run --quiet --manifest-path crates/Cargo.toml \
     -p trust-clean --example bridge_closure -- "$SHIP_LIB" "$CORE_LIB") > "$CLOSURE"
 N_TOTAL="$(wc -l < "$CLOSURE" | tr -d ' ')"
 N_TRUSTIR="$(grep -c '^TrustIr' "$CLOSURE")"

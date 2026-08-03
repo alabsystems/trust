@@ -627,6 +627,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let bytes1 = canonical_vc_bytes(&vc);
         let bytes2 = canonical_vc_bytes(&vc);
@@ -641,6 +642,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
         let bytes = canonical_vc_bytes(&vc);
         assert_eq!(&bytes[..4], b"tVC1", "must start with magic bytes");
@@ -660,6 +662,7 @@ mod tests {
             },
             formula: Formula::Int(42),
             contract_metadata: None,
+            obligation: None,
         };
         let vc2 = VerificationCondition {
             kind: VcKind::DivisionByZero,
@@ -673,6 +676,7 @@ mod tests {
             },
             formula: Formula::Int(42),
             contract_metadata: None,
+            obligation: None,
         };
         assert_eq!(
             canonical_vc_bytes(&vc1),
@@ -689,6 +693,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let vc2 = VerificationCondition {
             kind: VcKind::RemainderByZero,
@@ -696,6 +701,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         assert_ne!(
             canonical_vc_bytes(&vc1),
@@ -732,6 +738,7 @@ mod tests {
             location: SourceSpan::default(),
             formula,
             contract_metadata: None,
+            obligation: None,
         };
         let bytes = canonical_vc_bytes(&vc);
         // Must start with magic

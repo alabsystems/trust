@@ -105,6 +105,7 @@ pub fn encode_framed_unsafe_block(
             location: span.clone(),
             formula: Formula::Not(Box::new(disjointness)),
             contract_metadata: None,
+            obligation: None,
         });
     }
 

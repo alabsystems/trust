@@ -220,12 +220,13 @@ struct SessionState {
     /// to before. Cleared on process kill (a restarted process re-sends it via
     /// `send_base_assertions`).
     current_prefix: Vec<CommonAssertion>,
-    /// Trust: Names of the variables DECLARED by `current_prefix` at the base
-    /// scope. The per-VC push/pop scope SKIPS re-declaring these (re-declaring a
-    /// variable already bound at an enclosing scope is an error for most
-    /// solvers), so the bare obligation references the base-scope declaration.
-    /// Empty for the per-VC `verify` path (no prefix), so that path re-declares
-    /// exactly as before.
+    /// Trust: Names DECLARED by `current_prefix` at the base scope — variable
+    /// symbols and, since Lever A's datatype preamble, the `declare-sort` /
+    /// `declare-datatype` sort names too. The per-VC push/pop scope SKIPS
+    /// re-declaring these (re-declaring a name already bound at an enclosing
+    /// scope is an error for most solvers), so the bare obligation references
+    /// the base-scope declaration. Empty for the per-VC `verify` path (no
+    /// prefix), so that path re-declares exactly as before.
     prefix_declared_vars: std::collections::HashSet<String>,
     /// Trust: The SMT logic to set at the base scope for the current batch.
     ///
@@ -317,12 +318,13 @@ impl SessionState {
             self.kill_process();
         }
 
-        // Record which variables the prefix declares so the per-VC push scope
-        // can skip re-declaring them.
+        // Record what the prefix declares — variable symbols AND the datatype/
+        // sort names of Lever A's SMT preamble — so the per-VC push scope can
+        // skip re-declaring them.
         self.prefix_declared_vars = prefix
             .iter()
             .flat_map(|a| a.commands.iter())
-            .filter_map(|cmd| extract_var_name(cmd))
+            .filter_map(|cmd| extract_declared_name(cmd))
             .collect();
         self.current_prefix = prefix;
         self.prefix_logic = logic;
@@ -1087,33 +1089,57 @@ impl IncrementalAYSession {
 
     /// Extract common type constraints from a set of VCs.
     ///
-    /// Analyzes the VCs to find variable declarations that appear across
-    /// multiple VCs and promotes them to shared declarations. This avoids
-    /// re-declaring common variables in each push/pop scope.
+    /// Analyzes the VCs to find declarations that appear across multiple VCs and
+    /// promotes them to shared declarations. This avoids re-declaring common
+    /// symbols in each push/pop scope.
+    ///
+    /// Trust: a declaration is any command with a declaration identity —
+    /// `declare-fun` / `declare-const` variables AND the `declare-sort` /
+    /// `declare-datatype` commands of Lever A's SMT preamble. Dropping the
+    /// latter would promote a `(declare-fun e () Expr)` whose sort `Expr` was
+    /// never declared, making the base scope itself malformed.
     pub fn extract_common_declarations(&mut self, vcs: &[VerificationCondition]) {
         use std::collections::BTreeMap;
 
-        // Count variable occurrences across VCs.
-        let mut var_counts: BTreeMap<String, usize> = BTreeMap::new();
-        let mut var_decls: BTreeMap<String, String> = BTreeMap::new();
+        // Count declaration occurrences across VCs, keyed by declared name.
+        let mut decl_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut decl_text: BTreeMap<String, String> = BTreeMap::new();
+        // Sort/datatype names in FIRST-SEEN order. `emit_declarations` emits
+        // sorts before the `declare-fun`s that use them and topologically orders
+        // datatypes among themselves; promoting by name order alone would break
+        // that (`(declare-fun X () expr)` sorts before `(declare-datatype expr
+        // …)`), so the sort declarations are replayed in emission order ahead of
+        // the order-insensitive value declarations.
+        let mut sort_order: Vec<String> = Vec::new();
 
         for vc in vcs {
             let decls = smt2_export::emit_declarations(&vc.formula);
             for decl in &decls {
-                // Extract variable name from declaration like "(declare-fun x () Int)"
-                if let Some(name) = extract_var_name(decl) {
-                    *var_counts.entry(name.clone()).or_insert(0) += 1;
-                    var_decls.entry(name).or_insert_with(|| decl.clone());
+                // Declaration identity of e.g. "(declare-fun x () Int)" or
+                // "(declare-datatype Expr ((Leaf) (Node (l Expr) (r Expr))))".
+                if let Some(name) = extract_declared_name(decl) {
+                    *decl_counts.entry(name.clone()).or_insert(0) += 1;
+                    if declares_sort(decl) && !sort_order.contains(&name) {
+                        sort_order.push(name.clone());
+                    }
+                    decl_text.entry(name).or_insert_with(|| decl.clone());
                 }
             }
         }
 
-        // Promote variables that appear in 2+ VCs to common declarations.
-        let shared_decls: Vec<String> = var_counts
-            .iter()
-            .filter(|(_, count)| **count >= 2)
-            .filter_map(|(name, _)| var_decls.get(name).cloned())
-            .collect();
+        // Promote declarations that appear in 2+ VCs, sorts first (in emission
+        // order), then the value declarations in name order as before.
+        let mut shared_decls: Vec<String> = Vec::new();
+        for name in &sort_order {
+            if decl_counts.get(name).is_some_and(|count| *count >= 2) {
+                shared_decls.extend(decl_text.get(name).cloned());
+            }
+        }
+        for (name, count) in &decl_counts {
+            if *count >= 2 && !sort_order.contains(name) {
+                shared_decls.extend(decl_text.get(name).cloned());
+            }
+        }
 
         if !shared_decls.is_empty() {
             self.add_common_assertion(CommonAssertion::from_commands(
@@ -1136,27 +1162,25 @@ impl IncrementalAYSession {
         let deadline = start.checked_add(timeout).unwrap_or(start);
         self.ensure_base_initialized(st, vc, deadline)?;
 
-        // Snapshot which variables the base-scope prefix already declares, so the
-        // per-VC push scope below does NOT re-declare them. Cloning the (usually
-        // small, often empty) set sidesteps borrowing `st` while `st.process` is
-        // borrowed mutably as `proc`. Empty for the per-VC path ⇒ no skips ⇒
-        // byte-identical to before.
+        // Snapshot what the base-scope prefix already declares (variables AND
+        // datatype/sort names), so the per-VC push scope below does NOT
+        // re-declare them. Cloning the (usually small, often empty) set
+        // sidesteps borrowing `st` while `st.process` is borrowed mutably as
+        // `proc`. Empty for the per-VC path ⇒ no skips ⇒ byte-identical to
+        // before.
         let base_declared: std::collections::HashSet<String> = st.prefix_declared_vars.clone();
+        // Compute the scope's declarations BEFORE taking the &mut borrow on
+        // `st.process`.
+        let vc_declarations = scope_declarations(&vc.formula, &base_declared);
 
         let proc = st.process.as_mut().ok_or("no solver process")?;
         // Push a new scope for this VC.
         send_command_until(proc, "(push 1)", deadline)?;
 
-        // Declare VC-specific variables (skip those already declared at base level).
-        for decl in smt2_export::emit_declarations(&vc.formula) {
-            // Skip a variable already declared in the base-scope prefix: in
-            // incremental mode, redeclaring a variable bound at an enclosing
-            // scope is an error for most solvers. The base declaration is in
-            // scope here, so the assertion below still resolves the name.
-            if extract_var_name(&decl).is_some_and(|name| base_declared.contains(&name)) {
-                continue;
-            }
-            send_command_until(proc, &decl, deadline)?;
+        // Declare VC-specific symbols and sorts (those already declared at base
+        // level were dropped by `scope_declarations`).
+        for decl in &vc_declarations {
+            send_command_until(proc, decl, deadline)?;
         }
 
         // Assert the VC formula.
@@ -1928,20 +1952,71 @@ fn read_model_response(proc: &mut SolverProcess, timeout: Duration) -> Result<St
     Ok(output)
 }
 
-/// Extract a variable name from an SMT-LIB2 declaration command.
+/// Trust: The DECLARATION IDENTITY of an SMT-LIB2 declaration command — the
+/// name it introduces into the solver's namespace.
 ///
-/// Handles: `(declare-fun name () Sort)` and `(declare-const name Sort)`.
-fn extract_var_name(decl: &str) -> Option<String> {
+/// Handles every declaration shape `smt2_export::emit_declarations` can emit:
+///
+/// * `(declare-fun name () Sort)` / `(declare-fun name (Sorts) Bool)`
+/// * `(declare-const name Sort)`
+/// * `(declare-sort name 0)` — Lever A's by-name datatype back-edge
+/// * `(declare-datatype name ((Ctor (field Sort)) …))` — Lever A's inductive
+///   datatype preamble
+///
+/// The name is what the base-scope/per-VC-scope de-duplication keys on:
+/// re-declaring inside `(push 1)` something already bound at the enclosing base
+/// scope is an error for most solvers, which errors the session, forces a
+/// process restart, and (after `MAX_CONSECUTIVE_FAILURES`) permanently falls
+/// the session back to per-process mode. A `declare-sort`/`declare-datatype`
+/// carries EXACTLY that hazard — a datatype-bearing prefix and its per-VC
+/// obligations both emit the same `(declare-datatype Expr …)` — so sorts are
+/// keyed the same way as variables, not ignored.
+///
+/// Returns `None` for any non-declaration command (assertions, `set-logic`, …).
+fn extract_declared_name(decl: &str) -> Option<String> {
     let trimmed = decl.trim();
-    if let Some(rest) = trimmed.strip_prefix("(declare-fun ") {
-        let end = rest.find(|c: char| c.is_whitespace())?;
-        Some(rest[..end].to_string())
-    } else if let Some(rest) = trimmed.strip_prefix("(declare-const ") {
-        let end = rest.find(|c: char| c.is_whitespace())?;
-        Some(rest[..end].to_string())
-    } else {
-        None
+    for prefix in ["(declare-fun ", "(declare-const ", "(declare-sort ", "(declare-datatype "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let end = rest.find(|c: char| c.is_whitespace())?;
+            return Some(rest[..end].to_string());
+        }
     }
+    None
+}
+
+/// Trust: True for a declaration that introduces a SORT name (`declare-sort` /
+/// `declare-datatype`) rather than a value symbol (`declare-fun` /
+/// `declare-const`).
+///
+/// Ordering matters for sorts and not for values: a `(declare-fun e () Expr)`
+/// is malformed unless `Expr` is already declared, and a datatype whose field
+/// sort is another datatype must follow that one. `emit_declarations` emits
+/// sorts first, topologically ordered; any code that REORDERS declarations must
+/// preserve that, which is what this predicate is for.
+fn declares_sort(decl: &str) -> bool {
+    let trimmed = decl.trim();
+    trimmed.starts_with("(declare-sort ") || trimmed.starts_with("(declare-datatype ")
+}
+
+/// Trust: The declarations the per-VC push scope must send for `formula`, given
+/// the names already declared at the enclosing base scope.
+///
+/// A declaration whose identity is already bound at the base scope is SKIPPED:
+/// the base binding is in scope inside `(push 1)`, so the VC's assertion still
+/// resolves the name, while re-declaring it would error the session. This is
+/// the single place the skip rule lives, so the base-scope snapshot
+/// (`SessionState::prefix_declared_vars`) and the per-VC emission can never
+/// drift apart.
+fn scope_declarations(
+    formula: &Formula,
+    base_declared: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    smt2_export::emit_declarations(formula)
+        .into_iter()
+        .filter(|decl| {
+            !extract_declared_name(decl).is_some_and(|name| base_declared.contains(&name))
+        })
+        .collect()
 }
 
 /// Trust: Detect an SMT logic wide enough for EVERY VC in a function group.
@@ -2861,6 +2936,7 @@ mod tests {
             location: SourceSpan::default(),
             formula,
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -3081,6 +3157,7 @@ mod tests {
             location: SourceSpan::default(),
             formula,
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -3351,23 +3428,55 @@ mod tests {
         assert_eq!(session.stats().common_assertions, 0);
     }
 
-    // -- extract_var_name tests --
+    // -- extract_declared_name tests --
 
     #[test]
     fn test_extract_var_name_declare_fun() {
-        assert_eq!(extract_var_name("(declare-fun x () Int)"), Some("x".to_string()));
-        assert_eq!(extract_var_name("(declare-fun my_var () Bool)"), Some("my_var".to_string()));
+        assert_eq!(extract_declared_name("(declare-fun x () Int)"), Some("x".to_string()));
+        assert_eq!(
+            extract_declared_name("(declare-fun my_var () Bool)"),
+            Some("my_var".to_string())
+        );
     }
 
     #[test]
     fn test_extract_var_name_declare_const() {
-        assert_eq!(extract_var_name("(declare-const x Int)"), Some("x".to_string()));
+        assert_eq!(extract_declared_name("(declare-const x Int)"), Some("x".to_string()));
     }
 
     #[test]
     fn test_extract_var_name_other() {
-        assert_eq!(extract_var_name("(assert (> x 0))"), None);
-        assert_eq!(extract_var_name("(set-logic QF_LIA)"), None);
+        assert_eq!(extract_declared_name("(assert (> x 0))"), None);
+        assert_eq!(extract_declared_name("(set-logic QF_LIA)"), None);
+        assert_eq!(extract_declared_name("(push 1)"), None);
+    }
+
+    /// Trust: Lever A's datatype preamble introduces two MORE declaration
+    /// shapes. They bind a name in the same solver namespace as a variable, so
+    /// the same identity extractor must see them — otherwise the per-VC push
+    /// scope re-emits the base scope's `(declare-datatype …)` and errors the
+    /// session.
+    #[test]
+    fn extract_declared_name_reads_sort_and_datatype_declarations() {
+        assert_eq!(extract_declared_name("(declare-sort Expr 0)"), Some("Expr".to_string()));
+        assert_eq!(
+            extract_declared_name(
+                "(declare-datatype Expr ((Const (c (_ BitVec 32))) (App (f Expr) (x Expr))))"
+            ),
+            Some("Expr".to_string())
+        );
+        // The plural multi-sort form is NOT emitted by `emit_declarations` and
+        // its first token is a sort LIST, not a name — it must not be misread.
+        assert_eq!(extract_declared_name("(declare-datatypes ((Expr 0)) (((Leaf))))"), None);
+    }
+
+    #[test]
+    fn declares_sort_separates_sort_declarations_from_value_declarations() {
+        assert!(declares_sort("(declare-sort Expr 0)"));
+        assert!(declares_sort("(declare-datatype Expr ((Leaf)))"));
+        assert!(!declares_sort("(declare-fun e () Expr)"));
+        assert!(!declares_sort("(declare-const e Expr)"));
+        assert!(!declares_sort("(assert (= e e))"));
     }
 
     /// AY's element-count ceiling (mirrors `UNBOUNDED_ALLOC_ELEM_CEILING`).
@@ -3384,6 +3493,7 @@ mod tests {
             location: SourceSpan::default(),
             formula,
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -3558,6 +3668,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
         assert!(session.can_handle(&vc));
     }
@@ -3571,6 +3682,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
         assert!(!session.can_handle(&vc));
     }
@@ -3998,6 +4110,7 @@ mod tests {
             location: SourceSpan::default(),
             formula,
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -4325,5 +4438,236 @@ mod tests {
         // Empty conjunction is trivial-true; singleton is bare.
         assert_eq!(conjoin_formulas(Vec::new()), Formula::Bool(true));
         assert_eq!(conjoin_formulas(vec![le_var("a", 1)]), le_var("a", 1));
+    }
+
+    // -- Lever A: datatype/sort declarations on the incremental lane --
+    //
+    // `emit_declarations` now also returns `(declare-sort …)` and
+    // `(declare-datatype …)`. Those bind a name in the same solver namespace a
+    // variable does, so the incremental lane's base-scope/push-scope
+    // de-duplication must see them: the shared prefix and every bare obligation
+    // that mentions an `Expr`-sorted variable BOTH emit the identical
+    // `(declare-datatype Expr …)`, and sending it twice is a redeclaration
+    // error that kills the session (verdicts stay sound — the fallback solves
+    // the FULL formula per-process — but the session churns restarts and can end
+    // up `permanently_fallen_back`).
+
+    /// A recursive `Expr` datatype: a `Leaf(i)` base case and a binary
+    /// `Node(l, r)` whose children are BY-NAME references back to `Expr` (the
+    /// natively-recursive SMT-LIB datatype encoding Lever A emits).
+    fn expr_sort() -> Sort {
+        let expr_ref = Sort::Datatype { name: "Expr".into(), constructors: Vec::new() };
+        Sort::Datatype {
+            name: "Expr".into(),
+            constructors: vec![
+                ("Leaf".into(), vec![("i".into(), Sort::Int)]),
+                ("Node".into(), vec![("l".into(), expr_ref.clone()), ("r".into(), expr_ref)]),
+            ],
+        }
+    }
+
+    /// `a = b` over two `Expr`-sorted variables — a formula whose SMT preamble
+    /// carries a datatype declaration.
+    fn expr_eq(a: &str, b: &str) -> Formula {
+        Formula::Eq(
+            Box::new(Formula::Var(a.into(), expr_sort())),
+            Box::new(Formula::Var(b.into(), expr_sort())),
+        )
+    }
+
+    /// REGRESSION (no test covered this path): the per-VC push scope must NOT
+    /// re-declare a datatype the base-scope prefix already declared.
+    #[test]
+    fn push_scope_skips_a_datatype_the_base_prefix_declared() {
+        let session = IncrementalAYSession::new();
+        // Two obligations of one function sharing the datatype-bearing conjunct.
+        let shared = expr_eq("e", "f");
+        let vcs = vec![
+            vc_for("g", Formula::And(vec![shared.clone(), expr_eq("e", "g1")])),
+            vc_for("g", Formula::And(vec![shared, expr_eq("e", "g2")])),
+        ];
+        let (prefix_formulas, bare_vcs) = split_shared_prefix(&vcs);
+        assert_eq!(prefix_formulas.len(), 1, "the datatype-bearing conjunct is shared");
+
+        let prefix: Vec<CommonAssertion> = prefix_formulas
+            .iter()
+            .enumerate()
+            .map(|(i, f)| CommonAssertion::from_formula(format!("shared-prefix-{i}"), f))
+            .collect();
+        let base_commands: Vec<String> =
+            prefix.iter().flat_map(|a| a.commands.iter().cloned()).collect();
+        assert!(
+            base_commands.iter().any(|c| c.starts_with("(declare-datatype Expr ")),
+            "the base scope declares the datatype: {base_commands:?}"
+        );
+
+        let base_declared = {
+            let mut st = session.state.lock().unwrap();
+            st.set_prefix(prefix, Some("ALL".to_string()));
+            assert!(
+                st.prefix_declared_vars.contains("Expr"),
+                "a datatype name is a base-scope declaration identity, like a variable"
+            );
+            st.prefix_declared_vars.clone()
+        };
+
+        // Exactly what `verify_incremental` sends inside `(push 1)`.
+        let scoped = scope_declarations(&bare_vcs[0].formula, &base_declared);
+        assert!(
+            !scoped.iter().any(|c| c.starts_with("(declare-datatype Expr ")),
+            "redeclaring the base-scope datatype inside push/pop errors the session: {scoped:?}"
+        );
+        assert!(
+            !scoped.iter().any(|c| c.starts_with("(declare-fun e ")),
+            "the base-scope VARIABLE stays skipped (unchanged behavior): {scoped:?}"
+        );
+        assert!(
+            scoped.iter().any(|c| c.starts_with("(declare-fun g1 ")),
+            "the obligation's own variable is still declared in its scope: {scoped:?}"
+        );
+
+        // Whole-session view: the datatype is declared exactly ONCE.
+        let all: Vec<String> = base_commands.into_iter().chain(scoped).collect();
+        assert_eq!(
+            all.iter().filter(|c| c.starts_with("(declare-datatype Expr ")).count(),
+            1,
+            "one declaration of `Expr` across base scope + push scope: {all:?}"
+        );
+    }
+
+    /// A stand-in solver that RECORDS every command it is sent and answers
+    /// `(check-sat)` with `unknown` (the branch that pops and returns without a
+    /// model or a proof), so a test can assert on the exact command stream the
+    /// incremental session emits.
+    #[cfg(unix)]
+    struct RecordingSolver {
+        directory: std::path::PathBuf,
+        script: std::path::PathBuf,
+        log: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl RecordingSolver {
+        fn new(label: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let directory = std::env::temp_dir()
+                .join(format!("trust-recording-solver-{label}-{}-{nonce:x}", std::process::id()));
+            std::fs::create_dir_all(&directory).expect("create recording solver fixture");
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                .expect("make recording solver fixture private");
+            let log = directory.join("commands.log");
+            let script = directory.join("solver.sh");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\n\
+                     while IFS= read -r line; do\n\
+                     \x20 printf '%s\\n' \"$line\" >> '{}'\n\
+                     \x20 if [ \"$line\" = '(check-sat)' ]; then printf 'unknown\\n'; fi\n\
+                     done\n",
+                    log.display()
+                ),
+            )
+            .expect("write recording solver");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+                .expect("make recording solver executable");
+            Self { directory, script, log }
+        }
+
+        /// Every command the session sent, in order.
+        fn commands(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for RecordingSolver {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.log);
+            let _ = std::fs::remove_file(&self.script);
+            let _ = std::fs::remove_dir(&self.directory);
+        }
+    }
+
+    /// REGRESSION, end to end: drive two datatype-bearing obligations of one
+    /// function through `verify_batch` against a recording solver and assert the
+    /// datatype reaches the solver exactly ONCE — at the base scope, before the
+    /// first `(push 1)` — with no session fault or fallback.
+    #[cfg(unix)]
+    #[test]
+    fn batch_lane_sends_a_datatype_declaration_exactly_once() {
+        let _memory_authority = unconfigured_memory_authority();
+        let fixture = RecordingSolver::new("datatype-once");
+        let session = IncrementalAYSession::with_solver_path(
+            fixture.script.to_str().expect("utf-8 fixture path"),
+        );
+        let shared = expr_eq("e", "f");
+        let vcs = vec![
+            vc_for("g", Formula::And(vec![shared.clone(), expr_eq("e", "g1")])),
+            vc_for("g", Formula::And(vec![shared, expr_eq("e", "g2")])),
+        ];
+
+        let results = session.verify_batch(&vcs);
+        assert_eq!(results.len(), 2);
+
+        let commands = fixture.commands();
+        let pushes = commands.iter().filter(|c| c.trim() == "(push 1)").count();
+        assert_eq!(pushes, 2, "both obligations ran as push/pop scopes: {commands:?}");
+        assert_eq!(
+            commands.iter().filter(|c| c.starts_with("(declare-datatype Expr ")).count(),
+            1,
+            "the datatype must be declared ONCE; a redeclaration inside push/pop \
+             errors the session: {commands:?}"
+        );
+        let declared_at = commands
+            .iter()
+            .position(|c| c.starts_with("(declare-datatype Expr "))
+            .expect("the datatype must reach the solver at all");
+        let first_push =
+            commands.iter().position(|c| c.trim() == "(push 1)").expect("a push scope ran");
+        assert!(
+            declared_at < first_push,
+            "the datatype belongs to the BASE scope, ahead of every push: {commands:?}"
+        );
+
+        let stats = session.stats();
+        assert_eq!(stats.restarts, 0, "no session fault: {commands:?}");
+        assert_eq!(stats.incremental_queries, 2, "both queries stayed incremental: {commands:?}");
+        assert_eq!(stats.fallback_queries, 0, "no per-process fallback: {commands:?}");
+    }
+
+    /// A promoted `(declare-fun e () Expr)` is malformed unless `Expr` is
+    /// promoted with it, and ahead of it.
+    #[test]
+    fn extract_common_declarations_promotes_datatypes_before_their_users() {
+        let mut session = IncrementalAYSession::new();
+        let vcs = vec![make_vc(expr_eq("e", "a")), make_vc(expr_eq("e", "b"))];
+
+        session.extract_common_declarations(&vcs);
+
+        assert_eq!(session.stats().common_assertions, 1);
+        let commands = &session.common_assertions[0].commands;
+        // `Expr` and `e` both appear in 2 VCs, so both are promoted — and the
+        // sort must land ahead of the `declare-fun` that uses it.
+        let datatype = commands.iter().position(|c| c.starts_with("(declare-datatype Expr "));
+        let variable = commands.iter().position(|c| c.starts_with("(declare-fun e "));
+        assert!(
+            matches!((datatype, variable), (Some(sort), Some(var)) if sort < var),
+            "the promoted variable's datatype must be promoted with it, and declared \
+             before it: {commands:?}"
+        );
+        assert!(
+            !commands.iter().any(|c| c.starts_with("(declare-fun a ")),
+            "a variable in only ONE VC is not promoted: {commands:?}"
+        );
     }
 }

@@ -433,6 +433,7 @@ pub(crate) fn check_termination(func: &VerifiableFunction, vcs: &mut Vec<Verific
                     location: clause.span.clone(),
                     formula: Formula::Bool(false),
                     contract_metadata: source_contract_metadata(source_contract_index),
+                    obligation: None,
                 });
             }
             Ok(None) => {}
@@ -564,6 +565,7 @@ pub(crate) fn check_termination(func: &VerifiableFunction, vcs: &mut Vec<Verific
             location: span,
             formula: conjoin_loop_invariant_preconditions(func, measure_local, core),
             contract_metadata: None,
+            obligation: None,
         });
     }
 
@@ -660,6 +662,7 @@ pub(crate) fn check_termination(func: &VerifiableFunction, vcs: &mut Vec<Verific
                 conjoin_recursion_preconditions(func, core),
             ),
             contract_metadata: source_contract_metadata(explicit_source_contract_index),
+            obligation: None,
         });
     }
     if let Some(span) = explicit_binding_failure {
@@ -715,6 +718,7 @@ fn unsupported_recursion_decreases_vc(
         // satisfiable for direct solver callers too: it can never become Proved.
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     }
 }
 

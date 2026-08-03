@@ -7,8 +7,9 @@ use trust_types::fx::{FxHashMap, FxHashSet};
 
 use trust_types::{
     AggregateKind, AssertMessage, BinOp, BlockId, ConstValue, ContractKind, ContractMetadata,
-    Formula, GuardCondition, Operand, Place, Projection, Rvalue, Sort, SourceSpan, Statement,
-    Symbol, Terminator, Ty, VcKind, VerifiableFunction, VerificationCondition, VerificationResult,
+    Formula, GuardCondition, ObligationRecord, ObligationWrapper, Operand, PathGuardTerm, Place,
+    Projection, Rvalue, Sort, SourceSpan, Statement, Symbol, Terminator, Ty, VcKind,
+    VerifiableFunction, VerificationCondition, VerificationResult,
 };
 
 use crate::abstract_interp;
@@ -1286,6 +1287,12 @@ mod summary_callsite_tests;
 mod v2_path_guard_tests;
 #[cfg(test)]
 mod contract_field_bound_tests;
+// A `bool` contract clause could never equal the re-parse of its own source
+// text, because `parse_spec_expr` has no type environment and defaults every
+// leaf to `Sort::Int`. That minted a duplicate ill-sorted postcondition VC and
+// denied the clause its `source_contract_index`.
+#[cfg(test)]
+mod clause_sort_match_tests;
 #[cfg(test)]
 mod float_range_tests;
 #[cfg(test)]
@@ -1440,6 +1447,13 @@ mod widening_mul_tests;
 // instead of vacuously proving against the entry snapshot.
 #[cfg(test)]
 mod postcondition_mutated_param_tests;
+// Trust (out-parameter postcondition): an `ensures` over a place written
+// THROUGH a `&mut` parameter (`*x`, `(*self).0`) must be pinned to the stored
+// value. The deref store is not a block-def establish point (the pointer is an
+// opaque parameter), so without the explicit pin the pointee stays free and the
+// clause is decided by havoc — TRUE and FALSE twins both "refuted".
+#[cfg(test)]
+mod mut_ref_postcondition_tests;
 // Trust (task #77): `v2_bv_guard_constraint` now renders a dominating range guard as a
 // BV bound up to width 128 (was width<=64), so guarded signed-128 add/sub can prove.
 #[cfg(test)]

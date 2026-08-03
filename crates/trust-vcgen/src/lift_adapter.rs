@@ -781,6 +781,7 @@ fn allocator_lifetime_vc(
         location,
         formula: allocator_blocker_formula(&blockers),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -903,6 +904,7 @@ fn copy_sink_length_vc_from_fact(
         location: fact.location.clone(),
         formula,
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -1214,6 +1216,7 @@ pub fn generate_aarch64_selected_slice_boundary_vcs(
         location,
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     }]
 }
 
@@ -1617,6 +1620,7 @@ fn unsupported_record_vc(
         location,
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -2177,6 +2181,7 @@ pub fn generate_binary_abi_contradiction_vcs(
                     .map_or_else(|| fallback_location.clone(), trust_types::BinaryOrigin::span),
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             });
         }
     }
@@ -2645,6 +2650,7 @@ pub fn generate_memory_model_vcs(lifted: &LiftedFunction) -> Vec<VerificationCon
                             location: span.clone(),
                             formula: memory_oob_formula(addr.clone()),
                             contract_metadata: None,
+                            obligation: None,
                         });
                         vcs.push(saved_return_address_overwrite_store_vc(
                             func_name, block.id.0, span, addr, 8,
@@ -2669,6 +2675,7 @@ pub fn generate_memory_model_vcs(lifted: &LiftedFunction) -> Vec<VerificationCon
                 location: return_source_span(lifted, block, sp_local_index),
                 formula: sp_mismatch,
                 contract_metadata: None,
+                obligation: None,
             });
         }
 
@@ -2727,6 +2734,7 @@ pub fn generate_control_flow_vcs(lifted: &LiftedFunction) -> Vec<VerificationCon
                 location: unresolved_edge_source_span(block),
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             });
         }
     }
@@ -2777,6 +2785,7 @@ fn opaque_control_flow_vc(
         location,
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -2800,6 +2809,7 @@ fn format_string_call_vc(
         location: span.clone(),
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     })
 }
 
@@ -2857,6 +2867,7 @@ fn missing_memory_access_fact_vc(
         location: span.clone(),
         formula: unknown_memory_region_formula(addr),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -2945,6 +2956,7 @@ fn saved_return_address_overwrite_vc(
         location,
         formula,
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -3028,6 +3040,7 @@ fn memory_access_vc(func_name: &str, access: &MemoryAccessFact) -> VerificationC
         location: access.origin.span(),
         formula,
         contract_metadata: None,
+        obligation: None,
     }
 }
 

@@ -652,6 +652,7 @@ fn test_real_ay_safe_vs_unsafe_arithmetic_formulas() {
         location: SourceSpan::default(),
         formula: unsafe_formula,
         contract_metadata: None,
+        obligation: None,
     };
 
     let unsafe_result = ay.verify(&unsafe_vc);
@@ -689,6 +690,7 @@ fn test_real_ay_safe_vs_unsafe_arithmetic_formulas() {
         location: SourceSpan::default(),
         formula: safe_check_formula,
         contract_metadata: None,
+        obligation: None,
     };
 
     let safe_result = ay.verify(&safe_vc);

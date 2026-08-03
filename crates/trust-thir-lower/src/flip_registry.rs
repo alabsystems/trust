@@ -247,6 +247,116 @@ fn loop_contract_count_allows_flip(first_class_loop_contracts: usize) -> bool {
     first_class_loop_contracts == 0
 }
 
+/// Trust (union lane): may a body that registered `union_lane` union PLACEHOLDER lanes flip?
+///
+/// Never. Extracted as a `TyCtxt`-free predicate for the same reason
+/// [`loop_contract_count_allows_flip`] is: the refusal is then pinned by a unit test instead of
+/// living only inside a function no test can call.
+fn union_lane_allows_flip(union_lane: bool) -> bool {
+    !union_lane
+}
+
+/// Trust (enum param lane): may a body that registered ENUM PARAM PLACEHOLDER lanes flip?
+///
+/// Never. The lane spells `Ty::Unit` — zero bytes — for a variant field that holds a caller's
+/// `T`, so codegen'ing a function that copies such an enum by value would silently drop the
+/// payload; and `to_mir` has no arm that compares a trust-ir `EnumDef`'s field list against the
+/// built type, exactly as it has none for `StructDef` (the defect `union_lane_allows_flip`
+/// exists for).
+///
+/// STATED AS ITS OWN PREDICATE rather than left to the walls that also refuse the class today —
+/// `to_mir`'s param and return gates both require `!built.has_non_region_param()`, which a
+/// param-lane enum's rustc type fails BY CONSTRUCTION, so `record_green` is not even reached.
+/// That is a real wall, but it is somebody else's ground truth about GENERICS, not a decision
+/// about placeholder lanes: a future monomorphized instantiation reaching this seam must relax
+/// THIS line deliberately. Extracted `TyCtxt`-free for the same reason
+/// [`union_lane_allows_flip`] is: the refusal is then pinned by a unit test instead of living
+/// only inside a function no test can call.
+fn enum_param_lane_allows_flip(enum_param_lane: bool) -> bool {
+    !enum_param_lane
+}
+
+/// Trust (fn-ptr adapter lane): may a body whose module carries a PRODUCER-SYNTHESIZED
+/// closure→fn-pointer adapter flip?
+///
+/// Never. The adapter is a function with no rustc counterpart, so there is no built-MIR oracle
+/// for it and no `Instance` it could be codegen'd as; and the crate assembler drops it outright.
+///
+/// STATED AS ITS OWN PREDICATE rather than left to the three absences that also refuse it today —
+/// `body_lineage_digest` errs on a module with != 1 function (so `green_body` returns `None`),
+/// `to_mir::const_of` has no `Constant::FnDef` arm (so the derived-MIR verdict is never
+/// `DerivedAgreed` and this function is never even called), and `BodyKind::StaticInit` is outside
+/// the body-kind allow-list. Each of those is a real wall; none of them is a decision about
+/// synthetic functions, and two of them would evaporate the moment someone widened an unrelated
+/// arm. Extracted `TyCtxt`-free for the same reason [`union_lane_allows_flip`] is: the refusal is
+/// then pinned by a unit test instead of living only inside a function no test can call.
+fn fnptr_adapter_allows_flip(fnptr_adapter: bool) -> bool {
+    !fnptr_adapter
+}
+
+/// Trust (wave-TR): may a body that FORWARDED an unledgered THIN SHARED REBORROW flip?
+///
+/// Never, for now. The wave-TR arm returns a `&T` VALUE that this lowering did not produce and
+/// that is in no pointer ledger (`borrow_ptrs` / `ref_param_ptrs` / `global_ptrs` /
+/// `interior_ptrs`) — a call result, a by-ref match binding, a ref-typed local. That posture is
+/// right for the PRODUCER (the value already flowed unguarded before the reborrow existed; see
+/// `Lowered::thin_reborrow`), but it means the producer holds no record it could hand the flip
+/// about where the pointer came from. Codegen is the one seam where that matters, so it refuses.
+///
+/// STATED AS ITS OWN PREDICATE rather than left to the wall that also refuses the class today.
+/// `to_mir` rejects the DOMINANT provenance — a `&T`-returning callee is outside its call fragment
+/// ("Call(callee return outside the fragment: …)"), because `ir_scalar_of_body` is `None` for a
+/// reference and the fallback arm demands a `Copy`, `!needs_drop` `ty::Adt(struct)`. That is a real
+/// wall and it is NOT ABOUT THIS LANE: it is a call RETURN-FIDELITY rule, it would evaporate the
+/// moment someone widened the return fragment for an unrelated reason, and it says nothing at all
+/// about the other provenances (a by-ref match binding reaches its value through `ExtractField`,
+/// under entirely separate gates). Relying on it would be relying on unreachability — the exact
+/// mistake [`union_lane_allows_flip`] and [`fnptr_adapter_allows_flip`] exist to avoid. Extracted
+/// `TyCtxt`-free for the same reason they are: the refusal is then pinned by a unit test instead of
+/// living only inside a function no test can call.
+fn thin_reborrow_allows_flip(thin_reborrow: bool) -> bool {
+    !thin_reborrow
+}
+
+/// Trust: the conjunction of every per-body PLACEHOLDER/PROVENANCE LANE gate — the single thing
+/// [`record_green`] calls, so that "is this lane wired into the flip decision?" is a question a
+/// unit test can answer.
+///
+/// WHY THIS EXISTS AS A FUNCTION. Each lane predicate below is `TyCtxt`-free precisely so a test
+/// can execute it, but the CALL SITE was not: `record_green` takes a `TyCtxt` and no unit test can
+/// reach it, so with the four gates spelled as consecutive `if … { return; }` blocks, DELETING one
+/// left the whole suite green (measured, wave-TR: 262/262 passed with the thin-reborrow gate
+/// removed from the body). A gate nothing reads is not a gate. Routing them through one
+/// `&Lowered`-taking conjunction moves the wiring into a pure function, where
+/// `test_every_body_lane_gate_is_wired_into_the_flip_decision` pins each lane by fixture.
+///
+/// Order is irrelevant — every conjunct is a pure `!flag` on an independent field — so this is a
+/// conjunction, not a sequence, and nothing here may acquire a side effect.
+fn body_lane_gates_allow_flip(lowered: &Lowered) -> bool {
+    // Trust (union lane): a body whose module registered a UNION PLACEHOLDER LANE never flips.
+    // The lane spells `Ty::Unit` for a struct field that holds real `union` bytes, and `to_mir`'s
+    // param/return gates cannot catch it: both admit any concrete `ty::Adt(struct)` with
+    // `!needs_drop` and never compare the trust-ir `StructDef`'s field list against the built
+    // type. `<Sha256 as Clone>::clone` — which returns `Sha256` BY VALUE over exactly such a
+    // struct — is `BodyKind::Fn`, i.e. admitted by the body-kind gate in `record_green`, and fully
+    // concrete, i.e. past the layout pre-gate. Flipping it would emit a copy that silently drops
+    // the union's contents. Load-bearing, not defensive, and keyed on the producer's ledger
+    // (`Lowered::union_lane`), never on the `()` spelling.
+    union_lane_allows_flip(lowered.union_lane)
+        // Trust (enum param lane): a body whose module registered an ENUM PARAM PLACEHOLDER LANE
+        // never flips — see `enum_param_lane_allows_flip`. Load-bearing as a DECISION, not as a
+        // consequence of `to_mir`'s generic-param gates happening to refuse the class today.
+        && enum_param_lane_allows_flip(lowered.enum_param_lane)
+        // Trust (fn-ptr adapter lane): a body whose module carries a producer-synthesized adapter
+        // never flips — see `fnptr_adapter_allows_flip`. Load-bearing as a DECISION, not as a
+        // consequence of the lineage digest's arity rule.
+        && fnptr_adapter_allows_flip(lowered.fnptr_adapter)
+        // Trust (wave-TR): a body that forwarded an unledgered thin shared reborrow never flips —
+        // see `thin_reborrow_allows_flip`. Load-bearing as a DECISION, not as a consequence of
+        // `to_mir`'s call-return-fidelity gate happening to refuse the dominant provenance today.
+        && thin_reborrow_allows_flip(lowered.thin_reborrow)
+}
+
 /// Whether this definition has enough source-place provenance for the current
 /// TrustIr -> MIR flip. Native loop clauses are parser-island expressions whose
 /// identifiers are rebound to MIR places during E4/E5 reconstruction. The
@@ -279,6 +389,23 @@ pub fn record_green(tcx: TyCtxt<'_>, def: LocalDefId, lowered: &Lowered, markers
     }
     // Defensive: a green verdict implies a clean lowering, but never trust the caller.
     if !lowered.unsupported.is_empty() {
+        return;
+    }
+    // Trust: EVERY per-body PLACEHOLDER/PROVENANCE LANE refusal, in one call — see
+    // [`body_lane_gates_allow_flip`] for each lane's own predicate and its own reason. Aggregated
+    // rather than written as four consecutive `if … { return; }` blocks so that the WIRING itself
+    // is testable: no unit test can reach this `TyCtxt`-taking function, so with the gates spelled
+    // inline, dropping one from the list was a silent widening that every existing test still
+    // passed (measured, wave-TR mutation C).
+    //
+    // TWO tests, and both are needed — the aggregation moves the hole, it does not close it.
+    // `test_every_body_lane_gate_is_wired_into_the_flip_decision` executes the aggregate against a
+    // real `Lowered` fixture and goes red if any lane leaves THE FUNCTION. It says nothing about
+    // THIS LINE: delete the `if` below and that test stays green, which is mutation C one level up.
+    // `test_the_lane_gate_aggregate_is_read_by_record_green` pins this call site by source text —
+    // that the aggregate is read here, exactly once, as a REFUSAL (`if !… { return; }`).
+    // Neither test may be dropped because the other exists.
+    if !body_lane_gates_allow_flip(lowered) {
         return;
     }
     // Trust (CTFE flip lane): FN bodies flip on the CODEGEN seam (`optimized_mir` → `try_flip`);
@@ -347,8 +474,10 @@ mod tests {
     use trust_ir::{BlockId, FuncId, FuncTy, Function, Module};
 
     use super::{
-        GreenBody, SessionFlipRegistry, green_body, loop_contract_count_allows_flip,
-        session_gates_allow_flip,
+        GreenBody, Lowered, SessionFlipRegistry, body_lane_gates_allow_flip,
+        enum_param_lane_allows_flip, fnptr_adapter_allows_flip, green_body,
+        loop_contract_count_allows_flip, session_gates_allow_flip, thin_reborrow_allows_flip,
+        union_lane_allows_flip,
     };
     use crate::lineage::body_lineage_digest;
 
@@ -373,6 +502,10 @@ mod tests {
     /// Trust (L1) FAIL-CLOSED: no digest, no green. A mini-module that is not a
     /// single-function per-body lowering cannot be attested, so no registry entry
     /// exists for it and the body stays on built MIR.
+    ///
+    /// Trust (fn-ptr adapter lane): the MULTI-function half is now a shape the producer can
+    /// actually emit (a body plus its synthesized closure→fn-pointer adapter), not a
+    /// hypothetical — so it is asserted here alongside the body-less one.
     #[test]
     fn test_green_body_declines_when_lineage_cannot_be_digested() {
         assert!(
@@ -380,9 +513,190 @@ mod tests {
             "a body-less mini-module must not become a green entry: the flip event could \
              not name, by digest, which body it selected"
         );
+        let mut two = probe_module("probe");
+        let ty = two.functions[0].ty;
+        two.add_function(Function::new(
+            FuncId::new(crate::ADAPTER_FUNC_ID_BASE),
+            "probe::{fnptr-adapter}",
+            ty,
+            BlockId::new(0),
+        ));
+        assert!(
+            green_body(&two, &[]).is_none(),
+            "a mini-module carrying a producer-synthesized adapter names two program objects; \
+             it must not become a green entry"
+        );
         assert!(
             green_body(&probe_module("probe"), &[]).is_some(),
             "the ordinary single-function case must still be admitted (the gate is not vacuous)"
+        );
+    }
+
+    /// Trust (fn-ptr adapter lane) FLIP REFUSAL, PINNED AS A DECISION. A body whose module
+    /// carries a producer-synthesized adapter never flips.
+    ///
+    /// The point of testing the PREDICATE rather than the pipeline: three unrelated walls also
+    /// stop these bodies today — the lineage digest's `functions.len() != 1` rule above,
+    /// `to_mir::const_of`'s missing `Constant::FnDef` arm (so the derived-MIR verdict is never
+    /// `DerivedAgreed` and `record_green` is never called at all), and the `BodyKind` allow-list
+    /// that excludes `StaticInit`. None of those is a decision about synthetic functions, and a
+    /// future wave that widens any one of them must still meet this line.
+    #[test]
+    fn test_fnptr_adapter_body_never_flips() {
+        assert!(
+            fnptr_adapter_allows_flip(false),
+            "an ordinary body must still flip — otherwise this gate proves nothing"
+        );
+        assert!(
+            !fnptr_adapter_allows_flip(true),
+            "a body carrying a function with no rustc counterpart has no built-MIR oracle for \
+             that function and must never reach codegen"
+        );
+    }
+
+    /// Trust (wave-TR) FLIP REFUSAL, PINNED AS A DECISION. A body that forwarded an unledgered
+    /// thin shared reborrow (`&*r` where `r` is a call result / by-ref match binding / ref-typed
+    /// local) never flips.
+    ///
+    /// The point of testing the PREDICATE rather than the pipeline: a wall also stops the dominant
+    /// provenance today — `to_mir` puts a `&T`-returning callee outside its call fragment. That is
+    /// a call RETURN-FIDELITY rule, not a decision about reborrow provenance, and it covers none of
+    /// the other provenances. A future wave that widens the return fragment must still meet this
+    /// line.
+    #[test]
+    fn test_thin_reborrow_body_never_flips() {
+        assert!(
+            thin_reborrow_allows_flip(false),
+            "an ordinary body must still flip — otherwise this gate proves nothing"
+        );
+        assert!(
+            !thin_reborrow_allows_flip(true),
+            "a body forwarding a reference value the producer's ledgers do not record must never \
+             reach codegen on that value"
+        );
+    }
+
+    /// A `Lowered` in the posture a body reaches `record_green` in: CLEAN, no pending consts, and
+    /// every lane flag clear. The four lane flags are the ONLY thing the callers below vary.
+    fn lane_probe_lowered() -> Lowered {
+        Lowered {
+            module: probe_module("lane_gate_probe"),
+            body_kind: crate::BodyKind::Fn,
+            opaque_collapse: false,
+            enum_declines: Vec::new(),
+            union_lane: false,
+            enum_param_lane: false,
+            symbolic: false,
+            unsupported: Vec::new(),
+            contains_call: false,
+            place_path_carrier: false,
+            zst_closure_arg: false,
+            fnptr_adapter: false,
+            thin_reborrow: false,
+            callees: Vec::new(),
+            pending_consts: Vec::new(),
+        }
+    }
+
+    /// **THE WIRING PIN.** Every per-body lane gate must actually be READ by the flip decision.
+    ///
+    /// This test exists because of a measured hole, not a hypothetical one. While the four gates
+    /// were spelled as consecutive `if … { return; }` blocks inside `record_green` — a
+    /// `TyCtxt`-taking function no unit test can call — DELETING one of them left the entire suite
+    /// green (262/262, wave-TR mutation C). Each lane's own `*_allows_flip` test still passed,
+    /// because those test the PREDICATE and the predicate was still correct; what had gone missing
+    /// was the wire. `body_lane_gates_allow_flip` moves that wire into a pure function, and this
+    /// test drives it with a real `Lowered`: set exactly one lane flag, and the flip must be
+    /// refused. Drop any lane from the conjunction and the corresponding case goes red.
+    ///
+    /// The all-clear case is asserted first: a gate list that refuses everything would satisfy the
+    /// four refusals vacuously.
+    #[test]
+    fn test_every_body_lane_gate_is_wired_into_the_flip_decision() {
+        assert!(
+            body_lane_gates_allow_flip(&lane_probe_lowered()),
+            "a body with every lane flag clear must still be allowed to flip — otherwise the four \
+             refusals below are vacuous"
+        );
+        let lanes: [(&str, fn(&mut Lowered)); 4] = [
+            ("union_lane", |l| l.union_lane = true),
+            ("enum_param_lane", |l| l.enum_param_lane = true),
+            ("fnptr_adapter", |l| l.fnptr_adapter = true),
+            ("thin_reborrow", |l| l.thin_reborrow = true),
+        ];
+        for (name, set) in lanes {
+            let mut probe = lane_probe_lowered();
+            set(&mut probe);
+            assert!(
+                !body_lane_gates_allow_flip(&probe),
+                "lane `{name}` is declared to refuse the flip but is NOT WIRED INTO the decision — \
+                 its predicate being correct proves nothing if nothing calls it"
+            );
+        }
+    }
+
+    /// **THE WIRE ABOVE THE WIRE.** The test above proves each lane is read by
+    /// `body_lane_gates_allow_flip`. It proves NOTHING about whether `record_green` reads that
+    /// aggregate: `record_green` takes a `TyCtxt`, no unit test can call it, and deleting its
+    /// one-line refusal gate leaves the whole suite green. That is wave-TR mutation C displaced
+    /// one level up, and an adversarial review caught the refactor claiming to have fixed the hole
+    /// when it had only moved it.
+    ///
+    /// So the call site is pinned by SOURCE TEXT, in the `lib.rs` wave-DP idiom (see
+    /// `the_projected_pointee_lane_is_actually_wired`). Crude, and the honest tool for a property
+    /// about the shape of a call inside a function no test can reach. This test goes RED if the
+    /// gate is deleted, duplicated, evaluated without acting on the result, or turned into
+    /// anything other than a refusal.
+    #[test]
+    fn test_the_lane_gate_aggregate_is_read_by_record_green() {
+        // Needles are ASSEMBLED at run time: this test's own source is inside
+        // `include_str!("flip_registry.rs")`, so a literal needle would match itself and the guard
+        // would pass with the production call site deleted.
+        let producer = include_str!("flip_registry.rs");
+
+        // Read as a REFUSAL — `!aggregate(...)`. Exactly two occurrences in the file: this one's
+        // `record_green` gate, and the fixture-driven wiring test above. A third means some other
+        // caller now decides the same question; a first-and-only means the production gate is gone.
+        let refusal = format!("!{}(", "body_lane_gates_allow_flip");
+        assert_eq!(
+            producer.matches(refusal.as_str()).count(),
+            2,
+            "the lane aggregate must be READ as a refusal in exactly two places — the \
+             `record_green` gate and the wiring test — and this count is what makes deleting the \
+             gate visible at all",
+        );
+
+        // …and one of those two must be INSIDE `record_green`.
+        let fn_at = producer
+            .find(&format!("pub fn {}(", "record_green"))
+            .expect("`record_green` must exist");
+        let fn_end = fn_at
+            + producer[fn_at..]
+                .find("\npub fn ")
+                .expect("`record_green` must be followed by another item");
+        let body = &producer[fn_at..fn_end];
+        assert_eq!(
+            body.matches(refusal.as_str()).count(),
+            1,
+            "`record_green` must read the lane aggregate — a gate nothing calls is not a gate, \
+             and this is the exact hole (mutation C) this branch has now paid for twice",
+        );
+
+        // And it must REFUSE on it, not merely evaluate it: `if !… { return; }`.
+        let at = body.find(refusal.as_str()).expect("the gate is inside `record_green`");
+        assert!(
+            body[..at].ends_with("if "),
+            "the aggregate must be the CONDITION of an `if !…`, not a bound value some later line \
+             may or may not consult",
+        );
+        let tail = &body[at..];
+        let open = tail.find('{').expect("the gate must open a block");
+        let close = tail.find('}').expect("the gate must close it");
+        assert!(open < close, "the gate's block must be well-formed");
+        assert!(
+            tail[open..close].contains(&format!("{};", "return")),
+            "the gate's block must RETURN — refusing the flip. Any other body (a log, a counter) \
+             would let a lane-carrying body reach the registry",
         );
     }
 
@@ -473,6 +787,49 @@ mod tests {
         assert!(
             !loop_contract_count_allows_flip(2),
             "an invariant/decreases pair must block the flip as one provenance-sensitive lane"
+        );
+    }
+
+    /// Trust (union lane) FLIP REFUSAL, PINNED. A body carrying a union PLACEHOLDER lane is
+    /// permanently flip-ineligible. This is not defensive: the class contains `<Sha256 as
+    /// Clone>::clone`, which is `BodyKind::Fn` (admitted by the body-kind gate), fully concrete
+    /// (past the layout pre-gate), and returns the union-bearing struct BY VALUE. `to_mir`'s
+    /// return gate accepts any concrete `ty::Adt(struct)` with `!needs_drop` and never compares
+    /// the trust-ir `StructDef`'s field list against the built type, so it would wave through a
+    /// copy that silently drops the union's contents.
+    #[test]
+    fn union_placeholder_lane_permanently_blocks_the_flip() {
+        assert!(
+            union_lane_allows_flip(false),
+            "a body with no union lane must stay eligible — the gate is not vacuous"
+        );
+        assert!(
+            !union_lane_allows_flip(true),
+            "a union placeholder lane must block the flip: codegen would copy the struct by \
+             value and drop the union's bytes"
+        );
+    }
+
+    /// Trust (enum param lane) FLIP REFUSAL, PINNED, AND OWNED — not inherited.
+    ///
+    /// `to_mir`'s param and return gates both require `!built.has_non_region_param()`, which a
+    /// param-lane enum's rustc type fails BY CONSTRUCTION, so no body in the class reaches
+    /// `record_green` today. That is somebody else's ground truth about GENERICS, not a decision
+    /// about placeholder lanes: it evaporates the moment a monomorphized instantiation carrying
+    /// such a def reaches the seam. The refusal is stated here so that relaxation must be
+    /// deliberate.
+    ///
+    /// The negative half keeps the gate non-vacuous.
+    #[test]
+    fn enum_param_placeholder_lane_permanently_blocks_the_flip() {
+        assert!(
+            enum_param_lane_allows_flip(false),
+            "a body with no enum param lane must stay eligible — the gate is not vacuous"
+        );
+        assert!(
+            !enum_param_lane_allows_flip(true),
+            "an enum param placeholder lane must block the flip: codegen would copy the enum by \
+             value with a lane sized at zero bytes and drop the caller's `T`"
         );
     }
 }

@@ -28,6 +28,12 @@
 //   * RUNG B — `bad_acc_escape` / `bad_acc_read` / `bad_acc_alias` DECLINE BY
 //     NAME (`accumulator_escape` / `accumulator_read` / `accumulator_alias`),
 //     the design §4 rules (iii)/(ii)/(i).
+//   * `pick` (`&Tree -> &Tree`) is a RECORDED RETRACTION, not a fold row — see
+//     `pick_retraction_is_pinned_to_the_int_bool_carrier_gate` below and the
+//     RETRACTION block on its expectation row. It used to be this corpus's
+//     seventh FULLY_FAITHFUL row via the straight-line trust-ir lane; it no
+//     longer claims full faithfulness, and the expectation table says so
+//     explicitly.
 //
 // Run with:
 //   RUSTC_BOOTSTRAP=1 cargo test -p trust-clean --manifest-path crates/Cargo.toml \
@@ -80,21 +86,30 @@ fn structural_fold_corpus_scorecard() {
     assert_eq!(sc.total, 16, "expected all sixteen structural-fold-corpus dumps to load");
     // RUNGS A+B HEADLINE: the three overflow-free Int folds (rung A) + the two
     // bool folds + the good accumulator fold (rung B) are FULLY_FAITHFUL via
-    // the trust-ir structural-fold witness. The seventh FF row is `pick`
-    // (`&Tree -> &Tree` identity), which certifies via the PRE-EXISTING
-    // straight-line lane, not this one (`sem_structural_fold_shape_of` declines
-    // it `non_int_return` — pinned below). `size`/`sum` are shape-recognized
+    // the trust-ir structural-fold witness. `size`/`sum` are shape-recognized
     // and their witness mints, but they are held at the safety-discharge gate
     // by their genuine i64 overflow obligation; the adversarial members
     // decline by name.
+    //
+    // RETRACTED 6 <- 7 (RC-2, recorded 2026-08-01). The seventh row used to be
+    // `pick` (`&Tree -> &Tree` identity) via the PRE-EXISTING straight-line
+    // trust-ir lane. That certificate is withdrawn; the full rationale — the
+    // gate, the commit that introduced it, and why the row cannot re-earn the
+    // claim with the carrier the anchor has today — is on `pick`'s row in
+    // `structural_fold_member_verdicts` and enforced by
+    // `pick_retraction_is_pinned_to_the_int_bool_carrier_gate`. This is a
+    // capability LOSS honestly booked, not a recognizer gap and not a
+    // relaxation: nothing about the gate, the comparator or the corpus fixtures
+    // was touched to obtain it.
     assert_eq!(
-        sc.fully_faithful, 7,
+        sc.fully_faithful, 6,
         "exactly xor_all/first_leaf/tag_xor/has_leaf_zero/all_leaves_pos/collect_leaves \
-         (fold lane) + pick (straight-line lane) must be fully faithful — got {}",
+         (the fold lane) must be fully faithful — `pick` is RETRACTED, see its row in \
+         structural_fold_member_verdicts — got {}",
         sc.fully_faithful
     );
     assert_eq!(
-        sc.fully_faithful_via_trustir, 7,
+        sc.fully_faithful_via_trustir, 6,
         "every certificate here must be trust-ir-primary"
     );
     assert_eq!(sc.fully_faithful_mirsem_fallback, 0, "no MirSem lane exists for a recursive fold");
@@ -115,10 +130,65 @@ fn structural_fold_member_verdicts() {
         ("bad_self", false),
         ("bad_rebuilt", false),
         ("bad_nonsub", false),
-        // `pick` certifies via the PRE-EXISTING straight-line lane (a
-        // parameter-reflecting identity), NOT the fold lane — see
-        // `adversarial_members_decline_by_name`'s `non_int_return` pin.
-        ("pick", true),
+        // ------------------------------------------------------------------
+        // RETRACTION — `pick` (`&Tree -> &Tree`, body `_0 := Use(Copy(_1))`).
+        //
+        // WAS `true`. `pick` used to certify FULLY_FAITHFUL via the
+        // PRE-EXISTING straight-line trust-ir lane
+        // (`prove::straight_line_fully_faithful_via_trustir`), never via the
+        // fold lane (`sem_structural_fold_shape_of` declines it
+        // `non_int_return` — still pinned by
+        // `adversarial_members_decline_by_name`).
+        //
+        // THE GATE THAT NOW DECLINES IT: `prove.rs:7824`
+        //     if !matches!(body.return_ty, Ty::Int { .. } | Ty::Bool) {
+        //         return None;
+        //     }
+        // in `straight_line_ir_body`, together with its sibling operand gate at
+        // `prove.rs:7854` (`place_type(body, p)` must be `Int`/`Bool` before a
+        // bare `Copy`/`Move` becomes an `IrOperand::Var`). Both appear 0 times
+        // at 43feddf372 and 2 times at HEAD; both were introduced by
+        // 938f11049a ("Merge origin/main with audited TrustClean authority
+        // fixes"). Stated purpose, in `straight_line_ir_body`'s own SOUNDNESS
+        // paragraph: "The scalar trust-ir carrier admits only MIR `Int`/`Bool`
+        // values; floats and other typed values fail closed before
+        // translation."
+        //
+        // WHY `pick` TRIPS IT: `pick`'s return type and its parameter's type
+        // are both `&Tree` — not `Int`, not `Bool`. Nothing else about `pick`
+        // declines: `trust_vcgen::validate_function` passes,
+        // `assignment_types::all_assignments_match` passes (so this is NOT the
+        // equirecursive-lowering RC-1 that holds the fold rows), its safety VCs
+        // are vacuously discharged, and its trust-ir safety adequacy holds.
+        //
+        // WHY THE DECLINE IS CORRECT, NOT AN OVER-REJECTION. Measured, by
+        // disabling exactly these two gates and rerunning the lane:
+        //   * `pick` certifies again — so they are the whole cause; AND
+        //   * `fn fadd(a: f64, b: f64) -> f64 { a + b }` ALSO certifies
+        //     FULLY_FAITHFUL, as the Int-sorted trust-ir body
+        //     `Bin(Add, Var 0, Var 1)`. That claim is materially FALSE (IEEE-754
+        //     addition rounds; `Int` addition does not), and it is the exact
+        //     hazard the gates were written for.
+        // `pick`'s old certificate rode on that same admission: it modeled a
+        // `&Tree` value as a trust-ir `Int` variable. The refinement theorem the
+        // lane mints is `Eq` at `Int` (every statement builder in
+        // `trustir_anchor.rs` is `Expr::apps(eq, [int_ty(), lhs, rhs])`), so for
+        // a `&Tree`-valued function it is a sort-mismatched adequacy claim — a
+        // true theorem about `Int`s that says nothing about `pick`.
+        //
+        // WHY THE ROW IS NOT RE-EARNED HERE. Option (B) — mint a sort-neutral
+        // parameter-identity witness — needs a carrier the anchor does not have:
+        // `trustir_anchor.rs` has exactly one value sort (`Int`, `int_ty()`),
+        // so a legitimate `f(x) = x` at an arbitrary type requires NEW
+        // `Trust.TrustIr.*` registrations in `trustir_env_uncached` (new trusted
+        // spec surface, its own axiom-closure audit and fail-closed probe).
+        // That is a ratified design increment with its own kernel-facing
+        // soundness budget, not a test-table edit. Until that carrier exists,
+        // this row honestly claims nothing.
+        //
+        // DO NOT flip this back to `true` by relaxing `prove.rs:7824`/`:7854`.
+        // Flip it back only by landing the non-`Int` carrier above.
+        ("pick", false),
         // RUNG B — the bool lane:
         ("has_leaf_zero", true),
         ("all_leaves_pos", true),
@@ -144,6 +214,88 @@ fn structural_fold_member_verdicts() {
             d.fully_faithful
         );
     }
+}
+
+/// RC-2 — the RECORDED RETRACTION of the `pick` row, made ENFORCEABLE rather
+/// than merely commented (see the RETRACTION block on `pick`'s expectation row
+/// in `structural_fold_member_verdicts` for the full rationale).
+///
+/// This pins the ATTRIBUTION, so a future reader cannot mistake the retraction
+/// for either a lowering bug or a recognizer gap, and cannot quietly re-flip the
+/// expectation without first supplying the missing carrier:
+///
+///   1. `pick` is well-formed and assignment-typed — `validate_function` passes.
+///      So the retraction is NOT the equirecursive-lowering defect (RC-1) that
+///      holds the fold rows; that one fails closed at `all_assignments_match`,
+///      which `pick` passes.
+///   2. `pick`'s return type and its parameter's type are the SAME type, and
+///      that type is neither `Int` nor `Bool` — it is `&Tree`. That is exactly
+///      and only what `prove.rs:7824`
+///      (`!matches!(body.return_ty, Ty::Int { .. } | Ty::Bool)`) and its sibling
+///      operand gate at `prove.rs:7854` reject, because the trust-ir straight-
+///      line carrier has one value sort (`Int`) and would have to model a
+///      `&Tree` as an `Int` variable to proceed.
+///   3. The production gate therefore declines it, and the decline is a SHAPE
+///      decline (no recognizer accepted the body) — not a safety-VC residue:
+///      `pick`'s safety obligations are vacuous.
+///
+/// The day the anchor grows a sort-neutral value carrier, this test is the
+/// place that must be revisited together with the expectation row.
+#[test]
+fn pick_retraction_is_pinned_to_the_int_bool_carrier_gate() {
+    use trust_types::Ty;
+
+    let f = load("pick");
+
+    // (1) Well-formed: the retraction is not RC-1 and not a malformed fixture.
+    assert!(
+        trust_vcgen::validate_function(&f).is_ok(),
+        "pick must remain a well-formed, assignment-typed dump — if this fails the \
+         retraction rationale below no longer describes the actual decline"
+    );
+
+    // (2) The exact predicate `prove.rs:7824` tests, evaluated on the fixture.
+    let ret = &f.body.return_ty;
+    assert!(
+        !matches!(ret, Ty::Int { .. } | Ty::Bool),
+        "pick's return type must be the NON-scalar `&Tree` this retraction is about; \
+         got {ret:?}"
+    );
+    let param_ty = &f
+        .body
+        .locals
+        .get(1)
+        .expect("pick takes one parameter")
+        .ty;
+    assert_eq!(
+        ret, param_ty,
+        "pick is the parameter-identity `&Tree -> &Tree`; the retraction is precisely \
+         that the anchor cannot state `f(x) = x` at a non-`Int` sort"
+    );
+
+    // (3) The production verdict, and its shape/safety split.
+    let callees = std::collections::BTreeMap::new();
+    let d = trust_clean::prove::diagnose_fully_faithful_gate(&f, &callees);
+    println!(
+        "RETRACTED pick: fully_faithful={} via_ir_shape={} via_mirsem_shape={} cluster={}",
+        d.fully_faithful,
+        d.via_ir_shape,
+        d.via_mirsem_shape,
+        d.cluster_tag()
+    );
+    assert!(
+        !d.fully_faithful,
+        "pick's FULLY_FAITHFUL claim is RETRACTED — if it certifies again, either the \
+         non-`Int` carrier landed (then update the expectation row and this test \
+         together) or prove.rs:7824/:7854 were relaxed (which is forbidden: the same \
+         relaxation admits `fn fadd(a: f64, b: f64) -> f64 {{ a + b }}` as the Int-sorted \
+         `Bin(Add, Var 0, Var 1)`)"
+    );
+    assert!(
+        !d.via_ir_shape && !d.via_mirsem_shape,
+        "the retraction must be a SHAPE decline (no recognizer admits the body), not a \
+         safety-VC residue — pick raises no arithmetic obligation"
+    );
 }
 
 /// The two design-literal `+`-folds are SHAPE-recognized and their kernel

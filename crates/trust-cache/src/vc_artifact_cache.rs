@@ -440,6 +440,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Var(name.into(), Sort::Bool),
             contract_metadata: None,
+            obligation: None,
         }
     }
 

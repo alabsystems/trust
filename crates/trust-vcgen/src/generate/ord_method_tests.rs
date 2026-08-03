@@ -1,4 +1,4 @@
-use super::ord_method;
+use super::{is_bool_from_call, is_std_num_intrinsic, ord_method};
 
 #[test]
 fn matches_std_ord_min_max_clamp() {
@@ -25,4 +25,20 @@ fn rejects_user_min_outside_std_cmp() {
     // A user `mymod::min` is NOT the ordered min — must not be bounded.
     assert_eq!(ord_method("mycrate::mymod::min"), None);
     assert_eq!(ord_method("widget::clamp"), None);
+    assert_eq!(ord_method("mycrate::core::cmp::min"), None);
+}
+
+#[test]
+fn value_fact_callees_require_std_origin() {
+    assert!(is_bool_from_call("core::convert::From::from"));
+    assert!(is_bool_from_call("<usize as core::convert::From<bool>>::from"));
+    assert!(is_bool_from_call("<usize as From<bool>>::from"));
+    assert!(!is_bool_from_call("mycrate::convert::From::from"));
+    assert!(!is_bool_from_call("mycrate::core::convert::Into::into"));
+    assert!(!is_bool_from_call(
+        "<usize as mycrate::convert::From<bool>>::from"
+    ));
+
+    assert!(is_std_num_intrinsic("core::num::<impl u32>::count_ones"));
+    assert!(!is_std_num_intrinsic("mycrate::core::num::count_ones"));
 }

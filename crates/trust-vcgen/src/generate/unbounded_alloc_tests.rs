@@ -166,6 +166,53 @@ fn iterator_yield_name_gate_requires_exact_std_trait_namespace() {
     }
 }
 
+#[test]
+fn bounds_and_nonnull_fact_callees_require_canonical_owners() {
+    for callee in [
+        "alloc::vec::Vec::<u8>::push",
+        "std::vec::Vec::<u8>::with_capacity",
+        "<alloc::vec::Vec<u8>>::len",
+    ] {
+        assert!(super::vc_callee_is_std_vec_inherent(callee), "{callee}");
+    }
+    for callee in [
+        "mycrate::alloc::vec::Vec::push",
+        "<alloc::vec::Vec<u8> as mycrate::Trait>::push",
+        "mycrate::push",
+    ] {
+        assert!(!super::vc_callee_is_std_vec_inherent(callee), "{callee}");
+    }
+
+    assert!(super::vc_callee_is_slice_inherent(
+        "core::slice::<impl [u8]>::windows",
+        "windows"
+    ));
+    assert!(!super::vc_callee_is_slice_inherent(
+        "<[T] as mycrate::Trait>::windows",
+        "windows"
+    ));
+
+    assert!(super::is_slice_to_array_conversion(
+        "core::convert::TryInto::try_into"
+    ));
+    assert!(super::is_slice_to_array_conversion(
+        "<&[u8] as core::convert::TryInto<[u8; 8]>>::try_into"
+    ));
+    assert!(!super::is_slice_to_array_conversion(
+        "mycrate::core::convert::TryInto::try_into"
+    ));
+    assert!(!super::is_slice_to_array_conversion(
+        "<&[u8] as mycrate::convert::TryInto<[u8; 8]>>::try_into"
+    ));
+
+    assert!(super::is_std_container_as_ptr(
+        "alloc::vec::Vec::<u8>::as_ptr"
+    ));
+    assert!(!super::is_std_container_as_ptr(
+        "mycrate::core::slice::as_ptr"
+    ));
+}
+
 /// The exact shape of the interpreter OOM: `vec![None; size]` lowers to
 /// `std::vec::from_elem::<Option<u8>>(elem, size)` with `size` an unbounded
 /// `usize` param (size operand at index 1, after the element value). Before

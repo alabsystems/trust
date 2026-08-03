@@ -457,6 +457,13 @@ fn recognizer_matches_std_spellings_only() {
     assert!(!is_int_try_from_callee("mymod::try_from"));
     assert!(!is_int_try_from_callee("mycrate::convert::try_from"));
     assert!(!is_int_try_from_callee("<X as mycrate::TryFrom<Y>>::try_from"));
+    assert!(!is_int_try_from_callee("mycrate::core::convert::TryFrom::try_from"));
+    assert!(!is_int_try_from_callee(
+        "<u32 as mycrate::convert::TryFrom<i64>>::try_from"
+    ));
+    assert!(!is_int_try_from_callee(
+        "<u32 as mycrate::convert::TryInto<i64>>::try_into"
+    ));
     // EXACT method tail.
     assert!(!is_int_try_from_callee("core::convert::TryFrom::try_from_exact"));
 
@@ -466,4 +473,7 @@ fn recognizer_matches_std_spellings_only() {
     assert!(!is_std_unwrap_or_call("core::result::Result::<T, E>::unwrap_or_else"));
     assert!(!is_std_unwrap_or_call("core::result::Result::<T, E>::unwrap_or_default"));
     assert!(!is_std_unwrap_or_call("mycrate::Thing::unwrap_or"));
+    assert!(!is_std_unwrap_or_call(
+        "mycrate::core::result::Result::<T, E>::unwrap_or"
+    ));
 }

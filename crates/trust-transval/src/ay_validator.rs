@@ -173,6 +173,7 @@ impl TranslationValidator {
             location: func.span.clone(),
             formula: Formula::Not(Box::new(property.clone())),
             contract_metadata: None,
+            obligation: None,
         });
 
         normalize_property_vc(&mut prepared);
@@ -415,6 +416,7 @@ fn structural_vc(
         location: func.span.clone(),
         formula,
         contract_metadata: None,
+        obligation: None,
     }
 }
 

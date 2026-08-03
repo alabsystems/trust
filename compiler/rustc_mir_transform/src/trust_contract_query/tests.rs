@@ -108,7 +108,13 @@ fn lowered_text(
     let domains =
         if origin == ContractClauseOrigin::Native { native_domains.as_slice() } else { &[] };
     with_test_session_globals(|| {
-        match lower_contract_snippet_body_with_domains(body, kind, origin, domains)? {
+        match lower_contract_snippet_body_with_domains(
+            body,
+            kind,
+            origin,
+            domains,
+            &ProjectionEnvironment::default(),
+        )? {
             TrustContractPredicateKind::Typed { text, .. }
             | TrustContractPredicateKind::Opaque { text } => {
                 Some(text.as_str().strip_prefix(LOWERED_COMPILER_CONTRACT_PREFIX)?.to_string())
@@ -116,6 +122,94 @@ fn lowered_text(
             _ => None,
         }
     })
+}
+
+/// Build the projection environment a `&mut self` receiver of
+/// `struct Grid { storage: Storage }` / `struct Storage { detached: bool, n: u64 }`
+/// produces, plus a by-reference `s: &S` with one `u64` field.
+fn projection_fixture() -> ProjectionEnvironment {
+    let mut canonical_text = FxHashMap::default();
+    canonical_text.insert("self.storage.detached".to_string(), "(*self).0.0".to_string());
+    canonical_text.insert("self.storage.n".to_string(), "(*self).0.1".to_string());
+    canonical_text.insert("s.n".to_string(), "s.0".to_string());
+    ProjectionEnvironment { canonical_text }
+}
+
+fn projected_text(kind: TrustContractKind, body: &str) -> Option<String> {
+    use rustc_middle::mir::trust_contract::TrustContractPropositionDomain as Domain;
+
+    let domains = [
+        LoweredVariableDomain { name: "_0".to_string(), domain: Domain::Bool },
+        LoweredVariableDomain { name: "s.0".to_string(), domain: Domain::Bool },
+        LoweredVariableDomain { name: "self*.0.0".to_string(), domain: Domain::Bool },
+        LoweredVariableDomain {
+            name: "self*.0.1".to_string(),
+            domain: Domain::MachineInt { width: 64, signed: false },
+        },
+    ];
+    with_test_session_globals(|| {
+        match lower_contract_snippet_body_with_domains(
+            body,
+            kind,
+            ContractClauseOrigin::Native,
+            &domains,
+            &projection_fixture(),
+        )? {
+            TrustContractPredicateKind::Typed { text, .. }
+            | TrustContractPredicateKind::Opaque { text } => {
+                Some(text.as_str().strip_prefix(LOWERED_COMPILER_CONTRACT_PREFIX)?.to_string())
+            }
+            _ => None,
+        }
+    })
+}
+
+/// A projected field clause must emit the POSITIONAL, prefix-deref spelling
+/// whose `spec_parse` var name is byte-identical to the name
+/// `trust_vcgen::place_to_var_name` mints for the same MIR place — `(*self).0.0`
+/// parses to `self*.0.0`, which is what `(*_1).0.0` renders. Emitting the
+/// authored `self.storage.detached` instead would leave a FREE variable that no
+/// body fact can ever bind.
+#[test]
+fn native_field_projection_lowers_to_the_canonical_place_spelling() {
+    assert_eq!(
+        projected_text(TrustContractKind::Ensures, "!self.storage.detached").as_deref(),
+        Some("!((*self).0.0)")
+    );
+    assert_eq!(
+        projected_text(TrustContractKind::Ensures, "self.storage.n == 0").as_deref(),
+        Some("((*self).0.1) == (0)")
+    );
+    assert_eq!(
+        projected_text(TrustContractKind::Ensures, "result == s.n").as_deref(),
+        Some("(result) == (s.0)")
+    );
+}
+
+/// Every shape without a sound positional name must keep failing closed. A
+/// false PROVE is catastrophic; an honest refusal is merely annoying.
+#[test]
+fn native_field_projection_fails_closed_on_unresolvable_chains() {
+    for body in [
+        // Not a field of the receiver's type.
+        "!self.storage.missing",
+        "!self.missing",
+        // Not a parameter at all.
+        "!other.storage.detached",
+        // Deeper than the enumerated layout.
+        "self.storage.detached.deeper == 0",
+        // A method call is not a place.
+        "s.n() == 0",
+        // The result binding has no projected signature entry.
+        "result.0 == 0",
+        // The CANONICAL spelling is not author-reachable: only a chain that
+        // resolves through the environment may mint a name.
+        "!(*self).0.0",
+        // A named-field struct has no positional source spelling.
+        "self.0.0 == 0",
+    ] {
+        assert_eq!(projected_text(TrustContractKind::Ensures, body), None, "must reject `{body}`");
+    }
 }
 
 #[test]
@@ -139,6 +233,7 @@ fn native_function_clauses_fail_closed_on_unknown_source_names() {
                 TrustContractKind::Ensures,
                 ContractClauseOrigin::Native,
                 &domains,
+                &ProjectionEnvironment::default(),
             ),
             None,
         );
@@ -148,6 +243,7 @@ fn native_function_clauses_fail_closed_on_unknown_source_names() {
                 TrustContractKind::Ensures,
                 ContractClauseOrigin::Native,
                 &domains,
+                &ProjectionEnvironment::default(),
             )
             .is_some()
         );

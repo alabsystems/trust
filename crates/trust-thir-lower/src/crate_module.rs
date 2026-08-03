@@ -30,11 +30,13 @@
 //! Bodies that failed to lower (or trip a fail-closed guard) are NOT silently dropped: every
 //! recorded body appears in the `coverage.json` sidecar with its `unsupported` reasons.
 //!
-//! # Pending local consts (reentrancy-safe eval)
+//! # Pending consts (reentrancy-safe eval)
 //!
-//! Before assembly, [`finalize_and_dump`] runs `resolve_pending_consts`: every LOCAL const the
-//! hook deferred (evaluating it inside `mir_built` re-enters MIR building — see
-//! `crate::PendingConst`) is evaluated HERE via `const_eval_resolve_for_typeck` — safe at this
+//! Before assembly, [`finalize_and_dump`] runs `resolve_pending_consts`: every named const the
+//! hook deferred (the scalar leg defers LOCAL consts, because evaluating one inside `mir_built`
+//! re-enters MIR building; the wave-SC `&str` leg has no locality split and defers non-local
+//! consts too — see `crate::PendingConst`) is evaluated HERE via
+//! `const_eval_resolve_for_typeck` — safe at this
 //! seam because `run_required_analyses` has already forced `mir_borrowck` (hence `mir_built`)
 //! for every body owner — and its placeholder `Inst::Const` sentinel is patched with the real
 //! value. Failures mark the body unsupported (`PendingConst(...)` reasons in coverage), and a
@@ -61,8 +63,11 @@
 //! unmodeled ones; `Ty::Func` in a signature/merge stays refused, so fn-pointer
 //! params/returns/merges are lowered-but-not-spliced for now); a `CallIndirect`/`FnDef` whose
 //! per-body sig id fails `body_sig_ok` (out of table, vararg, or higher-order); a `FnDef`
-//! without exactly one ledger identity; or any other `Constant` outside the scalar/aggregate
-//! allow-list (`Closure`, `SymbolAddr`, …) makes the body non-spliceable (recorded in
+//! without exactly one ledger identity, a FORCED-HAVOC one, or one whose LOCAL target's own
+//! producer-signed `func_ty` does not structurally equal the claimed `Ty::Func` sig
+//! (`fnptr_target_sig_ok` — arity is not implied by sig-resolvability); or any other `Constant`
+//! outside the scalar/aggregate allow-list (`Closure`, `SymbolAddr`, …) makes the body
+//! non-spliceable (recorded in
 //! coverage), never mis-linked. Admitted bodies are prepared in pass 1
 //! (`prepare_body_tables`): enum defs intern via `add_enum_def`, struct defs via
 //! `add_struct_def` (both structural dedup), types entries via `intern_ty`, and every embedded
@@ -241,6 +246,19 @@ struct BodyRecord {
     /// executable crate module (`splice_ok` checks this field; a value-less global in
     /// the assembled module would be a lie).
     symbolic: bool,
+    /// Trust (union lane): the body registered >=1 UNION PLACEHOLDER LANE — a struct field whose
+    /// Rust type is a `union`, spelled `Ty::Unit`. NEVER spliced (`splice_ok` checks this field):
+    /// the assembled executable module must not contain a `StructDef` one of whose lanes claims
+    /// zero bytes for bytes that exist. This is also what confines the forced-`contains_call`
+    /// bodies out of the crate-seam interpreter — see `LowerCx::register_union_lane`.
+    union_lane: bool,
+    /// Trust (enum param lane): the body registered >=1 ENUM PARAM PLACEHOLDER LANE — a variant
+    /// field whose ground-truth rustc type is a bare `ty::Param`, spelled `Ty::Unit`. NEVER
+    /// spliced (`splice_ok` checks this field): the assembled executable module must not contain
+    /// an `EnumDef` one of whose lanes claims zero bytes for a caller's `T`. This is also what
+    /// confines the forced-`contains_call` bodies out of the crate-seam interpreter — see
+    /// `LowerCx::register_enum_param_lane`, whose doc states the 3↔4 dependency in full.
+    enum_param_lane: bool,
     /// `tcx.def_path_str` — unique, deterministic display identity within the crate.
     def_path: String,
     /// Trust (B3-2c seam guard): the body used a place-path VALUE carrier in a
@@ -248,6 +266,18 @@ struct BodyRecord {
     /// seam must not link+interpret it (a carried value hits the callee's real
     /// ptr param as a manufactured signature-mismatch defect verdict).
     place_path_carrier: bool,
+    /// Trust (wave-ZC): the body passed a capture-free closure to a call as the ZST
+    /// `Ty::Unit`/`Constant::PhantomData` value. `splice_ok` refuses the body on this
+    /// field ALONE — see `crate::Lowered::zst_closure_arg` for why the refusal must be
+    /// ours rather than a side effect of Rust having no syntax for a closure type.
+    zst_closure_arg: bool,
+    /// Trust (fn-ptr adapter lane): the body's mini-module carries a PRODUCER-SYNTHESIZED
+    /// closure→fn-pointer adapter — a function with no rustc counterpart. `splice_ok` refuses the
+    /// body on this field ALONE (and `run_seam_differentials` skips it on the same field), for
+    /// the reason spelled out at `crate::Lowered::fnptr_adapter`: the per-body channel below is
+    /// single-function, so the adapter is DROPPED at `record` and a spliced body would carry a
+    /// `Constant::FnDef` naming a function the assembled module does not contain.
+    fnptr_adapter: bool,
     /// The per-body lowered function (`functions[0]` of the throwaway per-body module), if the
     /// body was a fn body at all.
     function: Option<Function>,
@@ -292,9 +322,16 @@ struct BodyRecord {
     globals: Vec<Global>,
     /// Fail-closed reasons, aggregated `(reason, count)` and sorted by reason.
     unsupported: Vec<(String, u64)>,
-    /// Trust (v2 Phase 0a): per-tag DETAIL examples `(tag, up to 3 truncated details)`, sorted by
-    /// tag — decomposes the bare-"Ty"/"Other" catch-alls in the coverage JSON.
+    /// Trust (v2 Phase 0a): per-tag DETAIL examples `(tag, truncated details)`, sorted by
+    /// tag — decomposes the bare-"Ty"/"Other" catch-alls in the coverage JSON. At most
+    /// `DETAIL_CAP_DEFAULT` per tag unless `TRUST_COVERAGE_DETAIL_CAP` says otherwise
+    /// ([`coverage_detail_cap`]).
     unsupported_details: Vec<(String, Vec<String>)>,
+    /// Trust (wave-EF): `(enum def path, decline reason)` rows from `register_enum`, aggregated
+    /// and deduped — see `Lowered::enum_declines`. ALWAYS EMPTY unless
+    /// `TRUST_ENUM_DECLINE_CENSUS=1`, and never merged into `unsupported`: a decline is not a
+    /// body failure, so it must not move `lowered` for any body.
+    enum_declines: Vec<(String, String)>,
     /// Trust (v2 Phase 0b): the COLLECT-ALL pass's aggregated `(tag, count)` rows (empty for a
     /// clean body — the pass runs only when the strict pass failed), split PRIMARY vs CASCADE
     /// (unbound-local echo tags are cascades of an earlier failure, ~1339 events / 0 sole).
@@ -310,7 +347,11 @@ struct BodyRecord {
     /// and `Inst::Const { ty: Ty::Func(_) }` into the assembled module's table (`body_sig_ok`
     /// gates, pass 2 remaps).
     func_types: Vec<FuncTy>,
-    /// Trust: LOCAL consts the hook deferred (see `Lowered::pending_consts`). The finalizer —
+    /// Trust: named consts the hook deferred (see `Lowered::pending_consts`). NOT necessarily
+    /// LOCAL: the scalar leg defers only `def_id.is_local()` consts, but the wave-SC `&str` leg
+    /// deliberately has no locality split — it gates on finalizer-DERIVABILITY (`is_type_const` +
+    /// all-region args), which an upstream-crate const satisfies just as well. Do not reintroduce
+    /// a locality assumption here. The finalizer —
     /// the reentrancy-safe seam — evaluates each one and patches the placeholder `Inst::Const`
     /// in `function` before assembly; any failure marks the body unsupported (never spliced,
     /// never a guessed value). `PendingConst` is plain owned/`Copy` data (`DefId`/`Span` are
@@ -601,6 +642,250 @@ fn prepare_emit_publication(target: &EmitPublicationTarget) -> Result<PreparedPu
     .map_err(|error| error.to_string())
 }
 
+/// Trust (v2 Phase 0b): the exact CASCADE tag set — a fail-closed tag that is the downstream
+/// SHADOW of an earlier failed binding, not a leaf demand of its own. A body whose only remaining
+/// tags are cascade tags is blocked by whatever failed to bind, so booking these as primary demand
+/// would overstate the leaf work and mis-rank every coverage target derived from `collect_primary`.
+///
+/// MEASUREMENT ONLY. Nothing here gates splice/flip/differential (the five `unsupported.is_empty()`
+/// gates do that), so a wrong entry corrupts ranking, never soundness.
+///
+/// Every entry must name a LIVE emitter in `lib.rs`; a tag with no emitter is deleted rather than
+/// carried, so this table stays a description of the producer rather than of its history:
+///   * `VarRef(unbound)`          — reading a local that was never `set_local`'d.
+///   * `Borrow(unbound local)`    — `&x` where `x` has no live SSA value.
+///   * `AssignOp(unbound local)`  — `x += …` where `x` has no live SSA value.
+/// `Borrow(&mut unbound local)` was carried here with NO emitter anywhere in the crate and is
+/// therefore absent; re-add it only together with the site that pushes it. `Borrow(slot missing)`
+/// is deliberately NOT cascade: a promoted local with no `Alloca` means the local's own `let`
+/// declined, which is leaf demand at that `let`.
+///
+/// `pub` because it is THE classifier, not one of two: the `mir_built` hook
+/// (`rustc_mir_build::builder::mod.rs`, the collect-all debug event) used to carry a second inline
+/// copy that had already drifted (it missed `AssignOp(unbound local)` and still listed the
+/// emitter-less `Borrow(&mut unbound local)`). That copy now calls [`is_cascade_tag`], so the
+/// pinning tests below govern every classification the coverage program ranks off.
+pub const CASCADE_TAGS: [&str; 3] =
+    ["VarRef(unbound)", "Borrow(unbound local)", "AssignOp(unbound local)"];
+
+/// Trust: PRIMARY vs CASCADE classification for one collect-all tag. See [`CASCADE_TAGS`].
+/// The single classifier — both the coverage recorder ([`record`]) and the `mir_built` hook's
+/// collect-all debug event call THIS.
+pub fn is_cascade_tag(tag: &str) -> bool {
+    CASCADE_TAGS.contains(&tag)
+}
+
+/// Trust (tranche 4, 2026-07-31): how many DISTINCT detail examples a coverage row keeps per tag.
+///
+/// An enum, not a bare `usize`, because "no limit" is a different mode from "limit N" and the
+/// two must not be spelled by a magic number (`0` on the wire, never in the type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailCap {
+    /// At most `n` distinct examples per tag. `Limited(DETAIL_CAP_DEFAULT)` is the default and
+    /// reproduces every pre-tranche artifact byte-for-byte.
+    Limited(usize),
+    /// Every distinct example. Reached ONLY by `TRUST_COVERAGE_DETAIL_CAP=0`.
+    Unbounded,
+}
+
+/// The shipped budget. Moving this constant moves EVERY census artifact — the env channel below
+/// exists precisely so a measurement run does not have to.
+const DETAIL_CAP_DEFAULT: usize = 3;
+
+/// Per-example char budget (char-boundary safe by construction: `chars().take(..)`).
+const DETAIL_CHARS_MAX: usize = 120;
+
+impl DetailCap {
+    /// Does a tag that already holds `recorded` distinct examples admit one more?
+    fn admits(self, recorded: usize) -> bool {
+        match self {
+            DetailCap::Limited(cap) => recorded < cap,
+            DetailCap::Unbounded => true,
+        }
+    }
+}
+
+/// Trust (tranche 4): parse `TRUST_COVERAGE_DETAIL_CAP`. Split out of [`coverage_detail_cap`] so
+/// the parse is unit-testable without touching process-global env (the `OnceLock` below reads it
+/// once per process; a test that set the variable would race every other test in the binary).
+///
+/// * absent → [`DetailCap::Limited`]`(DETAIL_CAP_DEFAULT)` — the default artifact is unchanged.
+/// * `"0"` → [`DetailCap::Unbounded`].
+/// * a `u32` → `Limited(n)` (`u32`, not `usize`: the wire value must mean the same thing on a
+///   32-bit host, and no census wants more than 4G examples for one tag).
+/// * ANYTHING else — non-UTF-8, negative, non-numeric, overflowing — → the DEFAULT, not a
+///   panic and not unbounded. A typo must not silently move the artifact's bytes; the point of
+///   the default being byte-stable is that it cannot be disturbed by accident.
+fn parse_detail_cap(raw: Option<&std::ffi::OsStr>) -> DetailCap {
+    match raw.and_then(|v| v.to_str()).and_then(|v| v.trim().parse::<u32>().ok()) {
+        Some(0) => DetailCap::Unbounded,
+        Some(n) => DetailCap::Limited(n as usize),
+        None => DetailCap::Limited(DETAIL_CAP_DEFAULT),
+    }
+}
+
+/// Trust (tranche 4): the process-wide detail budget, read once.
+///
+/// # Why the lift exists — the fixed cap of 3 discards 58% of the evidence (MEASURED)
+///
+/// Measured on the checked-in census dump `t4-census/dump/clean_kernel.coverage.json`, produced
+/// by the pre-tranche loop this function's consumer replaces:
+///
+/// * **29,610 spans recorded against 70,303 total tag occurrences — 58% of all evidence is
+///   discarded** by the fixed `3`-distinct-examples-per-tag cap;
+/// * 4,516 of 25,135 `(body, tag)` entries are TRUNCATED, i.e. the row keeps 3 spans for a tag
+///   the body hit more times, and the coverage JSON records no trace that anything was dropped.
+///
+/// # The consequence: root/containment analysis over a truncated census is UNSOUND
+///
+/// This is stronger than "incomplete". Every root-cause question asked of this artifact — "is
+/// this tag a ROOT, or is it a PROPAGATION marker whose span strictly CONTAINS an inner tag's?",
+/// "is this body blocked by this tag ALONE?", "which construct actually failed?" — is decided by
+/// comparing the recorded spans of the tags a body carries. Truncation removes spans WITHOUT
+/// removing the tag, so the missing spans are silently read as "this tag has no inner span
+/// beneath it" ⇒ the analysis reports a ROOT where the evidence for containment merely was not
+/// kept. The error is directional (it manufactures roots, never suppresses them) and it is not
+/// detectable from the artifact, because the artifact does not record that it truncated.
+/// Concretely, in the class this tranche examined: span-containment is unanswerable for 366 of
+/// the 582 bodies carrying `EnumCtor(unsupported payload)`, and 185 occurrences that presented as
+/// "silent" roots turned out to be ENTIRELY a truncation artifact — every one of them resolved to
+/// a contained inner tag once the missing spans were recovered by hand. Any conclusion drawn from
+/// a default-cap census about roots or containment must therefore be re-derived under
+/// `TRUST_COVERAGE_DETAIL_CAP=0` before it is believed.
+///
+/// # What the default is, and why it is still 3
+///
+/// The cap is made CONFIGURABLE, not removed. Absent/garbage env ⇒
+/// [`DetailCap::Limited`]`(`[`DETAIL_CAP_DEFAULT`]` == 3)` — the pre-tranche budget, unchanged.
+/// Off-by-default is the same posture `TRUST_ENUM_DECLINE_CENSUS` takes
+/// (`crate::enum_decline_census` docs): this channel gates a MEASUREMENT, an unbounded census is
+/// substantially larger, and a dump whose bytes move when nobody asked cannot be diffed against a
+/// prior dump. The lift is therefore something an analysis run OPTS INTO
+/// (`TRUST_COVERAGE_DETAIL_CAP=0`), for exactly as long as it is answering a containment question.
+///
+/// # Effect on the emitted census artifact — stated plainly
+///
+/// * The DEFAULT emits the same bytes as before: `aggregate_detail_examples` under
+///   `parse_detail_cap(None)` is pinned equal to a verbatim copy of the retired loop by
+///   `default_cap_reproduces_the_pre_tranche_loop`. So THIS change, at its default, does not move
+///   the artifact.
+/// * `TRUST_COVERAGE_DETAIL_CAP=<n≠3>` or `=0` DOES move it, by design, and the moved dump is not
+///   comparable byte-for-byte with a default one — only the recovered spans are added, but the
+///   file differs.
+/// * Separately, and NOT because of this cap: the census artifact of this branch as a whole is
+///   **not** byte-stable against the pre-tranche dump, because the wave-ZC ZST-closure-arg lane
+///   changes which tags bodies carry (`Closure(value position)` occurrences disappear where the
+///   lane fires, and diverging-call arg arities move). Do not describe this branch's census as
+///   byte-stable on the strength of the cap default alone.
+///
+/// # Not a gate
+///
+/// It runs after lowering has finished, and neither accepts nor refuses any body.
+/// `unsupported_details` is consumed only by the JSON writer (`BodyRecord` field → the
+/// `CoverageRow` clone → `write_coverage_json`) — never by `to_mir` / the flip registry / the
+/// interpreter, and never by the `lowered_unsupported.is_empty()` predicates that decide
+/// spliceability, `deferred`, and the differential — so NO value of this variable can change
+/// what is spliced, flipped, or verified. The separation is structural: the field is write-only
+/// after `record`.
+fn coverage_detail_cap() -> DetailCap {
+    static CAP: std::sync::OnceLock<DetailCap> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| parse_detail_cap(std::env::var_os("TRUST_COVERAGE_DETAIL_CAP").as_deref()))
+}
+
+/// Trust (tranche 4): aggregate per-tag detail EXAMPLES for a coverage row.
+///
+/// Deterministic by construction: tags in `BTreeMap` order, examples in first-encounter order
+/// within a tag, each truncated to [`DETAIL_CHARS_MAX`] chars and deduped AFTER truncation (two
+/// spans sharing a 120-char prefix are one example — the pre-tranche behavior, preserved).
+///
+/// The linear `contains` is quadratic in the DISTINCT examples of a single tag within ONE body;
+/// bounded by that body's occurrence count, and only reachable at all under the opt-in
+/// `Unbounded` mode (the default's 3 makes it a three-element scan).
+///
+/// TyCtxt-free and pure: unit-tested directly in [`detail_cap_tests`].
+fn aggregate_detail_examples(
+    unsupported: &[(String, &'static str)],
+    cap: DetailCap,
+) -> Vec<(String, Vec<String>)> {
+    let mut details_by_tag: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (detail, what) in unsupported {
+        let ex: String = detail.chars().take(DETAIL_CHARS_MAX).collect();
+        let examples = details_by_tag.entry((*what).to_string()).or_default();
+        if cap.admits(examples.len()) && !examples.contains(&ex) {
+            examples.push(ex);
+        }
+    }
+    details_by_tag.into_iter().collect()
+}
+
+/// Trust (wave-EF R1): the three DIAGNOSTIC row vectors [`record`] derives from a body's
+/// fail-closed tags and its `register_enum` decline ledger. Grouped into one return so the
+/// derivation is a single pure function that can be tested without a `TyCtxt`.
+struct BodyTagRows {
+    /// Aggregated `(tag, count)` — the ONLY one of the three that is verdict-adjacent
+    /// (`unsupported.is_empty()` is what "lowered" means).
+    unsupported: Vec<(String, u64)>,
+    unsupported_details: Vec<(String, Vec<String>)>,
+    enum_declines: Vec<(String, String)>,
+}
+
+/// Trust (wave-EF R1): derive a body's diagnostic rows. Extracted from [`record`] verbatim so the
+/// decline channel's central claim becomes a TESTABLE property rather than a comment.
+///
+/// THE PROPERTY, pinned by `enum_decline_census_tests`: the returned `unsupported` and
+/// `unsupported_details` are a function of `lowered_unsupported` ALONE. `declines` cannot add,
+/// remove, or reweight a single failure tag, so a body that lowers clean lowers clean whether or
+/// not `TRUST_ENUM_DECLINE_CENSUS=1` — which is the promise the whole channel rests on. Before
+/// this split that promise was enforced only by nobody having written the merge; a test now fails
+/// if somebody does.
+///
+/// Declines are deduped and sorted (`BTreeSet`) because `mir_built` runs in parallel and the
+/// coverage artifact must be byte-deterministic. The dedup is a SECOND line: `push_decline_row`
+/// already deduped per body at push time, which is the one that bounds memory.
+///
+/// Trust (tranche 4 merge): the detail examples are NOT derived by a second inline copy of the
+/// example loop here. This function delegates to [`aggregate_detail_examples`] under
+/// [`coverage_detail_cap`], so `TRUST_COVERAGE_DETAIL_CAP` reaches the SHIPPING path rather than
+/// only the helper — a verbatim second copy would have silently pinned the census back to the
+/// fixed 3 and made the whole cap lift dead code. The env read is the one impurity, and it is the
+/// same one [`record`] performed before this extraction: absent/garbage ⇒ `Limited(3)`, so every
+/// pre-tranche assertion below still describes the default artifact exactly.
+fn aggregate_body_tag_rows(
+    lowered_unsupported: &[(String, &'static str)],
+    declines: Vec<(String, String)>,
+) -> BodyTagRows {
+    // Aggregate fail-closed reasons into deterministic (reason, count) rows.
+    let mut unsupported_by_tag: BTreeMap<String, u64> = BTreeMap::new();
+    for (_detail, what) in lowered_unsupported {
+        let count = unsupported_by_tag.entry((*what).to_string()).or_default();
+        *count = count.saturating_add(1);
+    }
+    // Trust (v2 Phase 0a, RFC docs/TRUST_IR_V2.md §4): ALSO carry per-tag DETAIL examples into the
+    // coverage row. Every push site already formats a detail string (`push((format!(..), TAG))`) —
+    // the `.0` element, previously DROPPED here — and the bare-"Ty" (397 sole) / "Other" (83 sole)
+    // catch-alls are undecomposable without it. Capped at `DETAIL_CAP_DEFAULT` distinct examples
+    // per tag, each truncated to `DETAIL_CHARS_MAX` chars (char-boundary safe), deterministic
+    // order (first-encounter within a tag; tags sorted). Purely additive diagnostics — no
+    // lowering/flip behavior change.
+    //
+    // Trust (tranche 4): the cap is `TRUST_COVERAGE_DETAIL_CAP`-settable (`0` = every example),
+    // because the fixed 3 discards 58% of the recorded evidence (29,610 spans kept of 70,303
+    // occurrences; 4,516 of 25,135 tag-entries truncated, with nothing in the artifact recording
+    // that they were) — which makes ROOT-tag attribution UNSOUND, not merely incomplete: a dropped
+    // span reads as "no inner tag beneath this one", so the analysis MANUFACTURES roots. Default
+    // is still 3, so this call's default output is byte-identical to the loop it replaced
+    // (`default_cap_reproduces_the_pre_tranche_loop`) — the same off-by-default posture
+    // `TRUST_ENUM_DECLINE_CENSUS` takes. That is not a claim that the branch's census is
+    // byte-stable; the wave-ZC lane moves tags independently of this cap. See
+    // [`coverage_detail_cap`] for the measurement and the full statement.
+    let unsupported_details = aggregate_detail_examples(lowered_unsupported, coverage_detail_cap());
+    BodyTagRows {
+        unsupported: unsupported_by_tag.into_iter().collect(),
+        unsupported_details,
+        enum_declines: declines.into_iter().collect::<BTreeSet<_>>().into_iter().collect(),
+    }
+}
+
 /// Trust: per-body registration, called from the `-Z trust-ir-lower` hook in
 /// `rustc_mir_build::builder::build_mir_inner_impl` right after the differential — the only seam
 /// where the THIR-side lowering reliably exists. Thread-safe (`mir_built` runs in parallel).
@@ -640,6 +925,7 @@ pub fn record(
         unsupported: lowered_unsupported,
         contains_call,
         place_path_carrier,
+        zst_closure_arg,
         callees,
         pending_consts,
         // Trust (#173): MEASUREMENT ONLY — consumed by the `body class` debug event at the
@@ -648,44 +934,86 @@ pub fn record(
         // differential, each of which declines on its own terms. Bound explicitly rather than
         // via `..` so a future field cannot slip past this destructure unnoticed.
         opaque_collapse: _opaque_collapse,
+        // Trust (union lane): GATES, unlike `opaque_collapse`. Carried into the `BodyRecord` so
+        // `splice_ok` can refuse the body by its own predicate. Bound explicitly for the same
+        // reason the two above are.
+        union_lane,
+        // Trust (enum param lane): GATES, exactly like `union_lane`, and for the same reason —
+        // `splice_ok` must refuse the body by its OWN predicate rather than inherit the
+        // `symbolic` refusal. Bound explicitly for the same reason the others are.
+        enum_param_lane,
+        // Trust (fn-ptr adapter lane): GATES, exactly like `union_lane`. Carried into the
+        // `BodyRecord` so `splice_ok` and the seam refuse the body by their own predicate rather
+        // than by inheriting the `remove(0)` drop below. Bound explicitly for the same reason.
+        fnptr_adapter,
+        // Trust (wave-TR): does NOT gate the splice, and that is a decision, not an omission.
+        //
+        // STATED CORRECTLY, because an earlier draft of this comment claimed the spliced module is
+        // "byte-identical to what the pre-wave-TR assembler would have produced minus the
+        // fail-closed tag" — that is FALSE, and an adversarial review falsified it. Pre-wave-TR
+        // `splice_ok` refused these bodies on its FIRST line (`!r.unsupported.is_empty()`), so the
+        // assembler produced NOTHING for them. The assembled module gains a whole function.
+        //
+        // The true reason it may gain one: the arm emits ZERO instructions — it returns the
+        // `ValueId` `lower_expr` already produced — so the function it adds makes no new claim
+        // about layout, lanes, or synthesized functions, and every value in it is one the module
+        // already contained. That is a claim about MISREPRESENTATION, and it is the property that
+        // separates this lane from `union_lane` / `enum_param_lane` / `zst_closure_arg` /
+        // `fnptr_adapter`, each of which puts a spelling into the module that stands for bytes it
+        // does not describe.
+        //
+        // WHERE THE TWO GATES DIVERGE, explicitly, because the flip's stated reason
+        // (`flip_registry::thin_reborrow_allows_flip`: "the producer holds no record it could hand
+        // the flip about where the pointer came from") would, taken alone, argue for refusing here
+        // too — a wave-TR body typically carries a call, hence is `deferred`, hence is what the
+        // crate-seam differential's step 0 executes, and that is precisely the consequence cited
+        // when `splice_ok` refuses the two placeholder lanes. The distinction this file takes: the
+        // placeholder lanes are refused because the module MISDESCRIBES bytes, which no consumer
+        // can detect; wave-TR's provenance gap is about what a CONSUMER can reconstruct, and the
+        // flip is the consumer that must reconstruct a MIR body from it. A body whose value the
+        // seam cannot follow is refused BY THE SEAM, on its own terms, not by pre-emptive
+        // exclusion here. If that turns out to be wrong the correction is to gate the splice too —
+        // NOT to weaken the flip refusal, which is the conservative side of the same question.
+        //
+        // Bound explicitly rather than via `..` for the same reason `opaque_collapse` is: a future
+        // field must not slip past this destructure.
+        thin_reborrow: _thin_reborrow,
+        // Trust (wave-EF): the register_enum decline-reason ledger. Empty unless
+        // `TRUST_ENUM_DECLINE_CENSUS=1`; carried to coverage BESIDE `unsupported`, never
+        // inside it. Bound explicitly for the same reason `opaque_collapse` is.
+        enum_declines: lowered_enum_declines,
     } = lowered;
     let deferred = lowered_unsupported.is_empty() && pending_consts.is_empty() && contains_call;
+    // Trust: `functions[0]` is THE body function. The producer maintains that: both
+    // `lower_fn` and `lower_const_body` add exactly one function, and the fn-ptr adapter lane
+    // appends its synthetic functions only AFTER that one (`lower_module_inner`'s flush, which
+    // fails the body closed unless exactly one function is already present). Everything past
+    // index 0 is a producer-synthesized function with no rustc counterpart and is DROPPED here —
+    // which is precisely why a body that carries one may never splice (`fnptr_adapter`).
     let function =
         if module.functions.is_empty() { None } else { Some(module.functions.remove(0)) };
     let func_ty = function.as_ref().and_then(|f| module.func_type(f.ty).cloned());
     let instr_count =
         function.as_ref().map(|f| f.blocks.iter().map(|b| b.body.len() as u64).sum()).unwrap_or(0);
 
-    // Aggregate fail-closed reasons into deterministic (reason, count) rows.
-    let mut unsupported_by_tag: BTreeMap<String, u64> = BTreeMap::new();
-    for (_detail, what) in &lowered_unsupported {
-        let count = unsupported_by_tag.entry((*what).to_string()).or_default();
-        *count = count.saturating_add(1);
-    }
-    let unsupported = unsupported_by_tag.into_iter().collect();
-    // Trust (v2 Phase 0a, RFC docs/TRUST_IR_V2.md §4): ALSO carry per-tag DETAIL examples into the
-    // coverage row. Every push site already formats a detail string (`push((format!(..), TAG))`) —
-    // the `.0` element, previously DROPPED here — and the bare-"Ty" (397 sole) / "Other" (83 sole)
-    // catch-alls are undecomposable without it. Capped at 3 distinct examples per tag, each
-    // truncated to 120 chars (char-boundary safe), deterministic order (first-encounter within a
-    // tag; tags sorted). Purely additive diagnostics — no lowering/flip behavior change.
-    let mut details_by_tag: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (detail, what) in &lowered_unsupported {
-        let ex: String = detail.chars().take(120).collect();
-        let examples = details_by_tag.entry((*what).to_string()).or_default();
-        if examples.len() < 3 && !examples.contains(&ex) {
-            examples.push(ex);
-        }
-    }
-    let unsupported_details = details_by_tag.into_iter().collect();
+    // Trust (wave-EF R1): tags, tag details, and the decline rows in one derivation — see
+    // `aggregate_body_tag_rows` for the neutrality property it exists to make testable. The
+    // decline rows are empty (⇒ the coverage key is omitted entirely) unless
+    // `TRUST_ENUM_DECLINE_CENSUS=1`, so a default run stays byte-identical.
+    //
+    // Trust (tranche 4): the per-tag DETAIL examples this derivation returns are capped by
+    // `TRUST_COVERAGE_DETAIL_CAP` (`0` = every example), read inside `aggregate_body_tag_rows` via
+    // [`coverage_detail_cap`]. The default is still 3, so a default run's bytes do not move.
+    let BodyTagRows { unsupported, unsupported_details, enum_declines } =
+        aggregate_body_tag_rows(&lowered_unsupported, lowered_enum_declines);
 
     // Trust (v2 Phase 0b): the COLLECT-ALL second pass — measurement only. The caller re-lowers a
     // failed body once when either tracing or coverage requests it and shares that bounded tag
     // snapshot with this recorder. Aggregate ONLY its tag vector (the collect-all module itself
     // is discarded by construction, and the five `unsupported.is_empty()` gates keep any
     // tag-bearing body out of splice/flip/differential).
-    // Tags are split PRIMARY vs CASCADE: an unbound-local echo (`VarRef(unbound)` / `Borrow(...
-    // unbound local)`) is the downstream shadow of an earlier failed binding, not a leaf demand.
+    // Tags are split PRIMARY vs CASCADE by [`is_cascade_tag`]: an unbound-local echo is the
+    // downstream shadow of an earlier failed binding, not a leaf demand. See [`CASCADE_TAGS`].
     // Capped at 4096 events (worst observed body: 1715) with an explicit overflow marker.
     let mut primary_by_tag: BTreeMap<String, u64> = BTreeMap::new();
     let mut cascade_by_tag: BTreeMap<String, u64> = BTreeMap::new();
@@ -697,13 +1025,8 @@ pub fn record(
         if collect_all_overflowed {
             cascade_by_tag.insert("collect-all event overflow (>4096)".to_string(), 1);
         }
-        let is_cascade = |t: &str| {
-            t == "VarRef(unbound)"
-                || t == "Borrow(unbound local)"
-                || t == "Borrow(&mut unbound local)"
-        };
         for (_detail, what) in collect_all {
-            let dst = if is_cascade(what) { &mut cascade_by_tag } else { &mut primary_by_tag };
+            let dst = if is_cascade_tag(what) { &mut cascade_by_tag } else { &mut primary_by_tag };
             let count = dst.entry((*what).to_string()).or_default();
             *count = count.saturating_add(1);
         }
@@ -784,8 +1107,12 @@ pub fn record(
         def_index,
         kind: body_kind,
         symbolic,
+        union_lane,
+        enum_param_lane,
         def_path,
         place_path_carrier,
+        zst_closure_arg,
+        fnptr_adapter,
         function,
         func_ty,
         structs: module.structs,
@@ -797,6 +1124,7 @@ pub fn record(
         files: module.files,
         unsupported,
         unsupported_details,
+        enum_declines,
         collect_primary,
         collect_cascade,
         instr_count,
@@ -961,6 +1289,38 @@ fn run_seam_differentials(records: &[BodyRecord], assembled: &Assembled) -> Vec<
                 "seam-deferred body: call args carry a place-path value carrier \
                  (CLEAN-ONLY receiver spelling); linked interpretation not asserted \
                  (coverage-only)",
+            ));
+            continue;
+        }
+        // Trust (wave-ZC): a ZST-closure-arg body is refused by `splice_ok` on its own field, so
+        // step 0 below already skips it (`func_of_def` → `None`). State the skip HERE too, on the
+        // flag itself, so the seam wall is a SECOND decision of ours and not a consequence of the
+        // splice verdict: if `splice_ok`'s line is ever relaxed (the recovery path needs a
+        // positive witness at the callee's declared input — see `Lowered::zst_closure_arg`), the
+        // linked interpreter must still not be handed a `Ty::Unit` standing in for a callee's
+        // declared closure param, which is exactly the manufactured signature-mismatch defect the
+        // `place_path_carrier` skip above exists to prevent.
+        if r.zst_closure_arg {
+            verdicts.push(skip(
+                r.def_index,
+                "seam-deferred body: call args carry a ZST closure value (Ty::Unit/PhantomData \
+                 standing in for a closure-typed param); linked interpretation not asserted \
+                 (coverage-only)",
+            ));
+            continue;
+        }
+        // Trust (fn-ptr adapter lane): an adapter-bearing body is refused by `splice_ok` on its
+        // own field, so step 0 below already skips it (`func_of_def` → `None`). State the skip
+        // HERE too, on the flag itself, for the same reason the `zst_closure_arg` skip above is
+        // stated twice: the linked interpreter must never be handed a body whose instruction
+        // stream names a function the assembled module does not contain, and that must not depend
+        // on `splice_ok`'s line staying where it is.
+        if r.fnptr_adapter {
+            verdicts.push(skip(
+                r.def_index,
+                "seam-deferred body: module carries a producer-synthesized closure→fn-pointer \
+                 adapter (no rustc counterpart, dropped at record); linked interpretation not \
+                 asserted (coverage-only)",
             ));
             continue;
         }
@@ -2356,7 +2716,46 @@ fn resolve_pending_consts(tcx: TyCtxt<'_>, records: &mut [BodyRecord]) {
         if r.pending_consts.is_empty() {
             continue;
         }
+        // Trust (wave-SC): the `&str`-const leg runs FIRST and per record, because it patches a
+        // GLOBAL as well as the placeholder node and must never reach `eval_pending_const`'s
+        // scalar/composite shape tripwire (a `&str` type matches none of its arms). Split out so
+        // the borrow of `r.globals` is disjoint from the `r.function` patch below.
+        for i in 0..r.pending_consts.len() {
+            let pc = r.pending_consts[i].clone();
+            let Some(gid) = pc.str_global else { continue };
+            let Some(bytes) = eval_pending_str_const(tcx, &pc) else {
+                bump_unsupported(&mut r.unsupported, "PendingStr(eval failed at finalize)");
+                continue;
+            };
+            // FAIL CLOSED on the empty string, for the same reason `emit_bytes_global` refuses
+            // `""`: a zero-length array global is not proven faithful end-to-end. `""` stays a
+            // missed clean-rate opportunity rather than a guessed lowering.
+            if bytes.is_empty() {
+                bump_unsupported(&mut r.unsupported, "PendingStr(empty)");
+                continue;
+            }
+            let Some(g) = r.globals.get_mut(gid.as_usize()) else {
+                bump_unsupported(&mut r.unsupported, "PendingStr(global not patched)");
+                continue;
+            };
+            if !patch_str_global(g, &bytes) {
+                // The slot is not the untouched `[u8; 0]` placeholder: a desync, or a SECOND
+                // record for the same deduped global carrying DIFFERENT bytes — the patch
+                // conflict. (An already-patched slot carrying these EXACT bytes — the benign
+                // repeated-read case — returns `true` and never reaches here.)
+                bump_unsupported(&mut r.unsupported, "PendingStr(global patch conflict)");
+                continue;
+            }
+            if !patch_placeholder(r.function.as_mut(), pc.value, Constant::Int(bytes.len() as i128))
+            {
+                bump_unsupported(&mut r.unsupported, "PendingConst(placeholder not found)");
+            }
+        }
         for pc in &r.pending_consts {
+            // Trust (wave-SC): the str leg above already handled (and reported on) this record.
+            if pc.str_global.is_some() {
+                continue;
+            }
             // Trust (B7): a composite pending const decodes against the PLACEHOLDER node's
             // mapped trust-ir type + this body's registered struct/enum tables (the same
             // per-body positional id space the node's Ty::Struct/Enum ids reference). A
@@ -2387,7 +2786,131 @@ fn resolve_pending_consts(tcx: TyCtxt<'_>, records: &mut [BodyRecord]) {
                 bump_unsupported(&mut r.unsupported, "PendingConst(sentinel leak)");
             }
         }
+        // Trust (wave-SC): the POSITIVE-LEDGER tripwire for str globals. This is REQUIRED, not
+        // belt-and-braces: `global_const_ok` accepts `(Ty::Array(tid, 0), Constant::Array([]))` as
+        // internally CONSISTENT (`0 == 0`), so an unpatched placeholder would otherwise splice
+        // silently as the EMPTY STRING. The existing `is_const_sentinel` scan above cannot see it
+        // — that scan reads instructions, and a global is not an instruction.
+        //
+        // A LEDGER, not a shape sniff: every `PendingConst` that CLAIMS a str global is checked to
+        // have produced a patched one, so a record whose patch was skipped for any reason (missing
+        // slot, conflict, an early `continue`) is caught by its own claim.
+        check_str_global_ledger(&r.globals, &r.pending_consts, &mut r.unsupported);
     }
+}
+
+/// Trust (wave-SC): has `g` been rewritten from the `[u8; 0]` placeholder into a REAL bytes
+/// global? Positive predicate: a non-empty `Ty::Array` whose declared length equals its
+/// `Constant::Array` initializer's element count. The `*n > 0` clause is the load-bearing one —
+/// without it the untouched placeholder `(Array(tid, 0), Array([]))` reads as "patched" and
+/// splices as `""`.
+fn str_global_patched(g: &Global) -> bool {
+    matches!(
+        (&g.ty, &g.initializer),
+        (Ty::Array(_, n), Some(Constant::Array(elems)))
+            if *n > 0 && *n as usize == elems.len()
+    )
+}
+
+/// Trust (wave-SC): rewrite the `[u8; 0]` placeholder global in place from the const's CTFE bytes.
+/// Keeps the placeholder's ELEMENT `TyId` (already interned into the body's `types` table by
+/// `lower_str_named_const`), so the patch moves only the declared length and the initializer and
+/// can never desync the table.
+///
+/// Returns `false` (caller fails the body closed) unless the slot is either the UNTOUCHED
+/// placeholder — `[u8; 0]`, empty `Constant::Array`, immutable — or already carries EXACTLY these
+/// bytes (the benign repeated-read case: one deduped global, several `PendingConst` records).
+/// A slot already patched with DIFFERENT bytes is the patch CONFLICT and is refused; so is any
+/// other shape. `bytes` must be non-empty (the caller reports `PendingStr(empty)` first).
+fn patch_str_global(g: &mut Global, bytes: &[u8]) -> bool {
+    if bytes.is_empty() || g.mutable {
+        return false;
+    }
+    let init: Vec<Constant> = bytes.iter().map(|b| Constant::Int(i128::from(*b))).collect();
+    match (&g.ty, &g.initializer) {
+        // The untouched placeholder.
+        (Ty::Array(tid, 0), Some(Constant::Array(elems))) if elems.is_empty() => {
+            let tid = *tid;
+            g.ty = Ty::Array(tid, bytes.len() as u64);
+            g.initializer = Some(Constant::Array(init));
+            true
+        }
+        // Already patched by an earlier record for the SAME deduped const — idempotent iff the
+        // bytes agree, a conflict otherwise.
+        (Ty::Array(_, n), Some(Constant::Array(elems)))
+            if *n as usize == bytes.len() && elems.as_slice() == init.as_slice() =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Trust (wave-SC): the positive-ledger check described at its call site in
+/// [`resolve_pending_consts`]. Every `PendingConst` claiming a `str_global` must point at a slot
+/// that exists and that [`str_global_patched`] accepts; anything else marks the body unsupported
+/// so `splice_ok` refuses it.
+fn check_str_global_ledger(
+    globals: &[Global],
+    pending: &[PendingConst],
+    unsupported: &mut Vec<(String, u64)>,
+) {
+    for pc in pending {
+        let Some(gid) = pc.str_global else { continue };
+        let patched = globals.get(gid.as_usize()).is_some_and(str_global_patched);
+        if !patched {
+            bump_unsupported(unsupported, "PendingStr(global not patched)");
+        }
+    }
+}
+
+/// Trust (wave-SC): CTFE the deferred `&str` const to its UTF-8 bytes, at the same reentrancy-safe
+/// `analysis` seam and through the same query as [`eval_pending_const`] — `identity_for_item` +
+/// region erasure + `const_eval_resolve_for_typeck` — because the producer's gate 4 only deferred
+/// all-region, non-`type_const` items. Both preconditions are RE-CHECKED here, not assumed.
+///
+/// Fail-closed (`None`) on: an mgca type const; non-all-region identity args; a re-derived type
+/// that is not a shared `&str` (the shape tripwire, the str twin of `eval_pending_const`'s
+/// kind/width check); a resolution/evaluation failure; a valtree that is not a BRANCH (guarding
+/// `try_to_raw_bytes`'s internal `to_branch()`, which `bug!`s on a Leaf — valtree.rs:180); or a
+/// branch whose elements are not all `u8` leaves (`try_to_raw_bytes` returns `None`).
+fn eval_pending_str_const(tcx: TyCtxt<'_>, pc: &PendingConst) -> Option<Vec<u8>> {
+    if tcx.is_type_const(pc.def_id) {
+        return None;
+    }
+    let args = ty::GenericArgs::identity_for_item(tcx, pc.def_id);
+    if !args.iter().all(|a| a.as_region().is_some()) {
+        return None;
+    }
+    // Shape tripwire: the const's declared type must still be a SHARED `&str`, and the record's
+    // scalar flags must be the ones `lower_str_named_const` writes. Same tcx as the hook, so a
+    // mismatch is a real bug — fail closed.
+    let rty = tcx.type_of(pc.def_id).instantiate_identity().skip_normalization();
+    let is_shared_str = matches!(
+        rty.kind(),
+        ty::Ref(_, pointee, rustc_hir::Mutability::Not) if matches!(pointee.kind(), ty::Str)
+    );
+    if !is_shared_str
+        || pc.composite
+        || pc.is_bool
+        || pc.is_float
+        || pc.signed
+        || pc.bits != 64
+    {
+        return None;
+    }
+    let uv = ty::AliasConst::new(tcx, ty::AliasConstKind::new_from_def_id(tcx, pc.def_id), args);
+    let uv = tcx.erase_and_anonymize_regions(uv);
+    let typing_env = ty::TypingEnv::fully_monomorphized();
+    let valtree = match tcx.const_eval_resolve_for_typeck(typing_env, uv, pc.span) {
+        Ok(Ok(v)) => v,
+        _ => return None,
+    };
+    let value = ty::Value { ty: rty, valtree };
+    // `try_to_raw_bytes` calls `to_branch()` unconditionally after its type gate; a Leaf valtree
+    // under a `&str` type would `bug!` (ICE) rather than return `None`. Refuse it here first.
+    value.try_to_branch()?;
+    value.try_to_raw_bytes(tcx).map(<[u8]>::to_vec)
 }
 
 /// Trust: evaluate ONE deferred local const via `const_eval_resolve_for_typeck` — the exact
@@ -2777,6 +3300,10 @@ struct CoverageRow {
     unsupported: Vec<(String, u64)>,
     /// Trust (v2 Phase 0a): per-tag detail examples (see `BodyRecord::unsupported_details`).
     unsupported_details: Vec<(String, Vec<String>)>,
+    /// Trust (wave-EF): register_enum decline reasons (see `BodyRecord::enum_declines`). Empty
+    /// unless `TRUST_ENUM_DECLINE_CENSUS=1`; the JSON key is OMITTED when empty, which is what
+    /// keeps a default census run byte-identical to a pre-wave-EF one.
+    enum_declines: Vec<(String, String)>,
     /// Trust (v2 Phase 0b): collect-all pass results (see `BodyRecord`).
     collect_primary: Vec<(String, u64)>,
     collect_cascade: Vec<(String, u64)>,
@@ -2818,12 +3345,12 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
     // coverage as un-spliced), never a silent mis-emit.
     let mut module = Module::new(crate_name.to_string());
     let mut assigned: Vec<(u32, FuncId)> = Vec::new();
-    let mut prepared: Vec<(u32, Function, FuncTy)> = Vec::new();
+    let mut prepared: Vec<(u32, Function, FuncTy, BodyMaps)> = Vec::new();
     for r in records {
-        if splice_ok(r) {
-            if let Some((func, func_ty)) = prepare_body_tables(r, &mut module) {
+        if splice_ok(r, records) {
+            if let Some((func, func_ty, maps)) = prepare_body_tables(r, &mut module) {
                 assigned.push((r.def_index, FuncId::new(assigned.len() as u32)));
-                prepared.push((r.def_index, func, func_ty));
+                prepared.push((r.def_index, func, func_ty, maps));
             }
         }
     }
@@ -2849,6 +3376,7 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
             instr_count: r.instr_count,
             unsupported: r.unsupported.clone(),
             unsupported_details: r.unsupported_details.clone(),
+            enum_declines: r.enum_declines.clone(),
             collect_primary: r.collect_primary.clone(),
             collect_cascade: r.collect_cascade.clone(),
             calls_resolved: 0,
@@ -2867,11 +3395,11 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
         };
         // Pass 1 admitted this body, so its pre-remapped function + signature are present
         // (assigned and prepared are pushed together, same keys, same order).
-        let Ok(pi) = prepared.binary_search_by_key(&r.def_index, |(d, _, _)| *d) else {
+        let Ok(pi) = prepared.binary_search_by_key(&r.def_index, |(d, _, _, _)| *d) else {
             rows.push(row);
             continue;
         };
-        let (_, func, func_ty) = &prepared[pi];
+        let (_, func, func_ty, body_maps) = &prepared[pi];
 
         let mut f = func.clone();
         f.id = new_id;
@@ -2893,7 +3421,7 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
         for block in &mut f.blocks {
             for node in &mut block.body {
                 match &mut node.inst {
-                    Inst::Call { callee, .. } => match resolve_callee(r, *callee, &lookup) {
+                    Inst::Call { callee, .. } => match resolve_callee(r, *callee, &lookup, body_maps) {
                         CalleeResolution::Local(id) => {
                             *callee = id;
                             row.calls_resolved += 1;
@@ -2928,7 +3456,7 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
                                     *sig = intern_func_ty(&mut module, ft);
                                 }
                             }
-                            match resolve_callee(r, *fid, &lookup) {
+                            match resolve_callee(r, *fid, &lookup, body_maps) {
                                 CalleeResolution::Local(id) => {
                                     *fid = id;
                                     row.calls_resolved += 1;
@@ -3004,6 +3532,7 @@ fn resolve_callee(
     r: &BodyRecord,
     callee: FuncId,
     lookup: &dyn Fn(u32) -> Option<FuncId>,
+    maps: &BodyMaps,
 ) -> CalleeResolution {
     let idents: Vec<&CalleeRef> = r.callees.iter().filter(|c| c.func_id == callee).collect();
     match idents.as_slice() {
@@ -3013,26 +3542,26 @@ fn resolve_callee(
         // generic site. The distinct `havoc:` key prefix keeps it from coalescing with any real
         // `local:`/`extern:` edge to the same symbol; it counts in the honest can't-resolve bucket.
         [c] if c.force_havoc => CalleeResolution::Decl {
-            key: format!("havoc:{}{}", c.def_path, ret_key(c)),
+            key: format!("havoc:{}{}", c.def_path, ret_key(c, maps)),
             name: c.def_path.clone(),
             is_extern: false,
-            ret: decl_ret(c),
+            ret: decl_ret(c, maps),
         },
         [c] if c.is_local => match lookup(c.def_index) {
             Some(id) => CalleeResolution::Local(id),
             // A real local fn, but its own body did not lower cleanly — declare, don't link.
             None => CalleeResolution::Decl {
-                key: format!("local-unlowered:{}{}", c.def_path, ret_key(c)),
+                key: format!("local-unlowered:{}{}", c.def_path, ret_key(c, maps)),
                 name: c.def_path.clone(),
                 is_extern: false,
-                ret: decl_ret(c),
+                ret: decl_ret(c, maps),
             },
         },
         [c] => CalleeResolution::Decl {
-            key: format!("extern:{}{}", c.def_path, ret_key(c)),
+            key: format!("extern:{}{}", c.def_path, ret_key(c, maps)),
             name: c.def_path.clone(),
             is_extern: true,
-            ret: decl_ret(c),
+            ret: decl_ret(c, maps),
         },
         // No ledger entry at all — there is no site evidence to type a return with.
         [] => CalleeResolution::Decl {
@@ -3139,16 +3668,23 @@ fn stamp_target_info_if_vacuous(tcx: TyCtxt<'_>, module: &mut Module) {
 /// agreed on, or `None` if the ledger entry was poisoned by disagreement. Reading the poison flag
 /// here (rather than only `ret_ty.is_some()`) is what keeps a contradicted type from being
 /// resurrected: `ret_ty` is cleared on conflict, and `ret_ty_conflict` records WHY it is empty.
-fn decl_ret(c: &crate::CalleeRef) -> Option<Ty> {
-    if c.ret_ty_conflict { None } else { c.ret_ty.clone() }
+fn decl_ret(c: &crate::CalleeRef, maps: &BodyMaps) -> Option<Ty> {
+    if c.ret_ty_conflict {
+        return None;
+    }
+    // Trust (#184): the recorded type is in the BODY's numbering; a declaration lives in the
+    // ASSEMBLED module, so it must be remapped or a `Ty::Struct(sid)` would name a different type.
+    // Table-free types remap to themselves, so the previously-shipped scalar lane is unchanged.
+    // A `None` here (out-of-range or not-yet-interned id) keeps the honest empty `returns`.
+    maps.remap(c.ret_ty.as_ref()?)
 }
 
 /// Trust (#178): the declaration dedup-key suffix for a callee's agreed return type. Two call
 /// sites that bind different types from one `def_path` must NOT collapse into one declaration —
 /// its signature would contradict half of them. Empty for the unknown case, so a callee with no
 /// agreed type keeps byte-identical keys to the pre-#178 producer.
-fn ret_key(c: &crate::CalleeRef) -> String {
-    match decl_ret(c) {
+fn ret_key(c: &crate::CalleeRef, maps: &BodyMaps) -> String {
+    match decl_ret(c, maps) {
         Some(t) => format!("|ret:{t:?}"),
         None => String::new(),
     }
@@ -3209,13 +3745,79 @@ fn intern_func_ty(module: &mut Module, ft: FuncTy) -> FuncTyId {
 ///     Instruction-embedded types are enumerated by `inst_embedded_tys` — an instruction
 ///     variant it does not model refuses the body (fail-closed) rather than moving an
 ///     unscanned type between modules.
-fn splice_ok(r: &BodyRecord) -> bool {
+fn splice_ok(r: &BodyRecord, records: &[BodyRecord]) -> bool {
     if !r.unsupported.is_empty() {
         return false;
     }
     // Trust (totality Batch C): a symbolic body's module carries value-less
     // extern-immutable globals — lowered-for-coverage, never spliced.
     if r.symbolic {
+        return false;
+    }
+    // Trust (union lane): the body's struct table carries a `StructDef` whose lane stands for a
+    // `union`'s real bytes while spelling `Ty::Unit`. Refused with its OWN predicate, on ground
+    // truth recorded by the producer's ledger — deliberately NOT inferred from the `()` lane type,
+    // which is indistinguishable from an honest zero-sized field (104 shipped structs carry honest
+    // ones). Two consequences ride on this refusal:
+    //   * no such `StructDef` ever enters the assembled executable module, so the unclosed
+    //     declared-`size` vs derived-field-`byte_size` layout disagreement cannot be reached
+    //     through this lane;
+    //   * these bodies carry a FORCED `contains_call` (their NotRun confinement), which makes them
+    //     `deferred` — and the crate-seam differential's step 0 requires a spliced entry. Refusing
+    //     here is therefore what keeps the seam interpreter away from them. See
+    //     `LowerCx::register_union_lane`: the two gates are sound only together.
+    if r.union_lane {
+        return false;
+    }
+    // Trust (enum param lane): the body's enum table carries an `EnumDef` one of whose variant
+    // fields stands for a caller's `T` — real bytes at the instantiation — while spelling
+    // `Ty::Unit`, i.e. claiming zero. Refused with its OWN predicate, on the ground truth the
+    // producer's ledger recorded (`matches!(rust_fty.kind(), ty::Param(_))`), and deliberately
+    // NOT inferred from the `()` lane spelling: the B3-2c E1 respell mints the SAME `Ty::Unit`
+    // for an honest drop-free ZST, and a `Ty`-keyed gate here would refuse the entire wave-EZ
+    // `fmt::Result` / `Option<()>` family.
+    //
+    // Stated as its own line rather than left to `r.symbolic` two lines up — which does refuse
+    // every body in this class today, because admitting a lane requires `map_ty` to have walked a
+    // bare `ty::Param` and that arm sets `param_opaque`. That is a real wall, but it is a claim
+    // about a SIDE EFFECT's ordering, not a decision about placeholder lanes, and this branch has
+    // twice paid for a gate that was "safe because something else happens to refuse it".
+    //
+    // The second consequence is the load-bearing one: these bodies carry a FORCED `contains_call`
+    // (their NotRun confinement — see `LowerCx::register_enum_param_lane`), which makes them
+    // `deferred`, and the crate-seam differential's step 0 requires a SPLICED entry. Refusing
+    // here is therefore what keeps the seam interpreter away from them. The two gates are sound
+    // only together; neither may be dropped because the other exists.
+    if r.enum_param_lane {
+        return false;
+    }
+    // Trust (wave-ZC): a body that passed a capture-free closure as the ZST
+    // `Ty::Unit`/`PhantomData` value. The producer and the oracle agree on that spelling, but
+    // the ASSEMBLED module would carry it across a call edge whose callee declares a real
+    // closure type, with nothing in the module recording that the two denote the same value.
+    // No such callee is spliceable today — a closure-typed param can only be a generic `F`,
+    // which goes `ty::Param` → `param_opaque` → `symbolic` → refused two lines up — but that
+    // is a wall made of Rust's inability to SPELL a closure type, not a claim of ours. State
+    // the refusal here, so filling that absence cannot open the lane silently. Recovering the
+    // splice needs a POSITIVE witness (the callee's UNINSTANTIATED declared input at this
+    // position is `ty::Param`/`Alias(Opaque)`), not the removal of this line.
+    if r.zst_closure_arg {
+        return false;
+    }
+    // Trust (fn-ptr adapter lane): the body's mini-module carried a PRODUCER-SYNTHESIZED
+    // closure→fn-pointer adapter, and `record` DROPPED it (`functions.remove(0)` keeps only the
+    // body). Splicing the body would put a `Constant::FnDef` into the assembled module naming a
+    // function that is not in it.
+    //
+    // STATED HERE, on the producer's own ledger, rather than left to the two absences that also
+    // happen to refuse it today: (a) the adapter's `FuncId` comes from the reserved synthetic band
+    // and so has ZERO callee-ledger entries, which the `Constant::FnDef` arm below rejects with
+    // its `!= 1` count; and (b) `run_seam_differentials`' step 0 needs a spliced entry. Both are
+    // real, but (a) lives inside an arm someone could reasonably widen, and this branch has twice
+    // paid for a gate that was "safe because nobody emits that yet". A future minting path for
+    // synthetic functions must relax THIS line deliberately, with a second-function carrier, not
+    // acquire the splice as a side effect.
+    if r.fnptr_adapter {
         return false;
     }
     let (Some(f), Some(ft)) = (&r.function, &r.func_ty) else {
@@ -3323,6 +3925,12 @@ fn splice_ok(r: &BodyRecord) -> bool {
                             return false;
                         }
                         if r.callees.iter().filter(|c| c.func_id == *fid).count() != 1 {
+                            return false;
+                        }
+                        // Trust: and the TARGET's own signature must actually be the one this
+                        // constant claims — see `fnptr_target_sig_ok`. Sig-resolvability plus a
+                        // unique ledger identity (the two checks above) say nothing about arity.
+                        if !fnptr_target_sig_ok(r, records, *fid, *sig) {
                             return false;
                         }
                     }
@@ -3653,7 +4261,35 @@ fn validation_error_class(e: &trust_ir_build::ValidationError) -> String {
     if name.is_empty() { "UnnamedVariant".to_string() } else { name }
 }
 
-fn prepare_body_tables(r: &BodyRecord, module: &mut Module) -> Option<(Function, FuncTy)> {
+/// Trust (#184): the per-body -> assembled-module id remaps `prepare_body_tables` builds, returned
+/// so pass 2 can remap a type it did NOT get from the body's instruction stream — specifically the
+/// call-result type recorded on a `CalleeRef`, which types a bodyless declaration's `returns`.
+///
+/// Without this the declaration lane was confined to TABLE-FREE types, which is the same wall
+/// `body_sig_ok` puts on `CallIndirect` signatures and reified fn-pointer constants
+/// (`params.chain(returns).all(ty_table_free)`); those are re-interned from the RAW body table with
+/// no remap, which is sound ONLY because of that requirement. Handing the maps out lifts the wall
+/// for all three consumers rather than just one.
+#[derive(Clone, Default)]
+struct BodyMaps {
+    enum_map: Vec<Option<EnumId>>,
+    struct_map: Vec<Option<StructId>>,
+    ty_map: Vec<TyId>,
+    closure_map: Vec<trust_ir::ClosureTyId>,
+}
+
+impl BodyMaps {
+    /// Remap a BODY-numbered `Ty` into the assembled module's numbering. `None` (fail-closed) for
+    /// an out-of-range id, a not-yet-interned def, or a variant `remap_ty` does not model.
+    fn remap(&self, ty: &Ty) -> Option<Ty> {
+        remap_ty(ty, &self.enum_map, &self.struct_map, &self.ty_map, &self.closure_map)
+    }
+}
+
+fn prepare_body_tables(
+    r: &BodyRecord,
+    module: &mut Module,
+) -> Option<(Function, FuncTy, BodyMaps)> {
     let (Some(func), Some(func_ty)) = (&r.function, &r.func_ty) else {
         return None;
     };
@@ -3825,7 +4461,7 @@ fn prepare_body_tables(r: &BodyRecord, module: &mut Module) -> Option<(Function,
             }
         }
         remap_func_scopes(&mut f, &r.files, module);
-        return Some((f, func_ty.clone()));
+        return Some((f, func_ty.clone(), BodyMaps::default()));
     }
     let mut ft = func_ty.clone();
     for t in ft.params.iter_mut().chain(ft.returns.iter_mut()) {
@@ -3849,7 +4485,7 @@ fn prepare_body_tables(r: &BodyRecord, module: &mut Module) -> Option<(Function,
         }
     }
     remap_func_scopes(&mut f, &r.files, module);
-    Some((f, ft))
+    Some((f, ft, BodyMaps { enum_map, struct_map, ty_map, closure_map }))
 }
 
 /// Trust: rewrite every `EnumId`/`StructId`/`TyId` embedded in `ty` through the pass-1 maps
@@ -3935,13 +4571,99 @@ fn intern_closure_ty(module: &mut Module, ct: trust_ir::ClosureTy) -> trust_ir::
 /// `Inst::Const { ty: Ty::Func(_) }`) resolvable AND movable? It must index the body's own
 /// snapshot table (`BodyRecord::func_types`), and the signature must be non-vararg with
 /// table-free params/returns — `ty_table_free` rejects `Ty::Func` itself, so a higher-order
-/// signature fails here and the pass-2 re-interning never needs to recurse (the producer's
-/// `map_fn_ptr_ty` enforces the same bound at emission; checked again, not assumed).
+/// signature fails here and the pass-2 re-interning never needs to recurse.
+///
+/// TABLE-FREEDOM IS THIS GATE'S OWN REQUIREMENT, not a restatement of the producer's. Pass 2
+/// re-interns the resolved `FuncTy` VERBATIM (`assemble`'s `Inst::CallIndirect` / `Inst::Const`
+/// arms call `intern_func_ty` with no `remap_ty`), so a per-body `StructId`/`EnumId`/`TyId` carried
+/// through would dangle against the assembled tables. The producer's `map_fn_ptr_ty` enforces only
+/// the HIGHER-ORDER bound, and since `ty_contains_func_resolved` it deliberately admits
+/// struct/enum-bearing signatures (the `fn() -> Name` shape behind the `LazyLock` statics) that
+/// this gate then refuses — a `lowered`-only admission. See
+/// `test_every_newly_admitted_component_is_still_refused_by_the_splice_predicate`: the two halves
+/// are consistent precisely because every signature that widening newly admits fails
+/// `ty_table_free`.
 fn body_sig_ok(r: &BodyRecord, sig: FuncTyId) -> bool {
     match r.func_types.get(sig.as_usize()) {
         Some(ft) => !ft.is_vararg && ft.params.iter().chain(ft.returns.iter()).all(ty_table_free),
         None => false,
     }
+}
+
+/// Trust: does the TARGET of a fn-pointer constant `Inst::Const { ty: Ty::Func(sig), value:
+/// Constant::FnDef(fid) }` actually carry the signature `sig` claims for it?
+///
+/// WHY THIS EXISTS. `body_sig_ok` proves `sig` RESOLVES and the ledger-uniqueness check proves
+/// `fid` names ONE identity — neither says anything about the target's arity, and trust-ir's own
+/// validator does not either (`shape.rs` `shape_matches_ty` is `(FnDef(_), Ty::Func(_)) => true`,
+/// unconditionally). Today's only emitter, the `ReifyFnPointer` arm, is arity-exact by
+/// construction (`resolve_reify_target` + `map_fn_ptr_ty` both read the SAME rustc fn signature),
+/// so the hole has never been hit — i.e. the gate was "safe because nobody emits a bad `FnDef`
+/// yet", which is an absence, not a predicate. The concrete program the absence was hiding: a
+/// `ClosureFnPointer` coercion lowered as `Constant::FnDef(closure_body)` would be arity `N+1`
+/// against an arity-`N` `Ty::Func`, because this producer signs every closure body
+/// `[env, declared…]` (`lower_fn` prepends `closure_env_param_ty`; `signs_closure_env_slot`).
+/// That is a silently wrong program at any indirect call through the pointer.
+///
+/// THE PREDICATE, and why the two admitting branches are not themselves absences:
+///   * ONE ledger identity, never a FORCED-HAVOC edge. A havoc edge exists precisely to declare
+///     an unconstrained target (`resolve_callee`'s `havoc:` key); taking its ADDRESS at a
+///     concrete `Ty::Func` would claim the signature the havoc refuses to commit to.
+///   * A LOCAL target with a record in this crate is the linkable case: compare its
+///     producer-signed `func_ty` to `sig` STRUCTURALLY and refuse on any mismatch, on a record
+///     with no signature at all, and on a target signature that is not table-free (the two sides
+///     are numbered in DIFFERENT per-body tables, so only table-free types compare meaningfully;
+///     `body_sig_ok` already forces the `sig` side).
+///   * A target with NO record in this crate (cross-crate, or a local `DefIndex` this crate never
+///     recorded) cannot be linked at all: pass 2's `resolve_callee` sends it to `decl_id`, and a
+///     declaration is minted with the unknown-PARAMS encoding `FuncTy { params: [], is_vararg:
+///     true, .. }` (~:3034) — this file's own minting, not an outside guarantee — so no ARITY is
+///     asserted and there is nothing for `sig`'s param list to contradict.
+///
+/// WHAT THAT ARGUMENT DOES **NOT** COVER — stated because the same minting block asserts the other
+/// half. `returns` is NOT unknown-encoded: ~:3035 fills it from `decl_ret(c, maps)`, so a declaration
+/// whose call sites agreed on a table-free result type carries a POSITIVE return claim, and the two
+/// admitting branches above do not compare it against `claimed.returns`. The return side of the
+/// mismatch class therefore stays open on those branches; only the local-with-a-record branch
+/// compares both halves (`target == claimed`). It is left open deliberately: `decl_ret` is the type
+/// the CALL SITES agreed on (`ret_ty`, cleared to `None` on `ret_ty_conflict`), not the target's own
+/// signature, so a disagreement with `claimed.returns` is not by itself evidence of a wrong program
+/// — and refusing on it would add a second refusal whose splice-rate cost is as unmeasured as the
+/// one below. The hole this predicate is here to close is the ARITY hole; the residual is named
+/// rather than papered over.
+///
+/// SPLICE-RATE DELTA: UNMEASURED, pending a trustc rebuild + corpus run — and it could go either
+/// way, so no "strengthening only" claim is made here. The specific branch that makes the optimistic
+/// reading unsafe is `func_ty: None` (~:4062): a reify of a LOCAL fn whose own body did not lower
+/// has no producer-signed signature to compare, and this predicate refuses it, which un-splices the
+/// CALLER. Before this check that caller spliced and the edge simply became a `local-unlowered:`
+/// declaration. `c.force_havoc` refuses a second previously-splicing shape for the same reason.
+fn fnptr_target_sig_ok(r: &BodyRecord, records: &[BodyRecord], fid: FuncId, sig: FuncTyId) -> bool {
+    let Some(claimed) = r.func_types.get(sig.as_usize()) else {
+        return false;
+    };
+    let idents: Vec<&CalleeRef> = r.callees.iter().filter(|c| c.func_id == fid).collect();
+    let [c] = idents.as_slice() else {
+        return false;
+    };
+    if c.force_havoc {
+        return false;
+    }
+    if !c.is_local {
+        return true;
+    }
+    let Ok(i) = records.binary_search_by_key(&c.def_index, |t| t.def_index) else {
+        // No record for this local `DefIndex` ⇒ `lookup` misses in pass 2 ⇒ bodyless
+        // `local-unlowered:` declaration ⇒ no arity claim to contradict.
+        return true;
+    };
+    let Some(target) = &records[i].func_ty else {
+        return false;
+    };
+    if target.is_vararg || !target.params.iter().chain(target.returns.iter()).all(ty_table_free) {
+        return false;
+    }
+    target == claimed
 }
 
 /// True iff `ty` references no module-level table (`structs`/`enums`/`types`/`func_types`/
@@ -4271,6 +4993,23 @@ fn coverage_json(
             })
             .collect::<Vec<_>>()
             .join(", ");
+        // Trust (wave-EF): the register_enum decline reasons — `[["path", "reason"], ...]`.
+        // OMITTED ENTIRELY when empty (i.e. always, unless `TRUST_ENUM_DECLINE_CENSUS=1`), so a
+        // default census run is byte-identical to a pre-wave-EF one and old dumps stay diffable.
+        // This is a measurement key: it never appears in `unsupported` and never moves `lowered`.
+        let enum_declines = if r.enum_declines.is_empty() {
+            String::new()
+        } else {
+            let rows = r
+                .enum_declines
+                .iter()
+                .map(|(path, reason)| {
+                    format!("[\"{}\", \"{}\"]", json_escape(path), json_escape(reason))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(" \"enum_declines\": [{rows}],")
+        };
         // Trust (v2 Phase 0b): the collect-all pass rows (empty arrays for clean bodies).
         let fmt_pairs = |v: &Vec<(String, u64)>| {
             v.iter()
@@ -4325,7 +5064,7 @@ fn coverage_json(
              \"symbolic\": {}, \
              \"spliced\": {}, \"lineage\": {}, \"func_id\": {}, \"instr_count\": {}, \
              \"unsupported\": [{}], \
-             \"unsupported_details\": {{{}}}, \
+             \"unsupported_details\": {{{}}},{} \
              \"collect_primary\": [{}], \"collect_cascade\": [{}], \"calls\": {{ \
              \"resolved\": {}, \"extern_decls\": {}, \"unresolved\": {} }}, \
              \"differentials\": {{ \"interpreter\": {{ \"verdict\": \"{}\", \
@@ -4343,6 +5082,7 @@ fn coverage_json(
             r.instr_count,
             unsupported,
             unsupported_details,
+            enum_declines,
             collect_primary,
             collect_cascade,
             r.calls_resolved,
@@ -4365,6 +5105,137 @@ fn coverage_json(
     Ok(out)
 }
 
+/// Trust (tranche 4): the census detail-cap channel. Pure, TyCtxt-free, no process env touched
+/// (see [`parse_detail_cap`] for why the parse is split from the `OnceLock` read).
+#[cfg(test)]
+mod detail_cap_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    /// The literal pre-tranche loop, kept verbatim as the byte-stability oracle.
+    fn pre_tranche_loop(unsupported: &[(String, &'static str)]) -> Vec<(String, Vec<String>)> {
+        let mut details_by_tag: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (detail, what) in unsupported {
+            let ex: String = detail.chars().take(120).collect();
+            let examples = details_by_tag.entry((*what).to_string()).or_default();
+            if examples.len() < 3 && !examples.contains(&ex) {
+                examples.push(ex);
+            }
+        }
+        details_by_tag.into_iter().collect()
+    }
+
+    fn fixture() -> Vec<(String, &'static str)> {
+        // One tag with FIVE distinct details (the truncated case the census hit 4,516 times),
+        // a second tag interleaved (tag ordering must not depend on encounter order), and a
+        // duplicate detail (dedup must survive the lift).
+        let ctor: &'static str = "EnumCtor(unsupported payload)";
+        let borrow: &'static str = "Borrow(non-local place)";
+        vec![
+            ("flat/db.rs:376:13".to_string(), ctor),
+            ("flat/db.rs:1:1".to_string(), borrow),
+            ("flat/db.rs:377:13".to_string(), ctor),
+            ("flat/db.rs:378:13".to_string(), ctor),
+            ("flat/db.rs:377:13".to_string(), ctor),
+            ("flat/db.rs:379:13".to_string(), ctor),
+            ("flat/db.rs:380:13".to_string(), ctor),
+        ]
+    }
+
+    #[test]
+    fn test_parse_detail_cap_absent_or_garbage_returns_the_shipped_default() {
+        let default = DetailCap::Limited(DETAIL_CAP_DEFAULT);
+        assert_eq!(parse_detail_cap(None), default, "absent must not move the artifact");
+        for garbage in ["", " ", "three", "-1", "3.5", "0x0", "4294967296", "1e3"] {
+            assert_eq!(
+                parse_detail_cap(Some(OsStr::new(garbage))),
+                default,
+                "a typo ({garbage:?}) must fall back to the default, never to unbounded"
+            );
+        }
+        // Non-UTF-8 takes the same path (`to_str` yields None) — asserted on the platform that
+        // can spell it; on others the `to_str` arm is already covered by the strings above.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(parse_detail_cap(Some(OsStr::from_bytes(&[0xff, 0xfe]))), default);
+        }
+    }
+
+    #[test]
+    fn test_parse_detail_cap_zero_is_unbounded_and_n_is_limited_n() {
+        assert_eq!(parse_detail_cap(Some(OsStr::new("0"))), DetailCap::Unbounded);
+        assert_eq!(parse_detail_cap(Some(OsStr::new(" 0 "))), DetailCap::Unbounded);
+        assert_eq!(parse_detail_cap(Some(OsStr::new("1"))), DetailCap::Limited(1));
+        assert_eq!(parse_detail_cap(Some(OsStr::new("3"))), DetailCap::Limited(3));
+        assert_eq!(
+            parse_detail_cap(Some(OsStr::new("4294967295"))),
+            DetailCap::Limited(4_294_967_295)
+        );
+    }
+
+    #[test]
+    fn test_detail_cap_admits_counts_strictly_below_the_limit() {
+        assert!(DetailCap::Limited(3).admits(2));
+        assert!(!DetailCap::Limited(3).admits(3));
+        assert!(!DetailCap::Limited(0).admits(0), "Limited(0) records nothing");
+        assert!(DetailCap::Unbounded.admits(usize::MAX));
+    }
+
+    #[test]
+    fn default_cap_reproduces_the_pre_tranche_loop() {
+        let input = fixture();
+        assert_eq!(
+            aggregate_detail_examples(&input, parse_detail_cap(None)),
+            pre_tranche_loop(&input),
+            "the DEFAULT census artifact must stay byte-identical to the pre-tranche one"
+        );
+    }
+
+    #[test]
+    fn test_aggregate_detail_examples_cap_zero_keeps_every_distinct_example() {
+        let input = fixture();
+        let capped = aggregate_detail_examples(&input, parse_detail_cap(None));
+        let lifted = aggregate_detail_examples(&input, parse_detail_cap(Some(OsStr::new("0"))));
+
+        // Tag order is BTreeMap order in both, independent of encounter order.
+        let tags: Vec<&str> = lifted.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(tags, vec!["Borrow(non-local place)", "EnumCtor(unsupported payload)"]);
+
+        let capped_examples = &capped[1].1;
+        let lifted_examples = &lifted[1].1;
+        assert_eq!(capped_examples.len(), 3, "the default truncates — this is the 58% loss");
+        assert_eq!(lifted_examples.len(), 5, "cap 0 recovers every DISTINCT example");
+        // The repeated 377:13 detail is one example under BOTH caps: the lift changes the
+        // budget, never the dedup.
+        assert_eq!(lifted_examples.iter().filter(|e| e.ends_with("377:13")).count(), 1);
+        // The default's examples are a PREFIX of the lifted ones (first-encounter order).
+        assert_eq!(&lifted_examples[..3], &capped_examples[..]);
+    }
+
+    #[test]
+    fn test_aggregate_detail_examples_truncates_at_the_char_budget_under_every_cap() {
+        // Multi-byte chars: a byte-wise truncation would panic or split a char here.
+        let long: String = "é".repeat(200);
+        let input = vec![(long.clone(), "Ty")];
+        for cap in [parse_detail_cap(None), DetailCap::Unbounded, DetailCap::Limited(9)] {
+            let out = aggregate_detail_examples(&input, cap);
+            assert_eq!(out[0].1[0].chars().count(), DETAIL_CHARS_MAX);
+            assert!(long.starts_with(&out[0].1[0]));
+        }
+        // Two details sharing the 120-char prefix stay ONE example (dedup is post-truncation),
+        // under the lifted cap too — pinned because the lift is the only thing that could have
+        // exposed the second copy.
+        let shared = vec![(format!("{long}A"), "Ty"), (format!("{long}B"), "Ty")];
+        assert_eq!(aggregate_detail_examples(&shared, DetailCap::Unbounded)[0].1.len(), 1);
+    }
+
+    #[test]
+    fn test_aggregate_detail_examples_empty_input_yields_no_rows() {
+        assert!(aggregate_detail_examples(&[], DetailCap::Unbounded).is_empty());
+    }
+}
+
 #[cfg(test)]
 mod authority_tests {
     use super::*;
@@ -4384,6 +5255,7 @@ mod authority_tests {
             instr_count: 0,
             unsupported: Vec::new(),
             unsupported_details: Vec::new(),
+            enum_declines: Vec::new(),
             collect_primary: Vec::new(),
             collect_cascade: Vec::new(),
             calls_resolved: 0,
@@ -4556,8 +5428,12 @@ mod authority_tests {
             def_index,
             kind: BodyKind::Fn,
             symbolic: false,
+            union_lane: false,
+            enum_param_lane: false,
             def_path: fn_name.to_string(),
             place_path_carrier: false,
+            zst_closure_arg: false,
+            fnptr_adapter: false,
             function: Some(function),
             func_ty: Some(func_ty),
             files: Vec::new(),
@@ -4568,6 +5444,7 @@ mod authority_tests {
             globals: Vec::new(),
             unsupported: Vec::new(),
             unsupported_details: Vec::new(),
+            enum_declines: Vec::new(),
             collect_primary: Vec::new(),
             collect_cascade: Vec::new(),
             instr_count: 0,
@@ -4586,6 +5463,270 @@ mod authority_tests {
             mir_snapshot: None,
             lineage: Some(lineage),
         }
+    }
+
+    /// Trust (union lane) SPLICE REFUSAL, PINNED. A record that is spliceable in every other
+    /// respect stops being spliceable the moment it reports a union placeholder lane — and the
+    /// refusal keys on that flag alone, never on a `()` field type (which is indistinguishable
+    /// from an honest zero-sized field; 104 shipped structs carry honest ones).
+    ///
+    /// The negative half is what makes the gate non-vacuous, and the positive half is what keeps
+    /// the forced-`contains_call` confinement honest: these bodies are `deferred`, and the
+    /// crate-seam differential's step 0 requires a SPLICED entry, so this refusal is the thing
+    /// that keeps the seam interpreter away from them.
+    #[test]
+    fn union_lane_record_is_refused_by_the_splice() {
+        let clean = lineage_body_record(1, "probe::clean");
+        let records = vec![clean];
+        assert!(
+            splice_ok(&records[0], &records),
+            "the minimal mini-module must splice — otherwise the union-lane half proves nothing"
+        );
+
+        let mut tainted = lineage_body_record(1, "probe::union_lane");
+        tainted.union_lane = true;
+        let tainted_records = vec![tainted];
+        assert!(
+            !splice_ok(&tainted_records[0], &tainted_records),
+            "a body carrying a union placeholder lane must never enter the executable module"
+        );
+    }
+
+    /// Trust (enum param lane) SPLICE REFUSAL, PINNED — and it is OURS.
+    ///
+    /// The negative half is what makes the gate non-vacuous: the SAME record with the flag
+    /// cleared splices, and with `symbolic` ALSO false, so the only difference between the two
+    /// verdicts is `enum_param_lane`. That matters here more than for most flags, because
+    /// `symbolic` does refuse every body in this class today (admitting a lane requires `map_ty`
+    /// to have walked a bare `ty::Param`, whose arm sets `param_opaque`) — a fact about a side
+    /// effect's ordering, not a decision about placeholder lanes.
+    ///
+    /// The positive half is the load-bearing one: these bodies carry a FORCED `contains_call`,
+    /// which makes them `deferred`, and `run_seam_differentials`' step 0 requires a SPLICED
+    /// entry. This refusal is therefore what keeps the crate-seam interpreter away from them.
+    /// Delete it and the forcing alone would route them INTO the seam.
+    #[test]
+    fn enum_param_lane_record_is_refused_by_the_splice() {
+        let clean = vec![lineage_body_record(1, "probe::clean")];
+        assert!(
+            splice_ok(&clean[0], &clean),
+            "the minimal mini-module must splice — otherwise the param-lane half proves nothing"
+        );
+
+        let mut tainted = lineage_body_record(1, "probe::enum_param_lane");
+        tainted.enum_param_lane = true;
+        // Deliberately NOT symbolic: the refusal must be this flag's, not inherited.
+        assert!(!tainted.symbolic, "the fixture must isolate `enum_param_lane` from `symbolic`");
+        let tainted_records = vec![tainted];
+        assert!(
+            !splice_ok(&tainted_records[0], &tainted_records),
+            "a body carrying an enum param placeholder lane must never enter the executable \
+             module — an `EnumDef` lane claiming zero bytes for a caller's `T`"
+        );
+    }
+
+    /// A `Lowered` in the exact posture a param-lane body reaches the seams in: CLEAN (no
+    /// unsupported shapes, no pending consts), no `Inst::Call` of its own, ledger non-empty.
+    /// `contains_call` is COMPUTED by the production expression, never written down — that is
+    /// what makes the test below a test of the forcing rather than of a fixture.
+    fn param_lane_probe_lowered(
+        body_emitted_a_call: bool,
+        ledger_nonempty: bool,
+    ) -> crate::Lowered {
+        crate::Lowered {
+            module: Module::new("param_lane_confinement_probe"),
+            body_kind: BodyKind::Fn,
+            opaque_collapse: ledger_nonempty,
+            enum_declines: Vec::new(),
+            union_lane: false,
+            enum_param_lane: ledger_nonempty,
+            // The class IS symbolic in fact; carried so the assertion below that the differential
+            // is unmoved by it is made against the real posture, not a stripped one.
+            symbolic: ledger_nonempty,
+            unsupported: Vec::new(),
+            contains_call: crate::param_lane_forces_not_interpretable(
+                body_emitted_a_call,
+                ledger_nonempty,
+            ),
+            place_path_carrier: false,
+            zst_closure_arg: false,
+            fnptr_adapter: false,
+            thin_reborrow: false,
+            callees: Vec::new(),
+            pending_consts: Vec::new(),
+        }
+    }
+
+    /// Trust (enum param lane) — THE CONFINEMENT, PINNED END TO END. **This test fails if the
+    /// forced `contains_call` is removed.**
+    ///
+    /// The previous cut of this lane shipped without the forcing, on the argument that
+    /// "`symbolic` already carries the differential refusal". It does not:
+    /// [`crate::differential::compare`] never reads `symbolic`, and its only structural skip is
+    /// [`crate::differential::contains_call_forces_not_run`]. A clean, call-free param-lane body
+    /// would have been INTERPRETED, with both sides spelling the caller's `T` as a zero-byte
+    /// `Unit` and reporting agreement about a function neither modelled.
+    ///
+    /// The three assertions are the three legs, in order:
+    ///  1. a non-empty ledger forces the flag even though the body emitted NO call — remove the
+    ///     forcing and this is the assertion that goes red;
+    ///  2. with the flag set, the DIRECT differential skips the body — and the same probe with
+    ///     `symbolic: true` but the flag CLEAR does not, which is the falsified claim, executed;
+    ///  3. the flag makes the body `deferred_to_seam`, so the seam interpreter would take it —
+    ///     and only the splice refusal closes that half. Requirements 3 and 4 are sound together
+    ///     or not at all.
+    #[test]
+    fn enum_param_lane_forced_contains_call_routes_the_body_away_from_both_differentials() {
+        // (1) The forcing itself, at the production expression.
+        let probe = param_lane_probe_lowered(/* body_emitted_a_call */ false, true);
+        assert!(
+            probe.contains_call,
+            "a non-empty param-lane ledger must FORCE `contains_call` even though the body \
+             emitted no call — this is the correction the reverted cut omitted"
+        );
+
+        // (2) That flag, and nothing else on `Lowered`, is what the direct differential skips on.
+        assert!(
+            crate::differential::contains_call_forces_not_run(&probe),
+            "the direct interpretation differential must skip a param-lane body"
+        );
+        let symbolic_only = crate::Lowered {
+            symbolic: true,
+            contains_call: false,
+            enum_param_lane: true,
+            ..param_lane_probe_lowered(false, false)
+        };
+        assert!(
+            !crate::differential::contains_call_forces_not_run(&symbolic_only),
+            "`symbolic` alone does NOT route a body away from the direct differential — the \
+             falsified confinement argument, executed rather than argued"
+        );
+
+        // (3) The forcing defers the body to the crate-finalize seam, whose step 0 needs a
+        //     SPLICED entry — which `splice_ok` refuses. The two gates close the loop together.
+        assert!(
+            crate::differential::deferred_to_seam(&probe),
+            "a clean body with the forced flag is deferred — so the splice refusal is required"
+        );
+        let mut rec = lineage_body_record(1, "probe::enum_param_lane_seam");
+        rec.enum_param_lane = true;
+        rec.deferred = true;
+        let records = vec![rec];
+        assert!(
+            !splice_ok(&records[0], &records),
+            "the seam interpreter reaches only SPLICED entries; refusing the splice is what \
+             keeps the deferred param-lane body away from it"
+        );
+
+        // Control: an empty ledger forces nothing, so a body that meets no param lane keeps its
+        // own `contains_call` and its own differential verdict, exactly as before this change.
+        let untouched = param_lane_probe_lowered(false, false);
+        assert!(!untouched.contains_call, "the forcing must be keyed on the ledger, not blanket");
+        assert!(!crate::differential::contains_call_forces_not_run(&untouched));
+        assert!(param_lane_probe_lowered(true, false).contains_call, "a real call still counts");
+    }
+
+    /// Trust (wave-ZC): the ZST-closure-arg splice refusal is OURS, not a side effect of the
+    /// `ty::Param` → `symbolic` wall that also happens to stop these bodies today. The
+    /// positive half is what makes this a test of the predicate rather than of the fixture:
+    /// the SAME record with the flag cleared splices, so the only difference between the two
+    /// verdicts is the flag. If a closure-typed callee param ever becomes spliceable —
+    /// filling the absence the old wall was made of — this test still fails the body closed.
+    #[test]
+    fn test_splice_refuses_a_zst_closure_arg_body_on_its_own_predicate() {
+        let clean = vec![lineage_body_record(1, "probe::minimal")];
+        assert!(
+            splice_ok(&clean[0], &clean),
+            "the minimal record must be spliceable, or the refusal below proves nothing"
+        );
+        let mut flagged = lineage_body_record(1, "probe::zst_closure_arg");
+        flagged.zst_closure_arg = true;
+        let flagged_records = vec![flagged];
+        assert!(
+            !splice_ok(&flagged_records[0], &flagged_records),
+            "a body carrying a ZST closure call argument must be refused by `splice_ok`'s own \
+             predicate, independently of `symbolic` or of any table check"
+        );
+    }
+
+    /// Trust (fn-ptr adapter lane): the SPLICE refusal is OURS, on the producer's ledger, not a
+    /// side effect of the adapter's `FuncId` happening to carry zero callee-ledger entries (which
+    /// the `Constant::FnDef` arm would also reject) or of the seam's step-0 spliced-entry demand.
+    /// The positive half is what makes it a test of the predicate rather than of the fixture: the
+    /// SAME record with the flag cleared splices, so the flag is the only difference.
+    #[test]
+    fn test_splice_refuses_an_fnptr_adapter_body_on_its_own_predicate() {
+        let clean = vec![lineage_body_record(1, "probe::minimal")];
+        assert!(
+            splice_ok(&clean[0], &clean),
+            "the minimal record must be spliceable, or the refusal below proves nothing"
+        );
+        let mut flagged = lineage_body_record(1, "probe::fnptr_adapter");
+        flagged.fnptr_adapter = true;
+        let flagged_records = vec![flagged];
+        assert!(
+            !splice_ok(&flagged_records[0], &flagged_records),
+            "a body whose mini-module carried a producer-synthesized adapter must be refused by \
+             `splice_ok`'s own predicate: `record` DROPPED that adapter, so splicing would put a \
+             `Constant::FnDef` into the assembled module naming a function that is not in it"
+        );
+    }
+
+    /// Trust (fn-ptr adapter lane) THE WHOLE CLAIM OF THE LANE, ASSEMBLED. A body carrying a
+    /// synthesized adapter counts as `lowered` and is NEVER `spliced` — coverage moves, the
+    /// executable module does not, and no trust claim is made.
+    ///
+    /// `lowered` is `r.function.is_some() && r.unsupported.is_empty()`, computed from the
+    /// BodyRecord that `record` built by taking `functions[0]`; the adapter sat at index 1 and was
+    /// dropped there. `lineage` is `None` for exactly the same reason the flip refuses (the digest
+    /// needs a single-function module), and that must NOT move `lowered` — a null lineage is an
+    /// attestation absence, not a lowering failure.
+    #[test]
+    fn test_fnptr_adapter_body_is_lowered_but_never_spliced() {
+        let mut r = lineage_body_record(1, "probe::adapter_bearing");
+        r.fnptr_adapter = true;
+        // What `record` would have recorded for such a body: the adapter never reaches the
+        // BodyRecord (single-function channel), and the digest refused the two-function module.
+        r.lineage = None;
+        let assembled = assemble("fnptr_adapter_probe", &[r]);
+        assert_eq!(assembled.lowered, 1, "the body itself lowered clean and must be counted");
+        assert_eq!(assembled.spliced, 0, "and it must contribute nothing to the executable module");
+        assert!(
+            assembled.module.functions.is_empty(),
+            "no function from an adapter-bearing body may enter the assembled module"
+        );
+        let row = &assembled.coverage_rows[0];
+        assert!(row.lowered && !row.spliced);
+        assert!(row.func_id.is_none(), "an un-spliced row addresses no assembled function");
+        assert!(row.lineage.is_none(), "and it carries no attestation digest");
+    }
+
+    /// Trust (fn-ptr adapter lane) ARITY HONESTY, ON THE GATE'S OWN TERMS. The adapter exists
+    /// precisely so the reified constant does not lie about its target's signature, and the
+    /// measure of that is `fnptr_target_sig_ok` — the gate written to refuse the naive fix.
+    ///
+    /// Both halves are asserted against the SAME caller and the SAME claimed `Ty::Func`:
+    ///   * a target signed `[f64, f64] -> f64` — the adapter, whose `Function::ty` IS the coerced
+    ///     fn pointer's own `FuncTyId` — PASSES;
+    ///   * a target signed `[Ptr, f64, f64] -> f64` — the closure BODY, with the env slot
+    ///     `lower_fn` prepends — is REFUSED.
+    /// The gate is untouched by this lane; if a future edit ever made the closure-body row pass,
+    /// the adapter would have stopped being the thing that earns the constant.
+    #[test]
+    fn test_fnptr_adapter_signature_is_what_the_target_gate_accepts() {
+        let caller = fnptr_caller(probe_callee(42, true, false));
+        let adapter_shaped = vec![target_with_sig(42, vec![Ty::F64, Ty::F64])];
+        assert!(
+            fnptr_target_sig_ok(&caller, &adapter_shaped, FuncId::new(42), FuncTyId::new(1)),
+            "the adapter's signature IS the coerced fn pointer's signature and must satisfy the \
+             gate on its own terms"
+        );
+        let closure_body_shaped = vec![target_with_sig(42, vec![Ty::Ptr, Ty::F64, Ty::F64])];
+        assert!(
+            !fnptr_target_sig_ok(&caller, &closure_body_shaped, FuncId::new(42), FuncTyId::new(1)),
+            "the closure body it wraps must still be refused — that refusal is the reason the \
+             adapter is minted at all"
+        );
     }
 
     /// Trust (L1), the assembly leg of the lineage chain: assembly SORTS bodies, assigns
@@ -4643,6 +5784,212 @@ mod authority_tests {
             "distinct bodies must be distinguishable by digest, or matching is meaningless"
         );
         assert_ne!(first.func_id, second.func_id, "distinct bodies must get distinct addresses");
+    }
+
+    fn probe_def_id(index: u32) -> DefId {
+        DefId { krate: LOCAL_CRATE, index: rustc_span::def_id::DefIndex::from_u32(index) }
+    }
+
+    /// A ledger entry for `fid`, pointing at `def_index` in (or out of) this crate.
+    fn probe_callee(fid: u32, is_local: bool, force_havoc: bool) -> CalleeRef {
+        CalleeRef {
+            func_id: FuncId::new(fid),
+            is_local,
+            def_index: fid,
+            def_id: probe_def_id(fid),
+            def_path: format!("probe::target{fid}"),
+            force_havoc,
+            site_def_id: probe_def_id(fid),
+            site_args: None,
+            ret_ty: None,
+            ret_ty_conflict: false,
+        }
+    }
+
+    /// A caller record carrying ONE fn-pointer constant: `Ty::Func(FuncTyId(1))` over
+    /// `fn(f64, f64) -> f64`, targeting `FuncId(fid)` with the given ledger entry.
+    fn fnptr_caller(callee: CalleeRef) -> BodyRecord {
+        let mut r = lineage_body_record(1, "probe::caller");
+        r.func_types = vec![
+            FuncTy { params: Vec::new(), returns: Vec::new(), is_vararg: false },
+            FuncTy { params: vec![Ty::F64, Ty::F64], returns: vec![Ty::F64], is_vararg: false },
+        ];
+        r.callees = vec![callee];
+        r
+    }
+
+    fn target_with_sig(def_index: u32, params: Vec<Ty>) -> BodyRecord {
+        let mut t = lineage_body_record(def_index, "probe::target");
+        t.func_ty = Some(FuncTy { params, returns: vec![Ty::F64], is_vararg: false });
+        t
+    }
+
+    /// THE ARITY HOLE, closed by its own predicate. A `Constant::FnDef` naming a CLOSURE body
+    /// claims the coercion's `fn(f64, f64) -> f64` while the producer signs that body
+    /// `[env, f64, f64] -> f64` (`lower_fn` prepends `closure_env_param_ty`). Sig-resolvability
+    /// (`body_sig_ok`) and ledger uniqueness both hold for it, and trust-ir's own
+    /// `shape_matches_ty` is `(FnDef(_), Ty::Func(_)) => true` unconditionally — so before this
+    /// check the only thing stopping the miscompile was that nobody emitted it yet.
+    #[test]
+    fn test_fnptr_target_sig_refuses_closure_env_arity_mismatch() {
+        let caller = fnptr_caller(probe_callee(42, true, false));
+        let records = vec![target_with_sig(42, vec![Ty::Ptr, Ty::F64, Ty::F64])];
+        assert!(body_sig_ok(&caller, FuncTyId::new(1)), "the claimed sig itself resolves");
+        assert!(
+            !fnptr_target_sig_ok(&caller, &records, FuncId::new(42), FuncTyId::new(1)),
+            "an env-slot body must never satisfy the arity-N fn-pointer sig claiming it"
+        );
+    }
+
+    /// The exact-match case still admits — the check is not a ban on `Constant::FnDef` (this is the
+    /// shape today's `ReifyFnPointer` lane produces). It does NOT follow that nothing that spliced
+    /// before is refused now: see the UNMEASURED splice-rate note on `fnptr_target_sig_ok`, and
+    /// `test_fnptr_target_sig_refuses_signature_less_local_target` for the branch that makes the
+    /// delta genuinely unknown.
+    #[test]
+    fn test_fnptr_target_sig_admits_exact_signature_match() {
+        let caller = fnptr_caller(probe_callee(42, true, false));
+        let records = vec![target_with_sig(42, vec![Ty::F64, Ty::F64])];
+        assert!(fnptr_target_sig_ok(&caller, &records, FuncId::new(42), FuncTyId::new(1)));
+    }
+
+    /// THE JOINT-CHANGE LEMMA, pinned on THIS side of the boundary.
+    ///
+    /// `crate::ty_contains_func_resolved` widened `map_fn_ptr_ty` to admit a fn-pointer signature
+    /// whose params/returns carry a `Ty::Struct`/`Ty::Enum` (the 611 `LazyLock` `fn() -> Name`
+    /// statics). This gate was NOT widened with it, and must not be: pass 2 re-interns a
+    /// `CallIndirect { sig }` / `Const { ty: Ty::Func(sig) }` id VERBATIM out of
+    /// `BodyRecord::func_types` (`assemble`, the `Inst::CallIndirect` / `Inst::Const` arms) with no
+    /// `remap_ty` in sight, so a per-body `StructId`/`EnumId` moved that way would dangle against
+    /// the assembled tables.
+    ///
+    /// The two halves are consistent because of an EXACT relationship, asserted here rather than
+    /// argued: a signature the widening newly admits necessarily contains a `Ty::Struct` or a
+    /// `Ty::Enum` — otherwise the table-free `ty_contains_func` would already have admitted it —
+    /// and `ty_table_free` rejects both, at top level and nested inside a `Ty::Tuple`. So every
+    /// newly-lowered body carrying such a signature is refused HERE, by this gate's own predicate,
+    /// keyed on the property pass 2 actually needs. Net: `lowered` moves, `spliced` cannot.
+    #[test]
+    fn test_every_newly_admitted_component_is_still_refused_by_the_splice_predicate() {
+        let structs = [trust_ir::StructDef {
+            id: StructId::new(0),
+            name: "Name".into(),
+            fields: vec![trust_ir::FieldDef { name: "k".into(), ty: Ty::U64, offset: None }],
+            size: None,
+            align: None,
+            repr: trust_ir::StructRepr::Rust,
+        }];
+        let enums = [trust_ir::EnumDef::new(
+            trust_ir::EnumId::new(0),
+            "K",
+            vec![trust_ir::EnumVariant {
+                name: "A".into(),
+                fields: vec![Ty::U64],
+                field_names: vec![],
+            }],
+        )];
+        for newly_admitted in [
+            Ty::Struct(StructId::new(0)),
+            Ty::Enum(trust_ir::EnumId::new(0)),
+            Ty::Tuple(vec![Ty::U64, Ty::Struct(StructId::new(0))]),
+            Ty::Tuple(vec![Ty::Enum(trust_ir::EnumId::new(0))]),
+        ] {
+            assert!(
+                crate::ty_contains_func(&newly_admitted),
+                "{newly_admitted:?} is refused by the table-free wall (so it IS newly admitted)"
+            );
+            assert!(
+                !crate::ty_contains_func_resolved(&newly_admitted, &structs, &enums),
+                "{newly_admitted:?} is admitted once the tables answer"
+            );
+            assert!(
+                !ty_table_free(&newly_admitted),
+                "{newly_admitted:?} must still be refused by the splice's own predicate"
+            );
+        }
+        // Stated as the gate, not only as the predicate: a body whose indirect-call signature
+        // carries the widened shape does not splice.
+        let mut r = lineage_body_record(1, "probe::struct_bearing_sig");
+        r.func_types = vec![
+            FuncTy { params: Vec::new(), returns: Vec::new(), is_vararg: false },
+            FuncTy {
+                params: Vec::new(),
+                returns: vec![Ty::Struct(StructId::new(0))],
+                is_vararg: false,
+            },
+        ];
+        assert!(
+            !body_sig_ok(&r, FuncTyId::new(1)),
+            "`fn() -> Name` resolves, and is still not MOVABLE — that is the whole distinction"
+        );
+    }
+
+    /// A return-type disagreement is the same defect on the other side of the arrow.
+    #[test]
+    fn test_fnptr_target_sig_refuses_return_mismatch() {
+        let caller = fnptr_caller(probe_callee(42, true, false));
+        let mut target = target_with_sig(42, vec![Ty::F64, Ty::F64]);
+        target.func_ty =
+            Some(FuncTy { params: vec![Ty::F64, Ty::F64], returns: Vec::new(), is_vararg: false });
+        let records = vec![target];
+        assert!(!fnptr_target_sig_ok(&caller, &records, FuncId::new(42), FuncTyId::new(1)));
+    }
+
+    /// A FORCED-HAVOC edge exists to declare a target whose signature we refuse to commit to;
+    /// taking its address at a concrete `Ty::Func` would commit to it anyway.
+    #[test]
+    fn test_fnptr_target_sig_refuses_forced_havoc_edge() {
+        let caller = fnptr_caller(probe_callee(42, true, true));
+        let records = vec![target_with_sig(42, vec![Ty::F64, Ty::F64])];
+        assert!(
+            !fnptr_target_sig_ok(&caller, &records, FuncId::new(42), FuncTyId::new(1)),
+            "a havoc edge must not be given a concrete signature by its address site"
+        );
+    }
+
+    /// A target with no record in this crate (cross-crate, or a local `DefIndex` never recorded)
+    /// cannot be LINKED: pass 2 mints a bodyless declaration with the unknown-PARAMS encoding
+    /// (`is_vararg: true`, empty `params`), so no ARITY is asserted and there is nothing for the
+    /// claimed sig's param list to contradict. Admitting here is a decision about THIS file's decl
+    /// minting, not a bet on an absence. It is a decision about the PARAMS half only: the same
+    /// minting fills `returns` from `decl_ret(c, maps)`, which these branches do not compare — the named
+    /// residual on `fnptr_target_sig_ok`.
+    #[test]
+    fn test_fnptr_target_sig_admits_targets_that_can_only_become_declarations() {
+        // Cross-crate: even with a same-`DefIndex` LOCAL record present, `is_local == false`
+        // routes to an `extern:` declaration, so the local record is not the target.
+        let extern_caller = fnptr_caller(probe_callee(42, false, false));
+        let records = vec![target_with_sig(42, vec![Ty::Ptr, Ty::F64, Ty::F64])];
+        assert!(fnptr_target_sig_ok(&extern_caller, &records, FuncId::new(42), FuncTyId::new(1)));
+
+        // Local `DefIndex` this crate never recorded: `lookup` misses ⇒ `local-unlowered:` decl.
+        let local_caller = fnptr_caller(probe_callee(42, true, false));
+        assert!(fnptr_target_sig_ok(&local_caller, &[], FuncId::new(42), FuncTyId::new(1)));
+    }
+
+    /// No ledger entry, or two behind one DefIndex-derived `FuncId`: refuse rather than pick.
+    #[test]
+    fn test_fnptr_target_sig_refuses_zero_or_ambiguous_ledger_identity() {
+        let records = vec![target_with_sig(42, vec![Ty::F64, Ty::F64])];
+
+        let mut none = fnptr_caller(probe_callee(42, true, false));
+        none.callees.clear();
+        assert!(!fnptr_target_sig_ok(&none, &records, FuncId::new(42), FuncTyId::new(1)));
+
+        let mut two = fnptr_caller(probe_callee(42, true, false));
+        two.callees.push(probe_callee(42, false, false));
+        assert!(!fnptr_target_sig_ok(&two, &records, FuncId::new(42), FuncTyId::new(1)));
+    }
+
+    /// A local target with a record but NO signature at all is unverifiable, so it is refused —
+    /// the check never falls back to "assume it matches".
+    #[test]
+    fn test_fnptr_target_sig_refuses_signature_less_local_target() {
+        let caller = fnptr_caller(probe_callee(42, true, false));
+        let mut target = target_with_sig(42, vec![Ty::F64, Ty::F64]);
+        target.func_ty = None;
+        let records = vec![target];
+        assert!(!fnptr_target_sig_ok(&caller, &records, FuncId::new(42), FuncTyId::new(1)));
     }
 
     #[test]
@@ -5067,5 +6414,421 @@ mod temporal_tests {
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("failed closed"));
         assert!(errors[0].contains("has no #[trust::action] owner"));
+    }
+}
+
+/// Trust: the PRIMARY-vs-CASCADE split is measurement, and measurement is what ranks every
+/// coverage target. These pin the set EXACTLY (not merely "these are cascade"), so a tag rename at
+/// a `lib.rs` push site cannot silently reclassify an echo as leaf demand, or vice versa.
+///
+/// They govern EVERY classification made anywhere, because there is exactly one classifier: both
+/// [`record`]'s primary/cascade histogram and the `mir_built` hook's collect-all debug event
+/// (`rustc_mir_build::builder::mod.rs`) call [`is_cascade_tag`]. That was not true when this
+/// module was written — the hook held a second, already-divergent inline copy — and pinning one of
+/// two disagreeing copies pins nothing.
+#[cfg(test)]
+mod cascade_tag_tests {
+    use super::{CASCADE_TAGS, is_cascade_tag};
+
+    /// The whole table, as a literal. A change here must be a deliberate edit to this list.
+    #[test]
+    fn test_cascade_tags_exact_set_is_pinned() {
+        assert_eq!(
+            CASCADE_TAGS,
+            ["VarRef(unbound)", "Borrow(unbound local)", "AssignOp(unbound local)"],
+        );
+    }
+
+    #[test]
+    fn test_is_cascade_tag_every_table_entry_classifies_cascade() {
+        for tag in CASCADE_TAGS {
+            assert!(is_cascade_tag(tag), "table entry `{tag}` must classify as cascade");
+        }
+    }
+
+    /// The two conditions inside the shared-`Borrow` arm carry DISTINCT tags, and they land on
+    /// OPPOSITE sides of the split. `Borrow(unbound local)` is an echo of a binding that never
+    /// happened; `Borrow(slot missing)` means the promoted local's own `let` declined, which is
+    /// leaf demand at that `let`. Collapsing them again would re-book real demand as an echo.
+    #[test]
+    fn test_borrow_slot_missing_is_primary_not_cascade() {
+        assert!(is_cascade_tag("Borrow(unbound local)"));
+        assert!(!is_cascade_tag("Borrow(slot missing)"));
+    }
+
+    /// Neighbouring fail-closed tags from the same `Borrow` arm are leaf demand, not echoes. Each
+    /// names a real shape the lowering refuses on its own predicate.
+    #[test]
+    fn test_borrow_arm_neighbours_classify_primary() {
+        for tag in [
+            "Borrow(slot missing)",
+            "Borrow(non-scalar pointee)",
+            "Borrow(of a borrow ptr)",
+            "Borrow(non-local place)",
+            "Borrow(&mut unpromoted local)",
+            "Borrow(&mut slot missing)",
+            "Borrow(&mut non-local place)",
+            "Borrow(other)",
+        ] {
+            assert!(!is_cascade_tag(tag), "`{tag}` is leaf demand, not a cascade echo");
+        }
+    }
+
+    /// `Borrow(&mut unbound local)` sat in this table with NO emitter anywhere in the crate. It is
+    /// absent now, and this pins the ABSENCE OF THE STRING rather than a classification for it:
+    /// re-adding the tag to the table is fine, but only alongside the site that pushes it.
+    #[test]
+    fn test_borrow_mut_unbound_local_has_no_table_entry() {
+        assert!(!CASCADE_TAGS.contains(&"Borrow(&mut unbound local)"));
+    }
+
+    /// A tag the table does not name is primary by default — the conservative direction for
+    /// ranking (it overstates leaf demand rather than hiding it).
+    #[test]
+    fn test_is_cascade_tag_unknown_tag_classifies_primary() {
+        for tag in ["", "Ty", "Other", "Call(unsupported arg)", "varref(unbound)"] {
+            assert!(!is_cascade_tag(tag), "unknown tag `{tag}` must default to primary");
+        }
+    }
+}
+
+#[cfg(test)]
+mod enum_decline_neutrality_tests {
+    use super::*;
+
+    fn tags(rows: &[(&str, &'static str)]) -> Vec<(String, &'static str)> {
+        rows.iter().map(|(d, t)| ((*d).to_string(), *t)).collect()
+    }
+
+    fn declines(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+        rows.iter().map(|(p, r)| ((*p).to_string(), (*r).to_string())).collect()
+    }
+
+    /// THE NEUTRALITY PROPERTY, and the reason `aggregate_body_tag_rows` exists as a separate
+    /// function at all. A `register_enum` decline is NOT a body failure — the declining enum
+    /// collapses to the wave-EL opaque lane and the body may lower perfectly cleanly. A body
+    /// whose only "problem" is a full decline ledger must therefore still produce ZERO failure
+    /// tags, i.e. still count as lowered.
+    ///
+    /// This is the test that fails if the absence ever gets filled in: at wave-EF nothing merged
+    /// declines into `unsupported` only because nobody had written that merge, which is a wall
+    /// made of an absence. Fold the ledger into either tag vector and this assertion breaks.
+    #[test]
+    fn a_full_decline_ledger_produces_no_failure_tag() {
+        let rows = aggregate_body_tag_rows(
+            &[],
+            declines(&[
+                ("clean_kernel::env::EnvError", "field:Unit+Name in variant `UnknownConst`"),
+                ("clean_kernel::flat::FlatError", "no-canonical-tag"),
+                ("clean_kernel::cert::DictTrainError", "adt-depth"),
+            ]),
+        );
+        assert!(rows.unsupported.is_empty(), "a decline must never mint a failure tag");
+        assert!(rows.unsupported_details.is_empty(), "a decline must never mint a tag detail");
+        assert_eq!(rows.enum_declines.len(), 3);
+    }
+
+    /// Stronger form of the same claim: the two tag vectors are a function of the tag input
+    /// ALONE. Same tags, wildly different ledgers, identical verdict-adjacent output — which is
+    /// what makes `TRUST_ENUM_DECLINE_CENSUS=1` safe to run against a lowering that can flip
+    /// codegen.
+    #[test]
+    fn the_decline_ledger_cannot_perturb_tag_rows() {
+        let t = tags(&[("d1", "Call(unsupported arg)"), ("d2", "VarRef(unbound)")]);
+        let without = aggregate_body_tag_rows(&t, Vec::new());
+        let with = aggregate_body_tag_rows(
+            &t,
+            declines(&[("k::A", "recursive-adt"), ("k::B", "discriminants/repr")]),
+        );
+        assert_eq!(without.unsupported, with.unsupported);
+        assert_eq!(without.unsupported_details, with.unsupported_details);
+        assert!(without.enum_declines.is_empty());
+        assert_eq!(with.enum_declines.len(), 2);
+    }
+
+    /// The artifact must be byte-deterministic under parallel `mir_built`, so the rows are
+    /// deduped and SORTED here regardless of the order `register_enum` refused in. (Push-time
+    /// dedup in `push_decline_row` is what bounds memory; this is what bounds the bytes.)
+    #[test]
+    fn decline_rows_are_deduped_and_sorted_independently_of_arrival_order() {
+        let forward =
+            declines(&[("k::B", "adt-depth"), ("k::A", "recursive-adt"), ("k::B", "adt-depth")]);
+        let reverse =
+            declines(&[("k::B", "adt-depth"), ("k::B", "adt-depth"), ("k::A", "recursive-adt")]);
+        let expected = declines(&[("k::A", "recursive-adt"), ("k::B", "adt-depth")]);
+        assert_eq!(aggregate_body_tag_rows(&[], forward).enum_declines, expected);
+        assert_eq!(aggregate_body_tag_rows(&[], reverse).enum_declines, expected);
+    }
+
+    /// Pins the pre-existing tag/detail behavior across the wave-EF R1 code motion: counts
+    /// aggregate per tag, details cap at 3 DISTINCT examples in first-encounter order, tags sort.
+    #[test]
+    fn tag_aggregation_and_detail_capping_survive_the_extraction() {
+        let rows = aggregate_body_tag_rows(
+            &tags(&[
+                ("z1", "Zeta"),
+                ("a1", "Alpha"),
+                ("a2", "Alpha"),
+                ("a1", "Alpha"),
+                ("a3", "Alpha"),
+                ("a4", "Alpha"),
+            ]),
+            Vec::new(),
+        );
+        assert_eq!(
+            rows.unsupported,
+            vec![("Alpha".to_string(), 5u64), ("Zeta".to_string(), 1u64)]
+        );
+        assert_eq!(rows.unsupported_details[0].0, "Alpha");
+        assert_eq!(rows.unsupported_details[0].1, vec!["a1", "a2", "a3"]);
+        assert_eq!(rows.unsupported_details[1].0, "Zeta");
+    }
+
+    /// Detail truncation is CHAR-based, not byte-based: a multi-byte detail must not panic on a
+    /// split code point, and must keep exactly 120 chars.
+    #[test]
+    fn a_multibyte_detail_truncates_on_a_char_boundary() {
+        let long: String = "é".repeat(300);
+        let rows = aggregate_body_tag_rows(&tags(&[(long.as_str(), "Ty")]), Vec::new());
+        assert_eq!(rows.unsupported_details[0].1[0].chars().count(), 120);
+    }
+}
+
+#[cfg(test)]
+mod str_const_finalize_tests {
+    use super::*;
+    use rustc_span::def_id::DefIndex;
+
+    fn dummy_def_id() -> DefId {
+        DefId { krate: LOCAL_CRATE, index: DefIndex::from_u32(0) }
+    }
+
+    /// A `PendingConst` in exactly the shape `lower_str_named_const` mints.
+    fn str_pending(global: Option<GlobalId>) -> PendingConst {
+        PendingConst {
+            value: ValueId::new(7),
+            def_id: dummy_def_id(),
+            span: rustc_span::DUMMY_SP,
+            is_bool: false,
+            is_float: false,
+            signed: false,
+            bits: 64,
+            composite: false,
+            str_global: global,
+        }
+    }
+
+    /// The `[u8; 0]` placeholder exactly as the producer emits it.
+    fn placeholder_global() -> Global {
+        Global {
+            name: "__trust_strconst_0".to_string(),
+            ty: Ty::Array(TyId::new(0), 0),
+            mutable: false,
+            initializer: Some(Constant::Array(Vec::new())),
+            linkage: Linkage::Internal,
+            tls: None,
+            align: None,
+        }
+    }
+
+    fn bytes_global(bytes: &[u8]) -> Global {
+        let mut g = placeholder_global();
+        g.ty = Ty::Array(TyId::new(0), bytes.len() as u64);
+        g.initializer =
+            Some(Constant::Array(bytes.iter().map(|b| Constant::Int(i128::from(*b))).collect()));
+        g
+    }
+
+    /// THE HAZARD THIS WHOLE LEDGER EXISTS FOR, pinned as a property of the SPLICE gate rather
+    /// than asserted in prose: `global_const_ok` reads the untouched `[u8; 0]` placeholder as
+    /// internally CONSISTENT (`0 == 0`), so an unpatched global would splice silently as the
+    /// EMPTY STRING. If this test ever starts failing because `global_const_ok` learned to refuse
+    /// zero-length arrays, the positive ledger becomes redundant — but not before.
+    #[test]
+    fn test_global_const_ok_accepts_the_unpatched_placeholder() {
+        let mut r = minimal_record();
+        r.types = vec![Ty::U8];
+        let g = placeholder_global();
+        assert!(
+            global_const_ok(&r, &g.ty, g.initializer.as_ref().expect("placeholder has an init")),
+            "the splice gate does NOT refuse a zero-length bytes global — which is exactly why \
+             `check_str_global_ledger` must"
+        );
+    }
+
+    /// THE KEY GATE. The untouched placeholder must NOT read as patched. The `*n > 0` clause in
+    /// `str_global_patched` is the only thing standing between an unpatched global and a spliced
+    /// `""`, so it is pinned on its own.
+    #[test]
+    fn test_str_global_patched_refuses_the_untouched_placeholder() {
+        assert!(
+            !str_global_patched(&placeholder_global()),
+            "the `[u8; 0]` placeholder is NOT a patched global"
+        );
+    }
+
+    #[test]
+    fn test_str_global_patched_accepts_a_real_bytes_global_and_refuses_a_desync() {
+        assert!(str_global_patched(&bytes_global(b"Clean.BVC.bvAppend")));
+        // Declared length vs initializer element count disagree — a desync from any future
+        // minting path must not read as patched.
+        let mut desynced = bytes_global(b"ab");
+        desynced.ty = Ty::Array(TyId::new(0), 5);
+        assert!(!str_global_patched(&desynced));
+        // A non-array initializer under an array type.
+        let mut wrong = bytes_global(b"ab");
+        wrong.initializer = Some(Constant::Int(2));
+        assert!(!str_global_patched(&wrong));
+        // No initializer at all (the symbolic/extern shape) is not a patched bytes global.
+        let mut bare = bytes_global(b"ab");
+        bare.initializer = None;
+        assert!(!str_global_patched(&bare));
+    }
+
+    #[test]
+    fn test_patch_str_global_rewrites_the_placeholder_and_keeps_the_element_tyid() {
+        let mut g = placeholder_global();
+        g.ty = Ty::Array(TyId::new(3), 0);
+        assert!(patch_str_global(&mut g, b"Bool.or"));
+        assert_eq!(
+            g.ty,
+            Ty::Array(TyId::new(3), 7),
+            "the ELEMENT TyId must survive the patch — it is already interned in the body's \
+             types table and the splice remaps it"
+        );
+        assert_eq!(
+            g.initializer,
+            Some(Constant::Array(
+                b"Bool.or".iter().map(|b| Constant::Int(i128::from(*b))).collect()
+            )),
+        );
+        assert!(str_global_patched(&g));
+    }
+
+    /// `""` fails closed, for the same reason `emit_bytes_global` refuses it: a zero-length array
+    /// global is not proven faithful end-to-end. The caller reports `PendingStr(empty)`.
+    #[test]
+    fn test_patch_str_global_refuses_empty_bytes() {
+        let mut g = placeholder_global();
+        assert!(!patch_str_global(&mut g, b""));
+        assert_eq!(g.ty, Ty::Array(TyId::new(0), 0), "a refused patch must not mutate the slot");
+        assert!(!str_global_patched(&g));
+    }
+
+    /// One deduped global, several `PendingConst` records (two reads of one const in one body):
+    /// the second patch is a no-op that still reports success. A patch with DIFFERENT bytes is
+    /// the CONFLICT and is refused — a wrong-but-plausible string is never written.
+    #[test]
+    fn test_patch_str_global_is_idempotent_but_refuses_a_byte_conflict() {
+        let mut g = placeholder_global();
+        assert!(patch_str_global(&mut g, b"same"));
+        assert!(patch_str_global(&mut g, b"same"), "repeated read of one const must be benign");
+        assert!(!patch_str_global(&mut g, b"diff"), "a byte conflict must fail closed");
+        assert!(!patch_str_global(&mut g, b"same-but-longer"));
+        assert_eq!(
+            g.initializer,
+            Some(Constant::Array(b"same".iter().map(|b| Constant::Int(i128::from(*b))).collect())),
+            "a refused patch must leave the earlier bytes untouched"
+        );
+        // A MUTABLE slot is never a str-const placeholder.
+        let mut m = placeholder_global();
+        m.mutable = true;
+        assert!(!patch_str_global(&mut m, b"x"));
+    }
+
+    /// The positive ledger fires on a claim whose global was never patched, and stays silent on a
+    /// patched one. A record that claims NO str global is not the ledger's business at all.
+    #[test]
+    fn test_check_str_global_ledger_fires_only_on_an_unfulfilled_claim() {
+        let gid = GlobalId::new(0);
+
+        let mut rows = Vec::new();
+        check_str_global_ledger(&[placeholder_global()], &[str_pending(Some(gid))], &mut rows);
+        assert_eq!(rows, vec![("PendingStr(global not patched)".to_string(), 1)]);
+
+        let mut rows = Vec::new();
+        check_str_global_ledger(&[bytes_global(b"ok")], &[str_pending(Some(gid))], &mut rows);
+        assert!(rows.is_empty(), "a fulfilled claim must not tag the body");
+
+        // A claim pointing past the end of the globals table (a side-table/IR desync).
+        let mut rows = Vec::new();
+        check_str_global_ledger(&[], &[str_pending(Some(GlobalId::new(9)))], &mut rows);
+        assert_eq!(rows, vec![("PendingStr(global not patched)".to_string(), 1)]);
+
+        // A non-str pending const claims nothing, so the ledger has nothing to check.
+        let mut rows = Vec::new();
+        check_str_global_ledger(&[placeholder_global()], &[str_pending(None)], &mut rows);
+        assert!(rows.is_empty());
+
+        // Two records sharing ONE unpatched deduped global report once EACH — the ledger counts
+        // claims, not globals, so a body cannot hide a second unfulfilled claim behind the first.
+        let mut rows = Vec::new();
+        check_str_global_ledger(
+            &[placeholder_global()],
+            &[str_pending(Some(gid)), str_pending(Some(gid))],
+            &mut rows,
+        );
+        assert_eq!(rows, vec![("PendingStr(global not patched)".to_string(), 2)]);
+    }
+
+    /// The METADATA node the str lane emits is `Inst::Const { ty: Ty::U64, value: PhantomData }` —
+    /// already inside the sentinel set, so the leftover-sentinel tripwire covers the str lane with
+    /// no widening. Pinned because the str lane now DEPENDS on that membership.
+    #[test]
+    fn test_is_const_sentinel_covers_the_u64_metadata_node() {
+        assert!(is_const_sentinel(&Inst::Const {
+            ty: Ty::U64,
+            value: Constant::PhantomData
+        }));
+        // A REAL length is not a sentinel — this is the shape the finalizer patches in, and it
+        // must not read as a leak afterwards.
+        assert!(!is_const_sentinel(&Inst::Const { ty: Ty::U64, value: Constant::Int(7) }));
+    }
+
+    /// Minimal `BodyRecord` for the pure splice-gate probes above.
+    fn minimal_record() -> BodyRecord {
+        BodyRecord {
+            def_index: 0,
+            kind: BodyKind::Fn,
+            symbolic: false,
+            union_lane: false,
+            enum_param_lane: false,
+            def_path: "probe".to_string(),
+            place_path_carrier: false,
+            zst_closure_arg: false,
+            fnptr_adapter: false,
+            function: None,
+            func_ty: None,
+            files: Vec::new(),
+            closure_types: Vec::new(),
+            structs: Vec::new(),
+            enums: Vec::new(),
+            types: Vec::new(),
+            globals: Vec::new(),
+            unsupported: Vec::new(),
+            unsupported_details: Vec::new(),
+            enum_declines: Vec::new(),
+            collect_primary: Vec::new(),
+            collect_cascade: Vec::new(),
+            instr_count: 0,
+            callees: Vec::new(),
+            func_types: Vec::new(),
+            pending_consts: Vec::new(),
+            deferred: false,
+            interpreter: InterpreterEvidence {
+                verdict: ArtifactVerdict::NotRun,
+                samples: 0,
+                detail: "not run".to_string(),
+            },
+            derived_mir: DerivedMirEvidence {
+                verdict: ArtifactVerdict::NotRun,
+                detail: "not run".to_string(),
+                markers_exact: false,
+                markers_detail: String::new(),
+            },
+            differential_errors: Vec::new(),
+            mir_snapshot: None,
+            lineage: None,
+        }
     }
 }

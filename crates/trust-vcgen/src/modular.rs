@@ -478,6 +478,7 @@ pub fn generate_modular_vcs(
             location: func.span.clone(),
             formula: Formula::Not(Box::new(post.clone())),
             contract_metadata: None,
+            obligation: None,
         });
         let _check = ContractCheck::PostConditionOnReturn { postcondition_index: i };
     }
@@ -513,6 +514,7 @@ fn callsite_precondition_vcs(
             location: span.clone(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         }];
     }
 
@@ -554,6 +556,7 @@ fn callsite_precondition_vcs(
                     &replacements,
                 ))),
                 contract_metadata: None,
+                obligation: None,
             }
         })
         .collect()

@@ -10,7 +10,109 @@ use std::time::{Duration, Instant};
 
 const POST_EXIT_PIPE_CLOSE_GRACE: Duration = Duration::from_millis(250);
 
+/// Multiplier applied to every probe deadline when this crate is compiled as a
+/// test harness. See [`resolve_probe_deadline`] for why it exists and why it
+/// cannot change what a released binary does.
+///
+/// Sized from measurement, not taste. On a developer host running several Rust
+/// builds at once, 18 concurrently launched first-execs of a freshly written
+/// `#!/bin/sh` script whose whole body is one `echo` took 272.9s–275.4s and were
+/// released together within 2.5s of each other — a machine-wide barrier of
+/// ~275s, not a per-process cost. This multiplier puts a 10s production probe at
+/// 30 minutes in-harness, roughly 6.5x that measured barrier, and the 5s daemon
+/// readiness waits at 15 minutes.
+///
+/// A multiplier is used rather than a flat generous floor so that a test may
+/// still choose a deliberately tiny fixture deadline, traverse the real
+/// resolution path, and prove a non-terminating child is failed closed in
+/// fractions of a second. Under a floor, every such proof would cost the floor.
+const TEST_HARNESS_DEADLINE_SCALE: u32 = 180;
+
+/// Resolve a production probe deadline for the way this crate was compiled.
+///
+/// A probe deadline exists to catch a **hung** tool: one that will never make
+/// progress, whatever the machine does. In a production `targo-trust` run a
+/// probe is essentially alone on the box, so a 10s wall-clock bound measures
+/// exactly that question, and every call site's constant is the answer it wants.
+///
+/// Under `cargo test` the identical bound measures something else entirely.
+/// libtest runs the whole suite inside one process on a thread pool, and dozens
+/// of these tests each write a *fresh* fixture executable into a temporary
+/// directory and run it exactly once. That is structurally the opposite of
+/// production, where the same stage2 binaries are re-executed and the host
+/// authorizes their image once. Here the dominant cost of a probe is not the
+/// fixture's own work, and not CPU or memory — 94% of memory was free while
+/// this was failing — it is the operating system admitting a brand-new process
+/// image. Fixtures sampled mid-suite were parked at `_dyld_start + 0` for
+/// minutes at a time: the kernel had not yet let the dynamic loader run its
+/// first instruction of a script whose entire body is one `echo`. The queue is
+/// machine-global and shared with every other build on the box, and it drains as
+/// a barrier rather than per process. So a fixed wall-clock bound in the harness
+/// stops asking "is this tool hung?" and starts asking "how deep is the host's
+/// exec-authorization queue right now?" — a question no probe should fail on.
+///
+/// The bound is therefore *stretched* under the test harness, never removed and
+/// never conditioned on the observed result. A hung tool makes no progress ever,
+/// so a stretched bound still catches it and the test merely takes longer to
+/// fail; `trust_added::trustc_native::tests::capture_enforces_timeout_and_output_bound`
+/// proves exactly that on the production capture path, with a child that never
+/// terminates. A merely slow start now lands inside the bound and the probe goes
+/// on to report what it actually observed.
+///
+/// Bounding output *progress* instead of elapsed time was considered and does
+/// not work here: a process stalled before `_dyld_start` has produced no output
+/// and cannot, so "no progress yet" and "hung" are indistinguishable in the one
+/// window that matters. Bounding the harness's own probe concurrency does not
+/// work either: the authorization queue is filled by every process on the
+/// machine, not just this suite's.
+///
+/// The switch is `cfg(test)` — a property of how the crate was compiled, not of
+/// the environment it is run in. A released `targo-trust` is not built with
+/// `--test`, so this is the identity function there and the production guard is
+/// exactly the one its call site wrote. An environment variable was rejected for
+/// precisely that reason: it would let anything outside the binary lengthen a
+/// production guard, which is the one thing this must never permit.
+pub(crate) fn resolve_probe_deadline(production: Duration) -> Duration {
+    stretched_probe_deadline(production, cfg!(test))
+}
+
+fn stretched_probe_deadline(production: Duration, under_test_harness: bool) -> Duration {
+    if under_test_harness {
+        production.saturating_mul(TEST_HARNESS_DEADLINE_SCALE)
+    } else {
+        production
+    }
+}
+
+/// Capture a bounded subprocess under the caller's production probe deadline.
+///
+/// This is the single choke point every probe deadline in the crate flows
+/// through — constants, inline literals, and caller-supplied values alike — so
+/// resolving the deadline here cannot miss a probe site.
 pub(crate) fn output(
+    command: &mut Command,
+    context: &str,
+    max_stream_bytes: usize,
+    timeout: Duration,
+) -> Result<Output, String> {
+    output_with_exact_deadline(command, context, max_stream_bytes, resolve_probe_deadline(timeout))
+}
+
+/// Capture a bounded subprocess under exactly the supplied deadline.
+///
+/// Two callers legitimately want the deadline stated rather than resolved:
+///
+/// * a deadline the **caller supplied at runtime** — a declared budget such as
+///   `targo-trust verify-self --timeout-sec N` is data, and multiplying data by
+///   a build-mode constant would silently answer a different question than the
+///   caller asked. The harness stretch is for probe constants this code chose,
+///   which have no declared value to distort;
+/// * a test that **pins the deadline machinery itself** and wants a tiny bound
+///   so it stays fast and precise, rather than having its own fixture deadline
+///   stretched out from under it.
+///
+/// Every fixed probe constant must go through [`output`] instead.
+pub(crate) fn output_with_exact_deadline(
     command: &mut Command,
     context: &str,
     max_stream_bytes: usize,
@@ -244,12 +346,19 @@ mod tests {
                 .contains("output exceeded")
         );
 
+        // Pins the deadline machinery, so it states the deadline exactly rather
+        // than letting the harness stretch its own fixture bound.
         let mut hanging = Command::new("/bin/sh");
         hanging.args(["-c", "while :; do :; done"]);
         assert!(
-            output(&mut hanging, "hanging probe", 1024, Duration::from_millis(100))
-                .expect_err("hanging command must fail")
-                .contains("timeout")
+            output_with_exact_deadline(
+                &mut hanging,
+                "hanging probe",
+                1024,
+                Duration::from_millis(100)
+            )
+            .expect_err("hanging command must fail")
+            .contains("timeout")
         );
 
         let mut background = Command::new("/bin/sh");
@@ -292,5 +401,57 @@ mod tests {
             "redirected descendant {pid} survived cleanup and wrote its marker"
         );
         let _ = std::fs::remove_file(marker);
+    }
+
+    #[test]
+    fn probe_deadlines_are_production_exact_and_stretch_only_under_the_test_harness() {
+        for production in [
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+            Duration::from_secs(5 * 60),
+            Duration::from_secs(12 * 60 * 60),
+        ] {
+            assert_eq!(
+                stretched_probe_deadline(production, false),
+                production,
+                "a production build must use the caller's probe deadline unchanged"
+            );
+            let stretched = stretched_probe_deadline(production, true);
+            assert_eq!(stretched, production * TEST_HARNESS_DEADLINE_SCALE);
+            assert!(
+                stretched > production,
+                "the harness deadline must never be shorter than the production one"
+            );
+        }
+        assert_eq!(
+            stretched_probe_deadline(Duration::MAX, true),
+            Duration::MAX,
+            "an unrepresentable stretch must saturate rather than wrap into a shorter bound"
+        );
+        assert_eq!(
+            resolve_probe_deadline(Duration::from_secs(10)),
+            stretched_probe_deadline(Duration::from_secs(10), cfg!(test))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_applies_the_harness_stretch_and_still_fails_a_nonterminating_probe_closed() {
+        let requested = Duration::from_millis(2);
+        let effective = resolve_probe_deadline(requested);
+        let mut nonterminating = Command::new("/bin/sh");
+        nonterminating.args(["-c", "while :; do :; done"]);
+        let started = Instant::now();
+        let error = output(&mut nonterminating, "stretched probe", 1024, requested)
+            .expect_err("a nonterminating child must still fail closed under the harness");
+        assert!(error.contains("timeout"), "{error}");
+        // Asserting a lower bound on elapsed time is monotone in the safe
+        // direction: contention can only make the observed elapsed time longer,
+        // so this assertion cannot itself become a wall-clock flake.
+        assert!(
+            started.elapsed() >= effective,
+            "output did not resolve {requested:?} through the harness stretch to {effective:?}"
+        );
     }
 }

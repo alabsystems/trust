@@ -485,6 +485,7 @@ fn test_verification_condition_all_kinds_roundtrip() {
             },
             formula: formula.clone(),
             contract_metadata: None,
+            obligation: None,
         };
         let json = serde_json::to_string(&vc).expect("serialize");
         let round: VerificationCondition = serde_json::from_str(&json).expect("deserialize");
@@ -661,6 +662,7 @@ fn test_crate_verification_result_aggregation_roundtrip() {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Proved {
                 solver: "ay".into(),
@@ -689,6 +691,7 @@ fn test_crate_verification_result_aggregation_roundtrip() {
                     location: SourceSpan::default(),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 VerificationResult::Failed {
                     solver: "ay".into(),
@@ -703,6 +706,7 @@ fn test_crate_verification_result_aggregation_roundtrip() {
                     location: SourceSpan::default(),
                     formula: Formula::Bool(false),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 VerificationResult::Proved {
                     solver: "ay".into(),
@@ -788,6 +792,7 @@ fn test_binary_decompilation_blocker_json_keeps_proof_grade_gates_separate() {
                     location: origin.span(),
                     formula: vc_formula.clone(),
                     contract_metadata: None,
+                    obligation: None,
                 }),
                 solver: "ay".to_string(),
                 status: SolverDispatchStatus::Unsat,

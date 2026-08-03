@@ -56,6 +56,7 @@ fn overflow_vc() -> VerificationCondition {
             ),
         ]))),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -76,6 +77,7 @@ fn bounds_check_vc() -> VerificationCondition {
             Box::new(Formula::Var("array_len".into(), Sort::Int)),
         ),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -90,6 +92,7 @@ fn divzero_vc() -> VerificationCondition {
             Box::new(Formula::Int(0)),
         ))),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -134,6 +137,7 @@ fn postcondition_vc() -> VerificationCondition {
             )),
         ),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -237,6 +241,7 @@ fn test_certify_bounds_check_vc() {
             Box::new(Formula::Var("array_len".into(), Sort::Int)),
         ),
         contract_metadata: None,
+        obligation: None,
     };
     assert!(
         !cert.is_valid_for(&mutated_vc),
@@ -562,6 +567,7 @@ fn test_staleness_detection_across_pipeline() {
             Box::new(Formula::Int(i128::MAX)),
         ),
         contract_metadata: None,
+        obligation: None,
     };
 
     // Certificate should be stale for v2 (fingerprint mismatch before even reaching kernel)

@@ -1366,6 +1366,55 @@ fn witness_magnitude_shapes_are_disjunctive_round11() {
 }
 
 #[test]
+fn binary32_arithmetic_emits_the_same_advisory_witness_family_as_binary64() {
+    // Regression for the source-level f32/f64 parity hole: the safety dispatcher
+    // recognized both widths, but the semantic witness builder implemented only
+    // binary64 and silently returned `None` for every binary32 operation. Keep all
+    // four supported arithmetic operations visible as exact-width L1 advisories.
+    for op in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div] {
+        let ty = Ty::Float { width: 32 };
+        let func = make(
+            vec![
+                decl(0, ty.clone(), None),
+                decl(1, ty.clone(), Some("a")),
+                decl(2, ty.clone(), Some("b")),
+            ],
+            vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![assign(
+                    Place::local(0),
+                    Rvalue::BinaryOp(
+                        op,
+                        Operand::Copy(Place::local(1)),
+                        Operand::Copy(Place::local(2)),
+                    ),
+                )],
+                terminator: Terminator::Return,
+            }],
+            2,
+            ty,
+            vec![],
+        );
+        let lhs = Operand::Copy(Place::local(1));
+        let rhs = Operand::Copy(Place::local(2));
+        assert!(
+            v2_float_overflow_witness_formula(&func, op, &lhs, &rhs).is_some(),
+            "binary32 {op:?} must have a semantic witness"
+        );
+        let kinds = float_overflow_kinds(&func);
+        assert_eq!(kinds.len(), 1, "binary32 {op:?} must emit one advisory: {kinds:?}");
+        assert!(matches!(
+            &kinds[0],
+            VcKind::FloatOverflowToInfinity {
+                op: emitted_op,
+                operand_ty: Ty::Float { width: 32 },
+            } if *emitted_op == op
+        ));
+        assert_eq!(kinds[0].proof_level(), trust_types::ProofLevel::L1Functional);
+    }
+}
+
+#[test]
 fn user_crate_trig_suffixes_are_not_unit_bounded() {
     // Round-13 false-proof pin: a USER function whose def-path merely ends
     // in `::cos`/`::sin`/`::tanh` (a truncated-Taylor `approx::cos`,

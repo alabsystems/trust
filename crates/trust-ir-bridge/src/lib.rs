@@ -83,8 +83,8 @@ pub use lower::{
     lower_to_trust_ir_functions_with_abi_total_context,
     lower_to_trust_ir_functions_with_assumed_total_context,
     lower_to_trust_ir_functions_with_context, lower_to_trust_ir_functions_with_expected_absent,
-    map_binop, map_type, map_unop, NativeCalleeSummaryContext, NativeCalleeSummaryGuard,
-    verifiable_function_lowers_in_module_context,
+    map_binop, map_type, map_unop, pin_enum_tag_lane, NativeCalleeSummaryContext,
+    NativeCalleeSummaryGuard, verifiable_function_lowers_in_module_context,
 };
 #[cfg(feature = "compiler-context")]
 pub use lower::lower_to_trust_ir_functions_with_compiler_context;
@@ -136,7 +136,8 @@ pub use trust_ir::{
     NATIVE_VERIFICATION_BUNDLE_SCHEMA_VERSION, NativeAdapterInput, NativeAssertionId,
     NativeBundleProducer, NativeDiagnosticsPolicy, NativeObligationCause, NativeObligationSource,
     NativeRequestId, NativeRequestProvenance, NativeToolIdentity, NativeVerificationBundle,
-    NativeVerificationBundleError, NativeVerificationRequest, ProofDigest, TrustWpNativeRequest,
+    NativeVerificationBundleError, NativeVerificationRequest, ProofDigest,
+    SourceGenerationAuthority, SourceGenerationAuthorityMintError, TrustWpNativeRequest,
     TrustWpRequestOptions, TrustWpVerificationMode, TrustMcChcOptions, TrustMcNativeRequest,
     TrustMcRequestOptions, TrustMcVerificationMode,
 };

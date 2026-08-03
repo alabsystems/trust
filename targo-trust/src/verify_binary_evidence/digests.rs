@@ -2,7 +2,7 @@
 // verification evidence pipeline.
 
 use serde::Serialize;
-use trust_types::{BinaryArtifactDigestIdentity, ReplayStatus};
+use trust_types::{BinaryArtifactDigestIdentity, ReplayStatus, SerializableVc};
 
 use super::CheckedCertificateReplayDigestIdentityRecord;
 
@@ -10,6 +10,32 @@ pub(crate) fn binary_artifact_digest_identity_is_empty(
     identity: &BinaryArtifactDigestIdentity,
 ) -> bool {
     !identity.has_any_identity()
+}
+
+/// The ONE spelling of the canonical verification-condition bytes that a checked
+/// binary certificate is bound to (`vc_sha256`, and every digest derived from it).
+///
+/// This deliberately routes through [`trust_types::stable_model_json_bytes`]
+/// rather than calling `serde_json::to_vec` here. A hash domain that spells its
+/// own `serde_json` re-serializes every future additive
+/// `#[serde(default)] Option<_>` field as `,"<key>":null` and moves already-audited
+/// certificate digests for a change that carries no information — which is exactly
+/// what `VerificationCondition::obligation` did to the three checked-certificate
+/// goldens in this crate. The canonical form omits those defaults and keeps every
+/// `Some` hash-visible, so the pins that shipped before a field existed stay
+/// bit-for-bit valid while a populated field is still part of VC identity.
+///
+/// This is not only about the goldens. A checked-certificate artifact persists
+/// `vc_sha256`, and import re-derives the binding from the LIVE dispatch VC and
+/// requires equality (see `VerifyBinaryEvidence::import_checked_certificate_artifacts`).
+/// A digest that moves when a default-valued field is added therefore silently
+/// unbinds every certificate already on disk. Canonicalizing here keeps the
+/// pre-field artifacts matching, which is the behaviour their audit assumed.
+///
+/// Every producer of canonical VC bytes in targo-trust must call this; two
+/// spellings would make a certificate fail to bind to the dispatch that produced it.
+pub(crate) fn canonical_vc_bytes(vc: &SerializableVc) -> Option<Vec<u8>> {
+    trust_types::stable_model_json_bytes(vc).ok()
 }
 
 pub(super) fn stable_json_sha256<T: Serialize>(value: &T) -> Option<String> {

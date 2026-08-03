@@ -71,6 +71,32 @@ fn compiler_dist_bin_names(target: TargetSelection) -> [String; 2] {
     [exe("trustc", target), exe("rustc", target)]
 }
 
+/// The VERIFICATION BACKENDS the trustc component must carry: the temporal model
+/// checker, the SAT/SMT solver, and the CIC kernel.
+///
+/// These ship INSIDE the compiler component rather than as their own rustup
+/// components, for the same reason `trust-analyzer-proc-macro-srv` does (see the
+/// comment at its copy site below): they are REQUIRED ENTRYPOINTS of what a Trust
+/// compiler is, not optional add-ons like clippy or miri. `trustc` verifies as it
+/// compiles — `TrustVerify::On` is the default and `trust_verify_level` defaults to
+/// the maximum — so a distributed trustc without these is a compiler whose
+/// advertised behaviour silently cannot happen. It does not fail; it just never
+/// proves anything.
+///
+/// That is not hypothetical. Until this function existed, `x.py dist` shipped
+/// exactly `[trustc, rustc]`, and a locally-built stage2 was separately observed
+/// shipping no `ty` at all because `bootstrap.toml`'s `tools` allowlist omitted it —
+/// a toolchain that compiled perfectly and could not model-check a thing, reported
+/// as a successful build. Shipping that to users is the same defect at distribution
+/// scale, which is why absence here is an ERROR rather than a quiet skip.
+///
+/// No collision with a dedicated component (the concern that keeps cargo and the
+/// extended tools out of this image): none of these three HAS one — there is no
+/// `dist::Ty`/`Ay`/`Clean` step, so before this they were shipped by nothing.
+fn verifier_dist_bin_names(target: TargetSelection) -> [String; 3] {
+    [exe("ty", target), exe("ay", target), exe("clean", target)]
+}
+
 fn trustdoc_dist_bin_names(target: TargetSelection) -> [String; 1] {
     [exe("trustdoc", target)]
 }
@@ -557,6 +583,54 @@ impl Step for Rustc {
                     &image.join("bin").join(&compiler),
                     FileType::Executable,
                 );
+            }
+
+            // The VERIFICATION BACKENDS (see `verifier_dist_bin_names`).
+            //
+            // They must be ENSURED here, not assumed present: a local `x.py build`
+            // installs them into the sysroot via
+            // `should_ensure_default_verifier_tool_bins`, which is deliberately
+            // `kind == Kind::Build` ONLY — "dist/install/test steps have explicit
+            // component graphs" (compile.rs). So during dist the sysroot has the
+            // compiler and nothing else, and reading it directly finds no `ty`. This
+            // call IS the trustc component's explicit graph entry for them, and it is
+            // the same shape as the `RustAnalyzerProcMacroSrv` ensure below.
+            tool::ensure_default_verifier_tool_bins(builder, target_compiler, &src);
+
+            // ABSENCE IS FATAL, deliberately. After the ensure above, a backend is
+            // missing only when this build CANNOT produce it (its `tools = [...]`
+            // allowlist entry was omitted, or its source is absent), and quietly
+            // omitting it is exactly how a compile-only "Trust toolchain" gets
+            // published. Narrowing a build stays possible — you just cannot narrow it
+            // and still call the result a distributable trustc component. The panic
+            // names the backend, what the toolchain loses without it, and the two ways
+            // to resolve it.
+            for bin in verifier_dist_bin_names(target) {
+                let from = src.join("bin").join(&bin);
+                // Bootstrap executes every step TWICE — a dry-run pass that builds
+                // the step graph, then the real one. `copy_link` is a no-op in the
+                // first, so the backend legitimately does not exist on disk yet and
+                // an existence assertion there fires before anything has had a
+                // chance to run. Only the real pass can answer this question.
+                if !builder.config.dry_run() && !from.exists() {
+                    let role = match bin.split('.').next().unwrap_or(&bin) {
+                        "ty" => "the temporal model checker (every derived-model \
+                                 obligation is discharged by it)",
+                        "ay" => "the SAT/SMT solver behind the native verifier",
+                        _ => "the CIC proof kernel",
+                    };
+                    panic!(
+                        "\n\ndist trustc: REQUIRED verification backend `{bin}` is not in the \
+                         stage sysroot at {}.\n  It is {role}.\n  Shipping this component would \
+                         distribute a trustc that COMPILES BUT CANNOT VERIFY — the failure is \
+                         silent, because nothing that merely compiles ever notices.\n  Fix: add \
+                         it to `tools = [...]` in bootstrap.toml (the list is an ALLOWLIST — \
+                         absent means all, present means ONLY these), or drop `tools` entirely \
+                         to build everything; then rebuild before dist.\n",
+                        from.display()
+                    );
+                }
+                builder.copy_link(&from, &image.join("bin").join(&bin), FileType::Executable);
             }
 
             // If enabled, copy the Trust-named rustdoc binary. The inherited

@@ -478,6 +478,20 @@ pub fn select_logic(formula: &Formula) -> &'static str {
         // the BV/Int/UF scalar fields a recursive ADT's leaves produce; it only
         // widens the theory set and never changes a formula's models.
         Formula::Var(_, s) | Formula::SymVar(_, s) if s.contains_datatype() => has_datatype = true,
+        // …but a variable is NOT the whole datatype surface. A GROUND
+        // constructor term (`Ctor`) carries its datatype result sort, a
+        // selector application (`Sel`) and a constructor tester (`IsCtor`) are
+        // datatype-ranging BY CONSTRUCTION (their `datatype` field names the
+        // sort), and an uninterpreted application (`FnApp`) can return one. A
+        // formula whose only datatype content is such a term reaches no `Var`
+        // at all, so keying on variables alone would pick a logic that does not
+        // admit the datatype theory.
+        Formula::Sel { .. } | Formula::IsCtor { .. } => has_datatype = true,
+        Formula::Ctor { sort: s, .. } | Formula::FnApp { sort: s, .. }
+            if s.contains_datatype() =>
+        {
+            has_datatype = true;
+        }
         // FloatingPoint theory: any fp.* operator/literal or FP/RoundingMode var.
         Formula::Var(_, Sort::Float { .. } | Sort::RoundingMode)
         | Formula::SymVar(_, Sort::Float { .. } | Sort::RoundingMode) => has_fp = true,
@@ -510,7 +524,15 @@ pub fn select_logic(formula: &Formula) -> &'static str {
         Formula::Var(_, Sort::BitVec(_)) | Formula::SymVar(_, Sort::BitVec(_)) => has_bv = true,
         Formula::Select(..) | Formula::Store(..) => has_array = true,
         Formula::Var(_, Sort::Array(..)) | Formula::SymVar(_, Sort::Array(..)) => has_array = true,
-        Formula::Forall(..) | Formula::Exists(..) => has_quantifier = true,
+        // A binder's sorts live in the binding LIST, which is not a `children()`
+        // edge — so a datatype that appears only as a bound sort is invisible to
+        // the recursive walk over the body.
+        Formula::Forall(bindings, _) | Formula::Exists(bindings, _) => {
+            has_quantifier = true;
+            if bindings.iter().any(|(_, s)| s.contains_datatype()) {
+                has_datatype = true;
+            }
+        }
         Formula::Int(_) | Formula::UInt(_) => has_int = true,
         Formula::Var(_, Sort::Int) | Formula::SymVar(_, Sort::Int) => has_int = true,
         Formula::Add(..)
@@ -966,6 +988,64 @@ mod tests {
             Box::new(Formula::Var("m".into(), arr)),
         );
         assert_eq!(select_logic(&h), "ALL");
+    }
+
+    /// The datatype surface is bigger than `Var`/`SymVar`. A GROUND constructor
+    /// term, a selector application and a constructor tester each carry
+    /// datatype content that no variable mentions, so a `Var`-only rule picked
+    /// `QF_LIA`/`QF_BV` for them — a logic that does not admit datatypes.
+    #[test]
+    fn test_select_logic_ctor_sel_is_ctor_without_datatype_var_is_all() {
+        let expr = Sort::Datatype {
+            name: "Expr".into(),
+            constructors: vec![("Const".into(), vec![("c".into(), Sort::BitVec(32))])],
+        };
+
+        // (= (Const #x00000001) (Const #x00000001)) — no free var at all.
+        let ctor = Formula::Ctor {
+            ctor: "Const".into(),
+            args: vec![Formula::BitVec { value: 1, width: 32 }],
+            sort: expr,
+        };
+        let f = Formula::Eq(Box::new(ctor.clone()), Box::new(ctor));
+        assert_eq!(select_logic(&f), "ALL", "a ground Ctor term needs the datatype theory");
+
+        // Sel / IsCtor over a NON-datatype-sorted variable: the datatype is
+        // named by the node itself, so it must still select ALL.
+        let n = Formula::Var("n".into(), Sort::Int);
+        let sel = Formula::Eq(
+            Box::new(Formula::Sel {
+                datatype: "Expr".into(),
+                field: "c".into(),
+                field_sort: Sort::BitVec(32),
+                arg: Box::new(n.clone()),
+            }),
+            Box::new(Formula::BitVec { value: 0, width: 32 }),
+        );
+        assert_eq!(select_logic(&sel), "ALL", "a selector application ranges over a datatype");
+
+        let is_ctor = Formula::IsCtor {
+            datatype: "Expr".into(),
+            ctor: "Const".into(),
+            arg: Box::new(n),
+        };
+        assert_eq!(select_logic(&is_ctor), "ALL", "a constructor tester ranges over a datatype");
+    }
+
+    /// A datatype reached ONLY through a quantifier binder still needs the
+    /// datatype theory: the bound sorts are not `children()` edges, so the
+    /// recursive walk never sees them via the body.
+    #[test]
+    fn test_select_logic_quantifier_bound_datatype_is_all() {
+        let expr = Sort::Datatype { name: "Expr".into(), constructors: Vec::new() };
+        let f = Formula::Forall(
+            vec![("e".into(), expr)],
+            Box::new(Formula::Eq(
+                Box::new(Formula::Var("n".into(), Sort::Int)),
+                Box::new(Formula::Int(0)),
+            )),
+        );
+        assert_eq!(select_logic(&f), "ALL");
     }
 
     // --- collect_free_var_decls ---

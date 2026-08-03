@@ -280,6 +280,7 @@ fn build_test_vcs(func: &VerifiableFunction) -> Vec<VerificationCondition> {
                 location: span.clone(),
                 formula,
                 contract_metadata: None,
+                obligation: None,
             });
         }
 
@@ -305,6 +306,7 @@ fn build_test_vcs(func: &VerifiableFunction) -> Vec<VerificationCondition> {
                         location: span.clone(),
                         formula,
                         contract_metadata: None,
+                        obligation: None,
                     });
                 }
                 _ => {}
@@ -728,6 +730,7 @@ fn test_e2e_strengthen_rewrites_source() {
         },
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     };
     let failed_result =
         VerificationResult::Failed { solver: "ay-smtlib".into(), time_ms: 5, counterexample: None };

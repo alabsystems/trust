@@ -47,6 +47,7 @@ pub static LINTS: &[&::declare_clippy_lint::LintInfo] = &[
     crate::cargo::MULTIPLE_CRATE_VERSIONS_INFO,
     crate::cargo::NEGATIVE_FEATURE_NAMES_INFO,
     crate::cargo::REDUNDANT_FEATURE_NAMES_INFO,
+    crate::cargo::TRUST_EXTERNAL_DEPENDENCY_SOURCE_INFO,
     crate::cargo::WILDCARD_DEPENDENCIES_INFO,
     crate::casts::AS_POINTER_UNDERSCORE_INFO,
     crate::casts::AS_PTR_CAST_MUT_INFO,

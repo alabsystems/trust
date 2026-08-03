@@ -227,12 +227,20 @@ pub(crate) fn build_mir_inner_impl<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> 
                                 *count = count.saturating_add(1);
                             }
                             for (what, n) in agg {
-                                let class = match what {
-                                    "VarRef(unbound)"
-                                    | "Borrow(unbound local)"
-                                    | "Borrow(&mut unbound local)" => "cascade",
-                                    _ => "primary",
-                                };
+                                // Trust: ONE classifier. This site used to carry its own inline
+                                // copy of the cascade list, which then drifted out of step with
+                                // the producer's (`AssignOp(unbound local)` missing here,
+                                // emitter-less `Borrow(&mut unbound local)` still listed). Two
+                                // copies that disagree defeat the point of pinning the set, so
+                                // this calls the single table
+                                // `trust_thir_lower::crate_module::CASCADE_TAGS` /
+                                // `is_cascade_tag`, which its own tests pin exactly.
+                                let class =
+                                    if trust_thir_lower::crate_module::is_cascade_tag(what) {
+                                        "cascade"
+                                    } else {
+                                        "primary"
+                                    };
                                 tracing::debug!(
                                     ?def,
                                     what,

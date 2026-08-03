@@ -687,6 +687,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -728,6 +729,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let l0 = VerificationCondition {
             kind: VcKind::DivisionByZero,
@@ -735,6 +737,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
 
         assert!(backend.can_handle(&temporal));
@@ -761,6 +764,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let r = TyBackend.verify(&vc);
         assert!(
@@ -790,6 +794,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         // Truncatable file (no single-writer invariant): the env can shrink the
         // mapping, so an access-while-stale is reachable ⇒ ty CATCHES the hazard.
@@ -835,6 +840,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
 
         let result = backend.verify(&vc);
@@ -853,6 +859,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
 
         assert!(backend.can_handle(&vc));
@@ -965,6 +972,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
 
         assert!(backend.can_handle(&liveness_vc));
@@ -986,6 +994,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
 
         assert!(backend.can_handle(&fairness_vc));
@@ -1004,6 +1013,7 @@ mod tests {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             };
             assert!(!backend.can_handle(&vc), "ty should not handle L0 safety VCs");
         }
@@ -1299,6 +1309,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let result = TyBackend::verify_with_machine(&vc, &machine);
         // Machine has terminal state Done, so deadlock detected
@@ -1311,6 +1322,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let result = TyBackend::verify_with_machine(&vc, &machine);
         assert!(result.is_proved(), "EF(done) should hold: {result:?}");

@@ -262,11 +262,18 @@ impl InProcessAyBackend {
         // sort — SOUND (a fresh datatype/uninterpreted const can never make the
         // context vacuously UNSAT). `declare_datatype` is idempotent (deduped by
         // name) and `upgrade_logic_for_datatypes` keeps the logic datatype-capable.
-        let free_vars = smt2_export::collect_free_vars(formula);
-        for (_, sort) in &free_vars {
+        //
+        // The sorts come from `visit_datatype_bearing_sorts`, the SAME walker the
+        // text exporter's preamble uses, NOT from the free vars: a ground
+        // `Ctor`/`Sel`/`IsCtor` term carries a datatype sort that no `Var`
+        // mentions, and keying off free vars alone would assert a term over a
+        // datatype this program never declared.
+        smt2_export::visit_datatype_bearing_sorts(formula, &mut |sort| {
             Self::declare_datatype_sorts(&mut program, sort);
-        }
+        });
         program.upgrade_logic_for_datatypes();
+
+        let free_vars = smt2_export::collect_free_vars(formula);
 
         // Declare each free (non-quantifier-bound) variable exactly once before
         // the assertion, mirroring how smt2_export emits declarations.
@@ -293,8 +300,22 @@ impl InProcessAyBackend {
     /// from `sort` with `program` (deduped by name; nested datatypes declared
     /// before the datatypes that use them). A by-name back-edge reference (empty
     /// constructors) carries no definition and is skipped — ay handles it as an
-    /// unconstrained uninterpreted sort. Mirrors the text path's
-    /// `Sort::datatype_declarations` so both backends register the same datatypes.
+    /// unconstrained uninterpreted sort.
+    ///
+    /// This registers the same datatype NAMES as the text path's
+    /// `Sort::datatype_declarations`, but NOT structurally the same sorts. The
+    /// text path emits a genuinely inductive
+    /// `(declare-datatype Expr ((App (f Expr) (x Expr)) …))`, whose recursive
+    /// field sort IS `Expr` — so the solver's datatype theory supplies the
+    /// constructor/selector/tester axioms AND the acyclicity (well-foundedness)
+    /// of the term algebra. Here `sort_to_ay` maps the by-name child to
+    /// `AYSort::uninterpreted(name)` (see `trust_types::ay_bridge::sort_to_ay`),
+    /// which carries no constructors, no selectors, no testers, and no
+    /// acyclicity: the registered ay datatype is FLAT, its recursive positions
+    /// opaque. The gap is strictly FEWER facts than the text path, which is the
+    /// sound direction (an unconstrained sort can never make the context
+    /// vacuously UNSAT — see the soundness note above): an obligation that needs
+    /// the inductive structure reports Unknown on this lane instead of proving.
     fn declare_datatype_sorts(program: &mut AYProgram, sort: &Sort) {
         match sort {
             Sort::Array(idx, elem) => {
@@ -1593,6 +1614,7 @@ mod tests {
             location: SourceSpan::default(),
             formula,
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -1978,6 +2000,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
         assert!(!backend.can_handle(&unsupported));
 
@@ -1992,6 +2015,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
         assert!(backend.can_handle(&postcondition));
 
@@ -2002,6 +2026,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
         assert!(!backend.can_handle(&deadlock));
     }
@@ -2016,6 +2041,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
         let result = backend.verify(&vc);
         assert!(matches!(result, VerificationResult::Unknown { .. }));
@@ -2058,6 +2084,7 @@ mod tests {
             location: SourceSpan::default(),
             formula,
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -2399,6 +2426,40 @@ mod tests {
         assert!(
             !program.is_datatype_declared("Expr"),
             "a by-name back-edge has no definition to declare; it is an uninterpreted sort"
+        );
+    }
+
+    /// The in-process twin of the text lane's ground-`Ctor` regression: a
+    /// formula whose ONLY datatype content is a ground constructor term has no
+    /// datatype-sorted free variable, so the old free-var-keyed registration
+    /// declared nothing and asserted a `Const` term over a datatype ay had
+    /// never seen. `build_program` must register `Expr` and keep the logic
+    /// datatype-capable.
+    #[test]
+    fn ground_ctor_only_datatype_is_registered_by_build_program() {
+        let ground = Formula::Ctor {
+            ctor: "Const".into(),
+            args: vec![Formula::BitVec { value: 1, width: 32 }],
+            sort: expr_dt_sort(),
+        };
+        let formula = Formula::And(vec![
+            Formula::Eq(Box::new(int_var("n")), Box::new(Formula::Int(0))),
+            Formula::Eq(Box::new(ground.clone()), Box::new(ground)),
+        ]);
+        assert!(
+            smt2_export::collect_free_vars(&formula).iter().all(|(_, s)| !s.contains_datatype()),
+            "this test is only meaningful when no FREE VAR carries a datatype sort"
+        );
+
+        let program = InProcessAyBackend::new().build_program(&formula);
+        let logic = program.get_logic().expect("a logic must be set");
+        assert!(
+            logic == "ALL" || logic.contains("DT"),
+            "a ground-Ctor VC must use a datatype-capable logic, got: {logic}"
+        );
+        assert!(
+            program.is_datatype_declared("Expr"),
+            "the Ctor's datatype must be registered even with no datatype-sorted free var"
         );
     }
 

@@ -335,6 +335,7 @@ impl MemoryModelChecker {
                 location: race.first_span.clone(),
                 formula,
                 contract_metadata: None,
+                obligation: None,
             });
         }
 
@@ -355,6 +356,7 @@ impl MemoryModelChecker {
                 location: violation.span.clone(),
                 formula: reach,
                 contract_metadata: None,
+                obligation: None,
             });
         }
 
@@ -376,6 +378,7 @@ impl MemoryModelChecker {
                 location: gap.span.clone(),
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             });
         }
 
@@ -521,6 +524,7 @@ impl MemoryModelChecker {
             location: op.span.clone(),
             formula: reach,
             contract_metadata: None,
+            obligation: None,
         }
     }
 }

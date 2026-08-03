@@ -4,6 +4,199 @@
 use super::*;
 
 // ---------------------------------------------------------------------------
+// Authenticated-obligation recording (vertical slice: div/rem, negation)
+// ---------------------------------------------------------------------------
+// These helpers ONLY mutate `vc.obligation`; they never touch `vc.formula`, so the
+// emitted formula is byte-identical whether or not an obligation is recorded. A VC
+// with `obligation == None` (every non-slice kind, and every legacy dump) is left
+// untouched. The record is a CLAIM the consumer authenticates by reconstruct-and-
+// equate against `formula`; any incompleteness here costs certificates, never
+// soundness (the consumer DECLINES on any mismatch). Every wrapping site in the
+// shared loop below feeds one of these so the stored `{body, wrappers}` replays to
+// exactly `formula`.
+
+/// Record a `ConjoinFactsLast { facts }` wrapper — the shape every
+/// `vc.formula = And([facts.., vc.formula])` conjoin site produces. No-op when the
+/// VC carries no obligation or `facts` is empty (an empty conjoin is identity, and
+/// the conjoin sites themselves skip empty fact lists).
+pub(super) fn ob_record_conjoin(vc: &mut VerificationCondition, facts: &[Formula]) {
+    if facts.is_empty() {
+        return;
+    }
+    if let Some(ob) = vc.obligation.as_mut() {
+        ob.wrappers.push(ObligationWrapper::ConjoinFactsLast { facts: facts.to_vec() });
+    }
+}
+
+/// Apply `f` to every `Formula` stored in a wrapper (conjoin facts, or a guarded
+/// path term's guards). `Raw` terms carry no formula.
+pub(super) fn ob_map_wrapper_formulas(w: &mut ObligationWrapper, f: &mut impl FnMut(&Formula) -> Formula) {
+    match w {
+        ObligationWrapper::ConjoinFactsLast { facts } => {
+            for fact in facts.iter_mut() {
+                *fact = f(fact);
+            }
+        }
+        ObligationWrapper::PathGuardOr { paths } => {
+            for p in paths.iter_mut() {
+                if let PathGuardTerm::Guarded { guards } = p {
+                    for g in guards.iter_mut() {
+                        *g = f(g);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Mirror a whole-formula `version_rename_at` onto every recorded Formula — body,
+/// subject, and every wrapper fact accumulated SO FAR — so each stays byte-identical
+/// to its copy inside `formula`. `version_rename_at` is a per-variable deterministic
+/// map that distributes over `And`/`Or`, so applying it piecewise equals applying it
+/// to the whole tree. Called at the precondition step (the sole whole-formula rename
+/// in the shared loop) BEFORE the precondition facts are recorded (they are conjoined
+/// bare, after the rename).
+pub(super) fn ob_record_rename_at(
+    vc: &mut VerificationCondition,
+    sv: &StmtVersionCtx,
+    func: &VerifiableFunction,
+    block: BlockId,
+    stmt_idx: usize,
+) {
+    let Some(ob) = vc.obligation.as_mut() else {
+        return;
+    };
+    ob.body = version_rename_at(&ob.body, sv, func, block, stmt_idx);
+    if let Some(s) = ob.subject.as_mut() {
+        *s = version_rename_at(s, sv, func, block, stmt_idx);
+    }
+    for w in &mut ob.wrappers {
+        ob_map_wrapper_formulas(w, &mut |x| version_rename_at(x, sv, func, block, stmt_idx));
+    }
+}
+
+/// Record a pure `inner ↦ And([facts.., inner])` conjoin by reading the facts back
+/// from a before/after pair, for conjoin sites that compute their facts internally
+/// (the type-range conjoins) and do not expose them. This records the WRAPPER the
+/// step applied — the body was seeded earlier and is unchanged — so it is not a
+/// guess about which sub-formula is the obligation. `after == before` is identity
+/// (no wrapper). Any shape other than `And([.., before])` records nothing, so
+/// reconstruction diverges and the consumer DECLINES (fail-closed).
+pub(super) fn ob_record_conjoin_wrap(
+    vc: &mut VerificationCondition,
+    before: &Formula,
+    after: &Formula,
+) {
+    if vc.obligation.is_none() || after == before {
+        return;
+    }
+    if let Formula::And(children) = after
+        && children.last() == Some(before)
+        && children.len() >= 2
+    {
+        let facts = &children[..children.len() - 1];
+        ob_record_conjoin(vc, facts);
+    }
+    // Otherwise: unexpected shape — record nothing; reconstruction will mismatch
+    // and the consumer DECLINES (fail-closed).
+}
+
+/// Mirror the final `normalize_ssa_version_tokens` collapse onto every recorded
+/// Formula. Same distributivity argument: the collapse decision is per-local
+/// deterministic (a function of `func` + local, not of formula content), so
+/// per-piece normalization equals whole-formula normalization restricted to that
+/// piece. Called last, mirroring the shared loop's final normalize pass.
+pub(super) fn ob_record_normalize(vc: &mut VerificationCondition, func: &VerifiableFunction) {
+    let Some(ob) = vc.obligation.as_mut() else {
+        return;
+    };
+    ob.body = normalize_ssa_version_tokens(func, &ob.body);
+    if let Some(s) = ob.subject.as_mut() {
+        *s = normalize_ssa_version_tokens(func, s);
+    }
+    for w in &mut ob.wrappers {
+        ob_map_wrapper_formulas(w, &mut |x| normalize_ssa_version_tokens(func, x));
+    }
+}
+
+/// Trust (GAP 2): mirror the outermost `eliminate_term_ites` formula rewrite onto every
+/// recorded Formula — body, subject, and every wrapper fact/guard — at the SAME place
+/// (`generate_vcs`, entry.rs) it runs on `vc.formula`. The record is built PRE-elimination
+/// (each producer/wrapper site conjoins the raw, possibly `Ite`-carrying facts), so
+/// without this the record replays to the PRE-elimination formula and reconstruction
+/// diverges from the rewritten `formula`. `eliminate_term_ites` is a pure `Formula ->
+/// Formula` map that distributes over `And`/`Or`/`Not`/`Implies` exactly as
+/// `reconstruct_obligation` composes the wrappers, so applying it piecewise here keeps
+/// `reconstruct(record)` byte-identical to the eliminated `formula` (reuse the map — do
+/// not re-derive it). No-op when the VC carries no obligation.
+pub(super) fn ob_record_eliminate_ites(vc: &mut VerificationCondition, cap: usize) {
+    let Some(ob) = vc.obligation.as_mut() else {
+        return;
+    };
+    ob.body = eliminate_term_ites(&ob.body, cap);
+    if let Some(s) = ob.subject.as_mut() {
+        *s = eliminate_term_ites(s, cap);
+    }
+    for w in &mut ob.wrappers {
+        ob_map_wrapper_formulas(w, &mut |x| eliminate_term_ites(x, cap));
+    }
+}
+
+/// Trust (slice ARM 1): build a div/rem-by-zero VC whose obligation is seeded from
+/// what the emitter is ALREADY building — the raw assert-failure violation and the
+/// block-defs it conjoins — NOT re-parsed from the finished formula. `subject` and
+/// `width` are `None` (div/rem is payload-free). The shared wrapping loop below then
+/// appends any further wrappers it applies.
+fn v2_build_divrem_vc(
+    func: &VerifiableFunction,
+    block: &trust_types::BasicBlock,
+    cond: &Operand,
+    expected: bool,
+    span: &SourceSpan,
+    kind: VcKind,
+) -> VerificationCondition {
+    v2_build_divrem_vc_raw(
+        func,
+        block,
+        v2_assert_failure_formula(func, cond, expected),
+        block.stmts.len(),
+        span,
+        kind,
+    )
+}
+
+/// Trust (slice ARM 1): build a div/rem-by-zero VC from a raw violation the emitter
+/// already built (`v2_assert_failure_formula` for the assert-terminator path, or
+/// `v2_divisor_is_zero_formula` for the statement-`BinaryOp` and library-call
+/// paths). `end` is the use-point the block-defs are versioned at (the block
+/// terminal for the assert/call paths, the statement index for the mid-block
+/// statement path). Payload-free: `subject`/`width` are `None`. The VC is pushed
+/// into `block_vcs`, so the shared wrapping loop appends every later wrapper.
+fn v2_build_divrem_vc_raw(
+    func: &VerifiableFunction,
+    block: &trust_types::BasicBlock,
+    raw: Formula,
+    end: usize,
+    span: &SourceSpan,
+    kind: VcKind,
+) -> VerificationCondition {
+    let (formula, body, kept) =
+        v2_formula_with_block_defs_at_point_recorded(func, block, end, raw);
+    let mut wrappers = Vec::new();
+    if !kept.is_empty() {
+        wrappers.push(ObligationWrapper::ConjoinFactsLast { facts: kept });
+    }
+    VerificationCondition {
+        kind,
+        function: func.name.clone().into(),
+        location: span.clone(),
+        formula,
+        contract_metadata: None,
+        obligation: Some(ObligationRecord { body, wrappers, subject: None, width: None }),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline v2 VC generator
 // ---------------------------------------------------------------------------
 /// Generate safety VCs (overflow, divzero, remainder-by-zero) with real SMT
@@ -132,32 +325,26 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
             let vc = match msg {
                 AssertMessage::DivisionByZero => {
                     (!v2_assert_failure_is_known_false(block, cond, *expected)).then(|| {
-                        VerificationCondition {
-                            kind: VcKind::DivisionByZero,
-                            function: func.name.clone().into(),
-                            location: span.clone(),
-                            formula: v2_formula_with_block_defs(
-                                func,
-                                block,
-                                v2_assert_failure_formula(func, cond, *expected),
-                            ),
-                            contract_metadata: None,
-                        }
+                        v2_build_divrem_vc(
+                            func,
+                            block,
+                            cond,
+                            *expected,
+                            span,
+                            VcKind::DivisionByZero,
+                        )
                     })
                 }
                 AssertMessage::RemainderByZero => {
                     (!v2_assert_failure_is_known_false(block, cond, *expected)).then(|| {
-                        VerificationCondition {
-                            kind: VcKind::RemainderByZero,
-                            function: func.name.clone().into(),
-                            location: span.clone(),
-                            formula: v2_formula_with_block_defs(
-                                func,
-                                block,
-                                v2_assert_failure_formula(func, cond, *expected),
-                            ),
-                            contract_metadata: None,
-                        }
+                        v2_build_divrem_vc(
+                            func,
+                            block,
+                            cond,
+                            *expected,
+                            span,
+                            VcKind::RemainderByZero,
+                        )
                     })
                 }
                 AssertMessage::Overflow(op) => Some(
@@ -224,6 +411,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
                         v2_assert_failure_formula(func, cond, *expected),
                     ),
                     contract_metadata: None,
+                    obligation: None,
                 }),
                 // The coroutine transform inserts these guards at the illegal
                 // resume-after-completion/panic/drop states. They are executor-
@@ -283,9 +471,24 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
         if !overflow_guard_targets.contains(&block.id)
             && let Terminator::Call { func: callee, args, dest, span, .. } = &block.terminator
             && let Some(kind) = overflow_arith_call(callee)
-            && let Some((body, op, lhs_ty, rhs_ty)) = v2_overflow_call_body(func, kind, args, dest)
+            && let Some((body, op, lhs_ty, rhs_ty, width)) =
+                v2_overflow_call_body(func, kind, args, dest)
         {
-            let formula = v2_formula_with_block_defs(func, block, body);
+            // Trust (arith ARM, 2026-07-31): seed the authenticated obligation from the
+            // block-def-versioned body EXACTLY as the direct/checked BinaryOp Int path
+            // does — `v2_arith_overflow_seed_record` records the atomic out-of-range core
+            // and demotes the operand ranges + block-defs to ConjoinFactsLast wrappers.
+            // `.0` is byte-identical to the previous `v2_formula_with_block_defs`, so the
+            // emitted formula is UNCHANGED. Fail-closed to `None` for the Pow bodies
+            // (`Bool(true)` / 2-conjunct `And`), which are the genuinely-unmodeled shapes.
+            // The four arg/local/field/slice conjoins + every later wrapper are applied and
+            // mirrored by the shared loop below (this VC's kind is `ArithmeticOverflow`).
+            let (formula, rec_body, kept) = v2_formula_with_block_defs_at_point_recorded(
+                func,
+                block,
+                block.stmts.len(),
+                body,
+            );
             block_vcs.push((
                 block.id,
                 VerificationCondition {
@@ -294,6 +497,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
                     location: span.clone(),
                     formula,
                     contract_metadata: None,
+                    obligation: v2_arith_overflow_seed_record(&rec_body, &kept, width),
                 },
             ));
         }
@@ -329,6 +533,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
                     location: span.clone(),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 },
             ));
         }
@@ -361,6 +566,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
                     location: span.clone(),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 },
             ));
         }
@@ -387,17 +593,16 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
             // Args are evaluated BEFORE the terminator, so there are no in-block
             // statement defs to take "before the statement" — use the same
             // whole-block-defs builder the 1c overflow-call recognizer uses.
-            let formula =
-                v2_formula_with_block_defs(func, block, v2_divisor_is_zero_formula(func, divisor));
             block_vcs.push((
                 block.id,
-                VerificationCondition {
+                v2_build_divrem_vc_raw(
+                    func,
+                    block,
+                    v2_divisor_is_zero_formula(func, divisor),
+                    block.stmts.len(),
+                    span,
                     kind,
-                    function: func.name.clone().into(),
-                    location: span.clone(),
-                    formula,
-                    contract_metadata: None,
-                },
+                ),
             ));
         }
 
@@ -474,6 +679,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
                     location: span.clone(),
                     formula,
                     contract_metadata: None,
+                    obligation: None,
                 },
             ));
         }
@@ -502,18 +708,14 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
                     if !is_float && !v2_divisor_is_nonzero_constant(divisor) {
                         block_vcs.push((
                             block.id,
-                            VerificationCondition {
-                                kind: VcKind::DivisionByZero,
-                                function: func.name.clone().into(),
-                                location: span.clone(),
-                                formula: v2_formula_with_block_defs_before_stmt(
-                                    func,
-                                    block,
-                                    stmt_index,
-                                    v2_divisor_is_zero_formula(func, divisor),
-                                ),
-                                contract_metadata: None,
-                            },
+                            v2_build_divrem_vc_raw(
+                                func,
+                                block,
+                                v2_divisor_is_zero_formula(func, divisor),
+                                stmt_index,
+                                span,
+                                VcKind::DivisionByZero,
+                            ),
                         ));
                     }
 
@@ -558,18 +760,14 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
                 {
                     block_vcs.push((
                         block.id,
-                        VerificationCondition {
-                            kind: VcKind::RemainderByZero,
-                            function: func.name.clone().into(),
-                            location: span.clone(),
-                            formula: v2_formula_with_block_defs_before_stmt(
-                                func,
-                                block,
-                                stmt_index,
-                                v2_divisor_is_zero_formula(func, divisor),
-                            ),
-                            contract_metadata: None,
-                        },
+                        v2_build_divrem_vc_raw(
+                            func,
+                            block,
+                            v2_divisor_is_zero_formula(func, divisor),
+                            stmt_index,
+                            span,
+                            VcKind::RemainderByZero,
+                        ),
                     ));
 
                     if !overflow_guard_targets.contains(&block.id)
@@ -669,6 +867,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
         {
             let live = v2_live_path_defs(func, &func.body.blocks[block_id.0], path_defs);
             if !live.is_empty() {
+                ob_record_conjoin(vc, &live);
                 let mut conjuncts = live;
                 conjuncts.push(vc.formula.clone());
                 vc.formula = Formula::And(conjuncts);
@@ -693,6 +892,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
         if let Some(facts) = range_yield_guards.get(block_id)
             && !facts.is_empty()
         {
+            ob_record_conjoin(vc, facts);
             let mut conjuncts = facts.clone();
             conjuncts.push(vc.formula.clone());
             vc.formula = Formula::And(conjuncts);
@@ -711,6 +911,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
         if let Some(facts) = converging_facts.get(block_id)
             && !facts.is_empty()
         {
+            ob_record_conjoin(vc, facts);
             let mut conjuncts = facts.clone();
             conjuncts.push(vc.formula.clone());
             vc.formula = Formula::And(conjuncts);
@@ -732,6 +933,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
         if let Some(facts) = countdown_preval_facts.get(block_id)
             && !facts.is_empty()
         {
+            ob_record_conjoin(vc, facts);
             let mut conjuncts = facts.clone();
             conjuncts.push(vc.formula.clone());
             vc.formula = Formula::And(conjuncts);
@@ -750,6 +952,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
         if let Some(facts) = enumerate_yield_guards.get(block_id)
             && !facts.is_empty()
         {
+            ob_record_conjoin(vc, facts);
             let mut conjuncts = facts.clone();
             conjuncts.push(vc.formula.clone());
             vc.formula = Formula::And(conjuncts);
@@ -768,6 +971,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
         if let Some(facts) = slice_iter_yield_guards.get(block_id)
             && !facts.is_empty()
         {
+            ob_record_conjoin(vc, facts);
             let mut conjuncts = facts.clone();
             conjuncts.push(vc.formula.clone());
             vc.formula = Formula::And(conjuncts);
@@ -787,6 +991,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
         if let Some(facts) = push_guard_elem_len.get(block_id)
             && !facts.is_empty()
         {
+            ob_record_conjoin(vc, facts);
             let mut conjuncts = facts.clone();
             conjuncts.push(vc.formula.clone());
             vc.formula = Formula::And(conjuncts);
@@ -808,6 +1013,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
         if let Some(facts) = len_guard_field.get(block_id)
             && !facts.is_empty()
         {
+            ob_record_conjoin(vc, facts);
             let mut conjuncts = facts.clone();
             conjuncts.push(vc.formula.clone());
             vc.formula = Formula::And(conjuncts);
@@ -830,6 +1036,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
             if v2_is_unsupported_mir_vc(vc) {
                 continue;
             }
+            ob_record_conjoin(vc, &global_facts);
             let mut conjuncts = global_facts.clone();
             conjuncts.push(vc.formula.clone());
             vc.formula = Formula::And(conjuncts);
@@ -863,13 +1070,29 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
                 continue;
             }
             let killed = may_reassigned.get(block_id).unwrap_or(&empty);
-            vc.formula = conjoin_preconditions_versioned(
+            let (new_formula, conjoined) = conjoin_preconditions_versioned_recorded(
                 func,
                 *block_id,
                 &func.preconditions,
                 killed,
                 vc.formula.clone(),
             );
+            vc.formula = new_formula;
+            // Mirror the whole-formula version rename this step applies onto the
+            // recorded body/subject/wrappers (so they stay byte-identical to their
+            // copies in `formula`), THEN record the filtered preconditions as the
+            // outer ConjoinFactsLast wrapper (they are conjoined bare, after the
+            // rename). No-op when the VC carries no obligation.
+            if vc.obligation.is_some() {
+                let terminal = func
+                    .body
+                    .blocks
+                    .get(block_id.0)
+                    .filter(|b| b.id == *block_id)
+                    .map_or(0, |b| b.stmts.len());
+                ob_record_rename_at(vc, &sv, func, *block_id, terminal);
+                ob_record_conjoin(vc, &conjoined);
+            }
         }
     }
 
@@ -881,8 +1104,17 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
             continue;
         }
         if let Some(block_guard_paths) = guard_paths_map.get(block_id) {
-            vc.formula =
-                v2_formula_with_path_guards(func, &sv, block_guard_paths, vc.formula.clone());
+            let (new_formula, path_terms) = v2_formula_with_path_guards_recorded(
+                func,
+                &sv,
+                block_guard_paths,
+                vc.formula.clone(),
+            );
+            vc.formula = new_formula;
+            // The dominating path-guard map is the sole non-conjoining wrapper.
+            if let Some(ob) = vc.obligation.as_mut() {
+                ob.wrappers.push(ObligationWrapper::PathGuardOr { paths: path_terms });
+            }
         }
     }
     for (block_id, vc) in &mut block_vcs {
@@ -892,6 +1124,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
         if let Some(sem_guards) = semantic_guards.get(block_id)
             && !sem_guards.is_empty()
         {
+            ob_record_conjoin(vc, sem_guards);
             let mut conjuncts = sem_guards.clone();
             conjuncts.push(vc.formula.clone());
             vc.formula = Formula::And(conjuncts);
@@ -928,7 +1161,16 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
             continue;
         }
         if matches!(vc.kind, VcKind::ArithmeticOverflow { .. }) || bounds_kind {
+            // Trust (bounds ARM): each of these four conjoins is a pure
+            // `And([facts.., formula])` push (facts LAST) or identity when it has no
+            // facts, so mirror each onto the recorded obligation as a `ConjoinFactsLast`
+            // read back from the before/after pair (`ob_record_conjoin_wrap`). No-op when
+            // the VC carries no obligation (the ArithmeticOverflow arm is still `None`
+            // here), so this only threads the now-recorded bounds VCs.
+            let before = vc.formula.clone();
             vc.formula = conjoin_arg_type_ranges(func, vc.formula.clone());
+            let after = vc.formula.clone();
+            ob_record_conjoin_wrap(vc, &before, &after);
             // Trust (unsigned-sub vacuous-UNSAT false-accept fix): on an
             // ArithmeticOverflow VC, EXCLUDE the checked-op result copy closure's
             // type-ranges — `0 <= X` for an X tied to `a - b` conjoined onto the
@@ -944,11 +1186,20 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
             // sibling of arg ranges) — a `u32`/`i8` temp lowered to unbounded
             // `Sort::Int` otherwise lets the solver false-refute an overflow with an
             // out-of-type-range value. SOUNDNESS: DROP-ONLY (true range fact).
+            let before = vc.formula.clone();
             vc.formula = conjoin_local_type_ranges_excluding(func, vc.formula.clone(), &excl);
+            let after = vc.formula.clone();
+            ob_record_conjoin_wrap(vc, &before, &after);
             // Lever A: bound fixed-width-integer datatype FIELDS too (the modeled
             // `Expr`/`Level`/`Name` cluster), same sound Rust-type invariant. DROP-ONLY.
+            let before = vc.formula.clone();
             vc.formula = conjoin_datatype_field_ranges_excluding(func, vc.formula.clone(), &excl);
+            let after = vc.formula.clone();
+            ob_record_conjoin_wrap(vc, &before, &after);
+            let before = vc.formula.clone();
             vc.formula = conjoin_slice_len_bounds(func, vc.formula.clone());
+            let after = vc.formula.clone();
+            ob_record_conjoin_wrap(vc, &before, &after);
         }
     }
 
@@ -961,6 +1212,9 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
             continue;
         }
         vc.formula = normalize_ssa_version_tokens(func, &vc.formula);
+        // Mirror the same token collapse onto the recorded body/subject/wrappers so
+        // reconstruction stays byte-identical to the normalized `formula`.
+        ob_record_normalize(vc, func);
     }
 
     block_vcs
@@ -1067,6 +1321,22 @@ pub(super) fn v2_formula_with_path_guards(
     guard_paths: &[Vec<(BlockId, GuardCondition)>],
     formula: Formula,
 ) -> Formula {
+    v2_formula_with_path_guards_recorded(func, sv, guard_paths, formula).0
+}
+
+/// As [`v2_formula_with_path_guards`], but also returns the per-path terms the
+/// obligation recorder records as a [`ObligationWrapper::PathGuardOr`]. Trust: an
+/// empty guard list is a `Raw` term (body whole); a non-empty one is a `Guarded`
+/// term carrying the SAME version-renamed guard formulas this function conjoins,
+/// so the consumer's `Or([per-path term..])` reconstruction — with its `And`-splice
+/// of the body — reproduces this formula bit-for-bit.
+pub(super) fn v2_formula_with_path_guards_recorded(
+    func: &VerifiableFunction,
+    sv: &StmtVersionCtx,
+    guard_paths: &[Vec<(BlockId, GuardCondition)>],
+    formula: Formula,
+) -> (Formula, Vec<PathGuardTerm>) {
+    let mut path_terms: Vec<PathGuardTerm> = Vec::new();
     // Trust S2c: version each guard at ITS SOURCE block before conjoining (the
     // facts are conjoined EXEMPT from the whole-VC rename). An IN-BLOCK read in the
     // guard (`k = n%4` in `if k >= 4`) renames to `k#sSRC` and matches the renamed
@@ -1077,9 +1347,10 @@ pub(super) fn v2_formula_with_path_guards(
     for guards in guard_paths {
         if guards.is_empty() {
             terms.push(formula.clone());
+            path_terms.push(PathGuardTerm::Raw);
             continue;
         }
-        let mut conj: Vec<Formula> = guards
+        let renamed_guards: Vec<Formula> = guards
             .iter()
             .map(|(src, g)| {
                 let gf = guards::guard_to_formula(func, g);
@@ -1095,6 +1366,8 @@ pub(super) fn v2_formula_with_path_guards(
                 version_rename_at(&gf, sv, func, *src, terminal)
             })
             .collect();
+        path_terms.push(PathGuardTerm::Guarded { guards: renamed_guards.clone() });
+        let mut conj: Vec<Formula> = renamed_guards;
         // Trust: restore R1 recursion inductive-bound fact (regression from 52b31a7d2a,
         // which conjoined same-block statement defs into `formula` BEFORE this splice). When
         // the attributed callsite producer already wrapped `formula` as `And([defs…, ¬P[σ]])`
@@ -1115,9 +1388,10 @@ pub(super) fn v2_formula_with_path_guards(
         terms.push(Formula::And(conj));
     }
 
-    match terms.len() {
+    let result = match terms.len() {
         0 => formula,
         1 => terms.pop().unwrap_or_else(|| unreachable!("len checked above")),
         _ => Formula::Or(terms),
-    }
+    };
+    (result, path_terms)
 }

@@ -1063,6 +1063,32 @@ struct VerificationControls<'a> {
     proof_artifact_root: &'a Path,
 }
 
+/// Every `-Z` option this run may place in the graph-wide Cargo rustflags, by
+/// rustc-canonical option name.
+///
+/// This is the mirror of `VERIFIED_TARGO_HOST_POLICY_OPTIONS` in the sibling
+/// targo's `core/compiler/build_context/target_info.rs`, and it is a hard
+/// protocol boundary, not documentation: rustflags reach EVERY Unit Cargo
+/// builds, so an option that is legal here is by definition a graph-wide
+/// decision. `trust-verify` is deliberately absent — verification scope is
+/// resolved per compilation Unit inside targo, never here — and targo rejects
+/// any `-Ztrust_*` option outside this set before a single compiler is spawned.
+/// See `verification_control_options_stay_inside_the_verified_host_policy`.
+const VERIFIED_TARGO_HOST_POLICY_OPTIONS: &[&str] = &[
+    "trust-cg-output-gate",
+    "trust-policy",
+    "trust-proof-artifact-root",
+    "trust-verify-ay-path",
+    "trust-verify-function-budget-ms",
+    "trust-verify-include-dependencies",
+    "trust-verify-level",
+    "trust-verify-output",
+    "trust-verify-profile",
+    "trust-verify-session",
+    "trust-verify-timeout-ms",
+    "trust-verify-worker-threads",
+];
+
 fn verification_control_options(
     controls: &VerificationControls<'_>,
 ) -> Result<Vec<String>, String> {
@@ -1099,7 +1125,32 @@ fn verification_control_options(
                 .to_string(),
         );
     }
+    reject_out_of_protocol_host_policy(&options)?;
     Ok(options)
+}
+
+/// Fail closed, before any compiler is spawned, if this run would place an
+/// out-of-protocol option on the graph-wide rustflags channel.
+///
+/// The sibling targo rejects such an option too, but only once Cargo is
+/// already running, and a stage2 targo predating that check would instead
+/// honour it silently on every Unit. `-Ztrust-verify=off` is the specific
+/// catastrophe this exists for: on the graph-wide channel it switches the
+/// authenticated primary target off along with the dependencies, and nothing
+/// on this path would switch it back on — the report would still be assembled,
+/// from a build that proved nothing.
+fn reject_out_of_protocol_host_policy(options: &[String]) -> Result<(), String> {
+    for option in options {
+        let name = canonical_rustc_option_name(option).replace('_', "-");
+        if !VERIFIED_TARGO_HOST_POLICY_OPTIONS.contains(&name.as_str()) {
+            return Err(format!(
+                "-Z{name} is not part of the verified Targo host-policy protocol: Cargo rustflags \
+                 reach every compilation unit, so verification scope must be resolved per unit by \
+                 targo, never set here"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn append_verification_control_args(
@@ -4237,6 +4288,11 @@ mod selection_and_control_tests {
         validate_direct_custom_target_extension_tcb, verification_cache_target_dir,
         write_test_execution_authority,
     };
+    use super::{
+        VERIFIED_TARGO_HOST_POLICY_OPTIONS, canonical_rustc_option_name, env,
+        inherited_trust_rustflags_warning, reject_out_of_protocol_host_policy,
+        trust_verify_disable_diagnostic, verification_control_options,
+    };
     use crate::config::TrustConfig;
     use crate::pipeline::transport::{CargoTargetIdentity, CargoTestExecutable};
     use crate::pipeline::{CargoRustflags, ResolvedCargoPackage, ResolvedCargoSelection};
@@ -4871,6 +4927,343 @@ mod selection_and_control_tests {
             name == std::ffi::OsStr::new("CARGO_INCREMENTAL")
                 && value == Some(std::ffi::OsStr::new("0"))
         }));
+    }
+
+    /// RAII environment override, serialized by `crate::TEST_ENV_LOCK` the way
+    /// `pipeline::probe`'s tests are: the rustflags assembly below reads the
+    /// ambient RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS, so it cannot race another
+    /// test mutating them.
+    struct RustflagsEnvGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl RustflagsEnvGuard {
+        #[allow(unknown_lints, env_mutation)] // lock-serialized env helper (see the acquired TEST_ENV_LOCK); the single audited boundary.
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, old }
+        }
+
+        #[allow(unknown_lints, env_mutation)] // lock-serialized env helper (see the acquired TEST_ENV_LOCK); the single audited boundary.
+        fn unset(key: &'static str) -> Self {
+            let old = env::var_os(key);
+            env::remove_var(key);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for RustflagsEnvGuard {
+        #[allow(unknown_lints, env_mutation)] // lock-serialized env helper (see the acquired TEST_ENV_LOCK); the single audited boundary.
+        fn drop(&mut self) {
+            if let Some(old) = self.old.take() {
+                env::set_var(self.key, old);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
+
+    /// Read back the exact rustflags variable this run would export to the
+    /// child Cargo, in whichever of Cargo's two representations was selected.
+    fn exported_cargo_rustflags(command: &std::process::Command) -> (String, &'static str) {
+        for name in ["CARGO_ENCODED_RUSTFLAGS", "RUSTFLAGS"] {
+            if let Some(value) = command.get_envs().find_map(|(key, value)| {
+                (key == std::ffi::OsStr::new(name)).then_some(value).flatten()
+            }) {
+                return (
+                    value.to_str().expect("exported rustflags are UTF-8").to_string(),
+                    name,
+                );
+            }
+        }
+        panic!("no rustflags variable was exported to the child Cargo");
+    }
+
+    /// Whether the exported rustflags carry a `-Ztrust-verify` **activation**
+    /// option, in any of the spellings rustc accepts (`-Z name=value`,
+    /// `-Zname=value`, `_`-for-`-`). Deliberately compares the canonical option
+    /// NAME rather than substring-matching: the tracked policy legitimately
+    /// contains `trust-verify-session`, `trust-verify-level`,
+    /// `trust-verify-output` and friends, none of which is the off-switch.
+    fn carries_verification_activation_option(flags: &str, variable: &str) -> bool {
+        let args = if variable == "CARGO_ENCODED_RUSTFLAGS" {
+            flags.split('\x1f').map(str::to_string).collect::<Vec<_>>()
+        } else {
+            flags
+                .split(' ')
+                .map(str::trim)
+                .filter(|arg| !arg.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let mut index = 0;
+        while index < args.len() {
+            let option = if args[index] == "-Z" {
+                index += 1;
+                args.get(index).map(String::as_str)
+            } else {
+                args[index].strip_prefix("-Z").filter(|option| !option.is_empty())
+            };
+            if option.is_some_and(|option| canonical_rustc_option_name(option) == "trust-verify") {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+
+    /// The verification opt-out is scoped PER COMPILATION UNIT, and targo-trust
+    /// owns the half of that contract that lives in rustflags.
+    ///
+    /// `-Ztrust-verify=off` is the compiler's only off-switch, and RUSTFLAGS
+    /// reaches every unit Cargo builds — the workspace crate, every third-party
+    /// dependency, every build script and proc macro. Applying the opt-out
+    /// there is precisely what forces the `=on` enable value to exist: once a
+    /// build has been switched off wholesale, something has to switch it back
+    /// on for the one crate that was supposed to be proved.
+    ///
+    /// So the scoping lives one layer down, in the sibling `targo`'s own
+    /// per-Unit engine (`trust_unit_verification_enabled` /
+    /// `trust_unit_protocol_args` in
+    /// `src/tools/targo/src/cargo/core/compiler/mod.rs`): Targo appends
+    /// `-Ztrust-verify=off` *after* every caller-controlled flag source, on
+    /// exactly the Units that are neither a resolved proof root nor a
+    /// test-execution subject (build scripts are never proof roots), and hashes
+    /// that decision into the Cargo fingerprint
+    /// (`fingerprint::calculate`'s `targo-trust-unit-scope-v5` tuple) so a warm
+    /// cache can never serve a scoped-out artifact as a verified one.
+    ///
+    /// What targo-trust must guarantee is the other half: the run-level
+    /// rustflags carry the tracked `-Ztrust-verify-session` nonce — the
+    /// evidence hook `missing_trust_json_diagnostic` names — and carry NO
+    /// verification activation token in either direction, so the compiler's
+    /// batteries-on default governs every unit Targo did not explicitly scope
+    /// out. If dependency scoping is ever "simplified" back into these
+    /// rustflags, the authenticated primary target silently stops being
+    /// verified and only `-Ztrust-verify=on` could claw it back.
+    #[test]
+    fn verification_opt_out_is_never_applied_graph_wide_through_rustflags() {
+        let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let session = VerificationSession::create().expect("create session");
+        let controls = VerificationControls {
+            policy: TrustPolicySelection::Strict,
+            timeout_ms: 5000,
+            function_budget_ms: 120_000,
+            hardened_profile: None,
+            ay_path: None,
+            verification_session: &session.id,
+            proof_artifact_root: session.artifact_root(),
+        };
+        let configure = |command: &mut std::process::Command| {
+            apply_cargo_rustflags_env(
+                command,
+                &TrustConfig::default(),
+                None,
+                true,
+                true,
+                false,
+                &controls,
+                &TrustFlags::default(),
+            )
+            .expect("assemble verified Cargo rustflags");
+        };
+
+        // 1. Clean environment, Cargo's plain representation: the tracked nonce
+        //    reaches the compiler and nothing turns verification off or on.
+        {
+            let _plain = RustflagsEnvGuard::unset("RUSTFLAGS");
+            let _encoded = RustflagsEnvGuard::unset("CARGO_ENCODED_RUSTFLAGS");
+            let mut command = std::process::Command::new("unused");
+            configure(&mut command);
+            let (flags, variable) = exported_cargo_rustflags(&command);
+            assert_eq!(variable, "RUSTFLAGS", "{flags:?}");
+            assert!(
+                flags.contains(&format!("-Z trust-verify-session={}", session.id)),
+                "the tracked session nonce must reach the authenticated primary target: {flags:?}"
+            );
+            assert!(
+                !carries_verification_activation_option(&flags, variable),
+                "targo-trust applied a graph-wide verification switch: {flags:?}"
+            );
+        }
+
+        // 2. Cargo's encoded representation takes the same path.
+        {
+            let _plain = RustflagsEnvGuard::unset("RUSTFLAGS");
+            let _encoded =
+                RustflagsEnvGuard::set("CARGO_ENCODED_RUSTFLAGS", "-C\x1fopt-level=2");
+            let mut command = std::process::Command::new("unused");
+            configure(&mut command);
+            let (flags, variable) = exported_cargo_rustflags(&command);
+            assert_eq!(variable, "CARGO_ENCODED_RUSTFLAGS", "{flags:?}");
+            assert!(
+                flags.contains(&format!("\x1f-Z\x1ftrust-verify-session={}", session.id)),
+                "the tracked session nonce must survive the encoded merge: {flags:?}"
+            );
+            assert!(
+                !carries_verification_activation_option(&flags, variable),
+                "targo-trust applied a graph-wide verification switch: {flags:?}"
+            );
+        }
+
+        // 3. `-Ztrust-verify=on` — the flag a too-coarse opt-out forces callers
+        //    to invent — has no route into this lane. It is stripped from the
+        //    exported rustflags and surfaced toward TRUSTFLAGS, so it can never
+        //    re-widen a scope Targo resolved from the Cargo unit graph.
+        {
+            let _encoded = RustflagsEnvGuard::unset("CARGO_ENCODED_RUSTFLAGS");
+            let _plain = RustflagsEnvGuard::set("RUSTFLAGS", "-C opt-level=2 -Ztrust-verify=on");
+            let mut command = std::process::Command::new("unused");
+            configure(&mut command);
+            let (flags, variable) = exported_cargo_rustflags(&command);
+            assert!(
+                !carries_verification_activation_option(&flags, variable),
+                "an ambient enable value reached the compiler: {flags:?}"
+            );
+            assert!(flags.contains("-C opt-level=2"), "unrelated flags must survive: {flags:?}");
+            let warning = inherited_trust_rustflags_warning(None, Some("-Ztrust-verify=on"))
+                .expect("a stripped ambient trust option must be surfaced, not silent");
+            assert!(warning.contains("-Ztrust-verify=on"), "{warning}");
+            assert!(warning.contains("set TRUSTFLAGS instead"), "{warning}");
+        }
+
+        // 4. The off-switch is not merely stripped from RUSTFLAGS: it is a hard
+        //    error before any compiler is spawned, in both representations. A
+        //    caller that believes it disabled verification must never receive a
+        //    report that claims it ran.
+        {
+            let _encoded = RustflagsEnvGuard::unset("CARGO_ENCODED_RUSTFLAGS");
+            let _plain = RustflagsEnvGuard::set("RUSTFLAGS", "-Ztrust-verify=off");
+            let diagnostic = trust_verify_disable_diagnostic(&[], false)
+                .expect("an ambient graph-wide opt-out must fail closed");
+            assert!(
+                diagnostic.contains("RUSTFLAGS contains `-Z trust-verify=off`"),
+                "{diagnostic}"
+            );
+        }
+        {
+            let _plain = RustflagsEnvGuard::unset("RUSTFLAGS");
+            let _encoded =
+                RustflagsEnvGuard::set("CARGO_ENCODED_RUSTFLAGS", "-Z\x1ftrust_verify=off");
+            let diagnostic = trust_verify_disable_diagnostic(&[], false)
+                .expect("an ambient encoded graph-wide opt-out must fail closed");
+            assert!(
+                diagnostic.contains("CARGO_ENCODED_RUSTFLAGS contains `-Z trust-verify=off`"),
+                "{diagnostic}"
+            );
+        }
+
+        // 5. Neither activation value can be smuggled through the sanctioned
+        //    per-run policy channel either, so TRUSTFLAGS cannot reintroduce a
+        //    graph-wide decision that Targo resolves per unit.
+        for flag in ["-Ztrust-verify=off", "-Ztrust-verify=on", "-Z trust_verify=on"] {
+            let error = TrustFlags::parse_plain(flag)
+                .expect_err("TRUSTFLAGS must not carry a verification activation value");
+            assert!(error.contains("not a supported TRUSTFLAGS policy option"), "{flag}: {error}");
+        }
+
+        // 6. And not through `targo trust rustc -- <args>` passthrough.
+        for flag in [
+            vec!["-Ztrust-verify=off".to_string()],
+            vec!["-Z".to_string(), "trust-verify=on".to_string()],
+        ] {
+            assert!(
+                trust_verify_disable_diagnostic(&flag, true).is_some(),
+                "passthrough activation value survived: {flag:?}"
+            );
+        }
+    }
+
+    /// The rustflags targo-trust exports are a GRAPH-WIDE channel, and the
+    /// sibling targo enforces a closed allowlist over it
+    /// (`VERIFIED_TARGO_HOST_POLICY_OPTIONS` /
+    /// `extract_verified_targo_host_policy` in
+    /// `src/tools/targo/src/cargo/core/compiler/build_context/target_info.rs`):
+    /// any `-Ztrust_*` option outside that set aborts the build with
+    /// "is not part of the verified Targo host-policy protocol", and
+    /// `-Ztrust-verify=off` specifically is rejected a second time by
+    /// `resolve_trust_verification_protocol` as "reserved for Targo's resolved
+    /// compilation-unit scope".
+    ///
+    /// The test above proves targo-trust emits no verification ACTIVATION
+    /// token. This one proves the stronger, cheaper-to-maintain property that
+    /// actually protects the evidence chain: every option targo-trust can put
+    /// on the graph-wide channel is one targo's host boundary accepts. It is
+    /// the assertion that fails first — before any Cargo is spawned, on a
+    /// developer's machine rather than in a build that fails closed with a
+    /// confusing protocol error, or (against a stage2 targo predating those
+    /// checks) in a build that silently verifies nothing at all.
+    #[test]
+    fn verification_control_options_stay_inside_the_verified_host_policy() {
+        // `trust-verify` is the load-bearing absence: it is the compiler's
+        // sole verification switch, so admitting it here at all — in either
+        // direction — is exactly the too-coarse opt-out that forces an `=on`
+        // enable value to exist to claw the primary target back.
+        assert!(
+            !VERIFIED_TARGO_HOST_POLICY_OPTIONS.contains(&"trust-verify"),
+            "verification scope is resolved per compilation Unit inside targo, never graph-wide"
+        );
+
+        let session = VerificationSession::create().expect("create session");
+        // Maximal controls: every optional option is populated, so the
+        // allowlist is checked against the widest command line this run can
+        // produce rather than the default one.
+        let controls = VerificationControls {
+            policy: TrustPolicySelection::Advisory,
+            timeout_ms: 5000,
+            function_budget_ms: 120_000,
+            hardened_profile: Some("boundary"),
+            ay_path: Some(std::path::Path::new("/tmp/ay")),
+            verification_session: &session.id,
+            proof_artifact_root: session.artifact_root(),
+        };
+
+        for policy in [
+            TrustPolicySelection::Strict,
+            TrustPolicySelection::Certify,
+            TrustPolicySelection::Advisory,
+            TrustPolicySelection::MemorySafe,
+        ] {
+            let options = verification_control_options(&VerificationControls { policy, ..controls })
+                .expect("assemble verifier control options");
+            for option in &options {
+                let name = canonical_rustc_option_name(option).replace('_', "-");
+                assert!(
+                    VERIFIED_TARGO_HOST_POLICY_OPTIONS.contains(&name.as_str()),
+                    "-Z{name} is outside the verified Targo host-policy protocol and would abort \
+                     every `targo trust` run: {options:?}"
+                );
+            }
+            // The evidence hook itself: without the tracked nonce the run has
+            // no authenticated verification stream to authenticate at all.
+            assert!(
+                options.iter().any(|option| option
+                    == &format!("trust-verify-session={}", session.id)),
+                "the tracked session nonce must be part of every verified run: {options:?}"
+            );
+        }
+
+        // And the guard is live, not decorative: re-adding the graph-wide
+        // opt-out to this vector — in any spelling rustc accepts — aborts the
+        // run instead of producing a report for a build that proved nothing.
+        for forged in [
+            "trust-verify=off",
+            "trust_verify=off",
+            "trust-verify=on",
+            "trust-dump=mir-only:/tmp/d",
+        ] {
+            let mut options = verification_control_options(&controls).expect("baseline options");
+            options.push(forged.to_string());
+            let error = reject_out_of_protocol_host_policy(&options)
+                .expect_err("an out-of-protocol graph-wide option must fail closed");
+            assert!(
+                error.contains("not part of the verified Targo host-policy protocol"),
+                "{forged}: {error}"
+            );
+            assert!(error.contains("resolved per unit by targo"), "{forged}: {error}");
+        }
     }
 
     #[cfg(unix)]

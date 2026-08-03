@@ -13,7 +13,10 @@ pub(super) fn unwrap_is_infallible_slice_to_array(
 ) -> bool {
     // Only `Result::unwrap` — the receiver's sole failure path is `Err`. Be
     // conservative for `expect`/`unwrap_err`/`Option::unwrap` (kept as Unknown).
-    if method_tail(callee) != "unwrap" || !callee.contains("Result") {
+    if method_tail(callee) != "unwrap"
+        || !((callee.starts_with("core::") || callee.starts_with("std::"))
+            && callee.contains("::result::Result"))
+    {
         return false;
     }
     // The unwrap output type must itself be the array `[T; N]` (the `Ok` payload).
@@ -95,11 +98,19 @@ pub(super) fn unique_whole_local_conversion_call<'a>(
 
 /// `true` for the slice->array `TryInto`/`TryFrom` conversion methods. The result
 /// is `Ok` IFF the slice length equals the target array length, so a statically
-/// length-`N` slice into `[T; N]` is infallible. Matched conservatively by method
-/// tail AND trait path; a non-match keeps the unwrap obligation (sound).
+/// length-`N` slice into `[T; N]` is infallible. The trait path is anchored at
+/// `core`/`std` (or a qualified canonical `TryFrom`/`TryInto` spelling); a
+/// same-named user conversion keeps the unwrap obligation.
 pub(super) fn is_slice_to_array_conversion(callee: &str) -> bool {
     matches!(method_tail(callee), "try_into" | "try_from")
-        && (callee.contains("TryInto") || callee.contains("TryFrom") || callee.contains("convert"))
+        && (((callee.starts_with("core::") || callee.starts_with("std::"))
+            && callee.contains("::convert::"))
+            || callee.contains("as core::convert::TryFrom<")
+            || callee.contains("as std::convert::TryFrom<")
+            || callee.contains("as core::convert::TryInto<")
+            || callee.contains("as std::convert::TryInto<")
+            || callee.contains("as TryFrom<")
+            || callee.contains("as TryInto<"))
 }
 
 /// Array length `N` of a place whose type is `[T; N]` (`Ty::Array`). `None` for any

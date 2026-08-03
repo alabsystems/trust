@@ -1546,6 +1546,7 @@ fn test_classify_vc_from_assertion_transmute() {
         location: SourceSpan::default(),
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     };
     let kind = classify_vc_from_assertion(&vc);
     assert!(matches!(kind, UnsafeVcKind::Transmute { .. }));
@@ -1559,6 +1560,7 @@ fn test_classify_vc_from_assertion_ffi() {
         location: SourceSpan::default(),
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     };
     let kind = classify_vc_from_assertion(&vc);
     assert!(matches!(kind, UnsafeVcKind::FfiCall { .. }));
@@ -1572,6 +1574,7 @@ fn test_classify_vc_from_assertion_default() {
         location: SourceSpan::default(),
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     };
     let kind = classify_vc_from_assertion(&vc);
     assert!(matches!(kind, UnsafeVcKind::RawPointerDeref { .. }));

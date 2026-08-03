@@ -667,6 +667,7 @@ mod tests {
             location: trust_types::SourceSpan::default(),
             formula: sort_arm_functional_vc_formula(),
             contract_metadata: None,
+            obligation: None,
         }
     }
 

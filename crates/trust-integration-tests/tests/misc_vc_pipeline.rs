@@ -47,6 +47,7 @@ fn make_vc(kind: VcKind, function: &str) -> VerificationCondition {
             Box::new(Formula::Int(0)),
         ),
         contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -58,6 +59,7 @@ fn make_vc_trivial(kind: VcKind, function: &str) -> VerificationCondition {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     }
 }
 

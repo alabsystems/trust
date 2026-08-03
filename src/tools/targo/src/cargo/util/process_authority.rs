@@ -33,7 +33,8 @@ use std::os::unix::fs::OpenOptionsExt as _;
 #[cfg(target_os = "linux")]
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "linux")]
+// Trust: the pathname-authority ledgers (pinned launcher digests, scanned
+// runtime directories, printed disclosures) are process-wide on every platform.
 use std::sync::Mutex;
 use std::sync::OnceLock;
 #[cfg(target_os = "linux")]
@@ -806,51 +807,117 @@ struct VerifiedRuntimeLibraryClosure {
 /// stage directories and silently expanding later compiler/merge authority.
 static VERIFIED_RUNTIME_LIBRARY_CLOSURE: OnceLock<VerifiedRuntimeLibraryClosure> = OnceLock::new();
 
-/// Freeze the dev-only authority widening on first inspection. Even though
-/// Rust environment mutation is unsafe, process plugins or foreign code must
-/// not be able to change launcher policy between validation edges.
-static UNSEALED_DEV_LAUNCHER_AUTHORITY: OnceLock<bool> = OnceLock::new();
+/// Freeze the pathname-authority mode on first inspection. Even though Rust
+/// environment mutation is unsafe, process plugins or foreign code must not be
+/// able to change launcher policy between validation edges.
+static PATHNAME_AUTHORITY_MODE: OnceLock<PathnameAuthorityMode> = OnceLock::new();
 
-/// Trust (dev-toolchain launcher exemption): explicit opt-in that widens the
-/// verified-launcher pathname-authority check to accept a toolchain owned by the
-/// invoking developer (not just root) and to skip the release-only sealed-launcher
-/// requirement. It relaxes ONLY toolchain-binary provenance authority — never a
-/// proof verdict — and enforces every other guard (non-group/world-writable,
-/// canonical plain-file chain, O_NOFOLLOW dev/ino identity, non-root/untransformed
-/// credentials). Unset => byte-identical release behavior. Dev-only; a release
-/// gate must never set it.
+/// Trust: which principals may own a pathname-backed execution object.
+///
+/// The property being defended is **substitution**: between the moment Targo
+/// authorizes a launcher and the moment the kernel resolves that pathname for
+/// `exec`, no principal *other than the identity that asked for verification*
+/// may be able to swap the object. A group- or world-writable component hands
+/// exactly that power to an arbitrary local principal — that is the attack.
+/// Ownership by the invoking identity does not, because that identity already
+/// chose which toolchain to run and can redirect the build a hundred other ways.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PathnameAuthorityMode {
+    /// Default. Every path component must be a plain directory/file owned by
+    /// root **or** by the invoking identity and must not be group- or
+    /// world-writable; every component the caller does *not* own must
+    /// additionally be proven outside this identity's (possibly ACL-granted)
+    /// write authority. The leaf is bound to one opened object (`O_NOFOLLOW`
+    /// plus dev/ino agreement) and its bytes are pinned at first authorization
+    /// and re-checked on every later execution edge.
+    ///
+    /// This is the mode a real installation runs in: rustup installs to
+    /// `~/.rustup`, `rustup toolchain link trust` names a build under `$HOME`,
+    /// and an in-tree stage2 lives under the developer's checkout. Demanding
+    /// root ownership refuses every one of those and makes the branded verified
+    /// lane unusable by construction.
+    CallerOwned,
+    /// `TRUST_REQUIRE_SEALED_LAUNCHER=1`. Additionally demands a privileged
+    /// installation (every component root-owned and outside this identity's
+    /// write authority) and the exact runtime-closure enumeration, and then
+    /// still demands a sealed handle-bound launcher — which no platform
+    /// implements yet, so this mode continues to fail closed at
+    /// [`reject_unbound_platform_loader_authority`]. It is kept reachable and
+    /// tested so the release predicate cannot rot.
+    SealedRelease,
+}
+
+impl PathnameAuthorityMode {
+    /// Trust: root-only ownership is the *sealed-release provenance* rule, not
+    /// the substitution rule. See [`PathnameAuthorityMode`].
+    fn requires_privileged_owner(self) -> bool {
+        matches!(self, Self::SealedRelease)
+    }
+}
+
 #[expect(
     clippy::disallowed_methods,
     reason = "this process-wide startup policy is frozen before a GlobalContext is available"
 )]
-fn unsealed_dev_launcher_authority() -> bool {
-    *UNSEALED_DEV_LAUNCHER_AUTHORITY.get_or_init(|| {
-        std::env::var_os("TRUST_ALLOW_UNSEALED_DEV_LAUNCHER").is_some_and(|value| {
-            matches!(
-                value.to_str().map(str::trim),
-                Some("1") | Some("true") | Some("yes") | Some("on")
-            )
-        })
+fn authority_env_flag_enabled(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| {
+        matches!(
+            value.to_str().map(str::trim),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
     })
 }
 
-/// A pathname-backed execution closure is authoritative only when the invoking
-/// identity cannot replace the launcher, mutate an existing library, or add a
-/// new loader candidate after validation. Hashing before/after `exec` does not
-/// close that race: the loader may consume a different object between the two
-/// observations.
+/// Trust: the pathname-authority mode for this process, frozen on first use.
 ///
-/// The portable process API does not expose handle-bound `exec`. A privileged
-/// installation whose complete path is outside the effective user's write
-/// authority is therefore a necessary first condition, but not sufficient:
-/// embedded loader paths and platform default/shared-cache libraries remain an
-/// explicit release blocker below until Targo has a sealed runtime image.
+/// `TRUST_ALLOW_UNSEALED_DEV_LAUNCHER` used to be the only way *any* toolchain
+/// could execute: without it every path component had to be root-owned, and with
+/// it the sealed-launcher blocker was skipped wholesale. Since the sealed
+/// blocker fires unconditionally, the variable was not a dev convenience — it
+/// was the only reachable lane, and `targo-trust` sets it for Targo itself
+/// (`trust_added::trustc_native::public_cli_command`). The mode is now named
+/// after the property it defends instead of after a developer workaround; the
+/// old variable is still recognized and is a no-op, because what it selected is
+/// the default. `TRUST_REQUIRE_SEALED_LAUNCHER=1` opts back in to the
+/// (still-unimplementable) release predicate.
+fn pathname_authority_mode() -> PathnameAuthorityMode {
+    *PATHNAME_AUTHORITY_MODE.get_or_init(|| {
+        if authority_env_flag_enabled("TRUST_REQUIRE_SEALED_LAUNCHER") {
+            PathnameAuthorityMode::SealedRelease
+        } else {
+            PathnameAuthorityMode::CallerOwned
+        }
+    })
+}
+
+/// A pathname-backed execution closure is authoritative only when **no principal
+/// other than the invoking identity** can replace the launcher, mutate an
+/// existing library, or add a new loader candidate between authorization and
+/// execution.
+///
+/// Trust: that quantifier is the whole check. A group- or world-writable
+/// component is a substitution primitive for an arbitrary local principal and is
+/// rejected in every mode; a component owned by a *foreign* uid is rejected in
+/// every mode; a component owned by root that this identity can nonetheless
+/// write (an ACL) is rejected in every mode. Ownership by the invoking identity
+/// is admitted, because that identity is not the modelled adversary.
+///
+/// The portable process API does not expose handle-bound `exec`, so one residual
+/// remains under [`PathnameAuthorityMode::CallerOwned`]: same-identity code
+/// running later in the build — a build script, a proc macro — can rewrite a
+/// toolchain the invoking user owns. That residual is narrowed rather than
+/// ignored: the launcher's bytes are pinned at first authorization and
+/// re-checked at every later execution edge (see
+/// [`bind_opened_launcher_identity`]), so a persisted substitution is detected
+/// instead of silently trusted. It cannot be closed by pathname rules at all —
+/// requiring root ownership does not close it either, it only refuses every
+/// toolchain a developer can actually install.
 #[cfg(unix)]
-fn validate_unprivileged_root_owned_path(
+fn validate_unprivileged_authority_path(
     path: &Path,
     leaf_is_directory: bool,
     authority: &str,
-    dev_self_owned: bool,
+    mode: PathnameAuthorityMode,
 ) -> CargoResult<()> {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
@@ -928,17 +995,16 @@ fn validate_unprivileged_root_owned_path(
                 }
             );
         }
-        let owner_ok = metadata.uid() == 0 || (dev_self_owned && metadata.uid() == effective_uid);
-        if !owner_ok || metadata.mode() & 0o022 != 0 {
-            anyhow::bail!(
-                "{authority} path component `{}` is not root-owned and non-group/world-writable (uid={}, mode={:#o}); user-owned toolchains cannot provide pathname execution authority",
-                current.display(),
-                metadata.uid(),
-                metadata.mode() & 0o7777,
-            );
-        }
+        validate_authority_ownership(&metadata, &current, authority, mode, effective_uid)?;
 
-        if !dev_self_owned {
+        // Trust: an ACL can grant write authority that the mode bits do not
+        // show, so mode bits alone do not prove a foreign-owned component is
+        // closed to us. Prove it for every component this identity does not
+        // already own. On a component the caller *does* own the probe is
+        // vacuous — `W_OK` succeeds by construction — so running it there would
+        // not test anything; it would only convert the normal case into a
+        // refusal, which is exactly the defect this module had.
+        if metadata.uid() != effective_uid {
             let encoded = std::ffi::CString::new(current.as_os_str().as_bytes()).map_err(|_| {
                 anyhow::anyhow!(
                     "{authority} path component `{}` contains an interior NUL",
@@ -952,8 +1018,17 @@ fn validate_unprivileged_root_owned_path(
                 );
             }
             let access_error = std::io::Error::last_os_error();
+            // Trust: EACCES, EROFS and EPERM are all *denials* — each one is a
+            // proof that this identity cannot write the component. EPERM is not
+            // an exotic case: on macOS every SIP-protected system path
+            // (`/usr`, `/usr/lib`, `/System`) answers `access(W_OK)` with EPERM
+            // rather than EACCES, and `/usr/lib` is a directory Targo itself
+            // appends to the verified loader closure. Treating EPERM as an
+            // inconclusive error made the strictest platform the one that could
+            // not be authenticated.
             if access_error.kind() != std::io::ErrorKind::PermissionDenied
                 && access_error.raw_os_error() != Some(libc::EROFS)
+                && access_error.raw_os_error() != Some(libc::EPERM)
             {
                 return Err(access_error).with_context(|| {
                     format!(
@@ -967,12 +1042,58 @@ fn validate_unprivileged_root_owned_path(
     Ok(())
 }
 
+/// Trust: the substitution predicate, applied to one already-`lstat`ed object.
+///
+/// Two independent refusals, reported separately because they mean different
+/// things: a foreign owner (no principal but root or the caller may own an
+/// execution object) and group/world writability (the actual substitution
+/// primitive, refused no matter who owns the object).
+#[cfg(unix)]
+fn validate_authority_ownership(
+    metadata: &std::fs::Metadata,
+    current: &Path,
+    authority: &str,
+    mode: PathnameAuthorityMode,
+    effective_uid: u32,
+) -> CargoResult<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let owner_ok = if mode.requires_privileged_owner() {
+        metadata.uid() == 0
+    } else {
+        metadata.uid() == 0 || metadata.uid() == effective_uid
+    };
+    if !owner_ok {
+        if mode.requires_privileged_owner() {
+            anyhow::bail!(
+                "{authority} path component `{}` is owned by uid={}, but TRUST_REQUIRE_SEALED_LAUNCHER demands a root-owned installation for a sealed-release provenance claim",
+                current.display(),
+                metadata.uid(),
+            );
+        }
+        anyhow::bail!(
+            "{authority} path component `{}` is owned by uid={}, which is neither root nor the invoking identity (uid={effective_uid}); an execution object a foreign principal owns can be replaced between authorization and execution",
+            current.display(),
+            metadata.uid(),
+        );
+    }
+    if metadata.mode() & 0o022 != 0 {
+        anyhow::bail!(
+            "{authority} path component `{}` is group- or world-writable (uid={}, mode={:#o}); any local principal could substitute the executed object between authorization and execution",
+            current.display(),
+            metadata.uid(),
+            metadata.mode() & 0o7777,
+        );
+    }
+    Ok(())
+}
+
 #[cfg(not(unix))]
-fn validate_unprivileged_root_owned_path(
+fn validate_unprivileged_authority_path(
     path: &Path,
     _leaf_is_directory: bool,
     authority: &str,
-    _dev_self_owned: bool,
+    _mode: PathnameAuthorityMode,
 ) -> CargoResult<()> {
     anyhow::bail!(
         "{authority} path `{}` cannot own verified execution authority on this platform: Targo has no implemented immutable pathname-owner/ACL proof or handle-bound launcher",
@@ -995,13 +1116,76 @@ fn launcher_mode_is_safe(mode: u32) -> bool {
     mode & 0o111 != 0 && mode & (libc::S_ISUID | libc::S_ISGID | libc::S_ISVTX) as u32 == 0
 }
 
+/// Trust: content identity pinned at the first authorization of each launcher
+/// pathname and re-checked on every later execution edge in this process.
+/// Metadata alone (uid/mode/dev/ino) does not notice an in-place rewrite of an
+/// executable the invoking identity owns, which is precisely the residual that
+/// admitting a caller-owned toolchain carries.
 #[cfg(unix)]
-fn validate_opened_tool_launcher(tool: &Path, dev_self_owned: bool) -> CargoResult<()> {
+static AUTHENTICATED_LAUNCHER_DIGESTS: OnceLock<
+    Mutex<std::collections::BTreeMap<PathBuf, [u8; 32]>>,
+> = OnceLock::new();
+
+/// Trust: bind the *opened* object to the content authorized earlier in this
+/// process, so pathname authority stops being the only mechanism. The first
+/// observation pins a digest of the bytes behind the descriptor; every later
+/// edge must present the same bytes through the same dev/ino.
+///
+/// This is read through the already-opened `O_NOFOLLOW` descriptor, not by
+/// re-opening the pathname, so the digest describes the object whose ownership
+/// and mode were just checked.
+#[cfg(unix)]
+fn bind_opened_launcher_identity(tool: &Path, file: &std::fs::File) -> CargoResult<()> {
+    use std::io::Read as _;
+
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).with_context(|| {
+            format!(
+                "failed to read opened verified tool launcher `{}` for content authentication",
+                tool.display()
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = *hasher.finalize().as_bytes();
+
+    let pinned =
+        AUTHENTICATED_LAUNCHER_DIGESTS.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
+    let mut pinned = pinned
+        .lock()
+        .map_err(|_| anyhow::anyhow!("verified tool launcher digest ledger was poisoned"))?;
+    match pinned.entry(tool.to_path_buf()) {
+        std::collections::btree_map::Entry::Vacant(slot) => {
+            slot.insert(digest);
+            Ok(())
+        }
+        std::collections::btree_map::Entry::Occupied(slot) => {
+            if *slot.get() == digest {
+                Ok(())
+            } else {
+                anyhow::bail!(
+                    "verified tool launcher `{}` changed content after it was authenticated in this process; the executed object is not the one Targo authorized",
+                    tool.display()
+                )
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn validate_opened_tool_launcher(tool: &Path, mode: PathnameAuthorityMode) -> CargoResult<()> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
-    // The complete parent chain has already been proven root-owned and outside
-    // this identity's write authority. O_NOFOLLOW additionally binds the leaf
-    // check to one opened regular-file object rather than pathname metadata.
+    // The complete parent chain has already been proven to be owned only by root
+    // or the invoking identity and to be closed to every other principal.
+    // O_NOFOLLOW additionally binds the leaf check to one opened regular-file
+    // object rather than pathname metadata.
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -1014,13 +1198,17 @@ fn validate_opened_tool_launcher(tool: &Path, dev_self_owned: bool) -> CargoResu
         )
     })?;
     let euid = unsafe { libc::geteuid() };
-    if !metadata_is_plain_file_for_authority(&opened)
-        || !(opened.uid() == 0 || (dev_self_owned && opened.uid() == euid))
-        || opened.mode() & 0o022 != 0
-    {
+    let owner_ok = if mode.requires_privileged_owner() {
+        opened.uid() == 0
+    } else {
+        opened.uid() == 0 || opened.uid() == euid
+    };
+    if !metadata_is_plain_file_for_authority(&opened) || !owner_ok || opened.mode() & 0o022 != 0 {
         anyhow::bail!(
-            "opened verified tool launcher `{}` is not a root-owned, non-group/world-writable regular file",
-            tool.display()
+            "opened verified tool launcher `{}` is not a regular file owned by root or the invoking identity and closed to group/world writes (uid={}, mode={:#o})",
+            tool.display(),
+            opened.uid(),
+            opened.mode() & 0o7777,
         );
     }
     if !launcher_mode_is_safe(opened.mode()) {
@@ -1045,25 +1233,25 @@ fn validate_opened_tool_launcher(tool: &Path, dev_self_owned: bool) -> CargoResu
             tool.display()
         );
     }
-    Ok(())
+    bind_opened_launcher_identity(tool, &file)
 }
 
 #[cfg(not(unix))]
-fn validate_opened_tool_launcher(_tool: &Path, _dev_self_owned: bool) -> CargoResult<()> {
+fn validate_opened_tool_launcher(_tool: &Path, _mode: PathnameAuthorityMode) -> CargoResult<()> {
     Ok(())
 }
 
 fn validate_immutable_runtime_directories(
     paths: &[PathBuf],
-    dev_self_owned: bool,
+    mode: PathnameAuthorityMode,
 ) -> CargoResult<()> {
     let mut canonical_paths = std::collections::BTreeSet::new();
     for path in paths {
-        validate_unprivileged_root_owned_path(
+        validate_unprivileged_authority_path(
             path,
             true,
             "verified runtime-library directory",
-            dev_self_owned,
+            mode,
         )?;
         if !canonical_paths.insert(path.clone()) {
             anyhow::bail!(
@@ -1073,18 +1261,23 @@ fn validate_immutable_runtime_directories(
         }
     }
 
-    // Dev toolchain (TRUST_ALLOW_UNSEALED_DEV_LAUNCHER): each admitted runtime
-    // directory was just validated for dev-ownership (root OR the invoking
-    // developer) + non-group/world-writability above. Skip the release-grade
-    // exact-closure enumeration below, which forbids ANY loader-visible subdir
-    // outside the admitted set (e.g. the toolchain's own
-    // `lib/rustlib/<target>/lib/self-contained`). That anti-injection paranoia is
-    // inappropriate for a self-owned dev toolchain and gates only binary
-    // provenance, never a proof verdict; the essential ownership/immutability
-    // check has already run. Unset => this returns nothing and the full
-    // enumeration runs exactly as before (release path unchanged).
-    if dev_self_owned {
-        return Ok(());
+    // Trust: every admitted runtime directory was just proven, on THIS edge, to
+    // be a plain directory owned only by root or the invoking identity, closed
+    // to group/world writes, and (when foreign-owned) outside this identity's
+    // ACL write authority. That is what forbids another principal from adding or
+    // replacing a loader candidate mid-run, and it is re-proved at every
+    // execution edge.
+    //
+    // The exact-closure enumeration below is a different, release-only property:
+    // it forbids ANY subdirectory of an admitted directory that is not itself a
+    // container of another admitted directory — including the toolchain's own
+    // `lib/rustlib/<target>/lib/self-contained` — which no real toolchain layout
+    // satisfies. Under `CallerOwned` it is replaced by a content scan that still
+    // refuses symlinks, special files, and foreign-owned or group/world-writable
+    // entries. That is strictly more than the old dev exemption, which skipped
+    // enumeration entirely and is what every invocation actually ran.
+    if !mode.requires_privileged_owner() {
+        return validate_runtime_directory_contents(paths, mode);
     }
 
     for directory in paths {
@@ -1109,11 +1302,11 @@ fn validate_immutable_runtime_directories(
                 )
             })?;
             if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
-                validate_unprivileged_root_owned_path(
+                validate_unprivileged_authority_path(
                     &candidate,
                     false,
                     "verified runtime-library candidate",
-                    dev_self_owned,
+                    mode,
                 )?;
                 continue;
             }
@@ -1126,11 +1319,11 @@ fn validate_immutable_runtime_directories(
                 // search directory. It is safe only because its own path is
                 // immutable and the actually admitted descendant is checked
                 // independently.
-                validate_unprivileged_root_owned_path(
+                validate_unprivileged_authority_path(
                     &candidate,
                     true,
                     "verified runtime-library container",
-                    dev_self_owned,
+                    mode,
                 )?;
                 continue;
             }
@@ -1144,30 +1337,206 @@ fn validate_immutable_runtime_directories(
     Ok(())
 }
 
-fn reject_unbound_platform_loader_authority(tool: &Path) -> CargoResult<()> {
-    anyhow::bail!(
-        "verified pathname execution remains unavailable for `{}`: immutable injected search directories do not bind the executable's embedded RPATH/RUNPATH/install-name closure or the OS default loader cache/shared libraries; release authority requires a sealed handle-bound launcher and authenticated runtime image",
+/// Trust: the platform default loader directory Targo itself appends to the
+/// verified search path (`configure_verified_tool_loader_environment` pushes
+/// `/usr/lib` on macOS). Its own ownership, mode and non-writability are still
+/// proven like any other component; what is skipped is enumerating its
+/// *contents*, which on macOS are root-owned symlinks into the dyld shared
+/// cache. Those are exactly the "OS default loader cache/shared libraries" that
+/// [`unbound_platform_loader_authority_message`] discloses as outside any
+/// pathname closure Targo can authenticate — refusing them here would refuse a
+/// directory only root can write, which tests nothing about the modelled
+/// adversary while making the platform's own libc unreachable.
+#[cfg(unix)]
+fn is_platform_default_loader_directory(path: &Path) -> bool {
+    cfg!(target_os = "macos") && path == Path::new("/usr/lib")
+}
+
+/// Trust: directory content scans already performed in this process, keyed by
+/// the directory's observed identity. A directory whose device, inode, size and
+/// modification time are all unchanged has had no entry added, removed or
+/// renamed, so re-walking 33k compiler build-dependency artifacts on every
+/// compiler spawn would re-derive the same answer. Any change to the entry set
+/// moves the directory's own mtime and forces a fresh scan.
+#[cfg(unix)]
+static SCANNED_RUNTIME_DIRECTORIES: OnceLock<Mutex<std::collections::BTreeMap<PathBuf, DirScan>>> =
+    OnceLock::new();
+
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct DirScan {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+#[cfg(unix)]
+fn observed_directory_scan(metadata: &std::fs::Metadata) -> DirScan {
+    use std::os::unix::fs::MetadataExt as _;
+
+    DirScan {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        size: metadata.size(),
+        mtime: metadata.mtime(),
+        mtime_nsec: metadata.mtime_nsec(),
+    }
+}
+
+/// Trust: the `CallerOwned` replacement for the release-only exact-closure
+/// enumeration. It keeps the part that defends a real property — nothing in a
+/// loader search directory may be a symlink, a special file, foreign-owned or
+/// group/world-writable — and drops the part no toolchain layout can satisfy,
+/// namely that a plain subdirectory of a search directory is forbidden. A
+/// subdirectory is not itself searched by the loader for a leaf name; the
+/// toolchain's own `self-contained` directory is the case that made the old rule
+/// unsatisfiable.
+#[cfg(unix)]
+fn validate_runtime_directory_contents(
+    paths: &[PathBuf],
+    mode: PathnameAuthorityMode,
+) -> CargoResult<()> {
+    let effective_uid = unsafe { libc::geteuid() };
+    for directory in paths {
+        if is_platform_default_loader_directory(directory) {
+            continue;
+        }
+        let observed = observed_directory_scan(&std::fs::symlink_metadata(directory).with_context(
+            || {
+                format!(
+                    "failed to inspect verified runtime-library directory `{}`",
+                    directory.display()
+                )
+            },
+        )?);
+        let ledger = SCANNED_RUNTIME_DIRECTORIES
+            .get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
+        {
+            let scanned = ledger.lock().map_err(|_| {
+                anyhow::anyhow!("verified runtime-directory scan ledger was poisoned")
+            })?;
+            if scanned.get(directory) == Some(&observed) {
+                continue;
+            }
+        }
+        for entry in std::fs::read_dir(directory).with_context(|| {
+            format!(
+                "failed to inspect verified runtime-library directory `{}`",
+                directory.display()
+            )
+        })? {
+            let entry = entry.with_context(|| {
+                format!(
+                    "failed to inspect an entry in verified runtime-library directory `{}`",
+                    directory.display()
+                )
+            })?;
+            let candidate = entry.path();
+            let metadata = std::fs::symlink_metadata(&candidate).with_context(|| {
+                format!(
+                    "failed to inspect verified runtime-library candidate `{}`",
+                    candidate.display()
+                )
+            })?;
+            let plain_file = metadata.file_type().is_file() && !metadata.file_type().is_symlink();
+            if !plain_file && !metadata_is_plain_directory(&metadata) {
+                anyhow::bail!(
+                    "verified runtime-library directory `{}` contains unbound candidate `{}`; a symlink or special file in a loader search directory can redirect a loaded object and is forbidden",
+                    directory.display(),
+                    candidate.display()
+                );
+            }
+            validate_authority_ownership(
+                &metadata,
+                &candidate,
+                "verified runtime-library candidate",
+                mode,
+                effective_uid,
+            )?;
+        }
+        ledger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("verified runtime-directory scan ledger was poisoned"))?
+            .insert(directory.clone(), observed);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_runtime_directory_contents(
+    paths: &[PathBuf],
+    _mode: PathnameAuthorityMode,
+) -> CargoResult<()> {
+    if let Some(directory) = paths.first() {
+        anyhow::bail!(
+            "verified runtime-library directory `{}` cannot own verified execution authority on this platform",
+            directory.display()
+        );
+    }
+    Ok(())
+}
+
+fn unbound_platform_loader_authority_message(tool: &Path) -> String {
+    format!(
+        "immutable injected search directories do not bind `{}`'s embedded RPATH/RUNPATH/install-name closure or the OS default loader cache/shared libraries; release authority requires a sealed handle-bound launcher and authenticated runtime image",
         tool.display()
     )
 }
 
+fn reject_unbound_platform_loader_authority(tool: &Path) -> CargoResult<()> {
+    anyhow::bail!(
+        "verified pathname execution remains unavailable for `{}`: {}",
+        tool.display(),
+        unbound_platform_loader_authority_message(tool),
+    )
+}
+
+/// Trust: launchers whose unsealed-authority disclosure has already been printed
+/// in this process.
+static DISCLOSED_UNSEALED_LAUNCHERS: OnceLock<Mutex<std::collections::BTreeSet<PathBuf>>> =
+    OnceLock::new();
+
+/// Trust: say exactly once per launcher what pathname authority does and does
+/// not establish. The predecessor refused to run at all rather than say this,
+/// which is why no developer could reach the verified lane and why the visible
+/// failure was a downstream "missing coverage_summary transport" from a compiler
+/// that never launched.
 #[expect(
     clippy::print_stderr,
-    reason = "the dev-only authority downgrade must be visible before a Cargo Shell is available"
+    reason = "the pathname-authority disclosure must be visible before a Cargo Shell is available"
 )]
-fn validate_verified_tool_execution_closure(tool: &Path, paths: &[PathBuf]) -> CargoResult<()> {
-    let dev = unsealed_dev_launcher_authority();
-    validate_unprivileged_root_owned_path(tool, false, "verified tool launcher", dev)?;
-    validate_opened_tool_launcher(tool, dev)?;
-    validate_immutable_runtime_directories(paths, dev)?;
-    if dev {
+fn disclose_unsealed_launcher_authority(tool: &Path) -> CargoResult<()> {
+    let disclosed =
+        DISCLOSED_UNSEALED_LAUNCHERS.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()));
+    let first = {
+        let mut disclosed = disclosed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("verified launcher disclosure ledger was poisoned"))?;
+        disclosed.insert(tool.to_path_buf())
+    };
+    if first {
         eprintln!(
-            "warning: TRUST_ALLOW_UNSEALED_DEV_LAUNCHER: verified tool launcher `{}` accepted with DEV (unsealed) pathname authority — NOT release-grade; proof verdicts are unaffected, but the toolchain binary's release provenance is not proven",
-            tool.display()
+            "warning: verified tool launcher `{}` carries CALLER-OWNED (unsealed) pathname authority: no other principal can substitute it and its content is pinned for this run, but {}. Proof verdicts are unaffected; the toolchain binary's sealed release provenance is not proven. Set TRUST_REQUIRE_SEALED_LAUNCHER=1 to demand the release-grade closure instead.",
+            tool.display(),
+            unbound_platform_loader_authority_message(tool),
         );
-        return Ok(());
     }
-    reject_unbound_platform_loader_authority(tool)
+    Ok(())
+}
+
+fn validate_verified_tool_execution_closure(tool: &Path, paths: &[PathBuf]) -> CargoResult<()> {
+    let mode = pathname_authority_mode();
+    validate_unprivileged_authority_path(tool, false, "verified tool launcher", mode)?;
+    validate_opened_tool_launcher(tool, mode)?;
+    validate_immutable_runtime_directories(paths, mode)?;
+    if mode.requires_privileged_owner() {
+        // The sealed-release predicate is unchanged and still fails closed: no
+        // platform binds the embedded run-path closure yet.
+        return reject_unbound_platform_loader_authority(tool);
+    }
+    disclose_unsealed_launcher_authority(tool)
 }
 
 pub(crate) const FIX_ENV_INTERNAL: &str = "__CARGO_FIX_PLZ";
@@ -1867,13 +2236,12 @@ pub(crate) fn validate_verified_command_runtime_library_authority(
             "verified Targo command runtime-library search order no longer begins with the exact authenticated startup closure"
         );
     }
-    // Dev toolchain (TRUST_ALLOW_UNSEALED_DEV_LAUNCHER): this per-execution-edge
-    // runtime-library authority check fires for every verified child spawn, so it
-    // must honor the same dev-ownership exemption as the startup launcher closure
-    // — otherwise a self-owned dev toolchain passes the launcher gate but bails
-    // here on the identical `self-contained` enumeration. Unset => `false`, i.e.
-    // full release-grade validation, unchanged.
-    validate_immutable_runtime_directories(&runtime_paths, unsealed_dev_launcher_authority())
+    // Trust: this per-execution-edge runtime-library authority check fires for
+    // every verified child spawn and must run under the same pathname-authority
+    // mode as the startup launcher closure — otherwise the two edges disagree
+    // about which principals may own the toolchain, and a closure admitted at
+    // startup bails here on the identical enumeration.
+    validate_immutable_runtime_directories(&runtime_paths, pathname_authority_mode())
 }
 
 #[cfg(test)]
@@ -2562,41 +2930,332 @@ mod tests {
         );
     }
 
+    /// Trust: the substitution predicate, exercised on one already-`lstat`ed
+    /// object so the result does not depend on whatever the ambient temp root
+    /// happens to be. This is the decision the whole pathname walk is built out
+    /// of: ownership by root or by the invoking identity is admitted, ownership
+    /// by any other principal is not, and a group- or world-writable object is
+    /// refused no matter who owns it.
     #[cfg(unix)]
     #[test]
-    fn verified_execution_rejects_user_owned_tool_and_runtime_closure() {
-        use std::os::unix::fs::PermissionsExt as _;
+    fn pathname_authority_admits_caller_owned_and_refuses_shared_writers() {
+        use super::PathnameAuthorityMode;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let directory = tempfile::TempDir::new().unwrap();
-        let sysroot = directory.path().canonicalize().unwrap().join("stage2");
+        let object = directory.path().join("trustc");
+        std::fs::write(&object, b"fixture").unwrap();
+        let effective_uid = unsafe { libc::geteuid() };
+
+        let judge = |mode_bits: u32, authority: PathnameAuthorityMode| {
+            std::fs::set_permissions(&object, std::fs::Permissions::from_mode(mode_bits)).unwrap();
+            let metadata = std::fs::symlink_metadata(&object).unwrap();
+            assert_eq!(
+                metadata.uid(),
+                effective_uid,
+                "fixture must be owned by the invoking identity"
+            );
+            super::validate_authority_ownership(
+                &metadata,
+                &object,
+                "verified tool launcher",
+                authority,
+                effective_uid,
+            )
+        };
+
+        // ACCEPTED: owned by the caller and closed to every other principal.
+        // This is what `rustup toolchain link` and every in-tree stage2 produce;
+        // refusing it is refusing the only toolchain a developer can install.
+        for accepted in [0o755, 0o700, 0o555, 0o750] {
+            judge(accepted, PathnameAuthorityMode::CallerOwned).unwrap_or_else(|error| {
+                panic!("caller-owned mode {accepted:#o} must be admitted: {error:#}")
+            });
+        }
+
+        // REJECTED: a writer other than the owner. Group- and world-writable are
+        // the actual substitution primitive and stay refused in every mode.
+        for refused in [0o775, 0o757, 0o777, 0o707, 0o770] {
+            let error = judge(refused, PathnameAuthorityMode::CallerOwned).unwrap_err();
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("group- or world-writable"),
+                "mode {refused:#o} must be refused as a shared-writer object: {rendered}"
+            );
+        }
+
+        // REJECTED: a foreign owner, even with tight mode bits — that principal
+        // can replace the object between authorization and execution.
+        std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let metadata = std::fs::symlink_metadata(&object).unwrap();
+        let foreign = super::validate_authority_ownership(
+            &metadata,
+            &object,
+            "verified tool launcher",
+            PathnameAuthorityMode::CallerOwned,
+            effective_uid.wrapping_add(1),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{foreign:#}").contains("neither root nor the invoking identity"),
+            "a foreign-owned execution object must be refused: {foreign:#}"
+        );
+
+        // The opt-in release predicate is unchanged: it still demands root.
+        let sealed = super::validate_authority_ownership(
+            &metadata,
+            &object,
+            "verified tool launcher",
+            PathnameAuthorityMode::SealedRelease,
+            effective_uid,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{sealed:#}").contains("TRUST_REQUIRE_SEALED_LAUNCHER"),
+            "sealed-release mode must still demand a root-owned installation: {sealed:#}"
+        );
+    }
+
+    /// A fixture root every one of whose ancestors is already owned by root or
+    /// by the invoking identity and closed to group/world writes. `/tmp` is
+    /// `1777` on most hosts, so the shared temp root cannot host a test of the
+    /// *accepting* direction; this crate's own build-output directory can, and
+    /// the per-user macOS `TMPDIR` can too.
+    #[cfg(unix)]
+    fn caller_clean_fixture_root() -> Option<std::path::PathBuf> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        fn is_caller_clean(root: &std::path::Path) -> bool {
+            let effective_uid = unsafe { libc::geteuid() };
+            let mut current = std::path::PathBuf::from("/");
+            for component in root.components() {
+                match component {
+                    std::path::Component::RootDir => {}
+                    std::path::Component::Normal(name) => current.push(name),
+                    _ => return false,
+                }
+                let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+                    return false;
+                };
+                if !(metadata.uid() == 0 || metadata.uid() == effective_uid) {
+                    return false;
+                }
+                if metadata.mode() & 0o022 != 0 {
+                    return false;
+                }
+            }
+            true
+        }
+
+        [
+            std::path::Path::new(env!("OUT_DIR")).canonicalize().ok(),
+            std::env::temp_dir().canonicalize().ok(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|root| is_caller_clean(root))
+    }
+
+    #[cfg(unix)]
+    fn caller_owned_toolchain_fixture(
+        root: &std::path::Path,
+        name: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let sysroot = root.join(name);
+        let _ = std::fs::remove_dir_all(&sysroot);
         let bin = sysroot.join("bin");
         let lib = sysroot.join("lib");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&lib).unwrap();
+        for directory in [&sysroot, &bin, &lib] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let targo = bin.join("targo");
         std::fs::write(&targo, b"fixture").unwrap();
         std::fs::set_permissions(&targo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (targo, lib)
+    }
 
-        let error =
-            validate_verified_tool_execution_closure(&targo, &[lib.canonicalize().unwrap()])
-                .unwrap_err();
+    /// Trust: the headline regression. A toolchain under a user-owned `$HOME` —
+    /// what `rustup toolchain link` and every in-tree stage2 produce — must
+    /// carry verified execution authority. Refusing it made `targo trust check`
+    /// unusable for every developer, while the visible failure was the
+    /// *downstream* "missing coverage_summary transport" of a compiler that was
+    /// never launched.
+    #[cfg(unix)]
+    #[test]
+    fn verified_execution_admits_a_caller_owned_toolchain() {
+        let Some(root) = caller_clean_fixture_root() else {
+            // Refuse to claim a pass that was not observed: without a
+            // caller-clean ancestor chain this host cannot express the case.
+            eprintln!("skipping: no caller-clean fixture root on this host");
+            return;
+        };
+        let (targo, lib) = caller_owned_toolchain_fixture(&root, "caller-owned-stage2");
+
+        validate_verified_tool_execution_closure(&targo, &[lib.canonicalize().unwrap()])
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a caller-owned, non-group/world-writable toolchain must carry verified execution authority: {error:#}"
+                )
+            });
+    }
+
+    /// The property the old rule really defended, kept: a path component another
+    /// principal can write is still refused — on the very fixture the accepting
+    /// test above admits, so the two differ in exactly one bit.
+    #[cfg(unix)]
+    #[test]
+    fn verified_execution_rejects_group_or_world_writable_components() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let Some(root) = caller_clean_fixture_root() else {
+            eprintln!("skipping: no caller-clean fixture root on this host");
+            return;
+        };
+
+        for (name, shared_mode) in [
+            ("group-writable-stage2", 0o775),
+            ("world-writable-stage2", 0o757),
+        ] {
+            let (targo, lib) = caller_owned_toolchain_fixture(&root, name);
+            let bin = targo.parent().unwrap().to_path_buf();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(shared_mode)).unwrap();
+
+            let error =
+                validate_verified_tool_execution_closure(&targo, &[lib.canonicalize().unwrap()])
+                    .unwrap_err();
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("group- or world-writable"),
+                "a {shared_mode:#o} launcher directory must not carry execution authority: {rendered}"
+            );
+            assert!(
+                rendered.contains(&bin.display().to_string()),
+                "the refusal must name the shared-writable component `{}`: {rendered}",
+                bin.display()
+            );
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// A runtime-library directory another principal can write is still refused:
+    /// the loader would consume whatever that principal put there.
+    #[cfg(unix)]
+    #[test]
+    fn verified_runtime_closure_rejects_shared_writable_directory() {
+        use super::PathnameAuthorityMode;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for shared_mode in [0o775, 0o777] {
+            let directory = tempfile::TempDir::new().unwrap();
+            let runtime = directory.path().canonicalize().unwrap();
+            std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(shared_mode))
+                .unwrap();
+            let error = super::validate_immutable_runtime_directories(
+                &[runtime],
+                PathnameAuthorityMode::CallerOwned,
+            )
+            .unwrap_err();
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("group- or world-writable") || rendered.contains("runs as root"),
+                "a {shared_mode:#o} runtime directory lets any local principal add or replace a dylib after the snapshot: {rendered}"
+            );
+        }
+    }
+
+    /// A symlink in a loader search directory can redirect a loaded object to
+    /// somewhere outside the authenticated closure, so it is still refused even
+    /// though the directory itself is caller-owned.
+    #[cfg(unix)]
+    #[test]
+    fn verified_runtime_closure_rejects_symlinked_candidate() {
+        use super::PathnameAuthorityMode;
+
+        let Some(root) = caller_clean_fixture_root() else {
+            eprintln!("skipping: no caller-clean fixture root on this host");
+            return;
+        };
+        let (_targo, lib) = caller_owned_toolchain_fixture(&root, "symlinked-candidate-stage2");
+        let outside = root.join("symlinked-candidate-outside.dylib");
+        std::fs::write(&outside, b"fixture").unwrap();
+        std::os::unix::fs::symlink(&outside, lib.join("libstd.dylib")).unwrap();
+
+        let error = super::validate_immutable_runtime_directories(
+            &[lib.canonicalize().unwrap()],
+            PathnameAuthorityMode::CallerOwned,
+        )
+        .unwrap_err();
         let rendered = format!("{error:#}");
         assert!(
-            rendered.contains("not root-owned") || rendered.contains("runs as root"),
-            "same-UID writable stage2 must not be upgraded into verified execution authority: {rendered}"
+            rendered.contains("can redirect a loaded object"),
+            "a symlinked loader candidate must not be admitted: {rendered}"
         );
     }
 
+    /// Trust: metadata alone does not notice an in-place rewrite of a binary the
+    /// invoking identity owns — the residual that admitting a caller-owned
+    /// toolchain carries, and the one a root-ownership rule did not close either
+    /// (it only refused every real toolchain). The launcher's bytes are pinned
+    /// at first authorization and re-checked on every later execution edge, so a
+    /// persisted substitution is detected rather than trusted.
     #[cfg(unix)]
     #[test]
-    fn verified_runtime_closure_rejects_user_writable_directory() {
-        let directory = tempfile::TempDir::new().unwrap();
-        let runtime = directory.path().canonicalize().unwrap();
-        let error = super::validate_immutable_runtime_directories(&[runtime], false).unwrap_err();
+    fn opened_launcher_content_is_pinned_across_execution_edges() {
+        use super::PathnameAuthorityMode;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let Some(root) = caller_clean_fixture_root() else {
+            eprintln!("skipping: no caller-clean fixture root on this host");
+            return;
+        };
+        let (targo, _lib) = caller_owned_toolchain_fixture(&root, "pinned-stage2");
+
+        super::validate_opened_tool_launcher(&targo, PathnameAuthorityMode::CallerOwned)
+            .expect("first authorization pins the launcher content");
+        super::validate_opened_tool_launcher(&targo, PathnameAuthorityMode::CallerOwned)
+            .expect("an unchanged launcher must keep its authority");
+
+        // A same-identity build script rewriting the compiler in place keeps the
+        // uid, the mode, the device and the inode.
+        std::fs::write(&targo, b"substituted").unwrap();
+        std::fs::set_permissions(&targo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = super::validate_opened_tool_launcher(&targo, PathnameAuthorityMode::CallerOwned)
+            .unwrap_err();
         let rendered = format!("{error:#}");
         assert!(
-            rendered.contains("not root-owned") || rendered.contains("runs as root"),
-            "a same-UID process could add or replace a dylib after snapshot: {rendered}"
+            rendered.contains("changed content after it was authenticated"),
+            "an in-place rewrite must lose execution authority: {rendered}"
+        );
+    }
+
+    /// The sealed-release predicate is still reachable and still fails closed,
+    /// so it cannot rot while the default lane runs.
+    #[cfg(unix)]
+    #[test]
+    fn sealed_release_mode_still_refuses_a_caller_owned_toolchain() {
+        use super::PathnameAuthorityMode;
+
+        let Some(root) = caller_clean_fixture_root() else {
+            eprintln!("skipping: no caller-clean fixture root on this host");
+            return;
+        };
+        let (targo, _lib) = caller_owned_toolchain_fixture(&root, "sealed-release-stage2");
+
+        let error = super::validate_unprivileged_authority_path(
+            &targo,
+            false,
+            "verified tool launcher",
+            PathnameAuthorityMode::SealedRelease,
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("TRUST_REQUIRE_SEALED_LAUNCHER"),
+            "the opt-in release predicate must still demand a root-owned installation: {rendered}"
         );
     }
 

@@ -23,8 +23,10 @@ pub(super) fn ord_method(callee: &str) -> Option<&str> {
     // (`core::cmp::Ord::min`, `<T as ...Ord>::min`) or the `cmp` free function
     // (`core::cmp::min`). A user `mymod::min` matches none of these and is
     // (soundly) not assumed to satisfy the min/max bounds.
-    let std_shaped = callee.contains("core::cmp::")
-        || callee.contains("std::cmp::")
+    let std_shaped = ((callee.starts_with("core::") || callee.starts_with("std::"))
+        && callee.contains("::cmp::"))
+        || callee.contains("as core::cmp::Ord>::")
+        || callee.contains("as std::cmp::Ord>::")
         || callee.contains("as Ord>::");
     if std_shaped { Some(method) } else { None }
 }
@@ -51,9 +53,21 @@ pub(super) fn is_ord_clamp_call(callee: &str) -> bool {
 /// together pin this to `From<bool>`/`Into<int>` for a primitive int — so `usize::from(u8)`
 /// (non-bool arg) and a non-primitive `From<bool>` newtype (non-int dest) are both excluded.
 pub(super) fn is_bool_from_call(callee: &str) -> bool {
-    callee.contains("From<bool>")
-        || callee.ends_with("convert::From::from")
-        || callee.ends_with("convert::Into::into")
+    (callee.contains("From<bool>")
+        && (callee.contains("as core::")
+            || callee.contains("as std::")
+            || callee.contains("as From<bool>")))
+        || ((callee.starts_with("core::") || callee.starts_with("std::"))
+            && (callee.ends_with("convert::From::from")
+                || callee.ends_with("convert::Into::into")))
+}
+
+/// Whether `callee` is rooted at the genuine `core`/`std` primitive-number
+/// inherent implementation. Callers use this before minting value-range facts;
+/// a same-named user function must leave the destination unconstrained.
+pub(super) fn is_std_num_intrinsic(callee: &str) -> bool {
+    (callee.starts_with("core::") || callee.starts_with("std::"))
+        && callee.contains("::num::")
 }
 
 /// The std integer `wrapping_neg` inherent method (`core::num::<impl i128>::

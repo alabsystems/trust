@@ -78,6 +78,7 @@ pub(crate) fn generate_spec_vcs(func: &VerifiableFunction) -> Vec<VerificationCo
                 location: func.span.clone(),
                 formula: Formula::Bool(false),
                 contract_metadata,
+                obligation: None,
             });
         } else {
             vcs.push(crate::contracts::spec_unverifiable_vc(
@@ -133,6 +134,7 @@ pub(crate) fn generate_spec_vcs(func: &VerifiableFunction) -> Vec<VerificationCo
                 location: func.span.clone(),
                 formula: Formula::Not(Box::new(formula)),
                 contract_metadata,
+                obligation: None,
             });
         } else {
             vcs.push(crate::contracts::spec_ensures_unparseable_vc(func, func.span.clone(), expr));
@@ -168,6 +170,7 @@ pub(crate) fn generate_spec_vcs(func: &VerifiableFunction) -> Vec<VerificationCo
                 location: func.span.clone(),
                 formula: Formula::Not(Box::new(formula)),
                 contract_metadata,
+                obligation: None,
             });
         } else {
             vcs.push(crate::contracts::spec_unverifiable_vc(

@@ -29,549 +29,7 @@ pub(super) fn formula_var_name(f: &trust_types::Formula) -> Option<&str> {
     }
 }
 
-/// Search a `Formula` tree for the FIRST leaf matching `pred`, descending through
-/// `And`/`Or`/`Not`/`Implies`. Returns the matched sub-formula.
-///
-/// Trust: OBLIGATION-REGION SELECTION (2026-07-29) — this may ONLY be applied to a VC's
-/// [`emitted_obligation_body`], never to `vc.formula`. `vc.formula` is the violation
-/// WRAPPED in block-defs, dominating guards, the function's `preconditions` and its
-/// parameters' type bounds, all of which are comparisons that share the violation's
-/// shapes; a scan of the whole tree therefore reads a HYPOTHESIS. See
-/// [`emitted_obligation_body`] for the measurement and the two forgeries it closed.
-///
-/// Trust: it has NO production caller left — all seven were replaced first by
-/// `obligation_violation_leaf` (2026-07-29) and then, when that too proved to be a
-/// descent, by [`locate_violation`]'s shape match on the COLLAPSED body (2026-07-31,
-/// round-6 F1: `obligation_violation_leaf` is deleted). It is `#[cfg(test)]` so that a
-/// new one cannot be added by accident, and survives only as a test-side probe for
-/// "does this tree contain
-/// a leaf of that shape ANYWHERE", which is how the region tests demonstrate that the
-/// hypothesis the fix stops reading is still present in the wrapped formula.
-#[cfg(test)]
-pub(super) fn find_violation_leaf<'a>(
-    f: &'a trust_types::Formula,
-    pred: &dyn Fn(&trust_types::Formula) -> bool,
-) -> Option<&'a trust_types::Formula> {
-    use trust_types::Formula as F;
-    if pred(f) {
-        return Some(f);
-    }
-    match f {
-        F::And(v) | F::Or(v) => v.iter().find_map(|x| find_violation_leaf(x, pred)),
-        F::Not(a) => find_violation_leaf(a, pred),
-        F::Implies(a, b) => find_violation_leaf(a, pred).or_else(|| find_violation_leaf(b, pred)),
-        _ => None,
-    }
-}
-
-/// Trust: OBLIGATION-REGION SELECTION (2026-07-29) — the sub-formula of a wrapped VC
-/// formula that IS the obligation the emitter built, recovered by INVERTING the conjoin
-/// discipline every wrapper uses.
-///
-/// A safety VC's `formula` is not the violation. `trust_vcgen` wraps the violation, in
-/// this order and always the same way:
-///
-/// ```text
-/// combine_relevant_block_defs        -> And([def..,          body])
-/// versioned::conjoin (preconditions) -> And([precondition.., body])
-/// v2_formula_with_path_guards        -> Or([And([guards_p,   body]) for each path p])
-/// semantic / global / slice-iter     -> And([fact..,         body])
-/// conjoin_arg_type_ranges & siblings -> And([Le(lo,p),Le(p,hi).., body])
-/// ```
-///
-/// EVERY conjoining wrapper pushes the body LAST (`versioned::conjoin`,
-/// `combine_relevant_block_defs`, `conjoin_arg_type_ranges`,
-/// `conjoin_local_type_ranges_excluding`, `conjoin_datatype_field_ranges_excluding`,
-/// `conjoin_slice_len_bounds`, the semantic/global/slice-iter conjoins), and the ONLY
-/// non-conjoining wrapper — the dominating-path guard map — distributes one COPY of the
-/// body over a disjunction of paths. So the inverse is: take the LAST conjunct of a
-/// top-level `And`; descend into every disjunct of an `Or` that carries the path-guard
-/// shape and require the recovered bodies to AGREE. Genuine disagreement FAILS CLOSED,
-/// the same discipline [`emitted_shift_violation_pair_probe`] and `resolve_certified_callee`
-/// apply.
-///
-/// THE PATH-GUARD `Or`, EXACTLY (`generate/safety.rs:1078-1121`). One term per
-/// dominating path: a GUARDED path pushes `And([guards_p.., body..])` (the body is
-/// FLATTENED in when it is itself an `And`, so the body's last conjunct is the term's
-/// last conjunct either way); an EMPTY-guard path — every `unguarded_successors` edge:
-/// `Goto`, `Call{target}`, `Drop{target}`, `Opaque{targets}`, and every
-/// `UnwindEdge::Cleanup` target — pushes the RAW body, `And` or not. So a block reached
-/// by one guarded and one unguarded path whose body is NOT an `And` emits a MIXED `Or`,
-/// and the all-`And` test this arm used to apply (`v.iter().all(..)`) is the wrong
-/// inverse: it declined to decompose exactly that shape and returned the whole `Or`,
-/// dominating guards included, as "the obligation body".
-///
-/// Trust: MIXED-`Or` FORGERY (2026-07-29, lane A finding [1]) — that was a LIVE
-/// false-certificate path, reachable from an ordinary MIR CFG through
-/// `trust_vcgen::generate_vcs` with no hostile input beyond the CFG shape. MEASURED on
-/// the tree before this arm was widened: `bb0: Drop -> [bb1, Cleanup(bb2)]`,
-/// `bb1: _4 = i>=8; SwitchInt(_4) -> [(1,bb3)]`, `bb2: Goto(bb3)`,
-/// `bb3: Assert{cond:_5, expected:true, msg:BoundsCheck}` emits
-/// `And([Eq(_4, Ge(i,8)), Or([And([Ge(i,8), Not(_5)]), Not(_5)])])`; the peel returned
-/// the whole `Or` and `safety_vc_is_faithful_formula_aware` minted a kernel-checked
-/// `idx_oob 8 i` for an obligation whose own violation is `Not(_5)` and carries no
-/// modeled bounds core at all. Pinned by
-/// `a_mixed_path_guard_or_can_never_supply_a_bounds_core`.
-///
-/// The discriminator is therefore "ANY disjunct is an `And`", not "all are": a guarded
-/// path term is ALWAYS an `And` (guards are non-empty and the body is appended).
-///
-/// PRODUCER AUDIT, re-run and CORRECTED (2026-07-29, lane A round-3 finding [4] — the
-/// previous text asserted "a modeled violation `Or` has COMPARISON disjuncts and never
-/// an `And` one, checked at every producer", listing six sites; that sentence was FALSE
-/// at two of the six it cited, and this widening rests on it, so it is spelled out per
-/// site instead):
-///
-/// | site | shape | `And` disjunct? |
-/// |---|---|---|
-/// | `checked_vcs.rs:259` (bounds, signed index) | `Or([Lt(i,0), Ge(i,len)])` | no |
-/// | `checked_vcs.rs:537` (shift, signed amount) | `Or([Lt(n,0), Ge(n,W)])` | no |
-/// | `overflow_vc.rs:461` (signed add/sub/mul LIA) | `Or([Lt(a∘b,MIN), Gt(a∘b,MAX)])` | no |
-/// | `overflow_vc.rs:712` (`differ`, the BV sign test) | `Or([And([x,¬y]), And([¬x,y])])` | **YES** |
-/// | `int_conversion.rs:457` (`try_from` out-of-range) | `Or([Lt,Gt,Eq])` — THREE disjuncts | no |
-/// | `int_conversion.rs:462` (`try_from` unwrap_or FACT) | `Or([And([Le,Le]), Eq(dst,default)])` | **YES** |
-///
-/// So there are TWO `Or` shapes in trust-vcgen that carry an `And` disjunct, not one,
-/// and the second is not even a violation: `int_try_from_unwrap_or_facts` builds a
-/// semantic FACT whose first disjunct is `range::input_range_constraint`, which IS
-/// `And([Le(min,x), Le(x,max)])` (`range.rs:92-100`). Citing it as a checked violation
-/// producer was wrong on both counts.
-///
-/// PRODUCER AUDIT, RE-RUN AGAIN and CORRECTED A SECOND TIME (2026-07-30, round-4 defect
-/// [3] — the previous text at the `Implies` arm asserted "no safety violation is emitted
-/// as an implication (checked at every `Formula::Implies` construction site in
-/// trust-vcgen: `trait_verify`, the recursive-datatype induction schemas, and the CHC
-/// lowering — none of them reach a safety VC)". **That sentence omitted
-/// `generate/ite.rs`, and `generate/ite.rs` is on the safety path.** The
-/// `generate/ite.rs` sites, per row:
-///
-/// | site | shape it builds | safety VC? |
-/// |---|---|---|
-/// | `ite.rs:43-47` (`guarded`) | `Implies(g, c)`, or bare `c` when `g` is `Bool(true)` | **YES**, via the two below |
-/// | `ite.rs:136-143` (`lift_relation_ites`) | `And([guarded(g_ij, R(a_i,b_j))..])` | **YES** |
-/// | `ite.rs:180-186` (formula-position `Ite`) | `And([guarded(c,t), guarded(Not(c),e)])` | **YES** |
-/// | `ite.rs:20-32` (`ite_free_equality`) | `And([Implies(c,·), Implies(Not(c),·)])` | no |
-///
-/// That table is NOT an exhaustive re-audit, and is not offered as one. Measured
-/// 2026-07-30 by running the greps rather than quoting them: `Formula::Implies(Box::new`
-/// occurs at 25 sites across 14 files under `crates/trust-vcgen/src`, and 36 files
-/// mention `Formula::Implies` at all. The superseded sentence named three of them, and
-/// this pass traced one more to a safety VC. (An earlier draft of this paragraph said
-/// "22 files" — a number transcribed from a review rather than re-derived, in the very
-/// sentence disclaiming exhaustiveness. State the command or state nothing.) Nothing rests on
-/// completing that enumeration, deliberately — the `Implies` arm is now restricted to the
-/// ROOT position, so an implication from any producer whatsoever, at any inner position,
-/// is pushed as-is and fails closed.
-///
-/// `generate/entry.rs:603-604` runs `eliminate_term_ites` — the entry point of the middle
-/// two rows — over EVERY generated VC whose formula contains an `Ite`, safety VCs
-/// included. So a symbolic `Ite` divisor turns the div-by-zero body `Eq(b, 0)` into
-/// `And([Implies(c, Eq(n1,0)), Implies(Not(c), Eq(n2,0))])`, and the shift body
-/// `Ge(n, W)` into `And([Implies(c, Ge(n1,W)), Implies(Not(c), Ge(n2,W))])`.
-///
-/// The last row is `no` for a CHECKED reason, not an assumed one: `ite_free_equality`'s
-/// only caller in the tree is `generate/contract_vcs.rs:567`, the postcondition
-/// `_0 == <modeled saturating/wrapping_neg call>` return pin — grepped, one hit.
-///
-/// The same previous sentence also called `refine_vc_with_alias` "the only producer in
-/// the tree". That remains true of the WRAPPER, and it was re-checked: `:381` is the only
-/// `<vc>.formula = Formula::Implies(..)` anywhere in `trust-vcgen` (grepped for
-/// `.formula = ` across the crate; every other hit assigns an `And`, a conjoin helper, or
-/// a normalization). Note also that nothing in the tree CALLS `refine_vc_with_alias`
-/// today — it is a public API with no pipeline caller (only the re-export at
-/// `trust-vcgen/src/lib.rs:260` and its own two unit tests) — so its wrapper is
-/// unexercised on the emitted path, and "the wrapper is the ROOT" holds for a caller that
-/// applies it last, which is the only way it is used.
-/// What the sentence is NOT true of is `Implies` in general — the `generate/ite.rs`
-/// rows above build implications INSIDE a safety VC's body, and it was that sentence
-/// which licensed descending through every one of them.
-///
-/// Trust: THE ITE CASE-SPLIT PEEL (2026-07-30, round-4 defect [3]) — with the `And`-last
-/// rule feeding the (then-unrestricted) `Implies`-consequent rule, that shape peeled to
-/// the LAST arm's consequent WITH ITS CASE GUARD STRIPPED, certifying `n2` for an
-/// obligation that says `(c → …n1…) ∧ (¬c → …n2…)` and never reading the `c` arm.
-/// Selection was POSITIONAL, not semantic: the round-4 verdict measured arms
-/// `[Ge(n1,32), Ge(n2,64)]` yielding `ShiftOob(W64)` and the SAME TWO ARMS SWAPPED
-/// yielding `ShiftOob(W32)` — the certified WIDTH flipped with conjunct order.
-/// (Re-executed here as `shift_core_selection_tests::a_shift_case_split_certifies_no_
-/// arms_width_in_either_order`. That two-WIDTH pair is an API-level construction, not an
-/// emitted one — a lifted `Ite` AMOUNT gives both arms the same threshold, because
-/// `v2_shift_violation_formula` puts a plain `Formula::Int(width)` on the far side of the
-/// `Ge`. The EMITTED carrier of the same mechanism is div/rem, which is payload-free;
-/// see `obligation_region_tests::an_ite_divisor_case_split_is_certified_by_no_arm`.)
-/// Two arms close it, and they are complementary rather than redundant:
-///
-///   1. an `And` whose conjuncts are ALL `Implies` is refused outright (a case split has
-///      no body to peel to), and
-///   2. the `Implies` arm is restricted to the OUTERMOST position, the position
-///      `refine_vc_with_alias`'s wrapper occupies when it is applied last (see the
-///      no-caller note above).
-///
-/// Rule 1 alone is NOT sufficient, and the reason is worth spelling out because it is
-/// the whole argument. `guarded` (`ite.rs:43-47`) drops the implication for a
-/// `Bool(true)` guard, so a case split is not always all-`Implies`: `Ite(Bool(true), t, e)`
-/// lifts to `And([R(t), Implies(Not(Bool(true)), R(e))])`, whose FIRST conjunct is bare.
-/// What holds instead — read off the producer, not assumed — is that the LAST case of a
-/// multi-case list is always guarded:
-///
-///   * `term_ite_cases`' `Ite` arm (`ite.rs:58-74`) appends `else_cases` AFTER
-///     `then_cases`, and every else guard is `and_guard(Not(cond_free), g)`;
-///   * `and_guard` (`ite.rs:35-40`) reduces to `Bool(true)` only when BOTH operands are
-///     `Bool(true)`, and `Not(cond_free)` is an `F::Not`, never `Bool(true)`;
-///   * the `Neg` arm (`:75-80`) and `bin_term_ite_cases` (`:101-119`, `a_cases` outer,
-///     `b_cases` inner) both keep the last element last, and `term_ite_cases` yields a
-///     `Bool(true)` guard only for an `Ite`-free term (the `_` leaf arm at `:97`,
-///     propagated through `Neg`/the binop arms) — the one case `lift_relation_ites`
-///     short-circuits at `:133-134` before building any `And`, when it holds on BOTH
-///     sides;
-///   * the formula-position `Ite` arm (`:180-186`) is the same two-element shape, its
-///     second conjunct guarded by `Not(cond_free)`.
-///
-/// So today's `generate/ite.rs` always ends a lifted `And` with an `Implies`, which rule
-/// 2 refuses at any inner position. Rule 2 is therefore the one that closes the measured
-/// forgery; rule 1 is the semantic statement of the same thing (a case split is not a
-/// wrapper) and does not depend on that positional argument surviving a change to the
-/// lowering. Both are kept deliberately.
-///
-/// HONESTY ABOUT RULE 1: it is **not independently falsifiable today**, and this was
-/// checked rather than argued. Reverting rule 1 IN PLACE and re-running
-/// `obligation_region_tests` + `shift_core_selection_tests` leaves all 24 green, because
-/// rule 2 catches the same shapes one step later — an all-`Implies` `And` is only ever
-/// reached at a non-outermost position, where its last conjunct is an inner `Implies`.
-/// Reverting rule 2 alone fails 1 test; reverting BOTH fails 4, including
-/// `a_shift_case_split_certifies_no_arms_width_in_either_order` with the order flip in
-/// one line — `(Some(ShiftOob(W64, false)), Some(ShiftOob(W32, false)))` for one
-/// proposition written two ways. So rule 1 is redundancy against a future `go` or a
-/// future lowering, not a second measured closure, and it is recorded as such.
-///
-/// COST, MEASURED over `crates/trust-clean/fixtures` (2326 functions, 772 safety VCs):
-/// **zero**. 0 VCs peel through an `Implies` at a non-outermost position and 0 VCs peel
-/// to an all-`Implies` `And`, so no certificate in the corpus is withdrawn — the
-/// per-VC certificate count is 635 and the `function_safety_vcs_faithful` count is 286
-/// on both sides of the change. The defect is API-and-`Operand::Symbolic`-reachable, not
-/// present in the committed corpus; see the round-4 verdict's scope limit.
-///
-/// NEITHER is mistaken for a path-guard map, because the arm does not stop at "any
-/// `And`" — it decomposes and then REQUIRES THE RECOVERED BODIES TO AGREE. The BV sign
-/// test peels to `Not(y)` and `y`; the `unwrap_or` fact peels to `Le(x,max)` and
-/// `Eq(dst,default)`. Both disagree ⇒ `None` ⇒ fail closed. That is the same verdict the
-/// BV lane already got by other means (no `Gt(Add..)`/`Or([Lt,Gt])` leaf ⇒ decline),
-/// unchanged; and the `unwrap_or` facts are conjoined ahead of the obligation
-/// (`generate/safety.rs:893-897` pushes `vc.formula` LAST), so today the peel never even
-/// reaches one. An all-unguarded `Or([body, body])` has no `And` disjunct at all and is
-/// returned whole, which is harmless: the copies are identical, so the leaf search inside
-/// it is a singleton.
-///
-/// WHY this exists. `find_violation_leaf` used to be run over the WHOLE `vc.formula` at
-/// seven sites. Measured over the committed ladder + `real-spec-corpus`:
-///
-/// | site | safety VCs | whole-tree hit | obligation-body hit | **DISAGREE** |
-/// |---|---|---|---|---|
-/// | bounds | 35 | 34 | 7 | **30** |
-/// | div/rem | 20 | 16 | 10 | **6** |
-/// | unsigned-add | 36 | 32 | 32 | **9** |
-/// | signed add/sub/mul | 26 | 22 | 22 | 0 |
-/// | unsigned-mul | 47 | 42 | 42 | 0 |
-/// | unsigned-sub | 107 | 107 | 107 | 0 |
-///
-/// Every disagreement is a certificate about a proposition the VC does not contain:
-///
-///   * `itoa`'s `<i16 as Sealed>::write` raises a **u8** add-overflow VC whose own
-///     violation is `Gt(_63 + 48, 255)`; the whole-tree scan selected the semantic
-///     guard `Gt(_43 + 2, 18446744073709551615)` and minted `Overflow(U64)` — a
-///     kernel-checked adequacy certificate for a 64-bit addition on an 8-bit one, on
-///     unmodified real library code with no hostile input. 8 of the 9 add
-///     disagreements are this family.
-///   * the bounds disagreements are almost all obligations with NO modeled leaf of their
-///     own. `byteorder`'s `read_u*`/`write_u*` emit the container-length shape
-///     `Gt(Int 4, buf__slice_len)`; `check_ascii_printable`'s obligation is literally
-///     `Bool(true)`, the emitter's fail-closed marker. They were certified off a
-///     `Ge(p, 0)` — either `conjoin_slice_len_bounds`' slice-length type invariant
-///     (`type_ranges.rs:397`, present with NO contract at all) or the extractor's
-///     synthesized parameter-domain precondition — as `idx_oob 0 p`, i.e. "`p` is out of
-///     bounds of a length-0 collection", about a collection the VC never mentions.
-///     `swap_pop` instead read `Ge(index, len)` in place of its own two-index
-///     `Or([Ge(index, _7__slice_len), Ge(_8, _7__slice_len)])`.
-///   * `bit_field`'s `BitArray::get_bit`/`set_bit` div/rem obligations are the bare
-///     assert-condition local `Var(_4)` — outside the modeled fragment — yet were
-///     certified off an unrelated block-def `Eq(__trust_opaque_scalar_u64, 0)`.
-///
-/// CERTIFICATE DELTA over the same 485 dumps, exact: **28 bounds certificates dropped**
-/// (24 `byteorder`, 3 `arrayvec`, 1 `ascii_utils`), **8 `Overflow(W64)` corrected to
-/// `Overflow(W8)`**, and **4 div/rem certificates GAINED** — `udiv128::udivmod_1e19` and
-/// `unsafe_div`, whose assert-form obligations the loose scan had missed and the new
-/// [`assert_condition_binding`] route resolves honestly. No other row moved.
-///
-/// LADDER IMPACT: **zero**. Re-scored with `ff-gate-diagnose-2026-07-10`, no budget,
-/// over all 450 committed ladder dumps: 181 FULLY_FAITHFUL before and after
-/// (164 `via_trustir` / 17 `mirsem_fallback`), and the per-row TSVs are byte-identical
-/// across all twelve diagnosis columns. Every function that loses a safety certificate
-/// here was already `SHAPE_GAP` with `via_ir_shape = via_mirsem_shape = false`, so no
-/// ladder row's FULLY_FAITHFUL verdict was resting on a forged leaf. The forged
-/// certificates were inflating the scorecard's `safety_vc_faithful` tallies
-/// (`prove.rs:13151`), which is a published figure, and were a live false-certificate
-/// PATH — not a currently-green forged row on this corpus.
-///
-/// WHAT THAT LADDER NUMBER IS AND IS NOT EVIDENCE OF — CORRECTED (2026-07-29, lane A
-/// round-3 finding [3]). The previous text here said "`fully_faithful` does not read this
-/// function at all". **That was false, and it understated this certifier's authority.**
-/// The production gate (`prove.rs:13264`) is
-///
-/// ```text
-/// via_mirsem = ( function_fully_faithful_witness_with_callees(..).is_modulo_3()
-///                && function_safety_vcs_all_discharged(..)
-///                && function_call_requires_established(..) )
-///              || synth_loop_.. || break_loop_.. || monotone_nested_..
-/// fully_faithful = via_ir || via_mirsem     (and the ptr-offset conjunct)
-/// ```
-///
-/// and `function_fully_faithful_witness_with_callees`'s clause (b) is literally
-/// `let certs = function_safety_vcs_faithful(func)?;`
-/// (`mirsem/function_witness.rs:592`). So the mirsem straight-line lane's safety pillar
-/// is ADEQUACY **and** DISCHARGE conjoined — this certifier is one of its conjuncts, not
-/// absent from it. (`function_safety_vcs_all_discharged` is the other one; only the LOOP
-/// disjuncts and the trust-ir lane are independent of this function.) The diagnosis path
-/// is pinned equal to it by `diagnosis_fully_faithful_matches_production_gate`
-/// (`prove.rs:9600`, `:9713`).
-///
-/// CONSEQUENCE, both directions, and it is why finding [1] and finding [2] are
-/// load-bearing rather than tally-only: since `fully_faithful` is a DISJUNCTION, this
-/// certifier can only move a row that the trust-ir lane declines — i.e. the
-/// `mirsem_fallback` population. Within it, a FORGED certificate here flips a row INTO
-/// `fully_faithful`, and a FALSE DECLINE flips one OUT. The other consumer is the
-/// scorecard's `safety_vc_faithful` tally (`prove.rs:13151`), a published figure.
-///
-/// So a byte-identical ladder is a non-regression check over a population where the
-/// trust-ir lane was already carrying the verdict — not a measurement of this lane. The
-/// load-bearing measurement is the per-VC census over all 486 committed dumps
-/// (`census-2026-07-06` + `census-rung2-2026-07-07` + `real-spec-corpus`, recursive
-/// walk): 349 safety VCs, 265 certificates, 106 functions certified by
-/// [`function_safety_vcs_faithful`] — recorded per row and diffed, not just totalled.
-///
-/// VALIDATION. This peel is cross-checked against `emitted_shift_violation_pair_probe`,
-/// derived independently by matching `v2_shift_violation_formula`'s VERBATIM
-/// `And([input_range_constraint, invalid])` pair anywhere in the tree with a singleton
-/// requirement: over the ladder's **77 of 77** shift VCs the two agree exactly
-/// (`obligation_body_agrees_with_the_shift_emitter_locator`). Two independent
-/// derivations of "the emitter's own violation" that coincide on every real row is the
-/// evidence that this is the wrapper-inverse and not a heuristic. The probe is
-/// `#[cfg(test)]`: shape alone proved forgeable when scanned over the whole formula
-/// (round-3 finding [1]), so POSITION — this peel — is what the shift arm now reads.
-pub(super) fn emitted_obligation_body(
-    formula: &trust_types::Formula,
-) -> Option<&trust_types::Formula> {
-    emitted_obligation_body_located(formula).map(|(body, _)| body)
-}
-
-/// One visit of the wrapper peel: the node it stopped at, together with the conjunct
-/// list that node was the LAST element of. `siblings` is `None` when the node sits
-/// directly under an `Or` (a path-guard disjunct that is the RAW body) or IS the whole
-/// `vc.formula` — in both cases the emitter conjoined nothing beside it HERE, so no
-/// side condition can be read off this occurrence.
-///
-/// Trust: THE OCCURRENCES ARE THE DOMAIN OF A QUANTIFIER (2026-07-31, round-5 defects
-/// [5]/[6]/[7]). A lane that reads a SIDE CONDITION off the emitter's sibling conjuncts
-/// — the uadd vacuity check is the only one today — must quantify over EVERY occurrence
-/// the peel visits, and an occurrence carrying no sibling evidence must FAIL that
-/// universal rather than drop out of its domain. That is why the peel now returns the
-/// whole visit list instead of only the agreed body: the multi-path guard split repeats
-/// the same body once per dominating path, each with ITS OWN conjuncts, and the
-/// empty-guard path pushes the body RAW (`generate/safety.rs:1078-1080`) — an occurrence
-/// with `siblings: None` and no ranges at all.
-#[derive(Clone, Copy)]
-pub(super) struct BodyOccurrence<'a> {
-    pub(super) node: &'a trust_types::Formula,
-    pub(super) siblings: Option<&'a [trust_types::Formula]>,
-}
-
-/// [`emitted_obligation_body`] keeping EVERY occurrence of the agreed body, each with
-/// the emitter's own sibling conjuncts. The agreement rule is unchanged — genuine
-/// disagreement between two peeled bodies still fails closed.
-///
-/// Note that this lane's `Or` arm descends EVERY disjunct, the bare ones included, so a
-/// MIXED path-guard `Or` contributes its raw disjunct as an occurrence with
-/// `siblings: None` rather than being invisible here. That is the structural difference
-/// from the trust-ir lane's `violation_candidates`, whose `And`-only `Or` descent made
-/// the bare disjunct unexaminable and forced that lane to decline on a mixed `Or`
-/// outright (round-5 defect [7]). Here the bare disjunct is examined: it fails any
-/// sibling-read side condition, and if its body DISAGREES with the guarded twins the
-/// peel returns `None` before any site sees it.
-pub(super) fn emitted_obligation_body_located(
-    formula: &trust_types::Formula,
-) -> Option<(&trust_types::Formula, Vec<BodyOccurrence<'_>>)> {
-    let found = emitted_obligation_body_occurrences(formula);
-    let first = found.first()?.node;
-    found.iter().all(|o| o.node == first).then_some((first, found))
-}
-
-fn emitted_obligation_body_occurrences(
-    formula: &trust_types::Formula,
-) -> Vec<BodyOccurrence<'_>> {
-    use trust_types::Formula as F;
-    /// `sibs` is the conjunct list `f` is the LAST element of, threaded so a site can
-    /// read the emitter's own range constraints.
-    ///
-    /// Trust: THE `outermost` PARAMETER IS GONE (2026-07-31). Its only reader was the
-    /// `Implies` peel removed below. Keeping a positional flag that nothing consults
-    /// would assert that position governs here when it no longer does — and a locator
-    /// claiming a discipline it does not enforce is precisely the defect class this
-    /// file has been repairing for four rounds.
-    fn go<'a>(f: &'a F, sibs: Option<&'a [F]>, out: &mut Vec<BodyOccurrence<'a>>) {
-        macro_rules! push {
-            ($node:expr) => {
-                out.push(BodyOccurrence { node: $node, siblings: sibs })
-            };
-        }
-        match f {
-            // Trust: THE ITE CASE-SPLIT PEEL (2026-07-30, round-4 defect [3]). An `And`
-            // whose conjuncts are ALL `Implies` is a CASE SPLIT, not a wrapper — there is
-            // no body to peel to, and taking the last arm's consequent would strip that
-            // arm's case guard AND discard every other arm. Refuse: push the whole `And`,
-            // which no site's core probe matches, so the VC fails closed. See the
-            // ITE-elimination row of the producer table in the doc above.
-            F::And(v) if !v.is_empty() && v.iter().all(|c| matches!(c, F::Implies(..))) => {
-                push!(f);
-            }
-            F::And(v) if !v.is_empty() => {
-                go(v.last().expect("non-empty"), Some(v.as_slice()), out);
-            }
-            // The dominating-path guard map's `Or([And([guards_p, body..]) | body ..])`:
-            // one copy of the SAME body per path, wrapped in that path's guards when it
-            // has any. A GUARDED term is always an `And`; an unguarded one is the raw
-            // body. Two trust-vcgen `Or`s that are NOT path-guard maps also carry an
-            // `And` disjunct — the BV sign test (`overflow_vc.rs:712`) and the
-            // `try_from`-unwrap_or FACT (`int_conversion.rs:462`) — so the `any(And)`
-            // test alone does not identify this shape; what does is the AGREEMENT
-            // requirement below, which both of them fail. See the producer-by-producer
-            // table in the doc above, and the mixed-`Or` forgery this arm closes.
-            F::Or(v) if !v.is_empty() && v.iter().any(|d| matches!(d, F::And(_))) => {
-                // A disjunct is not a conjunct of anything: `sibs` is cleared, so a RAW
-                // (unguarded-path) disjunct arrives at the site carrying NO sibling
-                // evidence and fails any side condition read off the siblings.
-                for d in v {
-                    go(d, None, out);
-                }
-            }
-            // HISTORY OF THIS ARM, kept because it is a four-round case study in
-            // narrowing a defect instead of removing it.
-            //
-            // 2026-07-29 (lane A finding [3]) — an `Implies` peel was ADDED here.
-            // Before it, the whole implication was returned as "the body" and the leaf
-            // search descended into the antecedent: measured
-            // `Implies(Ge(i,8), Bool(true))` -> `Some(Bounds)`.
-            //
-            // 2026-07-30 (round-4 defect [3]) — the peel was NARROWED to the outermost
-            // position, because at any inner position an `Implies` is a case-split arm
-            // (that is what `generate/ite.rs` builds) and peeling it strips the guard.
-            //
-            // 2026-07-31 (round-6 recipe R17) — the narrowing was not enough, because
-            // the antecedent was still discarded at the root. The peel is now REMOVED.
-            //
-            // Trust: THE PEEL IS GONE — FAIL CLOSED AT EVERY POSITION (2026-07-31,
-            // round-6 recipe R17). This arm used to be
-            //     F::Implies(_, consequent) if outermost => go(consequent, ..)   [removed]
-            // and the `_` is the whole defect: it DISCARDED THE ANTECEDENT. Because
-            // this peel runs strictly ABOVE `locate_violation`, round 6's entire
-            // collapsed-body fix ran underneath it and never saw what was thrown away.
-            //
-            // MEASURED, on the tree that had just closed the disjunctive decoy:
-            // `Implies(Not(Gt(__decoy,5)), core)` — the SAME PROPOSITION as the
-            // `Or([core, decoy])` round 6 closed — and `Implies(Bool(false), core)` —
-            // an identically-true obligation — each minted a kernel-checked
-            // certificate at ALL TEN `site_cores()` rows, including the unsigned-add
-            // arm that was round 5's own negative control. trust-ir declined all 20.
-            //
-            // The arm is removed rather than narrowed to the producer's real shape,
-            // for three reasons, each checked here rather than recalled:
-            //   1. Nothing CALLS the producer. `grep -rn refine_vc_with_alias` over the
-            //      whole tree returns its definition (alias_analysis.rs:349), the
-            //      re-export (trust-vcgen/src/lib.rs:260), its own two unit tests, and
-            //      documentation — no pipeline caller.
-            //   2. Root `Implies` occurs 0 times across the 772 safety VCs the real
-            //      emitter raises from the 2326 fixture functions (round-6 census), so
-            //      removing the inverse withdraws nothing.
-            //   3. The wrapper it inverted is not even the shape the tests described:
-            //      `refine_vc_with_alias` builds `Not(Eq(Var(alias-loc, Int), Var(..)))`
-            //      or an `And` of those, never the `Var(_, Bool)` the old control used.
-            //
-            // So this was speculative generality in a certificate locator, and it cost
-            // a forgery at ten arms. An `Implies` at ANY position now falls to the
-            // default and is pushed as-is, which fails closed. If an aliasing wrapper
-            // ever acquires a real caller, re-introduce the inverse GATED ON THE
-            // ANTECEDENT — match the producer's shape and verify the antecedent is not
-            // contentless — never on position alone.
-            _ => push!(f),
-        }
-    }
-    let mut found: Vec<BodyOccurrence<'_>> = Vec::new();
-    go(formula, None, &mut found);
-    found
-}
-
-/// THE ONE LOCATOR every arm of this lane goes through: the single proposition this
-/// VC's BODY states, together with every body-position occurrence of it — returned ONLY
-/// when the COLLAPSED body itself satisfies the arm's own shape predicate.
-///
-/// Trust: `is_core` APPLIES TO THE COLLAPSED BODY, NEVER TO A LEAF FOUND BY DESCENDING
-/// IT (2026-07-31, round-6). This function REPLACES `obligation_violation_leaf`, which
-/// peeled the wrapper to the body and then searched INSIDE it for the first sub-formula
-/// matching the arm's predicate. That search was the round-6 root cause and it is
-/// deleted rather than narrowed: a leaf found under a body is not the body, so
-/// certifying it states something the obligation does not.
-///
-/// THE FORGERY IT CLOSES, in one shape. For any arm whose core is `C`, the body
-/// `Or([C, Gt(decoy, 5)])` — an obligation asserting `C ∨ decoy > 5`, strictly weaker
-/// than `C` —
-/// has no `And` disjunct, so [`emitted_obligation_body_occurrences`] returns the whole
-/// `Or` as the body; the deleted leaf search then descended it, found `C`, and minted a
-/// kernel-checked certificate for `C`. MEASURED on the tree before this change, driven
-/// through `safety_vc_is_faithful_formula_aware` with each arm's own emitted core in the
-/// first position (`obligation_region_tests::a_disjoined_decoy_is_certified_by_no_arm`):
-///
-/// ```text
-/// bounds / IndexOutOfBounds -> Bounds
-/// bounds / SliceBoundsCheck -> Bounds
-/// div-by-zero               -> DivByZero
-/// rem-by-zero               -> RemByZero
-/// unsigned-sub underflow    -> UnsignedSubUnderflow(W32)
-/// unsigned-mul overflow     -> UnsignedMulOverflow(W32)
-/// signed add overflow       -> SignedOverflow(Add, W32)
-/// negation overflow         -> NegationOverflow(W32)
-/// ```
-///
-/// — eight of that test's ten rows. The two that already declined are the arms this
-/// change was copied FROM, and they are unchanged: the unsigned-ADD arm was already a
-/// SHAPE MATCH on the collapsed body (round-5 defects [5]/[6]), and the SHIFT arm has read
-/// `shift_violation_shape` off the collapsed body since round 3.
-///
-/// NOT CLAIMED HERE: what the trust-ir lane does with the same recipes. The round-6
-/// defect list states that `trustir_safety.rs`'s own `locate_violation` declines them,
-/// and that asymmetry is the reason this change exists — but nothing in this file drives
-/// that lane, so it is recorded as the brief's finding rather than as a measurement taken
-/// here. Its owner is repairing it concurrently and a parity checker runs afterwards.
-///
-/// AGREEMENT AND OCCURRENCES are unchanged — they come from
-/// [`emitted_obligation_body_located`], which already collapses every body-position
-/// occurrence the wrapper peel visits and fails closed on genuine disagreement. What is
-/// new is only that the arm's predicate is asked about THAT node.
-///
-/// COST over `crates/trust-clean/fixtures`: **zero**, re-measured in this tree rather
-/// than quoted — `obligation_region_tests::mirsem_corpus_census` reports
-/// `funcs=2326 safety=772 certs=635 fn_certified=286` and the identical 28-entry
-/// per-kind table before and after. Every certified row's peeled body IS its arm's core
-/// (or is the assert-condition indirection, which the second route resolves); the only
-/// leaf-under-body population was unsigned-mul's 51 `Or([Lt(a*b,0), Gt(a*b,MAX)])`
-/// bodies, and that arm is converted to the unsigned-add shape match with the same
-/// vacuity side condition rather than left descending.
-pub(super) fn locate_violation<'a>(
-    formula: &'a trust_types::Formula,
-    is_core: &dyn Fn(&trust_types::Formula) -> bool,
-) -> Option<(&'a trust_types::Formula, Vec<BodyOccurrence<'a>>)> {
-    let (body, occurrences) = emitted_obligation_body_located(formula)?;
-    is_core(body).then_some((body, occurrences))
-}
-
-/// Which of the two emitter constructions [`assert_bound_or_body_core`] recovered a
+/// Which of the two emitter constructions `assert_bound_or_body_core` recovered a
 /// core from. The negation arm layers an ADDITIONAL subject gate on the assert route
 /// (see the `assert_negation_subject` call there), so the route has to be reported
 /// rather than erased.
@@ -694,113 +152,6 @@ fn carries_signed_index_violation(f: &trust_types::Formula) -> bool {
     }
 }
 
-/// Trust: SHIFT-CORE SELECTION (2026-07-29) — locate a shift VC's OWN emitted
-/// violation by the EMITTER'S CONSTRUCTION, not by a loose scan for a leaf that
-/// merely looks like one.
-///
-/// `v2_shift_violation_formula` returns, VERBATIM,
-///
-/// ```text
-/// And([ input_range_constraint(n, shift_ty),   //  And([Le(Int lo, n), Le(n, Int hi)])
-///       invalid ])                             //  Ge(n, Int W)  |  Or([Lt(n,0), Ge(n,W)])
-/// ```
-///
-/// and `v2_build_shift_overflow_vc` then WRAPS that in block definitions, dominating
-/// guards, the function's own `preconditions`, and its parameters' type bounds. The
-/// wrapper is full of comparisons that share the violation's shape, so a first-match
-/// pre-order scan of `vc.formula` for `Ge(var|int, Int)` — what this lane used to do —
-/// picks a HYPOTHESIS most of the time. Measured on the 450 committed ladder fixtures:
-/// of the 77 emitted `ShiftOverflow` VCs, **68** had more than one candidate leaf and in
-/// all 68 the first one was a hypothesis, never the violation. Both directions of that
-/// mis-selection were real:
-///
-///   * FAIL-CLOSED — the extractor's synthesized parameter-domain precondition
-///     `And([Ge(bit,0), Le(bit,u64::MAX)])` puts `Ge(bit,0)` ahead of the real core
-///     `Ge(bit,8)`; `ShiftWidth::from_bits(0)` then declines and the FUNCTION loses its
-///     certificate. That is the whole `bit_field::get_bit` −12 in
-///     `reports/2026-07-29-ladder-fixture-refreeze.md` §5. Note the asymmetry that
-///     report measured: the mirror spelling `Le(0,bit)` — the SAME proposition, and the
-///     one `augment_with_type_bounds` emits — never matched the `F::Ge` probe, so it
-///     never declined. The gap was a spelling collision, not a missing arm.
-///   * FALSE CERTIFICATE — a precondition `Ge(other, 32)` on a `u8` body (real core
-///     `Ge(bit, 8)`) was selected instead and minted a kernel-checked `ShiftOob(W32)`
-///     adequacy certificate: a claim about a width the VC does not contain, over a
-///     variable the body never shifts by. Pinned by
-///     `shift_core_selection_tests::a_precondition_can_never_supply_the_certified_shift_width`.
-///
-/// The first repair took the violation from the emitter's PAIR — the range constraint's
-/// bounds must be integer LITERALS, its constrained term `n` must be the SAME formula as
-/// the violation's amount, and the set of DISTINCT violations so located must be a
-/// SINGLETON — but ran that match over the WHOLE `vc.formula`, descending through `Not`
-/// and `Implies` as well. SHAPE without POSITION is not enough, and this function is
-/// therefore no longer the production locator.
-///
-/// Trust: WHOLE-FORMULA SHIFT FORGERY (2026-07-29, lane A round-3 finding [1]) — the
-/// shape match alone was FORGEABLE, MEASURED against `probe_func()` on the tree that
-/// preceded this change, with `vc.kind = ShiftOverflow{Shl, u32, u32}` and `pair` the
-/// emitter's verbatim `And([And([Le(0,n), Le(n,u32::MAX)]), Ge(n,32)])`:
-///
-/// ```text
-/// Not(pair)                    -> Some(ShiftOob(W32, false))
-/// Implies(pair, Bool(true))    -> Some(ShiftOob(W32, false))
-/// And([pair, Bool(true)])      -> Some(ShiftOob(W32, false))
-/// And([Not(pair), Bool(true)]) -> Some(ShiftOob(W32, false))
-/// ```
-///
-/// The third needs no polarity trick at all: the obligation's own body is the emitter's
-/// fail-closed marker `Bool(true)` and the certified core is read out of a HYPOTHESIS
-/// conjunct — verbatim the statement of
-/// `obligation_region_tests::no_site_certifies_an_obligation_whose_own_body_has_no_modeled_core`,
-/// at the one site whose `site_hypotheses()` table has no row. Pinned now by
-/// `shift_core_selection_tests::a_shift_hypothesis_conjunct_can_never_supply_the_certified_core`.
-///
-/// So POSITION governs: the production arm reads [`emitted_obligation_body`], the same
-/// region the other seven sites read, and this pair matcher survives ONLY as the
-/// INDEPENDENT derivation the region tests cross-check that peel against
-/// (`obligation_body_agrees_with_the_shift_emitter_locator`, 77/77 on the ladder). It is
-/// `#[cfg(test)]` so a new production caller cannot be added by accident — the same
-/// treatment [`find_violation_leaf`] got.
-#[cfg(test)]
-pub(super) fn emitted_shift_violation_pair_probe(
-    formula: &trust_types::Formula,
-) -> Option<&trust_types::Formula> {
-    use trust_types::Formula as F;
-
-    fn is_int_literal(f: &F) -> bool {
-        matches!(f, F::Int(_) | F::UInt(_))
-    }
-
-    fn walk<'a>(f: &'a F, out: &mut Vec<&'a F>) {
-        if let F::And(conjuncts) = f
-            && let [F::And(range), invalid] = conjuncts.as_slice()
-            && let [F::Le(lo, n_lo), F::Le(n_hi, hi)] = range.as_slice()
-            && is_int_literal(lo)
-            && is_int_literal(hi)
-            && n_lo == n_hi
-            && shift_violation_shape(invalid).is_some_and(|(n, _, _)| n == &**n_lo)
-        {
-            out.push(invalid);
-        }
-        match f {
-            F::And(v) | F::Or(v) => v.iter().for_each(|x| walk(x, out)),
-            F::Not(a) => walk(a, out),
-            F::Implies(a, b) => {
-                walk(a, out);
-                walk(b, out);
-            }
-            _ => {}
-        }
-    }
-
-    let mut found: Vec<&F> = Vec::new();
-    walk(formula, &mut found);
-    let first = *found.first()?;
-    // The wrapper duplicates conjuncts (32 of the ladder's 77 shift VCs carry the pair
-    // more than once); duplicates of the SAME proposition are fine, two DIFFERENT ones
-    // are not.
-    found.iter().all(|f| *f == first).then_some(first)
-}
-
 /// The base place name of a versioned VC variable — `_6#s3_0` names the same place as
 /// `_6`. The staleness machinery stamps `#token` suffixes on both defs and body reads
 /// (`version_rename_at` / `version_block_def_at_establish`), so a name comparison that
@@ -824,7 +175,7 @@ fn base_var_name(f: &trust_types::Formula) -> Option<&str> {
 /// (`abs_nonneg`'s negation VC is exactly this shape: obligation body `Var("_6", Bool)`;
 /// so are `checked_div`/`guarded_div`/`BitArray::get_bit`'s div and rem twins.)
 ///
-/// **ONLY the bare `Var(c)` body is admitted** — see [`assert_bound_or_body_core`]. For
+/// **ONLY the bare `Var(c)` body is admitted** — see `assert_bound_or_body_core`. For
 /// `expected == false` the emitted violation IS `c`, so `c`'s binding RHS is literally
 /// the obligation and certifying it is exact. A `Not(Var c)` body (`expected == true`,
 /// the shape the BOUNDS assert takes) means the violation is `¬RHS`, which is NOT the
@@ -1174,7 +525,7 @@ fn formula_agrees_modulo_versions(a: &trust_types::Formula, b: &trust_types::For
 }
 
 /// This VC's own violation core: the emitted body itself when the body IS the core
-/// ([`locate_violation`]), else — for the `expected == false` ASSERT shape, whose body
+/// (`locate_violation`), else — for the `expected == false` ASSERT shape, whose body
 /// is the BARE condition local — the core that local is BOUND to
 /// ([`assert_condition_binding`]). Both routes are the emitter's own construction; a
 /// body outside both declines. The `CoreRoute` says which one fired.
@@ -1182,25 +533,124 @@ fn formula_agrees_modulo_versions(a: &trust_types::Formula, b: &trust_types::For
 /// A `Not(Var c)` body is deliberately NOT admitted: there the violation is the
 /// COMPLEMENT of the binding, so the binding is not this obligation.
 ///
-/// Trust: THE BODY ROUTE IS A SHAPE MATCH (2026-07-31, round-6). The first route used
-/// to be `obligation_violation_leaf`, which DESCENDED the peeled body looking for the
-/// arm's core. That is the round-6 root cause and it is gone: see [`locate_violation`]
-/// for the four recipes (`div`, `rem`, `negation` and the bounds arm that shares this
-/// helper's discipline) it minted.
-fn assert_bound_or_body_core<'a>(
+/// The certified core from an ALREADY-AUTHENTICATED obligation `body` (the peel is
+/// deleted; `body` is always `&ObligationRecord::body`, admitted only after
+/// `reconstruct_obligation == formula`). Two routes, both the emitter's own construction:
+/// the body IS the core, or it is the bare `expected == false` assert-condition local
+/// whose MIR-confirmed binding ([`assert_condition_binding`]) is the core. A `Not(Var c)`
+/// body is deliberately NOT admitted: there the violation is the COMPLEMENT of the binding.
+/// The `CoreRoute` says which one fired.
+fn assert_bound_or_body_core_with<'a>(
     func: &trust_types::VerifiableFunction,
     formula: &'a trust_types::Formula,
+    body: &'a trust_types::Formula,
     is_core: &dyn Fn(&trust_types::Formula) -> bool,
 ) -> Option<(&'a trust_types::Formula, CoreRoute)> {
-    if let Some((core, _)) = locate_violation(formula, is_core) {
-        return Some((core, CoreRoute::Body));
+    if is_core(body) {
+        return Some((body, CoreRoute::Body));
     }
-    let cond = emitted_obligation_body(formula)?;
-    if formula_var_name(cond).is_none() {
+    if formula_var_name(body).is_none() {
         return None;
     }
-    let bound = assert_condition_binding(func, formula, cond)?;
+    let bound = assert_condition_binding(func, formula, body)?;
     is_core(bound).then_some((bound, CoreRoute::AssertCondition))
+}
+
+/// Trust: AUTHENTICATED-OBLIGATION RECONSTRUCTION (2026-07-31, the consumer half of the
+/// emitter's recorded [`trust_types::ObligationRecord`]). Replays every wrapper the
+/// emitter recorded — innermost-first — onto the recorded raw violation `body`. This is
+/// the CONSUMER's copy of the emitter's own wrapping loop, and it is the load-bearing
+/// authenticator: the recorded obligation is a CLAIM (the field is
+/// `Serialize`/`Deserialize` and a hostile fixture can set it to anything), admitted ONLY
+/// when `reconstruct_obligation(rec) == vc.formula` bit-for-bit, `#token` version stamps
+/// included. The closed wrapper vocabulary has NO `Implies`, NO `Not` and NO
+/// free-disjunct, so no wrapper-spelling decoy (`Or([core, decoy])`,
+/// `Implies(Not(decoy), core)`) can be reconstructed — a formula outside the vocabulary
+/// simply fails the equate and the consumer DECLINES (fail-closed; costs certificates,
+/// never soundness). Byte-identical to the producer-validated replay (28/28
+/// reconstructions over the committed `trust-vcgen` fixtures) and to the trust-ir twin
+/// `trustir_safety::reconstruct_obligation`.
+pub(super) fn reconstruct_obligation(
+    rec: &trust_types::ObligationRecord,
+) -> trust_types::Formula {
+    use trust_types::{Formula as F, ObligationWrapper as W, PathGuardTerm as P};
+    let mut cur = rec.body.clone();
+    for w in &rec.wrappers {
+        cur = match w {
+            W::ConjoinFactsLast { facts } => {
+                let mut v = facts.clone();
+                v.push(cur);
+                F::And(v)
+            }
+            W::PathGuardOr { paths } => {
+                let terms: Vec<F> = paths
+                    .iter()
+                    .map(|p| match p {
+                        P::Raw => cur.clone(),
+                        P::Guarded { guards } => {
+                            let mut c = guards.clone();
+                            match cur.clone() {
+                                F::And(inner) => c.extend(inner),
+                                other => c.push(other),
+                            }
+                            F::And(c)
+                        }
+                    })
+                    .collect();
+                match terms.len() {
+                    0 => cur,
+                    1 => terms.into_iter().next().expect("len checked == 1"),
+                    _ => F::Or(terms),
+                }
+            }
+        };
+    }
+    cur
+}
+
+/// Trust: THE VERTICAL-SLICE OBLIGATION GATE (2026-07-31, FIELD-REQUIRED). Every safety
+/// arm now certifies off the emitter's RECORDED obligation, admitted ONLY when it
+/// reconstructs to `vc.formula` bit-for-bit. The two dispositions the fail-closed contract
+/// requires:
+///
+///   * AUTHENTICATED — the emitter RECORDED an obligation and it AUTHENTICATES
+///     (`reconstruct_obligation(rec) == vc.formula`). The recorded body is what the arm
+///     certifies: a field read no wrapper spelling can fool, because the equate proves
+///     `vc.formula` IS that body wrapped by the closed vocabulary (no `Implies`, no `Not`,
+///     no free-disjunct ⇒ R17 is structurally closed).
+///   * DECLINE — NO obligation was recorded, OR one is recorded but does NOT reconstruct.
+///     Both fail closed: the PEEL IS GONE, so an unrecorded (legacy/unmigrated/unmodeled)
+///     obligation and a hostile/desynchronised claim alike decline. `None` return ⇒ no
+///     certificate, never a fallback that a benign `obligation` paired with a violable
+///     `formula` could slip through.
+///
+/// This REPLACES the former `ObligationSelection`/`select_obligation` three-way, whose
+/// `Peel` fallback existed only while producers were being migrated. All five remaining
+/// producers are migrated, so the fallback is deleted and the field is REQUIRED.
+fn authenticated_record(
+    vc: &trust_types::VerificationCondition,
+) -> Option<&trust_types::ObligationRecord> {
+    let rec = vc.obligation.as_ref()?;
+    (reconstruct_obligation(rec) == vc.formula).then_some(rec)
+}
+
+/// Whether the record's conjoined FACTS pin `term ≥ 0` — the authenticated replacement for
+/// the sibling-conjunct read the deleted peel used for the unsigned-overflow vacuity side
+/// condition. The emitter demoted each operand range to a `ConjoinFactsLast` wrapper
+/// (`generate/overflow_vc.rs` `v2_arith_overflow_seed_record`), which is INNERMOST and so
+/// shared across every path-guard disjunct: one check over the record's facts covers every
+/// occurrence the peel's universal used to quantify over, and it is read off the
+/// authenticated record rather than off a guessed sibling list.
+fn record_pins_nonneg(
+    rec: &trust_types::ObligationRecord,
+    term: &trust_types::Formula,
+) -> bool {
+    rec.wrappers.iter().any(|w| match w {
+        trust_types::ObligationWrapper::ConjoinFactsLast { facts } => {
+            has_nonneg_range_sibling(facts, term)
+        }
+        trust_types::ObligationWrapper::PathGuardOr { .. } => false,
+    })
 }
 
 /// Kernel-check that the LIVE grounding of `cg.core` (via `clean_ground::ground_prop`)
@@ -1312,100 +762,6 @@ fn has_nonneg_range_sibling(sibs: &[trust_types::Formula], term: &trust_types::F
     })
 }
 
-/// Trust: UNSIGNED-OVERFLOW VACUITY (2026-07-31, round-5 defects [5]/[6]; extended to
-/// unsigned-MUL in round-6) — whether the disjunct the unsigned-add / unsigned-mul
-/// certificate DISCARDS is provably unsatisfiable at every occurrence of the violation.
-///
-/// The emitter's unsigned-add violation is the two-disjunct
-/// `Or([Lt(a+b, 0), Gt(a+b, MAX)])` — `generate/overflow_vc.rs:459-465`, the `else` of
-/// the unsigned-`Sub` special case, so it is the shape BOTH the signed and the unsigned
-/// non-`Sub` arms build (unsigned MUL included, with `Mul` in place of `Add`); the
-/// emitter then wraps it as
-/// `And([range(lhs), range(rhs), out_of_range])` at `:467`, which is where the two
-/// sibling ranges this check reads come from. The pinned specs
-/// `uadd_overflows_uW` / `umul_overflows_uW` model the `Gt` half ONLY. Grounding that
-/// half alone certifies LESS than the VC states — a certificate about a strictly weaker
-/// proposition, which is the same defect class as certifying a hypothesis. It is sound
-/// EXACTLY WHEN the discarded `Lt(a∘b, 0)` half is unsatisfiable under the conjuncts the
-/// emitter puts beside the violation: `0 ≤ a` and `0 ≤ b`, its two unsigned operand
-/// ranges.
-///
-/// THIS LANE HAD NO SUCH SIDE CONDITION AT ALL. Before round 5 the unsigned-add arm took
-/// the `Gt` leaf out of the `Or` with the since-deleted `obligation_violation_leaf` and
-/// certified it, at EVERY uadd row — the honest ones included. The check is therefore not
-/// a narrowing of an existing defence; it is the defence, and it is the same one
-/// `trustir_safety.rs`'s uadd arm carries.
-///
-/// Trust: AND THE UNSIGNED-MUL ARM NOW SHARES IT (2026-07-31, round-6). Round 5 left the
-/// mul twin descending into the same `Or` with `obligation_violation_leaf` and recorded
-/// the gap; round 6 routes both arms through [`unsigned_overflow_over_disjunct`], which
-/// shape-matches the `Or` on the COLLAPSED body and calls this universal. That is why
-/// the name no longer says `uadd`.
-///
-/// A REJECTED OCCURRENCE FAILS, IT DOES NOT DROP. The universal ranges over every
-/// occurrence [`emitted_obligation_body_located`] visited, and an occurrence with NO
-/// sibling list — a RAW disjunct of a mixed path-guard `Or`, or a body that IS the whole
-/// formula — FAILS it. That is round-5 defects [5]/[6] stated as code: a path with no
-/// vacuity evidence must not be excluded from the quantifier it cannot satisfy. The
-/// empty occurrence list fails too (`!occurrences.is_empty()`), so the universal can
-/// never pass vacuously.
-///
-/// COST: zero, at BOTH arms. All 114 unsigned-add and all 51 unsigned-mul certificates
-/// over `crates/trust-clean/fixtures` carry the `Or([Lt(a∘b,0), Gt(a∘b,MAX)])` shape and
-/// satisfy this condition at every occurrence — the census's `uadd={Or2-Lt0: 114}` and
-/// `umul={Or2-Lt0: 51}` lines, re-run in this tree after the round-6 change with
-/// `certs=635` unchanged.
-///
-/// MEASUREMENT COMMAND, stated rather than transcribed (2026-07-31). Every cost number
-/// in this file comes from `obligation_region_tests::mirsem_corpus_census`, an
-/// `#[ignore]`d harness that walks every committed dump under
-/// `crates/trust-clean/fixtures` (2330 files, 2326 of which deserialize into a
-/// `VerifiableFunction`), drives `trust_vcgen::generate_vcs` on each, and tallies
-/// `safety_vc_is_faithful_formula_aware` per VC and `function_safety_vcs_faithful` per
-/// function. It ASSERTS the numbers below, so they cannot rot silently:
-///
-/// ```text
-/// cd crates && RUSTC_BOOTSTRAP=1 cargo test --offline \
-///   -p trust-clean --lib -- --ignored --nocapture mirsem_corpus_census
-/// ```
-///
-/// PRE (this tree, before the round-5 fixes), POST-round-5 and POST-round-6 are all
-/// IDENTICAL: `funcs=2326 safety=772 certs=635 fn_certified=286`, the same 28-entry
-/// per-kind table, `neg=12/12 (assert route 7)`, `bounds=68/33 signed_body=0`,
-/// `uadd={Or2-Lt0: 114}`, `umul={Or2-Lt0: 51}`. The round-6 run was taken in this tree
-/// with the command above.
-///
-/// Trust: A FALSE "IN BOTH LANES" CORRECTED (2026-07-31, round-6 item F5). The text that
-/// stood here said the unguarded unsigned-mul shape was open "IN BOTH LANES". That was
-/// FALSE and it was a transcription, not a measurement: `trustir_safety.rs` has no
-/// unsigned-mul arm AT ALL, so the shape cannot be open there. RE-RUN in this tree on
-/// 2026-07-31, from `crates/`:
-///
-/// ```text
-/// grep -c 'umul\|UMul\|UnsignedMul' trust-clean/src/trustir_safety.rs   # 0
-/// ```
-///
-/// What is true is narrower and is the reason the gap survived round 5: the mul twin was
-/// deferred because the round-5 defect list named uadd only, and a single-lane fix looked
-/// like the asymmetry that had already made this defect recur. Round 6's F1 closes it on
-/// the lane that HAS the arm; there is no counterpart to match on the other lane, and
-/// that is a fact about the arm's existence rather than a matched deferral.
-fn discarded_negative_disjunct_is_vacuous(
-    occurrences: &[BodyOccurrence<'_>],
-    a_op: &trust_types::Formula,
-    b_op: &trust_types::Formula,
-) -> bool {
-    !occurrences.is_empty()
-        && occurrences.iter().all(|o| match o.siblings {
-            Some(sibs) => {
-                has_nonneg_range_sibling(sibs, a_op) && has_nonneg_range_sibling(sibs, b_op)
-            }
-            // No sibling conjuncts at this occurrence ⇒ no vacuity evidence for THIS
-            // path ⇒ FAIL the universal (never drop out of it).
-            None => false,
-        })
-}
-
 /// Trust: THE UNSIGNED-OVERFLOW BODY, SHAPE-MATCHED (2026-07-31, round-6) — the
 /// load-bearing `Gt(a∘b, MAX)` disjunct of an unsigned add/mul obligation, taken from
 /// the COLLAPSED body rather than searched for inside it.
@@ -1434,8 +790,8 @@ fn discarded_negative_disjunct_is_vacuous(
 /// descend and certify.
 fn unsigned_overflow_over_disjunct<'a>(
     body: &'a trust_types::Formula,
-    occurrences: &[BodyOccurrence<'a>],
     head: &dyn Fn(&trust_types::Formula) -> bool,
+    vacuous: &dyn Fn(&trust_types::Formula, &trust_types::Formula) -> bool,
 ) -> Option<&'a trust_types::Formula> {
     use trust_types::Formula as F;
     match body {
@@ -1455,7 +811,7 @@ fn unsigned_overflow_over_disjunct<'a>(
                 return None;
             }
             let (a_op, b_op) = binop_operands(over_t)?;
-            discarded_negative_disjunct_is_vacuous(occurrences, a_op, b_op).then_some(gt)
+            vacuous(a_op, b_op).then_some(gt)
         }
         _ => None,
     }
@@ -1616,17 +972,26 @@ pub(super) fn safety_vc_is_faithful_formula_aware(
             // the tree before this change: a body of `Or([Ge(i, len), Gt(z, 5)])` —
             // strictly weaker than `idx_oob len i` — minted `Some(Bounds)`, and so did
             // every blacklisted decoy wrapped in the same disjunction. The predicate is
-            // now asked about the COLLAPSED body ([`locate_violation`]) and that recipe
+            // now asked about the COLLAPSED body (`locate_violation`) and that recipe
             // returns `None`, which is what the trust-ir lane has always returned.
-            let body = emitted_obligation_body(&vc.formula)?;
-            if carries_signed_index_violation(body) {
+            // Trust: AUTHENTICATED OBLIGATION (2026-07-31, FIELD-REQUIRED). The bounds core
+            // is the emitter's RECORDED body (`v2_build_bounds_assert_vc`'s `Ge(i, len)` /
+            // signed `Or([Lt(i,0), Ge(i,len)])`, block-defs demoted to `ConjoinFactsLast`),
+            // admitted only when it reconstructs to `vc.formula`. No peel: an unrecorded or
+            // unfaithful obligation declines. The signed `Or` form and the bare
+            // assert-condition body fail the `Ge` shape below and decline (the signed shape
+            // is the declined kind gap, unchanged).
+            let rec = authenticated_record(vc)?;
+            let leaf = &rec.body;
+            if carries_signed_index_violation(leaf) {
                 return None;
             }
-            let (leaf, _) = locate_violation(&vc.formula, &|f| {
-                matches!(f, F::Ge(a, b)
-                    if formula_var_name(a).is_some()
-                        && (formula_var_name(b).is_some() || matches!(&**b, F::Int(_))))
-            })?;
+            if !matches!(leaf, F::Ge(a, b)
+                if formula_var_name(a).is_some()
+                    && (formula_var_name(b).is_some() || matches!(&**b, F::Int(_))))
+            {
+                return None;
+            }
             let F::Ge(i_f, len_f) = leaf else { return None };
             let i_name = formula_var_name(i_f)?;
             // Bind the index at bvar 0; the length VARIABLE (if any) at bvar 1.
@@ -1662,7 +1027,7 @@ pub(super) fn safety_vc_is_faithful_formula_aware(
             // whose own obligation is `Var("_4", Bool)`).
             //
             // Trust: THE BODY IS SHAPE-MATCHED, NOT SEARCHED (2026-07-31, round-6 F1).
-            // [`assert_bound_or_body_core`]'s first route used to descend the peeled
+            // `assert_bound_or_body_core`'s first route used to descend the peeled
             // body. MEASURED before this change: a body of `Or([Eq(b, 0), Gt(z, 5)])`
             // minted `Some(DivByZero)` / `Some(RemByZero)` for an obligation that says
             // only `b = 0 ∨ z > 5`. The assert route is untouched — it resolves the bare
@@ -1671,7 +1036,14 @@ pub(super) fn safety_vc_is_faithful_formula_aware(
             let is_core = |f: &F| {
                 matches!(f, F::Eq(a, b) if formula_var_name(a).is_some() && matches!(&**b, F::Int(0)))
             };
-            let (leaf, _) = assert_bound_or_body_core(func, &vc.formula, &is_core)?;
+            // Trust: AUTHENTICATED OBLIGATION (2026-07-31, vertical slice ARM 1). Read the
+            // emitter's RECORDED obligation body instead of guessing it out of the wrapped
+            // formula. `Authenticated` ⇒ `reconstruct_obligation == vc.formula`, so the
+            // recorded body is provably `vc.formula`'s own core; `Peel` ⇒ no record
+            // (legacy dumps / unmigrated producers), fall back to the peel; `Decline` ⇒ a
+            // recorded-but-unfaithful (hostile) claim ⇒ fail closed, never peel.
+            let rec = authenticated_record(vc)?;
+            let (leaf, _) = assert_bound_or_body_core_with(func, &vc.formula, &rec.body, &is_core)?;
             let F::Eq(b_f, _) = leaf else { return None };
             let b_name = formula_var_name(b_f)?;
             let params = debruijn_params(&[b_name]);
@@ -1723,7 +1095,12 @@ pub(super) fn safety_vc_is_faithful_formula_aware(
             // bridge, zero binders). UNSIGNED amounts only for the literal arm (a
             // signed literal amount would need the `Or` core located at a literal too —
             // not observed in real MIR, fail-closed).
-            let core = emitted_obligation_body(&vc.formula)?;
+            // Trust: AUTHENTICATED OBLIGATION (2026-07-31, FIELD-REQUIRED). The shift core
+            // is the emitter's RECORDED body (`v2_shift_overflow_seed_record`: atomic
+            // `Ge(n,W)` / signed `Or([Lt(n,0), Ge(n,W)])`, `shift_range` demoted to a
+            // `ConjoinFactsLast` fact), admitted only when it reconstructs to `vc.formula`.
+            let rec = authenticated_record(vc)?;
+            let core = &rec.body;
             let (n_f, threshold, signed_form) = shift_violation_shape(core)?;
             // The emitted violation's FORM must agree with the VC's own `shift_ty`: a
             // signed amount emits the `Or([Lt(n,0), Ge(n,W)])` disjunction, an unsigned
@@ -1784,6 +1161,26 @@ pub(super) fn safety_vc_is_faithful_formula_aware(
             // the emitted threshold and from the region-selected body alone, and the
             // kind cross-check this arm CAN make is signedness, which it makes above.
             let w = ShiftWidth::from_bits(u32::try_from(threshold).ok()?)?;
+            // Trust: (D)/(E) AUTHENTICATED SUBJECT/WIDTH (2026-07-31, the [10] fix). The
+            // record carries the TRUE shifted-operand width (threaded from MIR by the
+            // emitter, NOT the fabricated `operand_ty`) and the shift amount as its subject.
+            // The recorded width must equal the emitted threshold `W` — which the emitter
+            // records as exactly that true shifted width — and a recorded plain-`Var`
+            // subject must name the shift amount. This is the width cross-check the peel era
+            // deliberately left open, now closed by the recorded MIR authority; a mismatch
+            // is a desynchronised record ⇒ fail closed.
+            if let Some(rec_w) = rec.width {
+                if i128::from(rec_w) != threshold {
+                    return None;
+                }
+            }
+            if let Some(rec_subject) = rec.subject.as_ref() {
+                if let (Some(rs), Some(ns)) = (base_var_name(rec_subject), base_var_name(n_f)) {
+                    if rs != ns {
+                        return None;
+                    }
+                }
+            }
             // Trust: M6 rung 6 — the CLOSED-LITERAL amount arm (unsigned only).
             if let F::Int(k) = n_f {
                 if amount_signed {
@@ -1846,10 +1243,21 @@ pub(super) fn safety_vc_is_faithful_formula_aware(
                     // copies the discipline outward and the match itself is now the
                     // shared [`unsigned_overflow_over_disjunct`], which the unsigned-MUL
                     // arm calls with `F::Mul` in place of `F::Add`.
-                    let (body, occurrences) = emitted_obligation_body_located(&vc.formula)?;
-                    let leaf = unsigned_overflow_over_disjunct(body, &occurrences, &|t| {
-                        matches!(t, F::Add(_, _))
-                    })?;
+                    // Trust: AUTHENTICATED OBLIGATION (2026-07-31, FIELD-REQUIRED). The
+                    // out-of-range core is the emitter's RECORDED body
+                    // (`Or([Lt(a+b,0), Gt(a+b,MAX)])`, operand ranges demoted to
+                    // `ConjoinFactsLast`), admitted only when it reconstructs to
+                    // `vc.formula`. The vacuity of the discarded `Lt(a+b,0)` half — which
+                    // makes the `Gt`-only spec adequate — is checked against the record's
+                    // own conjoined operand ranges ([`record_pins_nonneg`]), the innermost
+                    // wrapper shared across every path, so the peel's occurrence-universal
+                    // collapses to one authenticated check.
+                    let rec = authenticated_record(vc)?;
+                    let leaf = unsigned_overflow_over_disjunct(
+                        &rec.body,
+                        &|t| matches!(t, F::Add(_, _)),
+                        &|a, b| record_pins_nonneg(rec, a) && record_pins_nonneg(rec, b),
+                    )?;
                     let F::Gt(add_t, max_f) = leaf else { return None };
                     let (a_op, b_op) = binop_operands(add_t)?;
                     let F::Int(max) = &**max_f else { return None };
@@ -1867,6 +1275,15 @@ pub(super) fn safety_vc_is_faithful_formula_aware(
                     // width-from-formula arms.
                     if overflow_vc_modeled_width(&vc.kind) != Some(w) {
                         return None;
+                    }
+                    // Trust: (E) AUTHENTICATED WIDTH (2026-07-31). The record carries the
+                    // REAL operand width (`int_op_type`, not `min(wa,wb)`); it must equal the
+                    // width recovered from the emitted `MAX` threshold. Fail closed on
+                    // mismatch.
+                    if let Some(rec_w) = rec.width {
+                        if rec_w != w.bits() {
+                            return None;
+                        }
                     }
                     let name = uadd_overflows_name(w);
                     let ok = overflow_family_live_def_eq(leaf, &[a_op, b_op], &|ops| {
@@ -1908,16 +1325,21 @@ pub(super) fn safety_vc_is_faithful_formula_aware(
                     // W8))` for an obligation stating the disjunction OR `z > 5`. Asking
                     // the SAME predicate about the COLLAPSED body declines it: the outer
                     // `Or` has two disjuncts but its first is not an `Lt`.
-                    let (or, _) = locate_violation(&vc.formula, &|f| match f {
-                        F::Or(v) if v.len() == 2 => {
-                            let lt_min = matches!(&v[0], F::Lt(l, r)
-                                if binop_operands(l).is_some() && matches!(&**r, F::Int(_)));
-                            let gt_max = matches!(&v[1], F::Gt(l, r)
-                                if binop_operands(l).is_some() && matches!(&**r, F::Int(_)));
-                            lt_min && gt_max
-                        }
-                        _ => false,
-                    })?;
+                    // Trust: AUTHENTICATED OBLIGATION (2026-07-31, FIELD-REQUIRED). The
+                    // out-of-range core is the emitter's RECORDED body
+                    // (`Or([Lt(a∘b,MIN), Gt(a∘b,MAX)])`, operand ranges demoted to
+                    // `ConjoinFactsLast`), admitted only when it reconstructs to
+                    // `vc.formula`.
+                    let rec = authenticated_record(vc)?;
+                    let or = &rec.body;
+                    if !matches!(or, F::Or(v) if v.len() == 2
+                        && matches!(&v[0], F::Lt(l, r)
+                            if binop_operands(l).is_some() && matches!(&**r, F::Int(_)))
+                        && matches!(&v[1], F::Gt(l, r)
+                            if binop_operands(l).is_some() && matches!(&**r, F::Int(_))))
+                    {
+                        return None;
+                    }
                     let F::Or(v) = or else { return None };
                     let (F::Lt(under_t, min_f), F::Gt(over_t, max_f)) = (&v[0], &v[1]) else {
                         return None;
@@ -1955,6 +1377,15 @@ pub(super) fn safety_vc_is_faithful_formula_aware(
                     if !mixed_width_narrowing_is_justified(&vc.kind, a_op, b_op) {
                         return None;
                     }
+                    // Trust: (E) AUTHENTICATED WIDTH (2026-07-31). The record carries the
+                    // REAL operand width (`int_op_type`, the signed mixed-width fix — NOT
+                    // `min(wa,wb)`); it must equal the width recovered from the emitted
+                    // `(MIN,MAX)`. Fail closed on mismatch.
+                    if let Some(rec_w) = rec.width {
+                        if rec_w != w.bits() {
+                            return None;
+                        }
+                    }
                     let name = signed_overflows_name(sop, w);
                     let ok = overflow_family_live_def_eq(or, &[a_op, b_op], &|ops| {
                         Expr::apps(cst(&name), [ops[0].clone(), ops[1].clone()])
@@ -1985,16 +1416,30 @@ pub(super) fn safety_vc_is_faithful_formula_aware(
                     // special case, which is the ONE arm that does not build the
                     // two-disjunct `Or` — so requiring the collapsed body to BE it costs
                     // nothing: all 188 corpus certificates keep theirs.
-                    let (leaf, _) = locate_violation(&vc.formula, &|f| match f {
-                        F::Lt(lhs, rhs) => {
-                            matches!(&**lhs, F::Sub(_, _))
-                                && binop_operands(lhs).is_some()
-                                && matches!(&**rhs, F::Int(0))
-                        }
-                        _ => false,
-                    })?;
+                    // Trust: AUTHENTICATED OBLIGATION (2026-07-31, FIELD-REQUIRED). The
+                    // underflow core is the emitter's RECORDED body (the unsigned-`Sub`
+                    // special case's bare `Lt(a-b, 0)`, operand ranges demoted to
+                    // `ConjoinFactsLast`), admitted only when it reconstructs to
+                    // `vc.formula`.
+                    let rec = authenticated_record(vc)?;
+                    let leaf = &rec.body;
+                    if !matches!(leaf, F::Lt(lhs, rhs)
+                        if matches!(&**lhs, F::Sub(_, _))
+                            && binop_operands(lhs).is_some()
+                            && matches!(&**rhs, F::Int(0)))
+                    {
+                        return None;
+                    }
                     let F::Lt(sub_t, _) = leaf else { return None };
                     let (a_op, b_op) = binop_operands(sub_t)?;
+                    // Trust: (E) AUTHENTICATED WIDTH (2026-07-31). The width names the
+                    // per-kind tally bucket (the `0` threshold carries none); the recorded
+                    // REAL operand width must equal the VC kind's. Fail closed on mismatch.
+                    if let Some(rec_w) = rec.width {
+                        if rec_w != w.bits() {
+                            return None;
+                        }
+                    }
                     let name = usub_underflows_name(w);
                     let ok = overflow_family_live_def_eq(leaf, &[a_op, b_op], &|ops| {
                         Expr::apps(cst(&name), [ops[0].clone(), ops[1].clone()])
@@ -2041,10 +1486,19 @@ pub(super) fn safety_vc_is_faithful_formula_aware(
                     // arm's own matcher, with `F::Mul` for `F::Add`. COST: zero — all 51
                     // corpus certificates carry the `Or2-Lt0` shape and satisfy the
                     // vacuity condition, so `certs=635` is unchanged.
-                    let (body, occurrences) = emitted_obligation_body_located(&vc.formula)?;
-                    let leaf = unsigned_overflow_over_disjunct(body, &occurrences, &|t| {
-                        matches!(t, F::Mul(_, _))
-                    })?;
+                    // Trust: AUTHENTICATED OBLIGATION (2026-07-31, FIELD-REQUIRED). The
+                    // out-of-range core is the emitter's RECORDED body
+                    // (`Or([Lt(a*b,0), Gt(a*b,MAX)])`, operand ranges demoted to
+                    // `ConjoinFactsLast`), admitted only when it reconstructs to
+                    // `vc.formula`. Vacuity of the discarded half is checked against the
+                    // record's own conjoined ranges, exactly as the unsigned-add twin. A
+                    // `var*var` BV mul records no such body ⇒ declines (honest deferral).
+                    let rec = authenticated_record(vc)?;
+                    let leaf = unsigned_overflow_over_disjunct(
+                        &rec.body,
+                        &|t| matches!(t, F::Mul(_, _)),
+                        &|a, b| record_pins_nonneg(rec, a) && record_pins_nonneg(rec, b),
+                    )?;
                     let F::Gt(mul_t, max_f) = leaf else { return None };
                     let (a_op, b_op) = binop_operands(mul_t)?;
                     let F::Int(max) = &**max_f else { return None };
@@ -2054,6 +1508,14 @@ pub(super) fn safety_vc_is_faithful_formula_aware(
                     // with body `Gt(a*b, 255)` minted `Some(UnsignedMulOverflow(W8))`.
                     if umul_overflow_vc_modeled(&vc.kind) != Some(w) {
                         return None;
+                    }
+                    // Trust: (E) AUTHENTICATED WIDTH (2026-07-31). Recorded REAL operand
+                    // width must equal the width recovered from the emitted `MAX`. Fail
+                    // closed on mismatch.
+                    if let Some(rec_w) = rec.width {
+                        if rec_w != w.bits() {
+                            return None;
+                        }
                     }
                     let name = umul_overflows_name(w);
                     let ok = overflow_family_live_def_eq(leaf, &[a_op, b_op], &|ops| {
@@ -2092,11 +1554,17 @@ pub(super) fn safety_vc_is_faithful_formula_aware(
                 _ => false,
             };
             // Trust: THE BODY IS SHAPE-MATCHED, NOT SEARCHED (2026-07-31, round-6 F1).
-            // [`assert_bound_or_body_core`]'s body route used to descend the peeled body,
+            // `assert_bound_or_body_core`'s body route used to descend the peeled body,
             // so the DECOY `Or([Eq(x, -128), Gt(z, 5)])` — an obligation stating strictly
             // less than `neg_overflows_i8 x` — located the `Eq` and minted
             // `Some(NegationOverflow(W8))`. MEASURED before this change; `None` after.
-            let (leaf, route) = assert_bound_or_body_core(func, &vc.formula, &is_core)?;
+            // Trust: AUTHENTICATED OBLIGATION (2026-07-31, vertical slice ARM 2). Same
+            // three-way gate as div/rem (ARM 1): the recorded body REPLACES the peel when
+            // it authenticates (`reconstruct_obligation == vc.formula`), the peel is the
+            // legacy fallback when nothing is recorded, and a recorded-but-unfaithful claim
+            // fails closed. The subject/width are additionally cross-checked below.
+            let rec = authenticated_record(vc)?;
+            let (leaf, route) = assert_bound_or_body_core_with(func, &vc.formula, &rec.body, &is_core)?;
             let F::Eq(x_f, min_f) = leaf else { return None };
             if formula_var_name(x_f).is_none() {
                 return None;
@@ -2181,6 +1649,32 @@ pub(super) fn safety_vc_is_faithful_formula_aware(
                 let (asserted_name, asserted_ty) = assert_negation_subject(func)?;
                 if asserted_name != subject || asserted_ty != subject_ty {
                     return None;
+                }
+            }
+            // Trust: THE RECORDED SUBJECT/WIDTH ARE AUTHENTICATED TOO (2026-07-31,
+            // vertical-slice design (D)/(E)). When the emitter recorded an obligation (the
+            // `Authenticated` branch above — `vc.obligation` is `Some` and reconstructed
+            // to `vc.formula`), its `subject`/`width` are CLAIMS, cross-checked here against
+            // the values MIR and the authenticated body already fixed: the recorded width
+            // must equal the width proven above (which came from the MIR subject type, the
+            // [10]-class authority, NOT the body literal alone), and the recorded subject —
+            // when it is a plain operand `Var` — must name the certified variable. A
+            // mismatch is a desynchronised/hostile record ⇒ fail closed. These run only on
+            // the `Some` path (the `Peel` fallback carries no record), so no legacy row is
+            // affected; the arm's own soundness rests on the MIR checks above, and this is
+            // the recorded field being consumed rather than trusted.
+            if let Some(rec) = vc.obligation.as_ref() {
+                if let Some(rec_w) = rec.width {
+                    if rec_w != w.bits() {
+                        return None;
+                    }
+                }
+                if let Some(rec_subject) = rec.subject.as_ref() {
+                    if let Some(rec_subject_name) = base_var_name(rec_subject) {
+                        if rec_subject_name != subject {
+                            return None;
+                        }
+                    }
                 }
             }
             let name = neg_overflows_name(w);

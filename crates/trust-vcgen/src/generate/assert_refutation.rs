@@ -1035,6 +1035,7 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
             location: span.clone(),
             formula,
             contract_metadata: None,
+            obligation: None,
         });
     }
     // verifier-perf (mid-generation work-bound): a function whose VC-gen tripped the work
@@ -1435,6 +1436,7 @@ pub(super) fn contract_panic_unused_vcs(func: &VerifiableFunction) -> Vec<Verifi
             location: func.span.clone(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         })
         .collect()
 }

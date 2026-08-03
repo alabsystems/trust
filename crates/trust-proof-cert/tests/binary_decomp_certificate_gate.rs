@@ -152,6 +152,7 @@ fn serializable_vc(function: &str) -> SerializableVc {
         location: SourceSpan::binary_address(0x401010),
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     }
 }
 

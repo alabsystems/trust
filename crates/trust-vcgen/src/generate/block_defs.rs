@@ -345,6 +345,22 @@ pub(super) fn v2_formula_with_block_defs_at_point(
     end: usize,
     formula: Formula,
 ) -> Formula {
+    v2_formula_with_block_defs_at_point_recorded(func, block, end, formula).0
+}
+
+/// As [`v2_formula_with_block_defs_at_point`], but also returns the pieces the
+/// authenticated-obligation recorder needs: the terminal-versioned `body` (the raw
+/// violation as it appears INSIDE the returned formula) and the block-defs KEPT (in
+/// conjoin order). Trust: seeding `ObligationRecord.body = renamed_body` and
+/// `wrappers = [ConjoinFactsLast { facts: kept }]` (omitted when `kept` is empty)
+/// reconstructs the returned formula bit-for-bit — the body is recorded at the
+/// point the emitter builds it, NOT re-parsed from the finished formula.
+pub(super) fn v2_formula_with_block_defs_at_point_recorded(
+    func: &VerifiableFunction,
+    block: &trust_types::BasicBlock,
+    end: usize,
+    formula: Formula,
+) -> (Formula, Formula, Vec<Formula>) {
     let sv = StmtVersionCtx::build(func);
     let body = version_rename_at(&formula, &sv, func, block.id, end);
     // Trust (ARM-B): the VERSIONED extract keeps pure place-read defs across a
@@ -368,7 +384,8 @@ pub(super) fn v2_formula_with_block_defs_at_point(
         .into_iter()
         .map(|d| version_block_def_at_establish(&sv, func, block, end, d))
         .collect();
-    combine_relevant_block_defs(defs, body)
+    let (combined, kept) = combine_relevant_block_defs_recorded(defs, body.clone());
+    (combined, body, kept)
 }
 
 /// The place name a block-definition fact DEFINES: the top-level lhs of an `Eq`
@@ -663,9 +680,18 @@ pub(super) fn v2_formula_with_block_defs_before_stmt(
 ///
 /// This is a sound optimization: dropping conjuncts that share no variables with
 /// the rest of the formula cannot change satisfiability.
-pub(super) fn combine_relevant_block_defs(defs: Vec<Formula>, formula: Formula) -> Formula {
+/// Attach the relevant block-defs AND return the ones KEPT, in the exact order they
+/// are conjoined (before `formula`). Trust: the
+/// authenticated-obligation recorder seeds a `ConjoinFactsLast { facts: kept }`
+/// wrapper from this so `reconstruct(body, [wrapper]) == And([kept.., body])`
+/// reproduces the combined formula bit-for-bit. An empty `kept` means the combined
+/// formula IS `formula` unchanged (no wrapper is recorded).
+pub(super) fn combine_relevant_block_defs_recorded(
+    defs: Vec<Formula>,
+    formula: Formula,
+) -> (Formula, Vec<Formula>) {
     if defs.is_empty() {
-        return formula;
+        return (formula, Vec::new());
     }
 
     let mut needed: FxHashSet<String> = FxHashSet::default();
@@ -689,12 +715,13 @@ pub(super) fn combine_relevant_block_defs(defs: Vec<Formula>, formula: Formula) 
     }
 
     if keep_rev.is_empty() {
-        return formula;
+        return (formula, Vec::new());
     }
 
-    let mut conjuncts: Vec<Formula> = keep_rev.into_iter().rev().collect();
+    let kept: Vec<Formula> = keep_rev.into_iter().rev().collect();
+    let mut conjuncts: Vec<Formula> = kept.clone();
     conjuncts.push(formula);
-    Formula::And(conjuncts)
+    (Formula::And(conjuncts), kept)
 }
 
 pub(super) fn collect_formula_var_names(formula: &Formula, out: &mut FxHashSet<String>) {

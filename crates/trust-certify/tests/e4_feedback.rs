@@ -18,6 +18,7 @@ fn e4_vc(kind: VcKind, formula: Formula) -> VerificationCondition {
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation: None,
     }
 }
 

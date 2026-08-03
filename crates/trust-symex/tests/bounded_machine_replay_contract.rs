@@ -736,6 +736,7 @@ fn checked_in_x86_64_load_replay_input(
             location: SourceSpan::binary_address(X86_64_LOAD_ENTRY),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         })
         .require_selected_image_identity()
 }

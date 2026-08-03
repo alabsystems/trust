@@ -2969,9 +2969,11 @@ mod tests {
         .expect_err("oversized output must fail closed");
         assert!(error.contains("output exceeded"), "{error}");
 
+        // Pins the deadline machinery, so it states the deadline exactly rather
+        // than letting the harness stretch its own fixture bound.
         let mut nonterminating = Command::new("sh");
         nonterminating.args(["-c", "while :; do :; done"]);
-        let error = bounded_process::output(
+        let error = bounded_process::output_with_exact_deadline(
             &mut nonterminating,
             "timeout fixture",
             64 * 1024,

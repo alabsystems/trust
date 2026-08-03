@@ -247,6 +247,7 @@ impl SendSyncChecker {
                     location: v.span.clone(),
                     formula: Formula::Bool(false), // violation => unsatisfiable
                     contract_metadata: None,
+                    obligation: None,
                 }
             })
             .collect()
@@ -375,6 +376,7 @@ impl DataRaceDetector {
                     location: race.access1.span.clone(),
                     formula: Formula::Bool(false),
                     contract_metadata: None,
+                    obligation: None,
                 }
             })
             .collect()
@@ -435,6 +437,7 @@ fn check_atomic_ordering(function: &str, atomics: &[AtomicOp]) -> Vec<Verificati
                 location: op.span.clone(),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             });
         }
 
@@ -451,6 +454,7 @@ fn check_atomic_ordering(function: &str, atomics: &[AtomicOp]) -> Vec<Verificati
                 location: op.span.clone(),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             });
         }
     }

@@ -224,6 +224,13 @@ pub fn native_verification_bundle_from_module(
             options: TrustVcRequestOptions::default(),
             diagnostics: NativeDiagnosticsPolicy::default(),
             provenance,
+            // Correct BY CONSTRUCTION, not by convention: every obligation in
+            // this module is checked against `function` in
+            // `obligation_sources_for_module`, which returns
+            // ObligationFunctionMismatch and aborts the builder before the
+            // ownership split below. `trust_vc_obligations` is a pure filter
+            // over that same set, so it cannot contain a foreign function.
+            function: Some(function),
         };
         let evidence_bundle =
             trust_vc_request_has_only_clean_cic_certificates(&bundle.module, &request)

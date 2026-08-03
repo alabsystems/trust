@@ -278,6 +278,7 @@ fn emit_bundle(func: &VerifiableFunction) -> Option<Vec<VerificationCondition>> 
         location: func.span.clone(),
         formula,
         contract_metadata: None,
+        obligation: None,
     };
     let mut vcs = Vec::new();
     let e_name = crate::place_to_var_name(func, &Place::local(PAYLOAD_LOCAL));
@@ -933,6 +934,7 @@ fn emit_loop_sim(
         location: loop_fn.span.clone(),
         formula,
         contract_metadata: None,
+        obligation: None,
     };
     let mut vcs = Vec::new();
     let mut equations = Vec::new();

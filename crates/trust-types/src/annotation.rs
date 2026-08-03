@@ -464,6 +464,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let failed_vc = VerificationCondition {
             kind: VcKind::DivisionByZero,
@@ -477,6 +478,7 @@ mod tests {
             },
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
 
         let results = vec![

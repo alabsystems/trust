@@ -432,9 +432,11 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
         let serializable_vc = SerializableVc::from_vc(&vc);
-        let canonical_vc = serde_json::to_vec(&serializable_vc).expect("serialize VC");
+        let canonical_vc = crate::verify_binary_evidence::canonical_vc_bytes(&serializable_vc)
+            .expect("serialize VC");
         let dispatch = SolverDispatchRecord {
             id: "external-checker-fixture:vc0".to_string(),
             function: Some("main".to_string()),

@@ -581,12 +581,27 @@ pub fn augment_vc_with_abstract_state(
         return vc.clone();
     }
 
+    // The augmentation is a single body-LAST conjoin `And([env_formula, formula])`,
+    // i.e. exactly a `ConjoinFactsLast { facts: [env_formula] }` wrapper. Extend the
+    // recorded obligation with it (rather than dropping it) so a sliced div/rem/neg
+    // VC stays authenticatable on the discharge path too: replaying the extra
+    // wrapper reproduces the augmented formula. It is the LAST transformation (post
+    // the safety pass's normalize), so no further rename/normalize applies. VCs
+    // without an obligation are unaffected.
+    let obligation = vc.obligation.as_ref().map(|rec| {
+        let mut rec = rec.clone();
+        rec.wrappers.push(trust_types::ObligationWrapper::ConjoinFactsLast {
+            facts: vec![env_formula.clone()],
+        });
+        rec
+    });
     VerificationCondition {
         kind: vc.kind.clone(),
         function: vc.function,
         location: vc.location.clone(),
         formula: Formula::And(vec![env_formula, vc.formula.clone()]),
         contract_metadata: vc.contract_metadata,
+        obligation,
     }
 }
 

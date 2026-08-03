@@ -500,6 +500,7 @@ mod tests {
             },
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -1041,6 +1042,7 @@ mod tests {
             },
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
 
         let cert = generate_certificate_record(&func, &[(vc, proved_result())])

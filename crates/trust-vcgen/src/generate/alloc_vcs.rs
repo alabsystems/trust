@@ -304,6 +304,7 @@ pub(super) fn generate_unbounded_allocation_vcs(func: &VerifiableFunction) -> Ve
             location: span.clone(),
             formula,
             contract_metadata: None,
+            obligation: None,
         });
     }
     vcs
@@ -590,6 +591,10 @@ pub(super) fn generate_v2_rvalue_safety_vcs_impl(
         if let Some(facts) = range_yield_guards.get(block_id)
             && !facts.is_empty()
         {
+            // Trust (bounds ARM, GAP 1): mirror the `And([facts.., body])` conjoin onto
+            // the recorded obligation as a `ConjoinFactsLast` wrapper (no-op when the VC
+            // carries no obligation), so `{body, wrappers}` still replays to `formula`.
+            ob_record_conjoin(vc, facts);
             let mut conjuncts = facts.clone();
             conjuncts.push(vc.formula.clone());
             vc.formula = Formula::And(conjuncts);
@@ -600,6 +605,7 @@ pub(super) fn generate_v2_rvalue_safety_vcs_impl(
         if let Some(facts) = slice_iter_yield_guards.get(block_id)
             && !facts.is_empty()
         {
+            ob_record_conjoin(vc, facts);
             let mut conjuncts = facts.clone();
             conjuncts.push(vc.formula.clone());
             vc.formula = Formula::And(conjuncts);
@@ -623,31 +629,70 @@ pub(super) fn generate_v2_rvalue_safety_vcs_impl(
         let empty = FxHashSet::default();
         for (block_id, vc) in &mut block_vcs {
             let killed = may_reassigned.get(block_id).unwrap_or(&empty);
-            vc.formula = conjoin_preconditions_versioned(
+            // Trust (bounds ARM, GAP 1): use the recorded variant so we can mirror the
+            // whole-formula version rename onto the recorded body/subject/wrappers, THEN
+            // record the filtered preconditions as an outer `ConjoinFactsLast` — exactly
+            // as `generate_v2_safety_vcs` does for the arithmetic/negation arms.
+            let (new_formula, conjoined) = conjoin_preconditions_versioned_recorded(
                 func,
                 *block_id,
                 &func.preconditions,
                 killed,
                 vc.formula.clone(),
             );
+            vc.formula = new_formula;
+            if vc.obligation.is_some() {
+                let terminal = func
+                    .body
+                    .blocks
+                    .get(block_id.0)
+                    .filter(|b| b.id == *block_id)
+                    .map_or(0, |b| b.stmts.len());
+                ob_record_rename_at(vc, &sv, func, *block_id, terminal);
+                ob_record_conjoin(vc, &conjoined);
+            }
         }
     }
 
     // Trust S2c (exemption): path guards + semantic guards conjoined AFTER the rename.
     for (block_id, vc) in &mut block_vcs {
         if let Some(block_guard_paths) = guard_paths_map.get(block_id) {
-            vc.formula =
-                v2_formula_with_path_guards(func, &sv, block_guard_paths, vc.formula.clone());
+            // Trust (bounds ARM, GAP 1): the dominating path-guard map is the sole
+            // non-conjoining wrapper. Use the recorded variant to capture the per-path
+            // terms and push a `PathGuardOr` wrapper mirroring the `Or` this builds.
+            let (new_formula, path_terms) = v2_formula_with_path_guards_recorded(
+                func,
+                &sv,
+                block_guard_paths,
+                vc.formula.clone(),
+            );
+            vc.formula = new_formula;
+            if let Some(ob) = vc.obligation.as_mut() {
+                ob.wrappers.push(ObligationWrapper::PathGuardOr { paths: path_terms });
+            }
         }
     }
     for (block_id, vc) in &mut block_vcs {
         if let Some(sem_guards) = semantic_guards.get(block_id)
             && !sem_guards.is_empty()
         {
+            ob_record_conjoin(vc, sem_guards);
             let mut conjuncts = sem_guards.clone();
             conjuncts.push(vc.formula.clone());
             vc.formula = Formula::And(conjuncts);
         }
+    }
+
+    // Trust (bounds ARM, GAP 1): FINAL token-collapse mirror. The rvalue lane does not
+    // normalize its formula here (the outermost `generate_vcs` pass at entry.rs does, for
+    // every lane), so mirror the SAME `normalize_ssa_version_tokens` collapse onto the
+    // recorded body/subject/wrappers now. `normalize_ssa_version_tokens` is per-local
+    // deterministic and distributes over `And`/`Or`, so per-piece normalization here plus
+    // the wholesale formula normalization at entry.rs leave `reconstruct(record)` byte-
+    // identical to the normalized `formula` (term-`Ite` elimination is mirrored at
+    // entry.rs alongside the formula rewrite — see `ob_record_eliminate_ites`).
+    for (_, vc) in &mut block_vcs {
+        ob_record_normalize(vc, func);
     }
 
     block_vcs.into_iter().map(|(_, vc)| vc).collect()

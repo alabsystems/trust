@@ -493,6 +493,12 @@ fn recognize_field_write<'tcx>(
     let Inst::Load { ty, ptr, volatile: false, align: None } = &nodes[i].inst else {
         return None;
     };
+    // Trust (wave-IL R1): THIS GATE IS LOAD-BEARING FOR ANOTHER WAVE. `aggregate_load_refusal`
+    // deliberately omits `Ty::Struct` so this idiom stays alive, which makes `Ty::Struct(_)` here
+    // the ONLY thing keeping a non-struct whole-aggregate `Load` out of the triple recognizer.
+    // Widening it (an enum field-write idiom, say) is a decision about wave-IL's flip exclusion
+    // too, not just about this recognizer — `test_field_write_recognizer_is_struct_only` pins it
+    // so that decision has to be taken explicitly.
     if !matches!(ty, Ty::Struct(_)) {
         return None;
     }
@@ -1173,6 +1179,11 @@ impl<'tcx> ShimCx<'tcx> {
     /// trust-ir constant -> `mir::Const`. Ints are masked to the type width before
     /// `Const::from_bits` (which expects in-range bits).
     fn const_of(&self, ty: &Ty, c: &Constant) -> Result<MirConst<'tcx>, Unsupported> {
+        // Trust (wave-UA): the value-less refusal runs FIRST, as this shim's own predicate.
+        // See `unit_const_refusal` for why it is a predicate and not a `_ =>` fall-through.
+        if let Some(reason) = unit_const_refusal(ty, c) {
+            return unsup(reason);
+        }
         match (ty, c) {
             (Ty::Bool, Constant::Bool(b)) => Ok(MirConst::from_bool(self.tcx, *b)),
             (t, Constant::Int(v)) if is_int(t) => {
@@ -1374,6 +1385,16 @@ fn param_rty<'tcx>(
             }
             _ => unsup(format!("enum param widening: trust-ir Enum vs built {built:?}")),
         },
+        // Trust (wave-UV): the by-VALUE (`FnOnce`) CAPTURING closure env, which the producer signs
+        // `Ty::Closure(ClosureTyId)` (`lib.rs closure_env_param_ty`). REFUSED BY NAME. It already
+        // fell into the catch-all below, so this arm is a zero-behaviour-change hardening — and
+        // that is the point: the wave-UV `UpvarRef` fork's CLEAN-ONLY claim rests on this refusal,
+        // and a claim resting on a catch-all is resting on somebody else's absence (the failure
+        // mode `aggregate_load_refusal` was written to eliminate). There is no congruent MIR decl
+        // type: the built rustc type is `ty::Closure`, whose fields are `repr(Rust)` upvars, while
+        // `Ty::Closure`'s captures are a positional register-level list with NO LAYOUT
+        // (`trust-ir/src/shape.rs`) — nothing to thread through as a declaration.
+        Ty::Closure(_) => unsup("closure-env param: no congruent MIR decl type (by-value env)"),
         _ => unsup(format!("non-scalar param type {p:?}")),
     }
 }
@@ -1408,6 +1429,15 @@ fn enum_flip_direct_only(module: &trust_ir::Module, eid: trust_ir::EnumId) -> bo
     match module.enum_def(eid) {
         None => false,
         Some(def) => match &def.layout {
+            // RECORDED FAIL-OPEN, deliberately NOT changed on this branch (it predates it).
+            // `layout: None` means NO descriptor was attached, not "the descriptor says Direct" —
+            // so a niche-encoded enum whose descriptor merely failed to be recorded is ADMITTED
+            // into the flip lane by this arm, which is exactly the read the `Some(desc)` arm below
+            // exists to refuse. The absence of a descriptor is being treated as evidence about the
+            // encoding, and it is not. Three independent implementers reviewing this branch each
+            // named this arm; none touched it, because flipping it to `false` changes flip
+            // admission for every descriptor-less enum in the corpus and that delta has not been
+            // measured. Fix it as its own change, with its own census.
             None => true,
             Some(desc) => {
                 matches!(desc.encoding, trust_ir::ty::EnumTagEncoding::Direct { .. })
@@ -2145,6 +2175,17 @@ pub fn lower_ir_to_mir<'tcx>(
             if node.results.iter().any(|r| agg_skip.contains(r)) {
                 i += 1;
                 continue;
+            }
+            // Trust (wave-IL R1): the AGGREGATE-load refusal runs HERE — at the top of the node
+            // loop, ABOVE `recognize_field_write` and above the `match &node.inst` arms — because
+            // "first" is the whole point of the predicate. `recognize_field_write` below consumes
+            // an `Inst::Load` triple WITHOUT ever reaching the `Inst::Load` arm, so a refusal
+            // sited in that arm is not first: it would sit behind whatever type set that
+            // recognizer happens to gate on today. See `aggregate_load_refusal`.
+            if let Inst::Load { ty, .. } = &node.inst {
+                if let Some(reason) = aggregate_load_refusal(ty) {
+                    return unsup(reason);
+                }
             }
             // Trust (wave-24, ref-escape FLIP-COHERENCE): collapse the WRITE triple
             // `agg = Load(*P):Struct` → `new = InsertField(agg, k, v)` → `Store(*P, new)` through a
@@ -3384,6 +3425,9 @@ pub fn lower_ir_to_mir<'tcx>(
                     i += 1;
                 }
                 Inst::Load { ty, ptr, volatile, align } => {
+                    // Trust (wave-IL R1): the AGGREGATE refusal already ran, at the TOP of this
+                    // node loop — above `recognize_field_write`, which consumes `Inst::Load`
+                    // triples without ever reaching this arm. Re-stating it here would be dead.
                     if *volatile {
                         return unsup("volatile Load");
                     }
@@ -4574,6 +4618,282 @@ fn shift_value_cast_pair(
     }
 }
 
+/// Trust (wave-IL): the shim's OWN refusal of a WHOLE-AGGREGATE `Inst::Load`, returning the
+/// fail-closed reason class, or `None` for a load `to_mir` may go on to consider.
+///
+/// WHY A PREDICATE AND NOT AN INHERITANCE. Before this wave a `Load { ty: Ty::Enum(_) }` — the
+/// instruction wave-IL's `if let PAT = <&E>` lowering emits — died in three different places, and
+/// all three were the SAME classifier wearing three hats: the `Alloca` pre-pass
+/// (`cx.scalar_ty(ty)` -> `None` -> "Alloca of non-scalar pointee", so an enum slot never enters
+/// `slot_map`), the forwarded-ref-param arm ("Load through ref param: non-scalar or mismatched
+/// pointee", again `scalar_ty`), and the "Load from a non-Alloca pointer" fall-through that only
+/// catches what the first two already excluded. One predicate behind three doors is not three
+/// walls; a future wave that teaches `scalar_ty` a niche-optimized enum spelling would open all
+/// three at once, silently, with no diff in this file. Stated here, the construct's flip
+/// exclusion survives that widening: `to_mir` consults this first and returns.
+///
+/// WHAT IS REFUSED: the COMPOSITE spellings for which this shim has NO congruent MIR lowering at
+/// all — `Enum`/`Array`/`Tuple`/`Record`/`Set`/`Sequence`/`Closure` — plus `Ty::Unit`, which
+/// denotes no value at all (the wave-UA lesson: the producer overloads `Ty::Unit` as a
+/// fail-closed placeholder AND as the wave-EL opaque-lane spelling, so a unit load is never a
+/// value read). `Ty::Struct` is deliberately EXCLUDED — see the next paragraph.
+/// `Ty::Ptr`/`FatPtr`/`Never`/`Error`/`Func`/`Ref`-family spellings are left to the pre-existing
+/// arms: they are not aggregates, and moving their rejection would relocate a reject this wave
+/// has no business touching.
+///
+/// WHY `Ty::Struct` IS NOT IN THE REFUSED SET, AND WHY THAT IS THE LOAD-BEARING PART. A
+/// whole-struct `Load` is a LIVE, SUPPORTED, FLIP-ELIGIBLE lane: `recognize_field_write` (wave-24)
+/// matches the triple `agg = Load(*P):Struct` / `new = InsertField(agg, k, v)` / `Store(*P, new)`
+/// through a `&mut`-param pointer and re-emits it as the byte-faithful `(*P).k = v`. That
+/// recognizer runs at the TOP of the node loop and consumes three nodes with `i += 3; continue` —
+/// it never reaches the `Inst::Load` match arm at all. Two consequences, both deliberate:
+///   * this predicate is CALLED from the top of that loop, ABOVE `recognize_field_write`, so
+///     "`to_mir` consults this first and returns" is a fact about the call site and not a hope;
+///   * `Ty::Struct` must therefore be ABSENT here, or the hoist would silently delete the wave-24
+///     field-write lane. Its exclusion is delegated, knowingly, to `recognize_field_write`'s own
+///     `matches!(ty, Ty::Struct(_))` gate — and `test_field_write_recognizer_is_struct_only` pins
+///     that gate, so extending the idiom to enums (which would otherwise reinstate exactly the
+///     wall-of-absence this predicate exists to remove) fails a test instead of passing silently.
+/// A struct whole-load that is NOT part of that triple still fails closed downstream on
+/// `scalar_ty`, unchanged by this wave.
+///
+/// A strict no-op at HEAD, but not because "everything listed already failed closed" — that claim
+/// was false for `Ty::Struct` and is why it is gone from the set. For the spellings that REMAIN,
+/// each returns `None` from `scalar_rustc_ty` and so already died on one of the three routes
+/// above; this changes only the reason CLASS the derived-verdict histogram records, the same
+/// separate-the-histogram discipline `unit_const_refusal` follows.
+fn aggregate_load_refusal(ty: &Ty) -> Option<&'static str> {
+    match ty {
+        Ty::Enum(_)
+        | Ty::Array(..)
+        | Ty::Tuple(_)
+        | Ty::Record(_)
+        | Ty::Set(..)
+        | Ty::Sequence(_)
+        | Ty::Closure(_) => Some("Load of a whole aggregate (no congruent MIR operand)"),
+        Ty::Unit => Some("Load of a unit value (no MIR operand)"),
+        _ => None,
+    }
+}
+
+/// Trust (wave-UA): the shim's OWN refusal of a VALUE-LESS constant, returning the fail-closed
+/// reason class, or `None` for a constant `const_of` may go on to consider.
+///
+/// WHY A PREDICATE AND NOT A FALL-THROUGH. Before this wave a `Ty::Unit` constant reached
+/// `const_of`'s `_ => unsup("Const(non int/bool)")` catch-all only because no arm above HAPPENED
+/// to match it: `Ty::Bool` no, `is_int(Ty::Unit)` false, `Ty::U128`/`Struct`/`Enum` no,
+/// `is_f32_or_f64` false. That is a wall made of somebody else's absence — the fb85a73d4a failure
+/// mode — and it is exactly the wall a future widening of `const_of` (a `Ty::Unit` arm added for
+/// some unrelated lane, or a broadened `is_int`) would silently delete, letting a unit-arg call
+/// reach the codegen flip on a const the comparator never proved congruent. Stated here, the
+/// refusal survives any such widening: `const_of` consults this first and returns.
+///
+/// WHAT IS REFUSED, AND WHY EACH:
+///   * `Ty::Unit` at any constant — built MIR carries no operand this shim can compare a
+///     zero-sized unit against; fabricating one is a claim the differential never checked. This
+///     is the type the wave-UA argument lane emits (`try_lower_unit_arg`).
+///   * `Constant::PhantomData` at any type — the producer's zero-size marker. It is legal ONLY
+///     against `Ty::Unit` per the IR validator (`shape_matches_ty`), so any OTHER pairing
+///     reaching here is already ill-typed; and the producer also uses it as a deferral SENTINEL
+///     under a mapped type (`PendingConst`) and as the `Ty::Ptr` lane filler inside aggregate
+///     seeds, neither of which denotes a value. None may be minted into MIR.
+///
+/// Both refusals are strict no-ops at HEAD — every pair they claim was ALREADY refused — but not
+/// all of them by the catch-all, and the difference is worth stating precisely. `(Ty::Unit, _)`
+/// and `PhantomData` at the scalar/pointer types did fall to `_ => unsup("Const(non int/bool)")`.
+/// `(Ty::Struct(_), PhantomData)` instead fell to the wall arm `unsup("Const(struct value)")`,
+/// and `(Ty::Enum(_), PhantomData)` to `unsup("Const(enum value)")`. Both of those still refuse;
+/// only the reason CLASS moves — to a hoisted, phantom-specific one — which is the same
+/// separate-the-histogram discipline those two wall arms were themselves written to serve.
+fn unit_const_refusal(ty: &Ty, c: &Constant) -> Option<&'static str> {
+    match (ty, c) {
+        (Ty::Unit, _) => Some("Const(unit value: no MIR operand)"),
+        (_, Constant::PhantomData) => Some("Const(phantom value: no MIR operand)"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod unit_const_wall_tests {
+    use std::collections::HashMap;
+
+    use rustc_middle::mir::{Local, Place};
+    use trust_ir::{Constant, Inst, InstrNode, Ty, ValueId};
+
+    use super::{SCALAR_CANDS, aggregate_load_refusal, recognize_field_write, unit_const_refusal};
+
+    /// THE wave-IL FLIP EXCLUSION. `Inst::Load { ty: Ty::Enum(_) }` is what
+    /// `try_lower_if_let_ref_enum` emits, and it is refused HERE, by this predicate, on the type
+    /// alone. The assertion is deliberately NOT routed through `scalar_ty`: the point of the
+    /// predicate is that it keeps refusing even if some future wave teaches the scalar
+    /// classifier a niche-optimized enum spelling — the widening that would otherwise open the
+    /// `Alloca` pre-pass, the ref-param arm and the non-Alloca fall-through simultaneously.
+    #[test]
+    fn test_aggregate_load_refusal_enum_load_refused() {
+        assert_eq!(
+            aggregate_load_refusal(&Ty::Enum(trust_ir::EnumId(0))),
+            Some("Load of a whole aggregate (no congruent MIR operand)"),
+        );
+    }
+
+    /// The rest of the composite family, plus the value-less `Ty::Unit` lane under its own
+    /// reason class. Stated over the whole set so the wall is not one hand-picked member.
+    /// `Ty::Struct` is NOT in this list — see `test_field_write_recognizer_is_struct_only`.
+    #[test]
+    fn test_aggregate_load_refusal_covers_the_composite_family() {
+        for ty in [
+            Ty::Enum(trust_ir::EnumId(2)),
+            Ty::Array(trust_ir::TyId(3), 4),
+            Ty::Tuple(vec![Ty::I64, Ty::Bool]),
+        ] {
+            assert_eq!(
+                aggregate_load_refusal(&ty),
+                Some("Load of a whole aggregate (no congruent MIR operand)"),
+                "a whole-aggregate load must not be mintable at {ty}",
+            );
+        }
+        assert_eq!(
+            aggregate_load_refusal(&Ty::Unit),
+            Some("Load of a unit value (no MIR operand)")
+        );
+    }
+
+    /// The predicate must not shadow any lane `to_mir` genuinely supports, or it would drop
+    /// coverage rather than add safety: every scalar the shim can denote passes through.
+    #[test]
+    fn test_aggregate_load_refusal_scalar_loads_pass_through() {
+        for ty in SCALAR_CANDS {
+            assert_eq!(aggregate_load_refusal(&ty), None, "{ty} is a supported load lane");
+        }
+        // The pointer/never spellings keep their PRE-EXISTING rejects; this wave does not
+        // relocate them.
+        assert_eq!(aggregate_load_refusal(&Ty::Ptr), None);
+        assert_eq!(aggregate_load_refusal(&Ty::FatPtr(trust_ir::FatPtrKind::Str)), None);
+        // And `Ty::Struct` passes through too — it is a LIVE lane (`recognize_field_write`), not
+        // an oversight. Refusing it here would silently delete the wave-24 field-write idiom,
+        // because this predicate is consulted ABOVE that recognizer in the node loop.
+        assert_eq!(
+            aggregate_load_refusal(&Ty::Struct(trust_ir::StructId(1))),
+            None,
+            "a struct whole-load is the wave-24 field-write lane, not a refusal",
+        );
+    }
+
+    /// Build the wave-24 WRITE triple `agg = Load(*P):<ty>` / `new = InsertField(agg, k, v)` /
+    /// `Store(*P, new)` over a carrier of type `load_ty`, with `P = %0` registered as a
+    /// `&mut`-param pointer. Everything except `load_ty` is held fixed, so the recognizer's
+    /// verdict isolates the type gate.
+    fn write_triple(load_ty: Ty) -> (HashMap<ValueId, Place<'static>>, Vec<InstrNode>) {
+        let (p, agg, new, v) =
+            (ValueId::new(0), ValueId::new(1), ValueId::new(2), ValueId::new(3));
+        let fwd: HashMap<ValueId, Place<'static>> =
+            HashMap::from([(p, Place::from(Local::from_u32(1)))]);
+        let nodes = vec![
+            InstrNode::new(Inst::Load { ty: load_ty.clone(), ptr: p, volatile: false, align: None })
+                .with_result(agg),
+            InstrNode::new(Inst::InsertField {
+                ty: load_ty.clone(),
+                aggregate: agg,
+                field: 0,
+                value: v,
+            })
+            .with_result(new),
+            InstrNode::new(Inst::Store {
+                ty: load_ty,
+                ptr: p,
+                value: new,
+                volatile: false,
+                align: None,
+            }),
+        ];
+        (fwd, nodes)
+    }
+
+    /// THE CORRECTION THAT MADE `aggregate_load_refusal` TRUE. `recognize_field_write` consumes an
+    /// `Inst::Load` triple at the TOP of the node loop with `i += 3; continue` — it never reaches
+    /// the `Inst::Load` match arm. So wave-IL's whole-enum-load flip exclusion held, before this
+    /// fix, only because that recognizer HAPPENS to gate on `Ty::Struct(_)`: somebody else's
+    /// current contents, i.e. the wall-of-absence the wave claimed to have removed.
+    ///
+    /// Two halves, and both are needed. The POSITIVE half proves the fixture really is the shape
+    /// the recognizer accepts (otherwise the negative half would be vacuous — every `None` could
+    /// be an unrelated structural miss). The NEGATIVE half is the pin: swap ONLY the load type to
+    /// an enum, and the recognizer must still decline. Fill that absence in — teach the idiom
+    /// enum field-writes — and this test fails, forcing the author to confront that the same edit
+    /// would route a `Load { ty: Ty::Enum(_) }` past `aggregate_load_refusal` were the predicate
+    /// not hoisted above it.
+    #[test]
+    fn test_field_write_recognizer_is_struct_only() {
+        let (fwd, nodes) = write_triple(Ty::Struct(trust_ir::StructId(7)));
+        assert_eq!(
+            recognize_field_write(&fwd, &nodes, 0),
+            Some((Place::from(Local::from_u32(1)), 0, ValueId::new(3))),
+            "the struct write triple IS the wave-24 lane — if this stops matching, the negative \
+             assertions below stop meaning anything",
+        );
+        for load_ty in [
+            Ty::Enum(trust_ir::EnumId(7)),
+            Ty::Tuple(vec![Ty::I64, Ty::Bool]),
+            Ty::Array(trust_ir::TyId(0), 2),
+            Ty::Unit,
+            Ty::U64,
+        ] {
+            let (fwd, nodes) = write_triple(load_ty.clone());
+            assert_eq!(
+                recognize_field_write(&fwd, &nodes, 0),
+                None,
+                "the field-write idiom must stay struct-only: a {load_ty} whole-load reaching it \
+                 would bypass `aggregate_load_refusal`",
+            );
+        }
+    }
+
+    /// The wave-UA argument lane's exact emission — `Inst::Const { ty: Ty::Unit, value:
+    /// PhantomData }` — is refused, by this predicate, under its own reason class. `Ty::Unit`
+    /// wins over the PhantomData arm so a unit const reads as a unit refusal, not a phantom one.
+    #[test]
+    fn test_unit_const_refusal_unit_typed_const_refused() {
+        assert_eq!(
+            unit_const_refusal(&Ty::Unit, &Constant::PhantomData),
+            Some("Const(unit value: no MIR operand)"),
+        );
+        // Refused for its TYPE, whatever constant is paired with it.
+        assert_eq!(
+            unit_const_refusal(&Ty::Unit, &Constant::Int(0)),
+            Some("Const(unit value: no MIR operand)"),
+        );
+        assert_eq!(
+            unit_const_refusal(&Ty::Unit, &Constant::Aggregate(Vec::new())),
+            Some("Const(unit value: no MIR operand)"),
+        );
+    }
+
+    /// The producer's zero-size marker never becomes a MIR const, including at the scalar and
+    /// pointer types where it appears as a deferral sentinel / aggregate-seed lane filler.
+    #[test]
+    fn test_unit_const_refusal_phantom_data_refused_at_every_type() {
+        for ty in [Ty::Ptr, Ty::I64, Ty::Bool, Ty::F64, Ty::U128] {
+            assert_eq!(
+                unit_const_refusal(&ty, &Constant::PhantomData),
+                Some("Const(phantom value: no MIR operand)"),
+                "PhantomData must not be mintable at {ty}",
+            );
+        }
+    }
+
+    /// The flippable scalar constants are untouched — this predicate must not shadow any lane
+    /// `const_of` genuinely supports, or it would silently drop coverage rather than add safety.
+    #[test]
+    fn test_unit_const_refusal_scalar_constants_pass_through() {
+        assert_eq!(unit_const_refusal(&Ty::Bool, &Constant::Bool(true)), None);
+        assert_eq!(unit_const_refusal(&Ty::I64, &Constant::Int(-7)), None);
+        assert_eq!(unit_const_refusal(&Ty::U128, &Constant::U128(u128::MAX)), None);
+        assert_eq!(unit_const_refusal(&Ty::F32, &Constant::Float(1.0)), None);
+        // The wall arms below it keep their own, more specific reason classes.
+        assert_eq!(unit_const_refusal(&Ty::Ptr, &Constant::Int(0)), None);
+    }
+}
+
 #[cfg(test)]
 mod u128_v24_reconstruction_tests {
     use super::*;
@@ -4672,5 +4992,129 @@ mod emission_chokepoint_tests {
              is allowed (the body of `push_node`). A new direct push bypasses span/scope \
              stamping — route it through `self.push_node(..)` instead."
         );
+    }
+
+    /// Trust (wave-UV): the by-VALUE closure-env param must be refused BY NAME, not by falling
+    /// off the end of `param_rty` into the catch-all.
+    ///
+    /// The `UpvarRef` by-value fork's CLEAN-ONLY claim is "no body of this shape can reach the
+    /// codegen flip", and the derived-MIR half of that claim is this refusal. A claim that rests
+    /// on a catch-all rests on somebody else's absence: widen the catch-all — or add a `Ty` arm
+    /// above it that happens to swallow closures — and the flip exclusion evaporates silently,
+    /// with no test going red. So the arm's EXISTENCE and its POSITION (before the catch-all,
+    /// which is what makes it the one that fires) are pinned at the source.
+    ///
+    /// Needles are assembled at run time: this test's own source is inside
+    /// `include_str!("to_mir.rs")`, so a literal needle would match itself and the guard would
+    /// pass with the production arm deleted.
+    #[test]
+    fn test_closure_env_param_is_refused_by_name() {
+        let producer = include_str!("to_mir.rs");
+        let lane = producer
+            .find(&format!("fn {}<'tcx>(", "param_rty"))
+            .expect("`param_rty` must exist");
+        let arm = format!("Ty::{}(_) => unsup(\"closure-env param", "Closure");
+        assert_eq!(
+            producer.matches(arm.as_str()).count(),
+            1,
+            "the by-value closure env must be refused by its OWN named arm, exactly once",
+        );
+        let arm_at = producer[lane..].find(arm.as_str()).expect("the arm is inside `param_rty`");
+        // The TOP-LEVEL catch-all, anchored by its 8-space match-arm indentation: the `Ty::Struct`
+        // arm nests a same-worded refusal one level deeper, and matching that one instead would
+        // make this ordering assertion pass for the wrong reason.
+        let catch_all = format!("\n        {} => unsup(format!(\"non-scalar param {}", "_", "type");
+        let catch_at =
+            producer[lane..].find(catch_all.as_str()).expect("the catch-all is inside `param_rty`");
+        assert!(
+            arm_at < catch_at,
+            "the named closure arm must precede the catch-all, or the catch-all is still what \
+             fires and the refusal is not by name",
+        );
+    }
+}
+
+#[cfg(test)]
+mod str_const_flip_firewall_tests {
+    use std::collections::HashMap;
+
+    use trust_ir::{Constant, FatPtrKind, Inst, InstrNode, Ty, ValueId};
+    use trust_ir::value::GlobalId;
+
+    use super::recognize_str_return;
+
+    fn node(inst: Inst, result: ValueId) -> InstrNode {
+        InstrNode::new(inst).with_result(result)
+    }
+
+    /// Build the three-node `&str` fat-pointer chain the producer emits, with `metadata` supplied
+    /// by the caller so the LITERAL lane (a real `Constant::Int` length) and the CONST lane (the
+    /// `Constant::PhantomData` sentinel) differ in exactly one node.
+    fn chain(metadata_value: Constant) -> (Vec<InstrNode>, ValueId) {
+        let data = ValueId::new(0);
+        let len = ValueId::new(1);
+        let fat = ValueId::new(2);
+        (
+            vec![
+                node(Inst::GlobalAddr { global: GlobalId::new(0) }, data),
+                node(Inst::Const { ty: Ty::U64, value: metadata_value }, len),
+                node(
+                    Inst::PtrFromParts {
+                        ptr_ty: Ty::FatPtr(FatPtrKind::Str),
+                        metadata_ty: Ty::U64,
+                        data,
+                        metadata: len,
+                    },
+                    fat,
+                ),
+            ],
+            fat,
+        )
+    }
+
+    fn defs(nodes: &[InstrNode]) -> HashMap<ValueId, &InstrNode> {
+        nodes.iter().filter_map(|n| n.results.first().map(|v| (*v, n))).collect()
+    }
+
+    /// THE MISCOMPILE FIREWALL, pinned at the node type.
+    ///
+    /// Built MIR keeps a `&str` CONST unevaluated (`_0 = const names::NAME`); it folds only a
+    /// LITERAL to `_0 = const "…"`. The shim's return-type gate ADMITS `Ty::FatPtr(Str)` against a
+    /// built `&str`, so if the const lane emitted a real `Constant::Int` length its chain would be
+    /// byte-indistinguishable from a literal's, `recognize_str_return` would match, and the shim
+    /// would rewrite the return into `_0 = const "Clean.BVC.bvAppend"` — a MANUFACTURED comparator
+    /// divergence against built MIR's unevaluated const.
+    ///
+    /// The `Constant::PhantomData` metadata sentinel makes this recognizer refuse BY ITS OWN
+    /// PREDICATE (the `Constant::Int(v)` arm), independently of the three `pending_consts`
+    /// emptiness gates upstream. Refusing means the chain is NOT added to the skip set, so the
+    /// unhandled `Inst::GlobalAddr` then fails the whole shim closed.
+    #[test]
+    fn test_recognize_str_return_refuses_a_phantomdata_metadata_node() {
+        let (nodes, fat) = chain(Constant::PhantomData);
+        assert!(
+            recognize_str_return(&defs(&nodes), fat).is_none(),
+            "a const-sourced fat pointer must NOT be recognized as a foldable &str literal"
+        );
+    }
+
+    /// The POSITIVE CONTROL that makes the refusal above non-vacuous: the same chain with a real
+    /// length IS recognized, so the test is discriminating the metadata node and nothing else.
+    #[test]
+    fn test_recognize_str_return_still_accepts_the_literal_chain() {
+        let (nodes, fat) = chain(Constant::Int(7));
+        let (global, len, skip) = recognize_str_return(&defs(&nodes), fat)
+            .expect("the str LITERAL lane must keep flipping");
+        assert_eq!(global, GlobalId::new(0));
+        assert_eq!(len, 7);
+        assert_eq!(skip.len(), 3, "all three chain nodes must be skipped");
+    }
+
+    /// A negative length is not a byte count. Pinned alongside the sentinel refusal so the
+    /// `v >= 0` clause is not silently dropped while widening the arm.
+    #[test]
+    fn test_recognize_str_return_refuses_a_negative_length() {
+        let (nodes, fat) = chain(Constant::Int(-1));
+        assert!(recognize_str_return(&defs(&nodes), fat).is_none());
     }
 }

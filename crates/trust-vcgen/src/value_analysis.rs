@@ -689,6 +689,7 @@ pub fn generate_vc_from_value_sets(
                                 .unwrap_or_else(|| unreachable!("empty clauses despite len == 1")),
                         )),
                         contract_metadata: None,
+                        obligation: None,
                     });
                 }
                 // Multi-value exact sets generate a disjunction constraint.
@@ -711,6 +712,7 @@ pub fn generate_vc_from_value_sets(
                     location: SourceSpan::default(),
                     formula: Formula::Not(Box::new(in_range)),
                     contract_metadata: None,
+                    obligation: None,
                 });
             }
 

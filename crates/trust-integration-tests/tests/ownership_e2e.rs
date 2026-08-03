@@ -464,6 +464,7 @@ fn test_lifetime_violation_vc_construction() {
         location: SourceSpan::default(),
         formula: Formula::Var("lifetime_check".into(), Sort::Bool),
         contract_metadata: None,
+        obligation: None,
     };
 
     assert_eq!(vc.function, "test::dangling_ref");
@@ -493,6 +494,7 @@ fn test_send_violation_vc_construction() {
         location: SourceSpan::default(),
         formula: Formula::Var("send_check".into(), Sort::Bool),
         contract_metadata: None,
+        obligation: None,
     };
 
     assert_eq!(vc.function, "test::spawn_with_rc");
@@ -522,6 +524,7 @@ fn test_sync_violation_vc_construction() {
         location: SourceSpan::default(),
         formula: Formula::Var("sync_check".into(), Sort::Bool),
         contract_metadata: None,
+        obligation: None,
     };
 
     assert_eq!(vc.function, "test::share_cell_across_threads");
@@ -605,6 +608,7 @@ fn test_construct_all_6_ownership_vcs() {
             location: SourceSpan::default(),
             formula: Formula::Var("uaf".into(), Sort::Bool),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationCondition {
             function: "df".into(),
@@ -612,6 +616,7 @@ fn test_construct_all_6_ownership_vcs() {
             location: SourceSpan::default(),
             formula: Formula::Var("df".into(), Sort::Bool),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationCondition {
             function: "alias_mut".into(),
@@ -619,6 +624,7 @@ fn test_construct_all_6_ownership_vcs() {
             location: SourceSpan::default(),
             formula: Formula::Var("alias_mut".into(), Sort::Bool),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationCondition {
             function: "alias_shared".into(),
@@ -626,6 +632,7 @@ fn test_construct_all_6_ownership_vcs() {
             location: SourceSpan::default(),
             formula: Formula::Var("alias_shared".into(), Sort::Bool),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationCondition {
             function: "lt".into(),
@@ -633,6 +640,7 @@ fn test_construct_all_6_ownership_vcs() {
             location: SourceSpan::default(),
             formula: Formula::Var("lt".into(), Sort::Bool),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationCondition {
             function: "send".into(),
@@ -640,6 +648,7 @@ fn test_construct_all_6_ownership_vcs() {
             location: SourceSpan::default(),
             formula: Formula::Var("send".into(), Sort::Bool),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationCondition {
             function: "sync".into(),
@@ -647,6 +656,7 @@ fn test_construct_all_6_ownership_vcs() {
             location: SourceSpan::default(),
             formula: Formula::Var("sync".into(), Sort::Bool),
             contract_metadata: None,
+            obligation: None,
         },
     ];
 

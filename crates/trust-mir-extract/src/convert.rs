@@ -142,6 +142,34 @@ const CLONE_TOTALITY_FUEL: u32 = 32;
 /// `trust_types::total_call_summaries::TRUST_TOTAL_CLONE_SENTINEL`.
 pub(crate) use trust_types::total_call_summaries::TRUST_TOTAL_CLONE_SENTINEL;
 
+/// Return whether `krate` is one of the compiler's actual sysroot crates.
+///
+/// Printed crate names and def paths are diagnostics, not identities: a dependency
+/// compiled with `--crate-name core`, `alloc`, or `std` can reproduce those strings.
+/// Bind name-prefiltered recognizers to StableCrateIds obtained from compiler-owned
+/// lang/diagnostic items instead. Missing anchors fail closed.
+pub(crate) fn is_real_sysroot_crate(
+    tcx: TyCtxt<'_>,
+    krate: rustc_span::def_id::CrateNum,
+) -> bool {
+    let target = tcx.stable_crate_id(krate).as_u64();
+    let anchors: [Option<DefId>; 6] = [
+        // core
+        tcx.get_diagnostic_item(rustc_span::sym::Option),
+        tcx.lang_items().clone_trait(),
+        // alloc
+        tcx.get_diagnostic_item(rustc_span::sym::Vec),
+        tcx.lang_items().owned_box(),
+        // std
+        tcx.get_diagnostic_item(rustc_span::sym::HashMap),
+        tcx.get_diagnostic_item(rustc_span::sym::HashSet),
+    ];
+    anchors
+        .into_iter()
+        .flatten()
+        .any(|did| tcx.stable_crate_id(did.krate).as_u64() == target)
+}
+
 /// Leaf-name set of std/alloc/core wrappers whose `Clone` DEEP-clones its contents
 /// (dispatches Clone into its type-arg element(s)) and runs no user code at the
 /// wrapper level — so the wrapper's clone is total IFF every element's clone is
@@ -167,12 +195,13 @@ fn is_std_deep_clone_container(tcx: TyCtxt<'_>, did: rustc_span::def_id::DefId) 
             | "Wrapping"
             | "Reverse"
     ) && (path.starts_with("std::") || path.starts_with("alloc::") || path.starts_with("core::"))
+        && is_real_sysroot_crate(tcx, did.krate)
 }
 
 /// Std leaf types whose `Clone` is total irrespective of any type parameter.
 fn is_element_free_total_std_adt(tcx: TyCtxt<'_>, did: rustc_span::def_id::DefId) -> bool {
     let path = crate::safe_def_path_str(tcx, did);
-    matches!(
+    let name_matches = matches!(
         path.as_str(),
         "alloc::string::String"
             | "std::string::String"
@@ -181,17 +210,8 @@ fn is_element_free_total_std_adt(tcx: TyCtxt<'_>, did: rustc_span::def_id::DefId
             | "core::time::Duration"
             | "std::time::Duration"
     ) || path.starts_with("core::num::NonZero")
-        || path.starts_with("std::num::NonZero")
-        // num-bigint arbitrary-precision integers are NON-generic (limbs are fixed
-        // primitive `u32`/`u64`), so their hand-written `Clone` bottoms out in
-        // primitives and runs NO user code (alloc-abort excluded, as everywhere in
-        // this TCB). Mirrors the bridge's already-trusted `is_element_free_total_std_type`
-        // (trust-ir-bridge/src/lower.rs:14708). DELIBERATELY excludes `num_rational::Ratio`
-        // / `BigRational`: it IS generic, so `Ratio<UserType>` must stay field-aware
-        // (`tcx_clone_is_total`'s derived arm recurses into `numer`/`denom`, which now
-        // bottom out here at `BigInt` — total — while a user element still fails closed).
-        || (path.starts_with("num_bigint")
-            && (path.ends_with("::BigInt") || path.ends_with("::BigUint")))
+        || path.starts_with("std::num::NonZero");
+    name_matches && is_real_sysroot_crate(tcx, did.krate)
 }
 
 /// True iff `<ty as Clone>::clone` is PROVABLY panic-free (total), WITHOUT an axiom.
@@ -292,7 +312,8 @@ fn tcx_clone_is_total<'tcx>(
             let leaf = path.rsplit("::").next().unwrap_or(&path);
             let leaf = leaf.split('<').next().unwrap_or(leaf);
             if matches!(leaf, "HashMap" | "HashSet")
-                && (path.starts_with("std::") || path.starts_with("hashbrown::"))
+                && path.starts_with("std::")
+                && is_real_sysroot_crate(tcx, did.krate)
             {
                 return args
                     .types()
@@ -302,8 +323,9 @@ fn tcx_clone_is_total<'tcx>(
             //       The std time types (`Instant`/`SystemTime`/`Duration`) derive Clone over such
             //       a field, so without this their clone (and any holder's, e.g. a
             //       `HashMap<_, TokenBucket{ last_refill: Option<Instant> }>`) fails.
-            if path.starts_with("core::num::niche_types::")
-                || path.starts_with("std::num::niche_types::")
+            if (path.starts_with("core::num::niche_types::")
+                || path.starts_with("std::num::niche_types::"))
+                && is_real_sysroot_crate(tcx, did.krate)
             {
                 return true;
             }
@@ -418,6 +440,7 @@ fn tcx_derived_trait_is_total<'tcx>(
                 && (path.starts_with("std::")
                     || path.starts_with("alloc::")
                     || path.starts_with("core::"))
+                && is_real_sysroot_crate(tcx, def.did().krate)
             {
                 return true;
             }
@@ -425,13 +448,15 @@ fn tcx_derived_trait_is_total<'tcx>(
             // int with a validity niche; their `eq`/`hash`/`cmp`/`default` are total int ops.
             // (Std types like `Duration` derive `PartialEq`/`Hash` over such a field, so without
             // this the derived `Duration` impl — and any type holding a `Duration` — fails.)
-            if path.starts_with("core::num::niche_types::")
-                || path.starts_with("std::num::niche_types::")
+            if (path.starts_with("core::num::niche_types::")
+                || path.starts_with("std::num::niche_types::"))
+                && is_real_sysroot_crate(tcx, def.did().krate)
             {
                 return true;
             }
             if (leaf == "HashMap" || leaf == "HashSet")
-                && (path.starts_with("std::") || path.starts_with("hashbrown::"))
+                && path.starts_with("std::")
+                && is_real_sysroot_crate(tcx, def.did().krate)
             {
                 match tcx.item_name(trait_did).as_str() {
                     // `default()` builds an EMPTY map/set — total, no per-element work.
@@ -569,8 +594,7 @@ fn is_total_keyed_collect_call<'tcx>(
     if !(keyed_by_ord || keyed_by_hash) {
         return false;
     }
-    let krate = tcx.crate_name(def.did().krate);
-    if !matches!(krate.as_str(), "core" | "alloc" | "std") {
+    if !is_real_sysroot_crate(tcx, def.did().krate) {
         return false;
     }
 
@@ -612,7 +636,7 @@ fn is_total_keyed_collect_call<'tcx>(
     let ty::Adt(hasher_def, _) = hasher_ty.kind() else {
         return false;
     };
-    if !matches!(tcx.crate_name(hasher_def.did().krate).as_str(), "core" | "alloc" | "std") {
+    if !is_real_sysroot_crate(tcx, hasher_def.did().krate) {
         return false;
     }
 
@@ -644,13 +668,9 @@ fn is_total_collection_extend_call<'tcx>(
             tcx.impl_trait_ref(impl_did).instantiate_identity().skip_normalization().def_id
         })
     });
-    // `Extend` is a std trait but not a diagnostic item; match by name + std origin.
+    // `Extend` is not a diagnostic item, so combine its name with sysroot identity.
     match trait_did {
-        Some(t)
-            if tcx.item_name(t).as_str() == "Extend" && {
-                let k = tcx.crate_name(t.krate);
-                matches!(k.as_str(), "core" | "alloc" | "std")
-            } => {}
+        Some(t) if tcx.item_name(t).as_str() == "Extend" && is_real_sysroot_crate(tcx, t.krate) => {}
         _ => return false,
     }
     // `<C as Extend<T>>::extend` — Self (the collection `C`) is the first type arg.
@@ -664,7 +684,7 @@ fn is_total_collection_extend_call<'tcx>(
         return false;
     };
     let adt_name = tcx.item_name(def.did());
-    if !matches!(tcx.crate_name(def.did().krate).as_str(), "core" | "alloc" | "std") {
+    if !is_real_sysroot_crate(tcx, def.did().krate) {
         return false;
     }
     // Sequence collections: push runs no user comparison — total for any element.
@@ -698,7 +718,7 @@ fn is_total_collection_extend_call<'tcx>(
         if adt_name.as_str() == "HashMap" { args.types().nth(2) } else { args.types().nth(1) };
     let Some(hasher_ty) = hasher_ty else { return false };
     let ty::Adt(hasher_def, _) = hasher_ty.kind() else { return false };
-    if !matches!(tcx.crate_name(hasher_def.did().krate).as_str(), "core" | "alloc" | "std") {
+    if !is_real_sysroot_crate(tcx, hasher_def.did().krate) {
         return false;
     }
     total_for(sym::Hash) && total_for(sym::Eq)
@@ -751,7 +771,7 @@ fn is_total_hash_map_query_call<'tcx>(
     if !(is_map || is_set) {
         return false;
     }
-    if !matches!(tcx.crate_name(def.did().krate).as_str(), "core" | "alloc" | "std") {
+    if !is_real_sysroot_crate(tcx, def.did().krate) {
         return false;
     }
     let Some(key_ty) = args.types().next() else {
@@ -765,7 +785,7 @@ fn is_total_hash_map_query_call<'tcx>(
     let ty::TyKind::Adt(hasher_def, _) = hasher_ty.kind() else {
         return false;
     };
-    if !matches!(tcx.crate_name(hasher_def.did().krate).as_str(), "core" | "alloc" | "std") {
+    if !is_real_sysroot_crate(tcx, hasher_def.did().krate) {
         return false;
     }
     let total_for = |item: rustc_span::Symbol| {
@@ -2965,7 +2985,7 @@ struct BoxAllocFacts {
 /// `exchange_malloc` lang items. CRITICALLY EXCLUDES `alloc::alloc` and friends,
 /// which are FALLIBLE (may return null) — discharging a null/misalign check on a
 /// fallible allocation would be a false PROVE.
-fn is_infallible_box_allocator(name: &str) -> bool {
+fn is_infallible_box_allocator<'tcx>(tcx: TyCtxt<'tcx>, did: DefId, name: &str) -> bool {
     // STD-ORIGIN GATE (defense-in-depth, mirrors the validated
     // `sep_engine::is_known_good_box_alloc`): the real `Box` is defined in `alloc`
     // (re-exported in `std`); its monomorphized callee path renders with one of
@@ -2985,7 +3005,18 @@ fn is_infallible_box_allocator(name: &str) -> bool {
         && (name.ends_with("::new")
             || name.ends_with("::new_uninit")
             || name.ends_with("::new_zeroed"));
-    boxed_method || name.ends_with("box_new_uninit") || name.ends_with("exchange_malloc")
+    if boxed_method {
+        let owned_box = tcx.lang_items().owned_box();
+        let self_adt = tcx
+            .impl_of_assoc(did)
+            .and_then(|impl_did| {
+                tcx.type_of(impl_did).instantiate_identity().skip_normalization().ty_adt_def()
+            })
+            .map(|adt| adt.did());
+        return owned_box.is_some() && self_adt == owned_box;
+    }
+    (name.ends_with("box_new_uninit") || name.ends_with("exchange_malloc"))
+        && is_real_sysroot_crate(tcx, did.krate)
 }
 
 /// Find the UNIQUE `Call` terminator whose destination is the whole local `local`
@@ -3084,10 +3115,12 @@ fn alloc_call_box_facts<'tcx>(
             unique_call_def_for_local(mir_body, local)
         {
             let name = func_operand_name(tcx, func);
-            if is_infallible_box_allocator(&name) {
-                return Some(BoxAllocFacts {
-                    align: box_allocator_alignment(tcx, typing_env, func),
-                });
+            if let Some((did, _)) = func.const_fn_def() {
+                if is_infallible_box_allocator(tcx, did, &name) {
+                    return Some(BoxAllocFacts {
+                        align: box_allocator_alignment(tcx, typing_env, func),
+                    });
+                }
             }
         }
         return None;
@@ -3696,7 +3729,10 @@ fn error_local_has_os_provenance<'tcx>(
         if let Some(mir::TerminatorKind::Call { func, .. }) =
             unique_call_def_for_local(mir_body, local)
         {
-            return is_os_error_constructor(&func_operand_name(tcx, func));
+            let sysroot_callee = func
+                .const_fn_def()
+                .is_some_and(|(did, _)| is_real_sysroot_crate(tcx, did.krate));
+            return sysroot_callee && is_os_error_constructor(&func_operand_name(tcx, func));
         }
         return false;
     }
@@ -3952,12 +3988,13 @@ fn ty_is_pointer_free_scalar<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool 
     match ty.ty_adt_def() {
         Some(adt) => {
             let path = crate::safe_def_path_str(tcx, adt.did());
-            path.starts_with("core::num::niche_types::")
+            let name_matches = path.starts_with("core::num::niche_types::")
                 || path.starts_with("std::num::niche_types::")
                 || matches!(
                     path.as_str(),
                     "alloc::collections::TryReserveError" | "std::collections::TryReserveError"
-                )
+                );
+            name_matches && is_real_sysroot_crate(tcx, adt.did().krate)
         }
         None => false,
     }
@@ -5110,7 +5147,9 @@ pub(crate) fn discharge_os_provenance_error_drops<'tcx>(
         let drop_ty = place.ty(&mir_body.local_decls, tcx).ty;
         let drop_ty = tcx.normalize_erasing_regions(typing_env, ty::Unnormalized::new_wip(drop_ty));
         let ty::Adt(adt_def, _) = drop_ty.kind() else { continue };
-        if !is_io_error_ty_name(&crate::safe_def_path_str(tcx, adt_def.did())) {
+        if !is_io_error_ty_name(&crate::safe_def_path_str(tcx, adt_def.did()))
+            || !is_real_sysroot_crate(tcx, adt_def.did().krate)
+        {
             continue;
         }
         if !error_local_has_os_provenance(tcx, mir_body, &aliased_locals, place.local) {
@@ -5874,7 +5913,9 @@ fn is_pinned_total_std_primitive_cmp_call<'tcx>(
 
     // (2) STRONG crate-of-DefId authentication: the resolved method is DEFINED in
     // `core` (the pinned std sources).
-    if tcx.crate_name(resolved.krate) != sym::core {
+    if tcx.crate_name(resolved.krate) != sym::core
+        || !is_real_sysroot_crate(tcx, resolved.krate)
+    {
         return false;
     }
 
@@ -6031,7 +6072,7 @@ fn std_try_carrier_kind<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Option<Std
     let path = crate::safe_def_path_str(tcx, def.did());
     let std_path =
         path.starts_with("core::") || path.starts_with("std::") || path.starts_with("alloc::");
-    if !std_path {
+    if !std_path || !is_real_sysroot_crate(tcx, def.did().krate) {
         return None;
     }
     match path.rsplit("::").next().unwrap_or(&path) {

@@ -351,6 +351,7 @@ mod tests {
             location: span(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         }
     }
 

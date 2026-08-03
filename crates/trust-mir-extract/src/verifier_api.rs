@@ -5121,6 +5121,7 @@ mod tests {
             location: function.span.clone(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
 
         let bundle = function_to_verifier_api_bundle_with_crate_name(
@@ -5167,6 +5168,7 @@ mod tests {
             location: function.span.clone(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
 
         let bundle = function_to_verifier_api_bundle(
@@ -6461,6 +6463,7 @@ mod tests {
             location: function.span.clone(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
 
         let bundle = function_to_verifier_api_bundle(
@@ -6515,6 +6518,7 @@ mod tests {
             location: function.span.clone(),
             formula: trust_types::Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         }];
 
         let bundle = function_to_verifier_api_bundle(&function, &compiler_contracts, &vcs);
@@ -6599,6 +6603,7 @@ mod tests {
             location: function.span.clone(),
             formula: trust_types::Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         }];
 
         let bundle = function_to_verifier_api_bundle(&function, &compiler_contracts, &vcs);
@@ -6652,6 +6657,7 @@ mod tests {
             location: function.span.clone(),
             formula: trust_types::Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let vc_false =
             VerificationCondition { formula: trust_types::Formula::Bool(false), ..vc_true.clone() };
@@ -6690,6 +6696,7 @@ mod tests {
             location: function.span.clone(),
             formula: trust_types::Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         }];
 
         let bundle = function_to_verifier_api_bundle(&function, &compiler_contracts, &vcs);
@@ -6750,6 +6757,7 @@ mod tests {
             location: function.span.clone(),
             formula: trust_types::Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         }];
 
         let bundle = function_to_verifier_api_bundle(&function, &compiler_contracts, &vcs);
@@ -6788,6 +6796,7 @@ mod tests {
                 location: function.span.clone(),
                 formula: trust_types::Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationCondition {
                 kind: VcKind::FfiBoundaryViolation {
@@ -6798,6 +6807,7 @@ mod tests {
                 location: function.span.clone(),
                 formula: trust_types::Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             },
         ];
 
@@ -6863,6 +6873,7 @@ mod tests {
                 Box::new(trust_types::Formula::BitVec { value: 0, width: 8 }),
             ),
             contract_metadata: None,
+            obligation: None,
         }];
 
         let bundle = function_to_verifier_api_bundle(&function, &compiler_contracts, &vcs);
@@ -7136,6 +7147,7 @@ mod tests {
             location: function.span.clone(),
             formula: trust_types::Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         }];
 
         let bundle = function_to_verifier_api_bundle(&function, &compiler_contracts, &vcs);
@@ -7232,6 +7244,7 @@ mod tests {
             location: function.span.clone(),
             formula: source_formula.clone(),
             contract_metadata: None,
+            obligation: None,
         }];
 
         let bundle = function_to_verifier_api_bundle(&function, &compiler_contracts, &vcs);
@@ -7287,6 +7300,7 @@ mod tests {
             location: function.span.clone(),
             formula: source_formula.clone(),
             contract_metadata: None,
+            obligation: None,
         };
 
         let selection = vc_formula_payload(&vc.kind, &vc.formula);
@@ -7355,6 +7369,7 @@ mod tests {
                 Box::new(Formula::UInt(5)),
             ),
             contract_metadata: None,
+            obligation: None,
         }];
 
         let bundle = function_to_verifier_api_bundle(&function, &compiler_contracts, &vcs);
@@ -7401,6 +7416,7 @@ mod tests {
             location: function.span.clone(),
             formula: source_formula,
             contract_metadata: None,
+            obligation: None,
         }];
 
         let bundle = function_to_verifier_api_bundle(&function, &compiler_contracts, &vcs);
@@ -7437,6 +7453,7 @@ mod tests {
             location: function.span.clone(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
         let obligation_kind = vc_obligation_kind(&vc.kind);
 
@@ -7488,6 +7505,7 @@ mod tests {
             location: function.span.clone(),
             formula: trust_types::Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         }];
 
         let bundle = function_to_verifier_api_bundle(&function, &compiler_contracts, &vcs);
@@ -7526,6 +7544,7 @@ mod tests {
             location: function.span.clone(),
             formula: trust_types::Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         }];
 
         let bundle = function_to_verifier_api_bundle(&function, &compiler_contracts, &vcs);
@@ -7574,6 +7593,7 @@ mod tests {
             location: function.span.clone(),
             formula: i128_range_guard_formula(lower),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -7632,6 +7652,7 @@ mod tests {
                 Box::new(Formula::Int(7)),
             ),
             contract_metadata: None,
+            obligation: None,
         };
         let payload = VcFormulaPayload {
             schema: TRUST_SYMBOLIC_FORMULA_SCHEMA.to_string(),

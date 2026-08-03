@@ -2042,31 +2042,38 @@ fn depth_probe_stale_put_key_declines() {
 
 /// BINDER-FIELD MISMATCH: the binder body threads a DIFFERENT folder field
 /// than the memo key → `fold_memo::key_mismatch`.
+///
+/// `Instantiator`'s only `u32` field IS the memo-key depth (field 1) — its
+/// other fields are `&Expr` and `FoldMemo` — so repointing the save/inc/restore
+/// chain at an existing field would assign a reference or a map into a `u32`
+/// local, and whole-body assignment typing would reject the binder as a coarse
+/// validation drift before the key check under test ever ran. The honest
+/// adversary is therefore a folder that carries a SECOND `u32` counter and a
+/// binder body that threads THAT one while the wrapper still keys the memo on
+/// field 1.
 #[test]
 fn depth_probe_binder_field_mismatch_declines() {
     let d = recognize_with_mutated_binder(INST_ROW, INST_BINDER_FILE, |b| {
+        let shadow =
+            push_folder_field(b, "shadow_depth", trust_types::Ty::Int { width: 32, signed: false });
+        let key_proj =
+            vec![trust_types::Projection::Deref, trust_types::Projection::Field(1)];
+        let shadow_proj =
+            vec![trust_types::Projection::Deref, trust_types::Projection::Field(shadow)];
+        let retarget = |p: &mut trust_types::Place| {
+            if p.local == 1 && p.projections == key_proj {
+                p.projections.clone_from(&shadow_proj);
+            }
+        };
         for blk in &mut b.body.blocks {
             for s in &mut blk.stmts {
                 if let trust_types::Statement::Assign { place, rvalue, .. } = s {
-                    for p in [Some(place)]
-                        .into_iter()
-                        .flatten()
-                        .map(Some)
-                        .chain([match rvalue {
-                            trust_types::Rvalue::Use(
-                                trust_types::Operand::Copy(p) | trust_types::Operand::Move(p),
-                            ) => Some(p),
-                            _ => None,
-                        }])
-                        .flatten()
+                    retarget(place);
+                    if let trust_types::Rvalue::Use(
+                        trust_types::Operand::Copy(p) | trust_types::Operand::Move(p),
+                    ) = rvalue
                     {
-                        for proj in &mut p.projections {
-                            if let trust_types::Projection::Field(f) = proj {
-                                if *f == 1 {
-                                    *f = 0;
-                                }
-                            }
-                        }
+                        retarget(p);
                     }
                 }
             }
@@ -2182,6 +2189,53 @@ fn call_mut<'a>(func: &'a mut VerifiableFunction, callee: &str) -> &'a mut trust
     &mut blk.terminator
 }
 
+/// The TYPE-COHERENT minimal state write through a `&mut FVarSubst`-shaped
+/// folder reference held in `local`: `(*local).id.0 = 0u64`.
+///
+/// `FVarSubst`'s first field is the `FVarId` NEWTYPE, not its scalar, so
+/// `(*local).id = 0u64` is ill-typed. Every recognizer entry point admits a
+/// body only after `trust_vcgen::validate_function` AND whole-body assignment
+/// typing, so an ill-typed doctoring is rejected as a coarse validation drift
+/// before the purity scan it is written to exercise ever runs — a probe that
+/// declines there proves nothing about purity. Reaching the newtype's `u64`
+/// payload keeps the write well typed while leaving it exactly what the purity
+/// scan must catch: a write through a folder-derived place.
+fn folder_scalar_write(local: usize) -> trust_types::Statement {
+    trust_types::Statement::Assign {
+        place: trust_types::Place {
+            local,
+            projections: vec![
+                trust_types::Projection::Deref,
+                trust_types::Projection::Field(0),
+                trust_types::Projection::Field(0),
+            ],
+        },
+        rvalue: trust_types::Rvalue::Use(trust_types::Operand::Constant(
+            trust_types::ConstValue::Uint(0, 64),
+        )),
+        span: trust_types::SourceSpan::default(),
+    }
+}
+
+/// Append an adversarial field to the folder ADT behind `&mut self` (local
+/// `_1`) of `func` and return its field index.
+///
+/// Several probes need the folder to EXPOSE a channel the real folder does not
+/// have (a second `u32` counter, a shared container hiding a `Cell`). Declaring
+/// it on the folder is what makes the doctored dump self-consistent: the copy
+/// out of it then type-checks and the probe reaches the check under test
+/// instead of dying at assignment typing.
+fn push_folder_field(func: &mut VerifiableFunction, name: &str, ty: trust_types::Ty) -> usize {
+    let trust_types::Ty::Ref { inner, .. } = &mut func.body.locals[1].ty else {
+        panic!("_1 is not a folder reference")
+    };
+    let trust_types::Ty::Adt { fields, .. } = inner.as_mut() else {
+        panic!("the folder is not a struct")
+    };
+    fields.push((name.to_string(), ty));
+    fields.len() - 1
+}
+
 /// PUT OF A NON-RESULT VALUE: put's value argument re-pointed at the memo-GET
 /// result instead of the fold result → `fold_memo::key_mismatch`.
 #[test]
@@ -2245,25 +2299,74 @@ fn memo_probe_depth_drift_declines() {
 
 /// PARTIAL CACHED USE: the hit arm projects INTO the cached value instead of
 /// returning it whole → `fold_memo::key_mismatch`.
+///
+/// The memo-get result `_5` is `Option<Option<Expr>>` and the honest hit arm is
+/// `_8 = mv _5@V1.f0 ; _0 = mv _8` — the cached `Option<Expr>` taken WHOLE.
+/// The adversary projects one `Option` deeper, reaching the cached `Expr`
+/// payload, and re-wraps it as `Some`. That is a genuine partial use (the
+/// cached `None` case is read as if it were `Some`), and re-wrapping is what
+/// keeps the arm WELL TYPED: simply deepening the projection would leave
+/// `_8: Option<Expr>` assigned from an `i64` discriminant slot, which
+/// whole-body assignment typing rejects before the cache-hit shape check under
+/// test ever runs.
 #[test]
 fn memo_probe_partial_cached_use_declines() {
     let d = mutate_row(|func| {
+        let cached_local = 8usize;
+        let payload_ty = {
+            let trust_types::Ty::Adt { fields, .. } = &func.body.locals[cached_local].ty else {
+                panic!("_8 (cached) is not Option<Expr>")
+            };
+            fields
+                .iter()
+                .find(|(name, _)| name == "__v1_0")
+                .map(|(_, ty)| ty.clone())
+                .expect("Option<Expr> payload field")
+        };
+        let some_kind = trust_types::AggregateKind::Adt {
+            name: "std::option::Option".to_string(),
+            variant: 1,
+            active_field: None,
+            args: None,
+        };
+        func.body.locals[cached_local].ty = payload_ty;
         for b in &mut func.body.blocks {
             for s in &mut b.stmts {
-                if let trust_types::Statement::Assign { rvalue, .. } = s {
-                    if let trust_types::Rvalue::Use(
+                let trust_types::Statement::Assign { place, rvalue, .. } = s else { continue };
+                let deepen = matches!(
+                    rvalue,
+                    trust_types::Rvalue::Use(
+                        trust_types::Operand::Move(p) | trust_types::Operand::Copy(p),
+                    ) if p.projections
+                        == vec![
+                            trust_types::Projection::Downcast(1),
+                            trust_types::Projection::Field(0),
+                        ]
+                );
+                let rewrap = place.local == 0
+                    && place.projections.is_empty()
+                    && matches!(
+                        rvalue,
+                        trust_types::Rvalue::Use(
+                            trust_types::Operand::Move(p) | trust_types::Operand::Copy(p),
+                        ) if p.local == cached_local && p.projections.is_empty()
+                    );
+                if deepen {
+                    let trust_types::Rvalue::Use(
                         trust_types::Operand::Move(p) | trust_types::Operand::Copy(p),
                     ) = rvalue
-                    {
-                        if p.projections
-                            == vec![
-                                trust_types::Projection::Downcast(1),
-                                trust_types::Projection::Field(0),
-                            ]
-                        {
-                            p.projections.push(trust_types::Projection::Field(0));
-                        }
-                    }
+                    else {
+                        unreachable!()
+                    };
+                    p.projections.extend([
+                        trust_types::Projection::Downcast(1),
+                        trust_types::Projection::Field(0),
+                    ]);
+                } else if rewrap {
+                    *rvalue = trust_types::Rvalue::Aggregate(
+                        some_kind.clone(),
+                        vec![trust_types::Operand::Move(trust_types::Place::local(cached_local))],
+                    );
                 }
             }
         }
@@ -2277,46 +2380,51 @@ fn memo_probe_partial_cached_use_declines() {
 #[test]
 fn memo_probe_impure_state_declines() {
     let d = mutate_row(|func| {
-        func.body.blocks[0].stmts.push(trust_types::Statement::Assign {
-            place: trust_types::Place {
-                local: 1,
-                projections: vec![
-                    trust_types::Projection::Deref,
-                    trust_types::Projection::Field(0),
-                ],
-            },
-            rvalue: trust_types::Rvalue::Use(trust_types::Operand::Constant(
-                trust_types::ConstValue::Uint(0, 64),
-            )),
-            span: trust_types::SourceSpan::default(),
-        });
+        func.body.blocks[0].stmts.push(folder_scalar_write(1));
     })
     .expect_err("a folder-state write must decline");
     assert_eq!(d.name(), "fold_memo::impure_state", "{d:?}");
 }
 
 /// DELEGATION-CLOSURE CAPTURE DRIFT: swapped captures → stack_safe drift.
+///
+/// The captures are swapped TOGETHER WITH the aggregate's declared capture
+/// types and the destination local's upvar types, so the doctored dump is
+/// self-consistent and reaches the delegation-capture check. Swapping only the
+/// operands would leave the closure aggregate ill-typed against its own upvar
+/// list, and whole-body assignment typing would reject the row up front — the
+/// probe would then witness a validation drift, not the capture check. The
+/// adversary is unchanged: the pinned closure body is handed (expr, folder)
+/// where it expects (folder, expr).
 #[test]
 fn memo_probe_swapped_closure_captures_declines() {
-    let d =
-        mutate_row(|func| {
-            for b in &mut func.body.blocks {
-                for s in &mut b.stmts {
-                    if let trust_types::Statement::Assign {
-                        rvalue:
-                            trust_types::Rvalue::Aggregate(
-                                trust_types::AggregateKind::Closure { .. },
-                                ops,
-                            ),
-                        ..
-                    } = s
-                    {
-                        ops.swap(0, 1);
-                    }
+    let d = mutate_row(|func| {
+        let mut closure_local = None;
+        for b in &mut func.body.blocks {
+            for s in &mut b.stmts {
+                if let trust_types::Statement::Assign {
+                    place,
+                    rvalue:
+                        trust_types::Rvalue::Aggregate(
+                            trust_types::AggregateKind::Closure { captures, .. },
+                            ops,
+                        ),
+                    ..
+                } = s
+                {
+                    ops.swap(0, 1);
+                    captures.swap(0, 1);
+                    closure_local = Some(place.local);
                 }
             }
-        })
-        .expect_err("swapped closure captures must decline");
+        }
+        let local = closure_local.expect("the miss arm's delegation closure aggregate");
+        let trust_types::Ty::Closure { upvars, .. } = &mut func.body.locals[local].ty else {
+            panic!("the delegation closure local is not a closure type")
+        };
+        upvars.swap(0, 1);
+    })
+    .expect_err("swapped closure captures must decline");
     assert_eq!(d.name(), "stack_safe_drift", "{d:?}");
 }
 
@@ -2408,16 +2516,7 @@ fn memo_probe_leaf_override_self_write_declines() {
     let leaf_path =
         "<expr::subst::FVarSubst<'_> as expr::visitor::opt::ExprFolderOpt>::fold_fvar_opt";
     let leaf = bodies.get_mut(leaf_path).expect("leaf");
-    leaf.body.blocks[0].stmts.push(trust_types::Statement::Assign {
-        place: trust_types::Place {
-            local: 1,
-            projections: vec![trust_types::Projection::Deref, trust_types::Projection::Field(0)],
-        },
-        rvalue: trust_types::Rvalue::Use(trust_types::Operand::Constant(
-            trust_types::ConstValue::Uint(0, 64),
-        )),
-        span: trust_types::SourceSpan::default(),
-    });
+    leaf.body.blocks[0].stmts.push(folder_scalar_write(1));
     let d = sem_expr_fold_shape_of(&func, &bodies)
         .expect_err("a self-writing leaf override must decline");
     assert_eq!(d.name(), "fold_memo::impure_state", "{d:?}");
@@ -2444,16 +2543,7 @@ fn memo_probe_leaf_copied_self_alias_write_declines() {
         rvalue: trust_types::Rvalue::Use(trust_types::Operand::Copy(trust_types::Place::local(1))),
         span: trust_types::SourceSpan::default(),
     });
-    leaf.body.blocks[0].stmts.push(trust_types::Statement::Assign {
-        place: trust_types::Place {
-            local: alias,
-            projections: vec![trust_types::Projection::Deref, trust_types::Projection::Field(0)],
-        },
-        rvalue: trust_types::Rvalue::Use(trust_types::Operand::Constant(
-            trust_types::ConstValue::Uint(0, 64),
-        )),
-        span: trust_types::SourceSpan::default(),
-    });
+    leaf.body.blocks[0].stmts.push(folder_scalar_write(alias));
     let d = sem_expr_fold_shape_of(&func, &bodies)
         .expect_err("a write through a copied self alias must decline");
     assert_eq!(d.name(), "fold_memo::impure_state", "{d:?}");
@@ -2516,19 +2606,7 @@ fn memo_probe_leaf_pointer_integer_alias_laundering_declines() {
             ),
             span: trust_types::SourceSpan::default(),
         },
-        trust_types::Statement::Assign {
-            place: trust_types::Place {
-                local: raw_after,
-                projections: vec![
-                    trust_types::Projection::Deref,
-                    trust_types::Projection::Field(0),
-                ],
-            },
-            rvalue: trust_types::Rvalue::Use(trust_types::Operand::Constant(
-                trust_types::ConstValue::Uint(0, 64),
-            )),
-            span: trust_types::SourceSpan::default(),
-        },
+        folder_scalar_write(raw_after),
     ]);
     let d = sem_expr_fold_shape_of(&func, &bodies)
         .expect_err("a pointer/integer cast chain must not launder the self alias");
@@ -2586,12 +2664,11 @@ fn memo_probe_leaf_shared_container_cell_alias_declines() {
     let leaf_path =
         "<expr::subst::FVarSubst<'_> as expr::visitor::opt::ExprFolderOpt>::fold_fvar_opt";
     let leaf = bodies.get_mut(leaf_path).expect("leaf");
-    let alias = leaf.body.locals.len();
-    let hidden_cell = trust_types::Ty::Adt { adt_kind: None, layout: None, 
+    let hidden_cell = trust_types::Ty::Adt { adt_kind: None, layout: None,
         name: "std::collections::VecDeque".into(),
         fields: vec![(
             "logical_payload".into(),
-            trust_types::Ty::Adt { adt_kind: None, layout: None, 
+            trust_types::Ty::Adt { adt_kind: None, layout: None,
                 name: "std::cell::Cell".into(),
                 fields: vec![("value".into(), trust_types::Ty::Int { width: 64, signed: false })],
                 variants: vec![],
@@ -2601,9 +2678,18 @@ fn memo_probe_leaf_shared_container_cell_alias_declines() {
         variants: vec![],
         disc_index_safe: false,
         faithful_enum_repr: None, enum_layout: None, };
+    let hidden_cell_ref =
+        trust_types::Ty::Ref { mutable: false, inner: Box::new(hidden_cell) };
+    // The alias must be COPIED OUT OF the folder for the detachment rule under
+    // test to apply at all, so the folder has to declare a field of exactly
+    // that type. Copying the real `FVarId` field into a
+    // `&VecDeque<Cell<_>>`-typed local is ill typed, and whole-body assignment
+    // typing would reject the leaf before the detachment rule ever ran.
+    let container_field = push_folder_field(leaf, "shared_container", hidden_cell_ref.clone());
+    let alias = leaf.body.locals.len();
     leaf.body.locals.push(trust_types::LocalDecl {
         index: alias,
-        ty: trust_types::Ty::Ref { mutable: false, inner: Box::new(hidden_cell) },
+        ty: hidden_cell_ref,
         name: Some("hidden_cell_alias".into()),
     });
     let block = leaf
@@ -2616,7 +2702,10 @@ fn memo_probe_leaf_shared_container_cell_alias_declines() {
         place: trust_types::Place::local(alias),
         rvalue: trust_types::Rvalue::Use(trust_types::Operand::Copy(trust_types::Place {
             local: 1,
-            projections: vec![trust_types::Projection::Deref, trust_types::Projection::Field(0)],
+            projections: vec![
+                trust_types::Projection::Deref,
+                trust_types::Projection::Field(container_field),
+            ],
         })),
         span: trust_types::SourceSpan::default(),
     });
@@ -2641,19 +2730,42 @@ fn memo_probe_pinned_hashmap_fixed_state_drift_declines() {
         "<expr::subst::LevelParamSubst<'_> as expr::visitor::opt::ExprFolderOpt>::fold_sort_opt";
     let mut bodies = all_bodies();
     let leaf = bodies.get_mut(leaf_path).expect("LevelParamSubst sort leaf");
-    let trust_types::Ty::Ref { mutable: false, inner } = &mut leaf.body.locals[9].ty else {
-        panic!("_9 must be the copied shared HashMap reference");
-    };
-    let trust_types::Ty::Adt { fields, .. } = inner.as_mut() else {
-        panic!("_9 pointee must be the extracted HashMap graph");
-    };
-    fields.push((
-        "adversarial_cell".into(),
+    let adversarial_cell = (
+        "adversarial_cell".to_string(),
         trust_types::Ty::adt(
             "std::cell::Cell",
             vec![("value".into(), trust_types::Ty::Int { width: 64, signed: false })],
         ),
-    ));
+    );
+    // `_9` is COPIED from the folder's `subst` field, so the SAME drift has to
+    // land on both ends of that copy. Drifting only the destination leaves an
+    // `&HashMap` copied into a differently shaped `&HashMap` local, which
+    // whole-body assignment typing rejects before the fixed-state pin under
+    // test is ever consulted.
+    {
+        let trust_types::Ty::Ref { inner, .. } = &mut leaf.body.locals[1].ty else {
+            panic!("_1 must be the &mut LevelParamSubst folder");
+        };
+        let trust_types::Ty::Adt { fields, .. } = inner.as_mut() else {
+            panic!("LevelParamSubst must be a struct");
+        };
+        let trust_types::Ty::Ref { inner, .. } = &mut fields[0].1 else {
+            panic!("LevelParamSubst::subst must be a shared reference");
+        };
+        let trust_types::Ty::Adt { fields, .. } = inner.as_mut() else {
+            panic!("subst pointee must be the extracted HashMap graph");
+        };
+        fields.push(adversarial_cell.clone());
+    }
+    {
+        let trust_types::Ty::Ref { mutable: false, inner } = &mut leaf.body.locals[9].ty else {
+            panic!("_9 must be the copied shared HashMap reference");
+        };
+        let trust_types::Ty::Adt { fields, .. } = inner.as_mut() else {
+            panic!("_9 pointee must be the extracted HashMap graph");
+        };
+        fields.push(adversarial_cell);
+    }
     let decline = sem_expr_fold_shape_of(&load(row), &bodies)
         .expect_err("HashMap graph drift must invalidate the fixed-state pin");
     assert_eq!(decline.name(), "fold_memo::impure_state", "{decline:?}");
@@ -2674,19 +2786,7 @@ fn memo_probe_leaf_mutating_helper_call_declines() {
     helper.body.arg_count = 1;
     helper.body.blocks = vec![trust_types::BasicBlock {
         id: trust_types::BlockId(0),
-        stmts: vec![trust_types::Statement::Assign {
-            place: trust_types::Place {
-                local: 1,
-                projections: vec![
-                    trust_types::Projection::Deref,
-                    trust_types::Projection::Field(0),
-                ],
-            },
-            rvalue: trust_types::Rvalue::Use(trust_types::Operand::Constant(
-                trust_types::ConstValue::Uint(0, 64),
-            )),
-            span: trust_types::SourceSpan::default(),
-        }],
+        stmts: vec![folder_scalar_write(1)],
         terminator: trust_types::Terminator::Return,
     }];
     bodies.insert(helper.def_path.clone(), helper);
@@ -2742,6 +2842,20 @@ fn memo_probe_interior_mutating_clone_declines() {
     ] {
         let mut bodies = all_bodies();
         let leaf = bodies.get_mut(leaf_path).expect("leaf");
+        // `_5` is the shared reborrow `&(*_1).id`, so the folder field it
+        // borrows carries the adversarial payload too. Retyping only `_5`
+        // leaves `&FVarId` assigned into a `&Cell`-typed local, which
+        // whole-body assignment typing rejects before the clone-payload rule
+        // under test is reached.
+        {
+            let trust_types::Ty::Ref { inner, .. } = &mut leaf.body.locals[1].ty else {
+                panic!("_1 must be the &mut FVarSubst folder")
+            };
+            let trust_types::Ty::Adt { fields, .. } = inner.as_mut() else {
+                panic!("FVarSubst must be a struct")
+            };
+            fields[0].1 = payload.clone();
+        }
         leaf.body.locals[5].ty = trust_types::Ty::Ref { mutable: false, inner: Box::new(payload) };
         let block = leaf
             .body
@@ -2787,3 +2901,4 @@ fn memo_probe_should_descend_interior_mutation_declines() {
         .expect_err("an interior-mutating G call must decline");
     assert_eq!(d.name(), "fold_memo::impure_state", "{d:?}");
 }
+

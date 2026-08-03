@@ -453,6 +453,7 @@ fn emit_cluster(
             location: func.span.clone(),
             formula,
             contract_metadata: None,
+            obligation: None,
         };
         let e_name = crate::place_to_var_name(func, &Place::local(PAYLOAD_LOCAL));
         let base = Formula::forall(&[(e_name.as_str(), e_sort.clone())], mo.base[0].clone());
@@ -480,6 +481,7 @@ fn emit_cluster(
             location: func.span.clone(),
             formula,
             contract_metadata: None,
+            obligation: None,
         };
         let e_name = crate::place_to_var_name(func, &Place::local(PAYLOAD_LOCAL));
         let base = Formula::forall(&[(e_name.as_str(), e_sort.clone())], mo.base[0].clone());
@@ -534,6 +536,7 @@ fn emit_cluster(
         location: members[0].span.clone(),
         formula: Formula::And(conjuncts),
         contract_metadata: None,
+        obligation: None,
     });
     Some(vcs)
 }

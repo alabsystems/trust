@@ -1401,6 +1401,7 @@ mod tests {
             location: span(),
             formula,
             contract_metadata: None,
+            obligation: None,
         }
     }
 

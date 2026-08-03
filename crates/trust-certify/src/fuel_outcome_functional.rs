@@ -2439,6 +2439,7 @@ mod tests {
             location: trust_types::SourceSpan::default(),
             formula,
             contract_metadata: None,
+            obligation: None,
         }
     }
 

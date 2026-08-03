@@ -183,6 +183,63 @@ pub enum BridgeError {
     },
 }
 
+/// Trust (wave-TW): pin an enum def's TAG LANE to `lane` — the integer width rustc's own layout
+/// gives that enum's `Direct` tag — returning `Some((was, now))` when the def actually moved.
+///
+/// # Why the tag lane needs pinning at all
+///
+/// [`trust_ir::EnumDef::canonical_tag_repr`] has two branches. With an explicit `#[repr(iN)]` it
+/// returns the HINT, which is ground truth carried from rustc. Without one it returns
+/// `EnumTagRepr::smallest_for(min, max)` — a GUESS, and one rustc does not share: a `repr(Rust)`
+/// enum whose payload out-aligns the minimal tag gets its in-memory tag WIDENED to fill the
+/// prefix padding (`Integer::for_align`), and a `repr(C)` enum's tag is floored at
+/// `c_enum_min_size`. `enum Lit { Nat(u64), Str(u32), Unit }` guesses `U8` and is laid out with a
+/// 64-bit tag.
+///
+/// That guess is not cosmetic, because `canonical_tag_repr` TYPES the tag lane everywhere: the
+/// interpreter sizes the Direct tag read at it, the producer stamps the tag `ExtractField` with
+/// it, and the discriminant `Const`s / `Switch` cases are minted at it. So the disagreement can
+/// NOT be papered over by handing the layout-descriptor fill rustc's width — that would DECLARE
+/// one width in memory and SWITCH on another. Pinning removes the disagreement at its source, so
+/// the descriptor, the extract, the constant and the switch all speak rustc's width.
+///
+/// # ONE implementation, called from both sides
+///
+/// The THIR producer (`trust-thir-lower`, from `layout_of`) and the MIR oracle (this crate, from
+/// the extractor's carried `tag_ty`) both call THIS function. It is deliberately not a mirrored
+/// pair: the differential's `tys_agree` compares the two sides' `canonical_tag_repr` — and, ahead
+/// of it, descriptor PRESENCE — so a drifted twin would manufacture fill-asymmetry skips out of
+/// bodies that agree perfectly.
+///
+/// # Fail-closed
+///
+/// Only a HINT-LESS def is pinned: an explicit `#[repr(iN)]` is normative and is never
+/// overwritten (with a hint rustc's `min_ity` IS that hint, so there is nothing to pin — that
+/// early return is a tripwire, not a load-bearing gate). The write is CHECKED, not assumed: the
+/// repr is written, `canonical_tag_repr()` is re-asked, and the previous value is fully restored
+/// unless the answer is exactly `lane` — so a lane the discriminants do not fit (a negative value
+/// under a `Pointer`-primitive tag pinned to U64) leaves the def exactly as it was rather than
+/// leaving behind a repr whose canonical tag no longer resolves.
+pub fn pin_enum_tag_lane(
+    def: &mut trust_ir::EnumDef,
+    lane: trust_ir::EnumTagRepr,
+) -> Option<(trust_ir::EnumTagRepr, trust_ir::EnumTagRepr)> {
+    if def.repr.is_some() {
+        return None;
+    }
+    let was = def.canonical_tag_repr()?;
+    if was == lane {
+        return None;
+    }
+    def.repr = Some(lane);
+    if def.canonical_tag_repr() == Some(lane) {
+        Some((was, lane))
+    } else {
+        def.repr = None;
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Type mapping: trust-types Ty -> trust_ir Ty
 // ---------------------------------------------------------------------------
@@ -2080,6 +2137,31 @@ impl<'a> LoweringCtx<'a> {
                         "enum {name} has no canonical tag repr (faithful-lane decline)"
                     )));
                 }
+                let map_hint = |h: &trust_types::EnumReprHint| match h {
+                    trust_types::EnumReprHint::U8 => trust_ir::EnumTagRepr::U8,
+                    trust_types::EnumReprHint::U16 => trust_ir::EnumTagRepr::U16,
+                    trust_types::EnumReprHint::U32 => trust_ir::EnumTagRepr::U32,
+                    trust_types::EnumReprHint::U64 => trust_ir::EnumTagRepr::U64,
+                    trust_types::EnumReprHint::I8 => trust_ir::EnumTagRepr::I8,
+                    trust_types::EnumReprHint::I16 => trust_ir::EnumTagRepr::I16,
+                    trust_types::EnumReprHint::I32 => trust_ir::EnumTagRepr::I32,
+                    trust_types::EnumReprHint::I64 => trust_ir::EnumTagRepr::I64,
+                };
+                // Trust (wave-TW): the ORACLE HALF of the tag-lane pinning —
+                // the SAME function the THIR producer calls (never a mirror:
+                // `pin_enum_tag_lane` is the one implementation, precisely
+                // because the two sides' defs are compared structurally by the
+                // differential's `tys_agree`, which reads `canonical_tag_repr`
+                // and, before it, descriptor PRESENCE). Pinning one side alone
+                // would turn every body whose signature mentions such an enum
+                // into a fill-asymmetry `Err` — coverage-only, but
+                // self-inflicted. The extractor already carries rustc's chosen
+                // `tag_ty` on the Direct encoding precisely as this carrier.
+                if let Some(trust_types::EnumTagEncodingInfo::Direct { tag_ty, .. }) =
+                    enum_layout.as_ref().map(|el| &el.encoding)
+                {
+                    pin_enum_tag_lane(&mut def, map_hint(tag_ty));
+                }
                 // Trust (B3-3): copy the extractor's concrete layout twin
                 // through verbatim (the T3 struct copy-through discipline).
                 // The descriptor is NORMATIVE on the trust-ir side, so two
@@ -2087,22 +2169,14 @@ impl<'a> LoweringCtx<'a> {
                 // tag scalar disagrees with the CANONICAL tag repr this def
                 // resolves to — the interpreter/validator size the Direct tag
                 // lane at canonical width, and a rustc-widened tag would mint
-                // a descriptor whose normative claim is wrong; (b) an
-                // unmappable niche lane (unreachable today: eligibility is
-                // Direct-only, but the mapping must not rot). A decline keeps
-                // layout=None — the documented fail-safe; a producer-side fill
-                // asymmetry then surfaces as a coverage-only Err in tys_agree.
+                // a descriptor whose normative claim is wrong (the widening
+                // above removes that disagreement wherever it legally can; the
+                // gate stays for the residue); (b) an unmappable niche lane
+                // (unreachable today: eligibility is Direct-only, but the
+                // mapping must not rot). A decline keeps layout=None — the
+                // documented fail-safe; a producer-side fill asymmetry then
+                // surfaces as a coverage-only Err in tys_agree.
                 if let Some(el) = enum_layout {
-                    let map_hint = |h: &trust_types::EnumReprHint| match h {
-                        trust_types::EnumReprHint::U8 => trust_ir::EnumTagRepr::U8,
-                        trust_types::EnumReprHint::U16 => trust_ir::EnumTagRepr::U16,
-                        trust_types::EnumReprHint::U32 => trust_ir::EnumTagRepr::U32,
-                        trust_types::EnumReprHint::U64 => trust_ir::EnumTagRepr::U64,
-                        trust_types::EnumReprHint::I8 => trust_ir::EnumTagRepr::I8,
-                        trust_types::EnumReprHint::I16 => trust_ir::EnumTagRepr::I16,
-                        trust_types::EnumReprHint::I32 => trust_ir::EnumTagRepr::I32,
-                        trust_types::EnumReprHint::I64 => trust_ir::EnumTagRepr::I64,
-                    };
                     let encoding = match &el.encoding {
                         trust_types::EnumTagEncodingInfo::Direct { tag_offset, tag_ty } => {
                             (def.canonical_tag_repr() == Some(map_hint(tag_ty)))
@@ -7694,6 +7768,7 @@ pub fn generate_native_safety_vcs(func: &VerifiableFunction) -> Option<Vec<Verif
                 location: span.clone(),
                 formula,
                 contract_metadata: None,
+                obligation: None,
             });
         }
     }
@@ -12272,6 +12347,49 @@ fn qualified_callee_trait_method(callee: &str) -> Option<(String, &str)> {
     Some((strip_generics(trait_spelling), method))
 }
 
+/// Remove a balanced trailing `<...>` group, returning the prefix before its
+/// opening angle bracket. Used only to peel method turbofish groups while
+/// preserving trait-level `<Rhs>` in a qualified comparison spelling.
+fn strip_trailing_angle_group(s: &str) -> Option<&str> {
+    if !s.ends_with('>') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (index, &byte) in s.as_bytes().iter().enumerate().rev() {
+        match byte {
+            b'>' => depth += 1,
+            b'<' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&s[..index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn call_head_without_trailing_turbofish(callee: &str) -> &str {
+    let mut head = callee;
+    while head.ends_with('>') {
+        match strip_trailing_angle_group(head) {
+            Some(prefix) => head = prefix.trim_end_matches(':'),
+            None => break,
+        }
+    }
+    head
+}
+
+/// A homogeneous `PartialEq`/`PartialOrd` call has the default `Rhs = Self`.
+/// A qualified trait generic before `>::method` denotes an independent
+/// heterogeneous impl that may run user code and must remain fail-closed.
+fn is_homogeneous_cmp_callee(callee: &str, trait_last: &str, method: &str) -> bool {
+    let head = call_head_without_trailing_turbofish(callee);
+    head.ends_with(&format!("{trait_last}>::{method}"))
+        || head.ends_with(&format!("::{trait_last}::{method}"))
+}
+
 /// Callee-NAME gate shared by the std ITERATOR-PROTOCOL totality recognizers
 /// (`total_slice_iterator_call` / `total_str_iterator_call` /
 /// `total_range_iterator_call` / `total_rev_range_iterator_call` /
@@ -12536,6 +12654,10 @@ fn total_range_contains_call(
     };
     let Ty::Adt { name, fields, .. } = adt else { return Ok(false) };
     if !RANGE_PATHS.iter().any(|p| name.starts_with(p)) {
+        return Ok(false);
+    }
+    let Some(item) = args.get(1) else { return Ok(false) };
+    if !field_is_primitive_copy(&operand_trust_type(item, ctx)?) {
         return Ok(false);
     }
     Ok(!fields.is_empty() && fields.iter().all(|(_, fty)| field_is_primitive_copy(fty)))
@@ -15067,13 +15189,15 @@ fn trait_method_impl_tail(callee: &str) -> Option<&'static str> {
         callee,
         &["core::cmp::PartialEq", "std::cmp::PartialEq"],
         "::eq",
-    ) {
+    ) && is_homogeneous_cmp_callee(callee, "PartialEq", "eq")
+    {
         Some("std::cmp::PartialEq>::eq")
     } else if is_canonical_trait_method(
         callee,
         &["core::cmp::PartialEq", "std::cmp::PartialEq"],
         "::ne",
-    ) {
+    ) && is_homogeneous_cmp_callee(callee, "PartialEq", "ne")
+    {
         Some("std::cmp::PartialEq>::ne")
     } else if is_canonical_trait_method(
         callee,
@@ -15109,13 +15233,15 @@ fn trait_method_impl_tail(callee: &str) -> Option<&'static str> {
         callee,
         &["core::cmp::PartialOrd", "std::cmp::PartialOrd"],
         "::partial_cmp",
-    ) {
+    ) && is_homogeneous_cmp_callee(callee, "PartialOrd", "partial_cmp")
+    {
         Some("std::cmp::PartialOrd>::partial_cmp")
     } else if is_canonical_trait_method(
         callee,
         &["core::cmp::PartialOrd", "std::cmp::PartialOrd"],
         "::le",
-    ) {
+    ) && is_homogeneous_cmp_callee(callee, "PartialOrd", "le")
+    {
         // The DEFAULT `le`/`lt`/`ge`/`gt` bodies call `PartialOrd::partial_cmp` and
         // match `Ordering` — for `Rat` that resolves to the bundled manual
         // `partial_cmp`, so the whole comparison is verified. If the monomorphized
@@ -15126,19 +15252,22 @@ fn trait_method_impl_tail(callee: &str) -> Option<&'static str> {
         callee,
         &["core::cmp::PartialOrd", "std::cmp::PartialOrd"],
         "::lt",
-    ) {
+    ) && is_homogeneous_cmp_callee(callee, "PartialOrd", "lt")
+    {
         Some("std::cmp::PartialOrd>::lt")
     } else if is_canonical_trait_method(
         callee,
         &["core::cmp::PartialOrd", "std::cmp::PartialOrd"],
         "::ge",
-    ) {
+    ) && is_homogeneous_cmp_callee(callee, "PartialOrd", "ge")
+    {
         Some("std::cmp::PartialOrd>::ge")
     } else if is_canonical_trait_method(
         callee,
         &["core::cmp::PartialOrd", "std::cmp::PartialOrd"],
         "::gt",
-    ) {
+    ) && is_homogeneous_cmp_callee(callee, "PartialOrd", "gt")
+    {
         Some("std::cmp::PartialOrd>::gt")
     } else {
         None
@@ -15521,7 +15650,10 @@ fn total_trait_call_on_total_type(
     // value-preserving int `Into` keeps riding the precise `value_preserving_int_convert`
     // cast (no precision loss) instead of collapsing to an opaque total result.
     if callee_is_trait_method_in(callee, NS_CONVERT, "Into", "into") {
-        return Ok(is_display_total_std_ty(&ty) && !ty.is_integer());
+        let Ok(target) = place_type(dest, ctx) else { return Ok(false) };
+        return Ok(
+            is_display_total_std_ty(&ty) && !ty.is_integer() && is_display_total_std_ty(&target),
+        );
     }
     // A `Clone::clone` call is total when the governing type's clone is provably
     // panic-free (primitive / pointer / bundled-verified / total-element container).
@@ -15532,8 +15664,10 @@ fn total_trait_call_on_total_type(
         return Ok(clone_is_total(&ty, ctx, CLONE_TOTALITY_FUEL));
     }
 
-    let is_partial_eq = callee_is_trait_method_in(callee, NS_CMP, "PartialEq", "eq")
-        || callee_is_trait_method_in(callee, NS_CMP, "PartialEq", "ne");
+    let is_partial_eq = ["eq", "ne"].iter().any(|method| {
+        callee_is_trait_method_in(callee, NS_CMP, "PartialEq", method)
+            && is_homogeneous_cmp_callee(callee, "PartialEq", method)
+    });
     if is_partial_eq {
         return Ok(match &ty {
             _ if is_primitive_copy_ty(&ty) => true,
@@ -15574,13 +15708,15 @@ fn total_trait_call_on_total_type(
 
     // Preserve receiver-gated comparison/Deref coverage without extending
     // authority to generic containers whose hidden element can run user code.
+    let homogeneous_partial_ord = ["partial_cmp", "le", "lt", "ge", "gt"].iter().any(
+        |method| {
+            callee_is_trait_method_in(callee, NS_CMP, "PartialOrd", method)
+                && is_homogeneous_cmp_callee(callee, "PartialOrd", method)
+        },
+    );
     let receiver_total_method = callee_is_trait_method_in(callee, NS_OPS_DEREF, "Deref", "deref")
         || callee_is_trait_method_in(callee, NS_CMP, "Ord", "cmp")
-        || callee_is_trait_method_in(callee, NS_CMP, "PartialOrd", "partial_cmp")
-        || callee_is_trait_method_in(callee, NS_CMP, "PartialOrd", "le")
-        || callee_is_trait_method_in(callee, NS_CMP, "PartialOrd", "lt")
-        || callee_is_trait_method_in(callee, NS_CMP, "PartialOrd", "ge")
-        || callee_is_trait_method_in(callee, NS_CMP, "PartialOrd", "gt");
+        || homogeneous_partial_ord;
     if receiver_total_method {
         return Ok(is_primitive_copy_ty(&ty)
             || adt_or_datatype_name(&ty).is_some_and(is_element_free_total_std_type));
@@ -27179,6 +27315,47 @@ mod step_by_full_native_tests {
             "<Local as mycrate::cmp::PartialOrd>::le",
         ] {
             assert_eq!(trait_method_impl_tail(callee), None, "must fail closed: {callee}");
+        }
+
+        for callee in [
+            "<Local as core::cmp::PartialEq<Other>>::eq",
+            "<Local as std::cmp::PartialEq<Other>>::ne",
+            "<Local as core::cmp::PartialOrd<Other>>::partial_cmp",
+            "<Local as std::cmp::PartialOrd<Other>>::lt",
+        ] {
+            assert_eq!(
+                trait_method_impl_tail(callee),
+                None,
+                "heterogeneous comparison must not resolve to the homogeneous impl: {callee}"
+            );
+        }
+    }
+
+    #[test]
+    fn comparison_totality_name_gate_requires_default_rhs() {
+        for (callee, trait_name, method) in [
+            ("core::cmp::PartialEq::eq", "PartialEq", "eq"),
+            ("<Local as core::cmp::PartialEq>::ne", "PartialEq", "ne"),
+            ("<f64 as std::cmp::PartialOrd>::lt", "PartialOrd", "lt"),
+        ] {
+            assert!(
+                is_homogeneous_cmp_callee(callee, trait_name, method),
+                "canonical homogeneous comparison declined: {callee}"
+            );
+        }
+        for (callee, trait_name, method) in [
+            ("<String as core::cmp::PartialEq<Local>>::eq", "PartialEq", "eq"),
+            ("<f64 as std::cmp::PartialOrd<Local>>::lt", "PartialOrd", "lt"),
+            (
+                "<f64 as core::cmp::PartialOrd<Local>>::partial_cmp::<u8>",
+                "PartialOrd",
+                "partial_cmp",
+            ),
+        ] {
+            assert!(
+                !is_homogeneous_cmp_callee(callee, trait_name, method),
+                "heterogeneous comparison admitted: {callee}"
+            );
         }
     }
 }

@@ -671,6 +671,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: trust_types::Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
         assert!(!backend.can_handle(&vc));
 

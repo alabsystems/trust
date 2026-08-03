@@ -423,6 +423,7 @@ mod tests {
                 Box::new(Formula::Int(0)),
             ))),
             contract_metadata: None,
+            obligation: None,
         }
     }
 
@@ -702,6 +703,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let vc2 = VerificationCondition {
             kind: VcKind::Assertion { message: "invariant".to_string() },
@@ -709,6 +711,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
         let result = proved_result();
 
@@ -783,6 +786,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         };
         let vc2 = VerificationCondition {
             kind: VcKind::DivisionByZero,
@@ -790,6 +794,7 @@ mod tests {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         };
         assert_ne!(compute_function_hash(&vc1), compute_function_hash(&vc2));
     }

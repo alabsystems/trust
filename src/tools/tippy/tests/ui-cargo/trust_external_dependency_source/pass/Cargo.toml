@@ -1,0 +1,12 @@
+[package]
+name = "trust_external_dependency_source"
+version = "0.1.0"
+publish = false
+
+# A dependency whose source is in this tree: a path dependency that is also a
+# workspace member. Neither fact may produce a report.
+[workspace]
+members = ["vendored"]
+
+[dependencies]
+vendored = { path = "vendored" }

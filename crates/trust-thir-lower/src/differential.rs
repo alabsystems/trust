@@ -44,7 +44,6 @@ use rustc_middle::mir;
 use rustc_middle::ty::{TyCtxt, TypeVisitableExt};
 use rustc_span::def_id::LocalDefId;
 use trust_ir::interpret::{InterpretErrorCode, InterpretValue, InterpretValueKind, Interpreter};
-use trust_ir::value::GlobalId;
 use trust_ir::{
     Block, CastOp, Constant, FuncId, FuncTy, Function, Inst, InstrNode, Module, Ty, ValueId,
 };
@@ -114,6 +113,23 @@ pub fn deferred_to_seam(thir_side: &Lowered) -> bool {
     thir_side.unsupported.is_empty()
         && thir_side.pending_consts.is_empty()
         && thir_side.contains_call
+}
+
+/// Trust: the DIRECT interpretation differential's STRUCTURAL SKIP — the one predicate on
+/// `Lowered` that routes a body away from [`compare`]'s sampled interpretation.
+///
+/// [`compare`] evaluates this before it builds the MIR-side oracle and returns
+/// `DiffMode::NotRun` when it holds (see the cross-module call guard, step 0.5). Nothing else in
+/// `Lowered` does this: in particular `Lowered::symbolic` is NEVER READ by `compare` — its only
+/// consumer outside the coverage census is `crate_module::record` → `BodyRecord::symbolic` →
+/// `splice_ok`. Producer lanes whose value model is degraded therefore FORCE `contains_call`
+/// (`LowerCx::register_union_lane`, `LowerCx::register_enum_param_lane`) rather than relying on
+/// `symbolic`, which would leave the manufactured-agreement channel open.
+///
+/// Extracted as a named `TyCtxt`-free predicate so those lanes' confinement can be pinned by a
+/// unit test end to end, instead of resting on a reading of `compare`'s control flow.
+pub fn contains_call_forces_not_run(thir_side: &Lowered) -> bool {
+    thir_side.contains_call
 }
 
 /// Compare the THIR-side `Lowered.module` against the MIR-via-bridge oracle by sampled
@@ -222,7 +238,7 @@ pub fn compare<'tcx>(
     //       We cannot assert interpretation-equivalence for such bodies; skip as coverage-only and
     //       do not even build the oracle (both sides would merely error at the call — a vacuous
     //       "agreement" we refuse to report as a verdict).
-    if thir_side.contains_call {
+    if contains_call_forces_not_run(thir_side) {
         report.equal = false;
         report.mode = DiffMode::NotRun;
         // Trust (B9-A): this note is now the FAIL-SAFE only — the hook suppresses the event for
@@ -2259,6 +2275,7 @@ impl Iterator for CartesianProduct<'_> {
 #[cfg(test)]
 mod tests {
     use trust_ir::interpret::InterpretErrorCode as C;
+    use trust_ir::value::GlobalId;
     use trust_ir::{EnumDef, EnumId, EnumTagRepr, EnumVariant};
 
     use super::*;

@@ -237,6 +237,7 @@ pub(crate) fn test_vc(kind: VcKind, function: &str) -> VerificationCondition {
         location: SourceSpan::default(),
         formula: Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     }
 }
 

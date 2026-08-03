@@ -1215,6 +1215,8 @@ impl VerificationReport {
                         Formula::Bool(false)
                     },
                     contract_metadata: None,
+                    // Not a contract-derived VC: no obligation to back-reference.
+                    obligation: None,
                 };
                 // Contract-panic rows carry no proof and are neither ordinary
                 // refutations nor runtime evidence. Keep the canonical report

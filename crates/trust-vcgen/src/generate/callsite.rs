@@ -97,6 +97,7 @@ pub fn generate_callsite_precondition_vcs(
                 location: span.clone(),
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             });
             continue;
         }
@@ -271,6 +272,7 @@ pub fn generate_callsite_precondition_vcs(
                 location: span.clone(),
                 formula,
                 contract_metadata: None,
+                obligation: None,
             });
         }
     }
@@ -368,6 +370,7 @@ pub fn generate_callsite_precondition_vcs_attributed(
                     location: span.clone(),
                     formula: Formula::Bool(true),
                     contract_metadata: None,
+                    obligation: None,
                 },
                 Formula::Bool(true),
                 Vec::new(),
@@ -558,6 +561,7 @@ pub fn generate_callsite_precondition_vcs_attributed(
                     location: span.clone(),
                     formula,
                     contract_metadata: None,
+                    obligation: None,
                 },
                 substituted,
                 guards,

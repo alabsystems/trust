@@ -507,6 +507,7 @@ fn make_concurrency_vc(kind: VcKind, function: &str) -> trust_types::Verificatio
         location: SourceSpan::default(),
         formula: trust_types::Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     }
 }
 

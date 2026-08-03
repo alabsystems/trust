@@ -1616,6 +1616,7 @@ pub fn build_v1_vcs(func: &VerifiableFunction) -> Vec<VerificationCondition> {
                     location: span.clone(),
                     formula,
                     contract_metadata: None,
+                    obligation: None,
                 });
                 continue;
             }
@@ -1661,6 +1662,7 @@ pub fn build_v1_vcs(func: &VerifiableFunction) -> Vec<VerificationCondition> {
                 location: span.clone(),
                 formula,
                 contract_metadata: None,
+                obligation: None,
             });
         }
 
@@ -1725,6 +1727,7 @@ pub fn build_v1_vcs(func: &VerifiableFunction) -> Vec<VerificationCondition> {
                 location: span.clone(),
                 formula,
                 contract_metadata: None,
+                obligation: None,
             });
         }
     }
@@ -1905,6 +1908,7 @@ fn unsupported_mir_v1_vc(
         location: span,
         formula: trust_types::Formula::Bool(true),
         contract_metadata: None,
+        obligation: None,
     }
 }
 

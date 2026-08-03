@@ -157,6 +157,7 @@ fn unsupported_mir_fails_closed_before_formula_routing() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
     let router = Router::with_backends(vec![Box::new(PanickingBackend)]);
 
@@ -264,6 +265,7 @@ fn vc(kind: VcKind, function: &'static str, formula: Formula) -> VerificationCon
         location: SourceSpan::default(),
         formula,
         contract_metadata: None,
+        obligation: None,
     }
 }
 

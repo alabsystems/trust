@@ -475,6 +475,7 @@ fn test_pipeline_raw_proved_statuses_are_not_published_as_verified() {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(false), // trivially UNSAT -> proved
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Proved {
                 solver: "constant-folder".into(),
@@ -495,6 +496,7 @@ fn test_pipeline_raw_proved_statuses_are_not_published_as_verified() {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Proved {
                 solver: "constant-folder".into(),
@@ -530,6 +532,7 @@ fn test_pipeline_mixed_results_verdict() {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Proved {
                 solver: "constant-folder".into(),
@@ -550,6 +553,7 @@ fn test_pipeline_mixed_results_verdict() {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(true),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Failed {
                 solver: "constant-folder".into(),
@@ -567,6 +571,7 @@ fn test_pipeline_mixed_results_verdict() {
                 location: SourceSpan::default(),
                 formula: Formula::Var("idx".to_string(), Sort::Int),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Unknown {
                 solver: "constant-folder".into(),
@@ -616,6 +621,7 @@ fn test_pipeline_backend_plan_for_different_vc_kinds() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     let l1_vc = VerificationCondition {
@@ -624,6 +630,7 @@ fn test_pipeline_backend_plan_for_different_vc_kinds() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     let l2_vc = VerificationCondition {
@@ -632,6 +639,7 @@ fn test_pipeline_backend_plan_for_different_vc_kinds() {
         location: SourceSpan::default(),
         formula: Formula::Bool(false),
         contract_metadata: None,
+        obligation: None,
     };
 
     // All three should get a backend plan from the mock router
@@ -827,6 +835,7 @@ fn test_pipeline_runtime_check_policy_propagation() {
             location: SourceSpan::default(),
             formula: Formula::Var("idx".to_string(), Sort::Int),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationResult::Unknown {
             solver: "constant-folder".into(),
@@ -1099,6 +1108,7 @@ fn test_pipeline_all_vc_kinds_through_mock() {
             location: SourceSpan::default(),
             formula: Formula::Bool(false),
             contract_metadata: None,
+            obligation: None,
         })
         .collect();
 
@@ -1152,6 +1162,7 @@ fn test_pipeline_counterexample_in_all_formats() {
             },
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationResult::Failed {
             solver: "constant-folder".into(),
@@ -1198,6 +1209,7 @@ fn test_pipeline_timeout_in_all_formats() {
             location: SourceSpan::default(),
             formula: Formula::Bool(true),
             contract_metadata: None,
+            obligation: None,
         },
         VerificationResult::Timeout { solver: "constant-folder".into(), timeout_ms: 30000 },
     )];
@@ -1242,6 +1254,7 @@ fn test_pipeline_proof_strengths_fail_closed_without_publication_evidence() {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Proved {
                 solver: "ay".into(),
@@ -1259,6 +1272,7 @@ fn test_pipeline_proof_strengths_fail_closed_without_publication_evidence() {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Proved {
                 solver: "trust-wp".into(),
@@ -1276,6 +1290,7 @@ fn test_pipeline_proof_strengths_fail_closed_without_publication_evidence() {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Proved {
                 solver: "ty".into(),
@@ -1293,6 +1308,7 @@ fn test_pipeline_proof_strengths_fail_closed_without_publication_evidence() {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Proved {
                 solver: "trust-mc".into(),
@@ -1382,6 +1398,7 @@ fn test_pipeline_proof_levels_in_report() {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Proved {
                 solver: "constant-folder".into(),
@@ -1399,6 +1416,7 @@ fn test_pipeline_proof_levels_in_report() {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Proved {
                 solver: "constant-folder".into(),
@@ -1416,6 +1434,7 @@ fn test_pipeline_proof_levels_in_report() {
                 location: SourceSpan::default(),
                 formula: Formula::Bool(false),
                 contract_metadata: None,
+                obligation: None,
             },
             VerificationResult::Proved {
                 solver: "constant-folder".into(),

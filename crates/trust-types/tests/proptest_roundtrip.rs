@@ -358,6 +358,7 @@ fn arb_verification_condition() -> impl Strategy<Value = VerificationCondition> 
                 location,
                 formula,
                 contract_metadata,
+                obligation: None,
             }
         })
 }
